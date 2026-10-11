@@ -871,6 +871,28 @@ mod cases {
         assert_eq!(read.records.len(), 1);
     }
 
+    pub(crate) async fn a_refused_append_leaves_no_trace_of_its_topic(case: &dyn Case) {
+        // Every store must answer a resume on a topic that never held a record the same way.
+        let chain = case.chain();
+        let landed = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        case.store().close_chain(&chain).await.unwrap();
+        assert_eq!(
+            kind(
+                Producer::new(case, &chain, OTHER, "p", 1)
+                    .send(&[data("2")])
+                    .await
+            ),
+            StreamFailureKind::Closed
+        );
+        let after = cursor(case, &chain, OTHER, &landed.last_position);
+        assert_eq!(
+            kind(read(case, &chain, OTHER, &after).await),
+            StreamFailureKind::NotFound
+        );
+    }
+
     pub(crate) async fn a_closed_topic_leaves_the_others_open(case: &dyn Case) {
         let chain = case.chain();
         case.store().close_topic(&chain, OUT).await.unwrap();
@@ -1132,6 +1154,7 @@ mod memory {
         a_cursor_from_another_stream_or_store_is_refused,
         a_closed_chain_refuses_new_batches_but_answers_a_repeat,
         a_closed_topic_leaves_the_others_open,
+        a_refused_append_leaves_no_trace_of_its_topic,
         a_stage_is_invisible_until_promoted,
         a_repeated_stage_holds_its_records_once,
         an_aborted_stage_never_lands,
