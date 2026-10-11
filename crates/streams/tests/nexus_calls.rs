@@ -138,6 +138,44 @@ mod cases {
         assert_eq!(values(&next), ["p@1 after"]);
     }
 
+    pub(crate) async fn rule_101_a_read_never_fails_on_a_record_it_cant_parse(
+        store: Arc<dyn StreamStore>,
+    ) {
+        // Unparsable entries first, in the middle and last of a page, so the store's reader
+        // meets each one both at the start of a call and partway through one.
+        let calls = service(store.clone(), NexusOptions::default());
+        let wf = workflow();
+        raw_entry(&store, &wf, b"\xff first".to_vec()).await;
+        write(&calls, &wf, "p", 1, 1, &["one", "two"]).await;
+        raw_entry(&store, &wf, Vec::new()).await;
+        write(&calls, &wf, "p", 1, 3, &["three"]).await;
+        raw_entry(&store, &wf, b"\xff last".to_vec()).await;
+        let (mut after, mut state) = (String::new(), Value::Null);
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            let answer = match read(&calls, read_input(&wf, &after, &state)).await {
+                Ok(answer) => answer,
+                Err(failure) => panic!("a read failed: {}", failure.message),
+            };
+            if answer["records"].as_array().unwrap().is_empty() {
+                break;
+            }
+            seen.extend(values(&answer).into_iter().map(|value| {
+                if value.starts_with("ERROR") {
+                    "ERROR".to_string()
+                } else {
+                    value
+                }
+            }));
+            after = answer["next_token"].as_str().unwrap().to_string();
+            state = answer["state"].clone();
+        }
+        assert_eq!(
+            seen,
+            ["ERROR", "p@1 one", "p@1 two", "ERROR", "p@1 three", "ERROR"]
+        );
+    }
+
     pub(crate) async fn a_body_the_codec_refuses_crosses_as_an_error_and_the_rest_reads(
         store: Arc<dyn StreamStore>,
     ) {
@@ -463,6 +501,7 @@ macro_rules! all_cases {
         lanes!($store;
             an_append_reads_back_with_its_body_decoded,
             rule_101_a_record_that_does_not_parse_crosses_as_an_error_at_its_cursor,
+            rule_101_a_read_never_fails_on_a_record_it_cant_parse,
             a_body_the_codec_refuses_crosses_as_an_error_and_the_rest_reads,
             rule_99_a_cut_hands_back_the_state_at_its_cut,
             rule_99_a_state_carries_across_handler_workers,

@@ -19,7 +19,7 @@ redis = ["dep:redis", "dep:crc16"]
 
 [dependencies]
 async-trait = "0.1"
-base64 = "0.22"
+base64 = "0.23"
 crc16 = { version = "0.4", optional = true }
 prost = { workspace = true }
 redis = { version = "1.7", optional = true, default-features = false, features = [
