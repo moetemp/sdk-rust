@@ -6,7 +6,6 @@ option ruby_package = "Temporalio::Internal::Bridge::Api::Streams";
 import "google/protobuf/duration.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/sdk/streams/v1/message.proto";
-import "temporal/sdk/core/streams/nexus.proto";
 
 // The stream calls lang makes, served in process by Core against the configured store.
 //
@@ -25,12 +24,6 @@ service StreamService {
   rpc Close(CloseRequest) returns (CloseResponse);
   // Deletes every stream of one owner.
   rpc DeleteOwner(DeleteOwnerRequest) returns (DeleteOwnerResponse);
-  // The stream service's Nexus `append` operation, over its JSON transfer form.
-  rpc NexusAppend(NexusCall) returns (NexusStep);
-  // The stream service's Nexus `read` operation, over its JSON transfer form.
-  rpc NexusRead(NexusCall) returns (NexusStep);
-  // Goes on with a call that asked for codec work.
-  rpc NexusResume(NexusResumeRequest) returns (NexusStep);
 }
 
 // Which store holds a process's streams, and how to reach it. Lang builds one store from it and
@@ -243,6 +236,10 @@ enum StreamFailureKind {
   STREAM_FAILURE_KIND_STORAGE = 10;
   // This release or this store does not offer the capability.
   STREAM_FAILURE_KIND_UNSUPPORTED = 11;
+  // The call's input breaks the contract, such as a missing member or a value out of range, so
+  // the same call fails the same way. The Nexus calls answer it, as BAD_REQUEST. A lang built
+  // before this kind maps it, as any kind it doesn't know, to a storage failure.
+  STREAM_FAILURE_KIND_INVALID_ARGUMENT = 12;
 }
 
 message StreamFailure {

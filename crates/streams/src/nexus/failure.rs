@@ -24,6 +24,7 @@ pub(crate) fn classify(kind: StreamFailureKind) -> (&'static str, &'static str, 
     use StreamFailureKind::*;
     match kind {
         NotFound => ("StreamNotFoundError", NOT_FOUND, false),
+        InvalidArgument => (INPUT_MISTAKE, BAD_REQUEST, false),
         Cursor => ("StreamCursorError", BAD_REQUEST, false),
         Expired => ("StreamExpiredError", BAD_REQUEST, false),
         ProducerDivergent | ProducerStale => ("StreamProducerError", BAD_REQUEST, false),
@@ -47,7 +48,7 @@ pub(crate) fn of_stream(error: &StreamError) -> NexusFailure {
 
 /// The failure a mistake in the call's input crosses as.
 pub(crate) fn input_mistake(message: impl Into<String>) -> NexusFailure {
-    failure(INPUT_MISTAKE, BAD_REQUEST, false, &message.into())
+    of_stream(&StreamError::invalid_argument(message))
 }
 
 /// A failure of `kind` with the cause class `class`. The message leads with the class, and the
@@ -94,6 +95,7 @@ mod tests {
         use StreamFailureKind::*;
         for (kind, class, nexus, retryable) in [
             (NotFound, "StreamNotFoundError", NOT_FOUND, false),
+            (InvalidArgument, "ValueError", BAD_REQUEST, false),
             (Cursor, "StreamCursorError", BAD_REQUEST, false),
             (Expired, "StreamExpiredError", BAD_REQUEST, false),
             (ProducerDivergent, "StreamProducerError", BAD_REQUEST, false),

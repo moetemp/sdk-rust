@@ -12,6 +12,16 @@ import "temporal/api/failure/v1/message.proto";
 // failure Core answers with to its Nexus handler. The contract is
 // `crates/streams/nexus/temporal_streams.nexusrpc.yaml`.
 
+// The calls Bridge adds beside `StreamService`, dispatched by name through the same entry.
+service StreamNexusService {
+  // The stream service's Nexus `append` operation, over its JSON transfer form.
+  rpc NexusAppend(NexusCall) returns (NexusStep);
+  // The stream service's Nexus `read` operation, over its JSON transfer form.
+  rpc NexusRead(NexusCall) returns (NexusStep);
+  // Goes on with a call that asked for codec work.
+  rpc NexusResume(NexusResumeRequest) returns (NexusStep);
+}
+
 // One Nexus operation call.
 message NexusCall {
   // The operation's input, the N0a model in its JSON transfer form.
