@@ -8,8 +8,6 @@ use redis::RedisError;
 pub(crate) enum Call {
     Read,
     Write,
-    /// A read a write makes first. Nothing is written yet, but a refusal refuses the write.
-    BeforeWrite,
     /// A producer's batch. A lang producer retries one whose outcome is unknown with the same
     /// sequence, which the dedupe answers, so a doubtful failure is reported as unknown.
     Append,
@@ -36,9 +34,7 @@ pub(crate) fn stream_error(error: &RedisError, call: Call) -> StreamError {
             Call::Write | Call::Append => StreamError::outcome_unknown(format!(
                 "the write may or may not have been applied: {error}"
             )),
-            Call::Read | Call::BeforeWrite => {
-                StreamError::storage(format!("Redis could not be reached: {error}"))
-            }
+            Call::Read => StreamError::storage(format!("Redis could not be reached: {error}")),
         };
     }
     let detail = error.detail().unwrap_or_default().to_string();
@@ -112,20 +108,6 @@ mod tests {
         assert!(error.message.contains("NOPERM"), "{error}");
         assert_eq!(
             stream_error(&refused, Call::Read).kind,
-            StreamFailureKind::Storage
-        );
-    }
-
-    #[test]
-    fn a_read_before_a_write_refuses_it_but_writes_nothing() {
-        let refused = stream_error(&server("WRONGTYPE", "wrong kind"), Call::BeforeWrite);
-        assert_eq!(refused.kind, StreamFailureKind::Refused);
-        let lost = RedisError::from(std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "reset",
-        ));
-        assert_eq!(
-            stream_error(&lost, Call::BeforeWrite).kind,
             StreamFailureKind::Storage
         );
     }

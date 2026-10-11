@@ -1005,3 +1005,38 @@ async fn a_topic_closed_before_its_first_write_still_expires() {
         .unwrap_err();
     assert_eq!(error.kind, StreamFailureKind::Closed);
 }
+
+#[tokio::test]
+async fn rule_10_1_an_append_that_races_a_topic_close_is_refused_once_the_close_returned() {
+    let Some(url) = url() else {
+        return;
+    };
+    let faults = Faults::start(&url).await;
+    let prefix = unique("race");
+    let producer = setup_with(&faults.url(), &url, &prefix, |_| {}).await;
+    let closer = setup_with(&url, &url, &prefix, |_| {}).await;
+    let chain = chain();
+    // A first batch loads the script, so the held call is the second batch's.
+    producer
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    faults.next(DELAY_SCRIPT);
+    let racing = {
+        let chain = chain.clone();
+        tokio::spawn(async move {
+            producer
+                .store
+                .append(append(&chain, "p", 2, 1, b"\x02"))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    closer.store.close_topic(&chain, "events").await.unwrap();
+    let error = racing.await.unwrap().unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Closed, "{error}");
+    let mut raw = closer.raw.clone();
+    let length: usize = raw.xlen(log_key(&prefix, &chain, "events")).await.unwrap();
+    assert_eq!(length, 1);
+}
