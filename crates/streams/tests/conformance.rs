@@ -1318,6 +1318,8 @@ mod cases {
             .await
             .unwrap_err();
         assert!(error.message.contains(OTHER), "{error}");
+        // A retry names the same topics, so the store refuses it for good.
+        assert_eq!(error.kind, StreamFailureKind::Refused);
         assert_eq!(latest(case, &chain, OUT).await, "");
         assert_eq!(store.pending_stages(&chain).await.unwrap().len(), 1);
     }

@@ -529,7 +529,7 @@ impl StreamStore for RedisStore {
             .invoke_async(&mut self.shared.clone())
             .await
             .map_err(|error| match error.code() {
-                Some("STREAMS_TOPIC") => StreamError::storage(error.detail().unwrap_or_default()),
+                Some("STREAMS_TOPIC") => StreamError::refused(error.detail().unwrap_or_default()),
                 _ => errors::stream_error(&error, Call::Write),
             })?;
         let (outcome, records) = match added {

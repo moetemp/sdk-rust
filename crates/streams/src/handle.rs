@@ -405,21 +405,34 @@ impl Streams {
                 topics: stage.topics,
             };
             // A reader never holds an attempt in flight, so the same-floor rule always holds.
-            match decide_token(&events, &stage.token, stage.history_floor_event_id, true) {
-                Decision::Promote => {
-                    let promoted = self.store.promote(&reference).await?;
-                    if promoted.outcome == PromoteOutcome::Lost as i32 {
-                        tracing::warn!(
-                            token = %stage.token,
-                            workflow_id = %chain.workflow_id,
-                            "Stream output the Workflow committed was dropped by retention \
-                             before it was promoted"
-                        );
-                    }
+            let settled =
+                match decide_token(&events, &stage.token, stage.history_floor_event_id, true) {
+                    Decision::Promote => self.store.promote(&reference).await.map(|promoted| {
+                        if promoted.outcome == PromoteOutcome::Lost as i32 {
+                            tracing::warn!(
+                                token = %stage.token,
+                                workflow_id = %chain.workflow_id,
+                                "Stream output the Workflow committed was dropped by retention \
+                                 before it was promoted"
+                            );
+                        }
+                    }),
+                    Decision::Abort => self.store.abort(&reference).await,
+                    // A stage History has not decided holds back the ones after it.
+                    Decision::Unknown => return Ok(()),
+                };
+            match settled {
+                Ok(()) => {}
+                // A stage the store refuses for good would hold back every later stage on every
+                // read, so it is left to its expiry and the repair goes on.
+                Err(error) if error.kind == crate::proto::StreamFailureKind::Refused => {
+                    tracing::warn!(
+                        token = %stage.token,
+                        workflow_id = %chain.workflow_id,
+                        "Leaving a stream stage the store refuses to settle: {error}"
+                    )
                 }
-                Decision::Abort => self.store.abort(&reference).await?,
-                // A stage History has not decided holds back the ones after it.
-                Decision::Unknown => return Ok(()),
+                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -1779,5 +1792,103 @@ mod tests {
             );
         }
         assert_eq!(setup.owners.describes(), 0);
+    }
+
+    /// A memory store that refuses for good to promote one stage.
+    struct Refusing {
+        inner: MemoryStore,
+        token: String,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamStore for Refusing {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        async fn append(
+            &self,
+            r: crate::proto::StoreAppendRequest,
+        ) -> StreamResult<crate::proto::StoreAppendResponse> {
+            self.inner.append(r).await
+        }
+        async fn read(
+            &self,
+            r: crate::proto::StoreReadRequest,
+        ) -> StreamResult<crate::proto::StoreReadResponse> {
+            self.inner.read(r).await
+        }
+        async fn latest(
+            &self,
+            r: crate::proto::StoreLatestRequest,
+        ) -> StreamResult<crate::proto::StoreLatestResponse> {
+            self.inner.latest(r).await
+        }
+        async fn record_at(&self, c: &ChainId, t: &str, p: &str) -> StreamResult<Option<Vec<u8>>> {
+            self.inner.record_at(c, t, p).await
+        }
+        async fn stage(&self, b: StagedBatch) -> StreamResult<()> {
+            self.inner.stage(b).await
+        }
+        async fn promote(&self, s: &StageRef) -> StreamResult<crate::proto::PromoteResult> {
+            if s.token == self.token {
+                return Err(StreamError::refused(
+                    "the stage names a topic the store can't key",
+                ));
+            }
+            self.inner.promote(s).await
+        }
+        async fn abort(&self, s: &StageRef) -> StreamResult<()> {
+            self.inner.abort(s).await
+        }
+        async fn close_chain(&self, c: &ChainId) -> StreamResult<()> {
+            self.inner.close_chain(c).await
+        }
+        async fn close_topic(&self, c: &ChainId, t: &str) -> StreamResult<()> {
+            self.inner.close_topic(c, t).await
+        }
+        async fn pending_stages(
+            &self,
+            c: &ChainId,
+        ) -> StreamResult<Vec<crate::proto::PendingStage>> {
+            self.inner.pending_stages(c).await
+        }
+        async fn delete_owner(
+            &self,
+            r: crate::proto::DeleteOwnerRequest,
+        ) -> StreamResult<crate::proto::DeleteOwnerResponse> {
+            self.inner.delete_owner(r).await
+        }
+    }
+
+    #[tokio::test]
+    async fn rule_12_2_repair_goes_past_a_stage_the_store_refuses_for_good() {
+        let store = Arc::new(Refusing {
+            inner: MemoryStore::new(),
+            token: "bad".to_string(),
+        });
+        let owners = Arc::new(Owners::default());
+        owners.run("wf", "run-1", "run-1");
+        let streams = Streams::new(store.clone(), owners.clone(), quick());
+        left_behind(&store.inner, "run-1", "bad", 3, "0").await;
+        left_behind(&store.inner, "run-1", "t1", 6, "1").await;
+        history(
+            &owners,
+            "run-1",
+            vec![marker(5, "bad", 3), marker(8, "t1", 6)],
+        );
+        let page = streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(values(&page), ["1"]);
+        let left: Vec<_> = store
+            .inner
+            .pending_stages(&chain("run-1"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|stage| stage.token)
+            .collect();
+        assert_eq!(left, ["bad"]);
     }
 }

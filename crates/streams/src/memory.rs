@@ -368,7 +368,7 @@ impl StreamStore for MemoryStore {
             .iter()
             .find(|record| !stage.topics.contains(&record.topic))
         {
-            return Err(StreamError::storage(format!(
+            return Err(StreamError::refused(format!(
                 "the stage holds topic {:?}, which the promotion did not name",
                 stray.topic
             )));
