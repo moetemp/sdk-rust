@@ -108,6 +108,42 @@ fn the_contract_names_the_operations_core_serves() {
     }
 }
 
+#[test]
+fn a_read_carries_its_state_through_the_generated_long_poll() {
+    // The generated caller sends each answer's state back on its next call, so the member it
+    // names must be the optional base64 `state` Core reads and answers.
+    let contract = contract();
+    let long_poll =
+        &contract["services"]["TemporalStreams"]["operations"]["read"]["x-nexus-long-poll"];
+    assert_eq!(long_poll["state-field"], "state");
+    for model_name in ["ReadInput", "ReadOutput"] {
+        let model = model(&contract, model_name);
+        let state = &model["properties"]["state"];
+        assert_eq!(state["type"], "string", "{model_name}");
+        assert_eq!(state["contentEncoding"], "base64", "{model_name}");
+        assert!(
+            !required(model).contains(&"state".to_string()),
+            "{model_name}"
+        );
+    }
+}
+
+#[test]
+fn the_operation_token_model_is_closed_and_versioned() {
+    // The generated token helpers refuse a token model that isn't closed or that lacks a
+    // required integer version constant.
+    let contract = contract();
+    let token = model(&contract, "StreamOperationToken");
+    assert_eq!(token["additionalProperties"], false);
+    assert_eq!(token["x-nexus-operation-token"]["version-field"], "v");
+    assert_eq!(token["properties"]["v"]["type"], "integer");
+    assert_eq!(token["properties"]["v"]["const"], 2);
+    assert_eq!(token["properties"]["ref"]["$ref"], "#/$defs/StreamRef");
+    let mut required = required(token);
+    required.sort();
+    assert_eq!(required, ["attach", "chain", "ref", "v"]);
+}
+
 #[tokio::test]
 async fn every_declared_input_member_is_accepted_and_nothing_else() {
     let contract = contract();

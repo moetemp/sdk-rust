@@ -48,6 +48,7 @@ services:
           wait-field: wait_ms
           result-field: records
           done-field: done
+          state-field: state
         input: { $ref: "#/$defs/ReadInput" }
         output: { $ref: "#/$defs/ReadOutput" }
 
@@ -279,3 +280,28 @@ $defs:
           below 64 KiB, so it can ride in a Workflow's History.
     required: [records, next_token, done]
     additionalProperties: true
+
+  StreamOperationToken:
+    type: object
+    description: >-
+      What a stream-returning operation's token carries. Core mints it when
+      the operation starts, and a caller reads the stream back from it. The
+      token is this model's transfer form as JSON with sorted keys and no
+      spaces, in base64url with no padding.
+    x-nexus-operation-token: { version-field: v }
+    properties:
+      v:
+        type: integer
+        const: 2
+        description: "The token version. A token of another version is refused."
+      ref: { $ref: "#/$defs/StreamRef" }
+      attach:
+        type: string
+        description: "The request id of the start that attached the caller."
+      chain:
+        type: string
+        description: >-
+          The first run of the run chain the start attached to, so a cancel
+          detaches from it even after the Workflow id moved on to a new chain.
+    required: [v, ref, attach, chain]
+    additionalProperties: false
