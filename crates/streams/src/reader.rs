@@ -15,6 +15,9 @@ use crate::{
 use prost::Message;
 use std::collections::HashMap;
 
+/// How many producers a read remembers the newest attempt of.
+pub const MAX_TRACKED_PRODUCERS: usize = 1_000;
+
 /// How many records one call returns when the request leaves it to Core.
 pub const DEFAULT_MAX_RECORDS: u32 = 100;
 
@@ -56,6 +59,12 @@ pub(crate) struct ReadState {
     watermark: String,
     #[prost(bool, tag = "8")]
     watermark_known: bool,
+    /// When this read last saw each producer in `attempts`, on the read's own clock, so the
+    /// least recently seen one is forgotten first.
+    #[prost(map = "string, uint64", tag = "9")]
+    last_seen: HashMap<String, u64>,
+    #[prost(uint64, tag = "10")]
+    clock: u64,
 }
 
 /// What one record tells the read about its producer's attempts.
@@ -82,11 +91,31 @@ impl ReadState {
         })
     }
 
+    /// Keeps the state small however many producers a long chain had, since it crosses to lang
+    /// on every call.
+    fn forget_beyond(&mut self, limit: usize) {
+        while self.attempts.len() > limit {
+            let oldest = self
+                .attempts
+                .keys()
+                .min_by_key(|producer| self.last_seen.get(*producer).copied().unwrap_or(0))
+                .cloned();
+            let Some(oldest) = oldest else { break };
+            self.attempts.remove(&oldest);
+            self.last_seen.remove(&oldest);
+        }
+        self.last_seen
+            .retain(|producer, _| self.attempts.contains_key(producer));
+    }
+
     fn observe(&mut self, record: &StreamRecord) -> Observed {
         // A producer that declares no attempt has no generation to compare.
         if record.producer_id.is_empty() || record.attempt <= 0 {
             return Observed::Known;
         }
+        self.clock += 1;
+        self.last_seen
+            .insert(record.producer_id.clone(), self.clock);
         let seen = self.attempts.get(&record.producer_id).copied().unwrap_or(0);
         if record.attempt < seen {
             return Observed::Behind { newest: seen };
@@ -96,6 +125,7 @@ impl ReadState {
         }
         self.attempts
             .insert(record.producer_id.clone(), record.attempt);
+        self.forget_beyond(MAX_TRACKED_PRODUCERS);
         Observed::Newer((seen > 0).then(|| Supersession {
             topic: record.topic.clone(),
             producer_id: record.producer_id.clone(),
@@ -113,7 +143,9 @@ impl ReadState {
 /// read delivered is still delivered, marked `stale`. The attempts seen ride in `state`, so this
 /// holds across calls. A read that starts from a cursor without state looks up the record at the
 /// cursor first, since that record was delivered before. Only that record's producer is known
-/// then, and another producer's earlier attempts are not.
+/// then, and another producer's earlier attempts are not. A read remembers at most
+/// [MAX_TRACKED_PRODUCERS] producers, and the next attempt of one it forgot reads without
+/// `SUPERSEDED`.
 ///
 /// A record that does not parse fails the call as `RECORD` with its cursor, so the caller resumes
 /// past it on purpose. Skipping it would lose data no one hears of. The records before it in the
@@ -502,6 +534,29 @@ mod tests {
         assert!(message.contains("attempt 1"), "{message}");
         assert!(message.contains("behind attempt 2"), "{message}");
         assert!(message.contains("\"model\""), "{message}");
+    }
+
+    #[test]
+    fn rule_6_1_a_read_forgets_the_producer_it_saw_least_recently() {
+        let mut state = ReadState::default();
+        for producer in 0..MAX_TRACKED_PRODUCERS {
+            observe(&mut state, &format!("p{producer}"), 1);
+        }
+        // Seen again, so `p0` is now the most recent and `p1` the least.
+        observe(&mut state, "p0", 1);
+        observe(&mut state, "new", 1);
+        assert_eq!(state.attempts.len(), MAX_TRACKED_PRODUCERS);
+        assert!(state.attempts.contains_key("p0"));
+        assert!(!state.attempts.contains_key("p1"));
+        // A forgotten producer's next attempt reads as its first, without `SUPERSEDED`.
+        assert_eq!(observe(&mut state, "p1", 2), Observed::Newer(None));
+        assert!(matches!(
+            observe(&mut state, "p0", 2),
+            Observed::Newer(Some(_))
+        ));
+        // The bound holds across calls, since it rides in the state.
+        let state = ReadState::decode_from(&state.encode_to_vec()).unwrap();
+        assert_eq!(state.attempts.len(), MAX_TRACKED_PRODUCERS);
     }
 
     #[test]

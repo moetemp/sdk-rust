@@ -20,7 +20,7 @@ if held then
       ' is below the next one expected, ' .. next_sequence)
   end
 end
-if redis.call('HGET', KEYS[3], 'closed') then
+if redis.call('HGET', KEYS[3], 'closed') or redis.call('HGET', KEYS[2], 'closed') then
   return redis.error_reply('STREAMS_CLOSED the Workflow that owns this stream ' ..
     'has closed')
 end
