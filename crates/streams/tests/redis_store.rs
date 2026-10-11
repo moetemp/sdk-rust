@@ -1597,6 +1597,43 @@ async fn a_delete_without_scan_is_refused_under_the_documented_acl() {
 }
 
 #[tokio::test]
+async fn an_append_after_the_server_lost_its_scripts_still_lands_once() {
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    // A restart or a failover to a replica without the script cache.
+    let _: () = redis::cmd("SCRIPT")
+        .arg("FLUSH")
+        .query_async(&mut setup.raw)
+        .await
+        .unwrap();
+    let landed = setup
+        .store
+        .append(append(&chain, "p", 2, 1, b"\x02"))
+        .await
+        .unwrap();
+    let again = setup
+        .store
+        .append(append(&chain, "p", 2, 1, b"\x02"))
+        .await
+        .unwrap();
+    assert_eq!(
+        again.last_position, landed.last_position,
+        "a repeat, not a new record"
+    );
+    assert_eq!(
+        setup.store.open_topics(&chain).await.unwrap(),
+        ["events".to_string()]
+    );
+}
+
+#[tokio::test]
 async fn an_acl_without_the_topic_set_rules_still_appends_and_stages() {
     // The ACL the Python SDK documented before the move. An upgraded Worker must keep writing
     // with it, and only the chain end loses the topics it can't list.

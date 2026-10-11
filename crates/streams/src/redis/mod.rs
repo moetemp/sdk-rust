@@ -137,24 +137,6 @@ impl RedisStore {
         }
     }
 
-    /// Adds `topics` to the chain's topic set, so a chain end lists them without a scan.
-    async fn add_topics(&self, keys: &ChainKeys, topics: &[&str]) {
-        let added: redis::RedisResult<Vec<redis::RedisResult<Value>>> = redis::pipe()
-            .ignore_errors()
-            .sadd(keys.topics(), topics)
-            .pexpire(keys.topics(), (self.retention_ms + self.grace_ms) as i64)
-            .query_async(&mut self.shared.clone())
-            .await;
-        match added {
-            Ok(replies) => {
-                if let Some(Err(error)) = replies.into_iter().find(Result::is_err) {
-                    self.topic_set_failed(&error);
-                }
-            }
-            Err(error) => self.topic_set_failed(&error),
-        }
-    }
-
     fn keys(&self, chain: Option<&ChainId>) -> StreamResult<ChainKeys> {
         let chain = chain
             .ok_or_else(|| StreamError::refused("a store call needs the chain it is about"))?;
@@ -636,21 +618,40 @@ impl StreamStore for RedisStore {
         for record in &batch.records {
             eval.arg(&record.topic).arg(record.record.as_slice());
         }
-        // Outside the transaction, since a refused write to the set would abort it.
-        self.add_topics(&keys, &topics).await;
         // The script appends to the stage, so a repeat after a lost answer would hold the records
         // twice. Clearing the stage in the same transaction makes a repeat replace it. `EVAL`
-        // and not `EVALSHA`, since a transaction can't load a script the server lost.
-        let mut transaction = redis::pipe();
-        transaction
-            .atomic()
+        // and not `EVALSHA`, since a transaction can't load a script the server lost. The staged
+        // topics join the chain's topic set in the same round trip but outside the transaction,
+        // since a refused write to the set would abort it.
+        let replies: Vec<redis::RedisResult<Value>> = redis::pipe()
+            .ignore_errors()
+            .sadd(keys.topics(), &topics)
+            .pexpire(keys.topics(), (self.retention_ms + self.grace_ms) as i64)
+            .add_command(redis::cmd("MULTI"))
             .del(keys.stage(&batch.token))
-            .ignore()
             .add_command(eval)
-            .ignore()
-            .query_async::<()>(&mut self.shared.clone())
+            .add_command(redis::cmd("EXEC"))
+            .query_async(&mut self.shared.clone())
             .await
-            .mapped(Call::Write)
+            .mapped(Call::Write)?;
+        let mut replies = replies.into_iter();
+        for set_reply in replies.by_ref().take(2) {
+            if let Err(error) = set_reply {
+                self.topic_set_failed(&error);
+                break;
+            }
+        }
+        // A command refused while queued aborts the transaction, and its own error says why.
+        let transaction: Vec<_> = replies.collect();
+        if let Some(Err(error)) = transaction.iter().find(|reply| reply.is_err()) {
+            return Err(error.clone()).mapped(Call::Write);
+        }
+        match transaction.into_iter().last() {
+            Some(Ok(executed)) => executed.extract_error().map(drop).mapped(Call::Write),
+            _ => Err(StreamError::storage(
+                "Redis answered the stage with no transaction reply",
+            )),
+        }
     }
 
     async fn promote(&self, stage: &StageRef) -> StreamResult<PromoteResult> {
