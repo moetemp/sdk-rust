@@ -20,6 +20,10 @@ the tombstone that tells a log that expired from one that never existed.
 **Stages.** A Workflow's own output is staged next to its logs and moved into them by one
 script, so readers see a Workflow Task's records together or not at all.
 
+**Deletes.** Deleting an owner's streams scans every primary for the Workflow id's keys. `SCAN`
+makes no promise about keys that move to another node while it runs, so a delete during a
+cluster reshard can miss some. Run it again once the reshard is done.
+
 **Server.** Redis 7.0 or later is required, and the store refuses an older server when it
 connects. At the same moment it reads `maxmemory-policy` on every primary and logs a warning
 for anything but `noeviction`, since an evicting Redis drops whole stream keys under memory
