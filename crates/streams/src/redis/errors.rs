@@ -8,9 +8,21 @@ use redis::RedisError;
 pub(crate) enum Call {
     Read,
     Write,
-    /// A read a write makes first. Nothing is written yet, but a refusal refuses the write.
-    BeforeWrite,
+    /// A producer's batch. A lang producer retries one whose outcome is unknown with the same
+    /// sequence, which the dedupe answers, so a doubtful failure is reported as unknown.
+    Append,
 }
+
+/// Replies that clear up on their own: a primary demoted in a failover, a server loading its
+/// data, a busy script, a slot in migration, a cluster or primary that is down.
+const TRANSIENT: [&str; 6] = [
+    "READONLY",
+    "LOADING",
+    "BUSY",
+    "TRYAGAIN",
+    "CLUSTERDOWN",
+    "MASTERDOWN",
+];
 
 /// The stream error a Redis error stands for.
 ///
@@ -19,12 +31,10 @@ pub(crate) enum Call {
 pub(crate) fn stream_error(error: &RedisError, call: Call) -> StreamError {
     if error.is_io_error() || error.is_timeout() || error.is_connection_dropped() {
         return match call {
-            Call::Write => StreamError::outcome_unknown(format!(
+            Call::Write | Call::Append => StreamError::outcome_unknown(format!(
                 "the write may or may not have been applied: {error}"
             )),
-            Call::Read | Call::BeforeWrite => {
-                StreamError::storage(format!("Redis could not be reached: {error}"))
-            }
+            Call::Read => StreamError::storage(format!("Redis could not be reached: {error}")),
         };
     }
     let detail = error.detail().unwrap_or_default().to_string();
@@ -32,6 +42,15 @@ pub(crate) fn stream_error(error: &RedisError, call: Call) -> StreamError {
         Some("STREAMS_DIVERGENT") => StreamError::new(StreamFailureKind::ProducerDivergent, detail),
         Some("STREAMS_STALE") => StreamError::new(StreamFailureKind::ProducerStale, detail),
         Some("STREAMS_CLOSED") => StreamError::closed(detail),
+        Some(code) if TRANSIENT.contains(&code) => match call {
+            Call::Append => StreamError::outcome_unknown(format!(
+                "Redis could not take the batch for now, so it may or may not have landed: \
+                 {code} {detail}"
+            )),
+            _ => StreamError::storage(format!(
+                "Redis could not serve the call for now: {code} {detail}"
+            )),
+        },
         // The reply as the server wrote it, so the message names the code the Redis docs use.
         Some(code) if call != Call::Read => {
             StreamError::refused(format!("Redis refused the write: {code} {detail}"))
@@ -94,17 +113,31 @@ mod tests {
     }
 
     #[test]
-    fn a_read_before_a_write_refuses_it_but_writes_nothing() {
-        let refused = stream_error(&server("WRONGTYPE", "wrong kind"), Call::BeforeWrite);
-        assert_eq!(refused.kind, StreamFailureKind::Refused);
-        let lost = RedisError::from(std::io::Error::new(
-            std::io::ErrorKind::ConnectionReset,
-            "reset",
-        ));
-        assert_eq!(
-            stream_error(&lost, Call::BeforeWrite).kind,
-            StreamFailureKind::Storage
-        );
+    fn rule_8_1_a_reply_that_clears_up_on_its_own_is_a_storage_failure() {
+        // A failover, a load or a busy script ends by itself, so the caller retries, not gives up.
+        for code in [
+            "READONLY",
+            "LOADING",
+            "BUSY",
+            "TRYAGAIN",
+            "CLUSTERDOWN",
+            "MASTERDOWN",
+        ] {
+            for call in [Call::Read, Call::Write] {
+                let error = stream_error(&server(code, "for a moment"), call);
+                assert_eq!(error.kind, StreamFailureKind::Storage, "{code} {call:?}");
+                assert!(error.message.contains(code), "{error}");
+            }
+            let append = stream_error(&server(code, "for a moment"), Call::Append);
+            assert_eq!(append.kind, StreamFailureKind::OutcomeUnknown, "{code}");
+        }
+        // A reply that won't change on a retry still refuses the write.
+        for code in ["NOPERM", "WRONGTYPE", "OOM"] {
+            for call in [Call::Write, Call::Append] {
+                let error = stream_error(&server(code, "no"), call);
+                assert_eq!(error.kind, StreamFailureKind::Refused, "{code} {call:?}");
+            }
+        }
     }
 
     #[test]
