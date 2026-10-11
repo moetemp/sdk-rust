@@ -437,13 +437,37 @@ impl StreamStore for RedisStore {
             }))
     }
 
-    async fn trimmed(&self, chain: &ChainId, topic: &str) -> StreamResult<Option<String>> {
-        redis::cmd("HGET")
+    async fn newest_ever(&self, chain: &ChainId, topic: &str) -> StreamResult<String> {
+        let last: Option<String> = redis::cmd("HGET")
+            .arg(ChainKeys::new(&self.prefix, chain).meta(topic))
+            .arg("last")
+            .query_async(&mut self.shared.clone())
+            .await
+            .mapped(Call::Read)?;
+        Ok(last.unwrap_or_default())
+    }
+
+    async fn dropped_after(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        mark: &str,
+    ) -> StreamResult<Option<String>> {
+        let trimmed: Option<String> = redis::cmd("HGET")
             .arg(ChainKeys::new(&self.prefix, chain).meta(topic))
             .arg("trimmed")
             .query_async(&mut self.shared.clone())
             .await
-            .mapped(Call::Read)
+            .mapped(Call::Read)?;
+        let Some(trimmed) = trimmed else {
+            return Ok(None);
+        };
+        // A log that expired comes back with `trimmed` set to its old `last`, which is the mark
+        // itself, so a revive counts as no loss.
+        if !mark.is_empty() && entry(&trimmed)? <= entry(mark)? {
+            return Ok(None);
+        }
+        Ok(Some(trimmed))
     }
 
     async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {

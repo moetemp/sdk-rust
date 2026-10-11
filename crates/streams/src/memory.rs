@@ -313,12 +313,29 @@ impl StreamStore for MemoryStore {
             .cloned())
     }
 
-    async fn trimmed(&self, chain: &ChainId, topic: &str) -> StreamResult<Option<String>> {
+    async fn newest_ever(&self, chain: &ChainId, topic: &str) -> StreamResult<String> {
+        let chains = self.chains.lock().unwrap();
+        Ok(chains
+            .get(&chain_key(chain))
+            .and_then(|chain| chain.topics.get(topic))
+            .and_then(|topic| topic.head().checked_sub(1))
+            .map(|offset| offset.to_string())
+            .unwrap_or_default())
+    }
+
+    async fn dropped_after(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        mark: &str,
+    ) -> StreamResult<Option<String>> {
+        let mark = parse_position(mark)?;
         let chains = self.chains.lock().unwrap();
         Ok(chains
             .get(&chain_key(chain))
             .and_then(|chain| chain.topics.get(topic))
             .and_then(|topic| topic.base.checked_sub(1))
+            .filter(|dropped| mark.is_none_or(|mark| *dropped > mark))
             .map(|offset| offset.to_string()))
     }
 
