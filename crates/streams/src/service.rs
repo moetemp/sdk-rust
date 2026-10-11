@@ -2,9 +2,10 @@
 
 use crate::{
     OwnerClient, StreamError, StreamResult, StreamStore, Streams, StreamsOptions,
+    nexus::{NexusCalls, NexusOptions},
     proto::{
-        AppendRequest, CloseRequest, DeleteOwnerRequest, LatestRequest, ReadRequest, StreamFailure,
-        StreamStoreConfig, stream_store_config,
+        AppendRequest, CloseRequest, DeleteOwnerRequest, LatestRequest, NexusCall,
+        NexusResumeRequest, ReadRequest, StreamFailure, StreamStoreConfig, stream_store_config,
     },
 };
 use prost::Message;
@@ -24,7 +25,8 @@ const MAX_READ_WAIT: Duration = Duration::from_secs(60);
 /// sends its stream calls to [StreamService::call] as serialized `coresdk.streams` requests.
 pub struct StreamService {
     store: Arc<dyn StreamStore>,
-    streams: Streams,
+    streams: Arc<Streams>,
+    nexus: NexusCalls,
 }
 
 impl std::fmt::Debug for StreamService {
@@ -65,8 +67,13 @@ impl StreamService {
         owner: Arc<dyn OwnerClient>,
         options: StreamsOptions,
     ) -> Self {
-        let streams = Streams::new(store.clone(), owner, options);
-        Self { store, streams }
+        let streams = Arc::new(Streams::new(store.clone(), owner, options));
+        let nexus = NexusCalls::new(streams.clone(), NexusOptions::default());
+        Self {
+            store,
+            streams,
+            nexus,
+        }
     }
 
     /// The store, for the Workers that stage and promote Workflow output in it.
@@ -103,6 +110,23 @@ impl StreamService {
                 .delete_owner(decode::<DeleteOwnerRequest>(rpc, request)?)
                 .await
                 .map(|r| r.encode_to_vec()),
+            // A Nexus call answers with a step, its failure included, so lang hands the failure
+            // to its Nexus handler as it is.
+            "NexusAppend" => Ok(self
+                .nexus
+                .append(decode::<NexusCall>(rpc, request)?)
+                .await
+                .encode_to_vec()),
+            "NexusRead" => Ok(self
+                .nexus
+                .read(decode::<NexusCall>(rpc, request)?)
+                .await
+                .encode_to_vec()),
+            "NexusResume" => Ok(self
+                .nexus
+                .resume(decode::<NexusResumeRequest>(rpc, request)?)
+                .await
+                .encode_to_vec()),
             other => Err(StreamError::unsupported(format!(
                 "the stream service has no call {other:?}"
             ))),
@@ -441,5 +465,49 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.kind, StreamFailureKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn the_nexus_calls_go_through_the_one_call_entry() {
+        use crate::proto::{NexusCall, NexusResumeRequest, NexusStep, nexus_step};
+        let service = service().await;
+        let input = serde_json::json!({
+            "stream": {"kind": "workflow", "workflow_id": "wf", "topic": "t"},
+            "producer_id": "p",
+            "attempt": 1,
+            "sequence": 1,
+            "finish": true,
+        });
+        let call = NexusCall {
+            input: serde_json::to_vec(&input).unwrap(),
+            namespace: "ns".to_string(),
+            ..Default::default()
+        };
+        let answer = service
+            .call("NexusAppend", &call.encode_to_vec())
+            .await
+            .unwrap();
+        let step = NexusStep::decode(answer.as_slice()).unwrap();
+        let Some(nexus_step::Step::Output(output)) = step.step else {
+            panic!("a finish needs no codec work, so it answers at once");
+        };
+        let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert!(output["cursor"].as_str().unwrap().starts_with("memory:"));
+        // A resume of nothing is a step too, a failure lang hands its Nexus handler.
+        let answer = service
+            .call(
+                "NexusResume",
+                &NexusResumeRequest {
+                    continuation: 99,
+                    results: Vec::new(),
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap();
+        let step = NexusStep::decode(answer.as_slice()).unwrap();
+        assert!(matches!(step.step, Some(nexus_step::Step::Failure(_))));
+        let refused = service.call("NexusRead", b"\xff").await.unwrap_err();
+        assert_eq!(refused.kind, StreamFailureKind::Refused as i32);
     }
 }
