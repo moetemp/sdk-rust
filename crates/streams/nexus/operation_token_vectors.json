@@ -60,6 +60,8 @@
     "",
     "not-a-token",
     "eyJ2IjogMn0",
-    "eyJ2IjogMSwgImF0dGFjaCI6ICJhdHRhY2gtMSIsICJjaGFpbiI6ICJjaGFpbi0xIiwgInJlZiI6IHsia2luZCI6ICJ3b3JrZmxvdyIsICJ3b3JrZmxvd19pZCI6ICJvd25lci0xIiwgInJ1bl9pZCI6IG51bGwsICJ0b3BpYyI6ICJ0b2tlbnMifX0="
+    "eyJ2IjogMSwgImF0dGFjaCI6ICJhdHRhY2gtMSIsICJjaGFpbiI6ICJjaGFpbi0xIiwgInJlZiI6IHsia2luZCI6ICJ3b3JrZmxvdyIsICJ3b3JrZmxvd19pZCI6ICJvd25lci0xIiwgInJ1bl9pZCI6IG51bGwsICJ0b3BpYyI6ICJ0b2tlbnMifX0=",
+    "eyJhdHRhY2giOiJhIiwiY2hhaW4iOiJjIiwiZXh0cmEiOjEsInJlZiI6eyJraW5kIjoid29ya2Zsb3ciLCJ0b3BpYyI6InQiLCJ3b3JrZmxvd19pZCI6IncifSwidiI6Mn0",
+    "eyJhdHRhY2giOiJhIiwiY2hhaW4iOiJjIiwicmVmIjp7ImN1cnNvciI6IngiLCJraW5kIjoid29ya2Zsb3ciLCJ0b3BpYyI6InQiLCJ3b3JrZmxvd19pZCI6IncifSwidiI6Mn0"
   ]
 }

@@ -107,8 +107,10 @@ pub struct OperationToken {
     pub chain_first_run_id: String,
 }
 
-// Fields in name order, since SDKs encode with sorted keys and the bytes must match.
+// Fields in name order, since SDKs encode with sorted keys and the bytes must match. The model is
+// closed in the contract, so a token with another member is not one of ours.
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TokenBody {
     attach: String,
     chain: String,
@@ -118,6 +120,7 @@ struct TokenBody {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TokenRef {
     kind: String,
     // An unpinned ref has none, as the generated SDK writers leave an unset member out. SDK
