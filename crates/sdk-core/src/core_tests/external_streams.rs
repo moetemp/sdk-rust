@@ -80,8 +80,8 @@ struct RecordingStore {
     close_topic_delay: Mutex<Option<Duration>>,
     /// Promotions, and topic and chain closes as they start and finish, in order.
     closes: Mutex<Vec<String>>,
-    /// Refuses every topic close for good.
-    refuse_topic_closes: Mutex<bool>,
+    /// Can't close topics at all.
+    unsupported_topic_closes: Mutex<bool>,
     /// How many promotions to fail for now before taking one.
     promote_failures: Mutex<usize>,
 }
@@ -197,11 +197,11 @@ impl StreamStore for RecordingStore {
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
-        if *self.refuse_topic_closes.lock() {
+        if *self.unsupported_topic_closes.lock() {
             self.closes
                 .lock()
-                .push(format!("close_topic {topic} refused"));
-            return Err(StreamError::refused("this topic can't be closed"));
+                .push(format!("close_topic {topic} unsupported"));
+            return Err(StreamError::unsupported("close_topic"));
         }
         self.closes.lock().push(format!("close_topic {topic} done"));
         let result = result.map(|r| String::from_utf8(r.data).unwrap());
@@ -1943,8 +1943,13 @@ async fn an_accepted_completion_promotes_its_stages_in_commit_order_after_it_is_
 
 /// Runs one publishing task whose completion the server answers with `refusal`.
 async fn completion_answered_with(refusal: tonic::Status) -> Vec<String> {
-    let (history, _) = output_then_timer_history(&["a"]);
     let store = Arc::new(RecordingStore::default());
+    completion_on_store_answered_with(store.clone(), refusal).await;
+    store.log()
+}
+
+async fn completion_on_store_answered_with(store: Arc<RecordingStore>, refusal: tonic::Status) {
+    let (history, _) = output_then_timer_history(&["a"]);
     let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", history, [1], mock_worker_client());
     let answer = Mutex::new(Some(refusal));
     mock_cfg.completion_mock_fn = Some(Box::new(move |_| {
@@ -1969,15 +1974,11 @@ async fn completion_answered_with(refusal: tonic::Status) -> Vec<String> {
         .await
         .unwrap();
     worker.drain_pollers_and_shutdown().await;
-    store.log()
 }
 
-#[rstest::rstest]
-#[case::task_not_found(tonic::Status::not_found("Workflow task not found"))]
-#[case::unhandled_command(tonic::Status::invalid_argument("UnhandledCommand"))]
 #[tokio::test]
-async fn a_completion_the_server_did_not_apply_aborts_its_stages(#[case] refusal: tonic::Status) {
-    let log = completion_answered_with(refusal).await;
+async fn a_completion_the_server_did_not_apply_aborts_its_stages() {
+    let log = completion_answered_with(tonic::Status::invalid_argument("UnhandledCommand")).await;
     let [stage, abort] = log.try_into().unwrap();
     assert!(stage.starts_with("stage "), "{stage}");
     assert_eq!(abort, stage.replacen("stage", "abort", 1));
@@ -1988,6 +1989,71 @@ async fn a_completion_with_an_unknown_outcome_leaves_its_stages_undecided() {
     let log = completion_answered_with(tonic::Status::unavailable("connection reset")).await;
     assert_eq!(log.len(), 1, "{log:?}");
     assert!(log[0].starts_with("stage "));
+}
+
+#[tokio::test]
+async fn a_stage_survives_a_not_found_answer_to_a_retried_completion() {
+    // The client retries a completion whose answer was lost, and the server answers the repeat of
+    // a completion it applied with `NotFound`. The marker is in History, so the stage must stay
+    // pending until a replay proves it.
+    let store = Arc::new(RecordingStore::default());
+    completion_on_store_answered_with(
+        store.clone(),
+        tonic::Status::not_found("Workflow task not found."),
+    )
+    .await;
+    let token = store.staged()[0].token.clone();
+
+    let mut applied = TestHistoryBuilder::default();
+    applied.add_by_type(EventType::WorkflowExecutionStarted);
+    let mut manifest = manifest_for(&records(&["a"]), applied.get_orig_run_id(), 1);
+    manifest.stage_token = token.clone();
+    applied.add_full_wf_task();
+    applied.add_external_stream_marker_data(output_marker(
+        ExternalStreamBoundary::CommandsProduced,
+        manifest,
+    ));
+    let timer_started = applied.add_by_type(EventType::TimerStarted);
+    applied.add_timer_fired(timer_started, "1".to_string());
+    applied.add_workflow_task_scheduled_and_started();
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        applied,
+        [ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    mock_cfg.completion_mock_fn = Some(Box::new(|_| {
+        Ok(RespondWorkflowTaskCompletedResponse::default())
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    let replaying_store = store.clone();
+    mock.worker_cfg(|w| {
+        w.stream_store = Some(replaying_store);
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+    let rebuilt = worker.poll_workflow_activation().await.unwrap();
+    let run_id = rebuilt.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(replayed(records(&["a"]))),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(has_fire_timer(&fired));
+    worker.complete_execution(&run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(
+        store.log(),
+        [format!("stage {token}"), format!("promote {token}")]
+    );
 }
 
 #[tokio::test]
@@ -2438,9 +2504,9 @@ async fn the_chain_closes_after_a_failed_final_promotion_lands_and_closes_its_to
 }
 
 #[tokio::test]
-async fn the_chain_still_closes_after_a_topic_close_is_refused() {
+async fn the_chain_still_closes_after_a_topic_close_the_store_cannot_take() {
     let store = Arc::new(RecordingStore::default());
-    *store.refuse_topic_closes.lock() = true;
+    *store.unsupported_topic_closes.lock() = true;
     let worker = final_task_closing_its_topic(store.clone()).await;
     store.wait_for_closes(1).await;
     worker.drain_pollers_and_shutdown().await;
@@ -2449,7 +2515,7 @@ async fn the_chain_still_closes_after_a_topic_close_is_refused() {
         [
             "promote".to_string(),
             format!("close_topic {TOPIC} started"),
-            format!("close_topic {TOPIC} refused"),
+            format!("close_topic {TOPIC} unsupported"),
             "close_chain".to_string(),
         ]
     );
