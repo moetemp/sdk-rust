@@ -3,12 +3,14 @@
 The store on the application's Redis.
 
 Records live in Redis and never pass through Temporal. The key layout, the stored values and
-the Lua scripts are the ones the SDKs used before the store moved into Core, so a stream one
-wrote stays readable and writable by the other.
+the Lua scripts are the ones the SDKs used before the store moved into Core, apart from the
+append's topic check, so a stream one wrote stays readable and writable by the other.
 
 **Appends.** One script writes a whole batch, so a reader never sees part of one. The topic's
 meta hash keeps one field per producer attempt: the newest batch's first sequence, its record
-count, its first and last entry ids, and lang's digest of it in hex.
+count, its first and last entry ids, and lang's digest of it in hex. The script refuses a
+new batch once the chain or the topic is closed, in the same step as the write, so no batch
+lands after a close returned. Only that topic check differs from the SDKs' script.
 
 **Retention.** Every script that writes a log trims it with `XTRIM MINID` to the retention and
 slides the expiry of the log and its meta, so a stream dies a retention after its last write
@@ -28,10 +30,12 @@ percent-encoded. A Redis ACL user for one namespace's applications, with the rul
 conformance suite runs as:
 
 ```text
-ACL SETUSER streams-app on >secret resetkeys ~temporal-streams:{my-ns:* resetchannels -@all +evalsha +eval +script|load +multi +exec +xadd +xread +xrevrange +xrange +xtrim +xlen +hget +hset +hgetall +hincrby +hdel +hscan +rpush +lrange +exists +del +unlink +pexpire +pttl +time +info +config|get +ping +hello +client|setinfo
+ACL SETUSER streams-app on >secret resetkeys ~temporal-streams:{my-ns:* resetchannels -@all +evalsha +eval +script|load +multi +exec +xadd +xread +xrevrange +xrange +xtrim +xlen +hget +hset +hgetall +hincrby +hdel +hscan +rpush +lrange +exists +del +unlink +pexpire +pttl +time +info +config|get +ping +hello +client|setinfo +cluster|slots
 ```
 
-Deleting an owner's streams also needs `+scan`. `+config|get` only reads
+A cluster client reads the topology with `CLUSTER SLOTS` first. An ACL user lives on one node,
+so on a cluster the user must exist on every node. Deleting an owner's streams also needs
+`+scan`. `+config|get` only reads
 `maxmemory-policy`, and the store goes on when a server refuses it.
 
 **Tests.** The Redis tests run when `STREAMS_REDIS_URL` names a standalone server and
