@@ -61,6 +61,11 @@ impl StreamError {
         Self::new(StreamFailureKind::NotFound, message)
     }
 
+    /// The call's input breaks its contract, so the same call fails the same way.
+    pub fn invalid_argument(message: impl Into<String>) -> Self {
+        Self::new(StreamFailureKind::InvalidArgument, message)
+    }
+
     /// This release or this store does not offer the capability.
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::new(StreamFailureKind::Unsupported, message)

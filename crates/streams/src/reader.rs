@@ -67,6 +67,26 @@ pub(crate) struct ReadState {
     clock: u64,
 }
 
+/// The producer attempts a read knows at one point of a page, so an answer cut short can hand back
+/// the state as it stood after the records it kept.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Attempts {
+    attempts: HashMap<String, i64>,
+    last_seen: HashMap<String, u64>,
+    clock: u64,
+}
+
+/// One page as [read_with] answers it.
+#[derive(Debug)]
+pub(crate) struct Page {
+    /// The records, with the answer's `state` left empty.
+    pub(crate) response: ReadResponse,
+    /// The store marked the chain or the topic closed.
+    pub(crate) closed: bool,
+    /// The attempts the read knew before the page's first record.
+    pub(crate) before: Attempts,
+}
+
 /// What one record tells the read about its producer's attempts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Observed {
@@ -106,6 +126,41 @@ impl ReadState {
         }
         self.last_seen
             .retain(|producer, _| self.attempts.contains_key(producer));
+    }
+
+    pub(crate) fn attempts(&self) -> Attempts {
+        Attempts {
+            attempts: self.attempts.clone(),
+            last_seen: self.last_seen.clone(),
+            clock: self.clock,
+        }
+    }
+
+    /// The state as it stood after `kept`, the first records of a page that began with `before`.
+    /// The rest of the state is this one's, since it doesn't depend on how far the page got.
+    pub(crate) fn at_cut<'a>(
+        &self,
+        before: &Attempts,
+        kept: impl IntoIterator<Item = &'a StreamRecord>,
+    ) -> ReadState {
+        let mut state = ReadState {
+            attempts: before.attempts.clone(),
+            last_seen: before.last_seen.clone(),
+            clock: before.clock,
+            ..self.clone()
+        };
+        for record in kept {
+            state.observe(record);
+        }
+        state
+    }
+
+    /// Forgets the least recently seen producers until the encoded state takes at most `bytes`.
+    /// A forgotten producer's next attempt reads without `SUPERSEDED`, as past the producer cap.
+    pub(crate) fn fit_within(&mut self, bytes: usize) {
+        while self.encoded_len() > bytes && !self.attempts.is_empty() {
+            self.forget_beyond(self.attempts.len() - 1);
+        }
     }
 
     fn observe(&mut self, record: &StreamRecord) -> Observed {
@@ -156,7 +211,9 @@ pub async fn read_page(
     request: &ReadRequest,
 ) -> StreamResult<ReadResponse> {
     let mut state = ReadState::decode_from(&request.state)?;
-    let (mut response, _) = read_with(store, target, request, &mut state).await?;
+    let mut response = read_with(store, target, request, &mut state)
+        .await?
+        .response;
     response.state = state.encode_to_vec();
     Ok(response)
 }
@@ -168,7 +225,7 @@ pub(crate) async fn read_with(
     target: &ReadTarget,
     request: &ReadRequest,
     state: &mut ReadState,
-) -> StreamResult<(ReadResponse, bool)> {
+) -> StreamResult<Page> {
     let from_end = request.after == END;
     let position = if from_end {
         store
@@ -227,6 +284,7 @@ pub(crate) async fn read_with(
         })
         .await?;
     let closed = page.closed;
+    let before = state.attempts();
     let mut records = Vec::with_capacity(page.records.len());
     let mut previous = start;
     for stored in page.records {
@@ -265,15 +323,16 @@ pub(crate) async fn read_with(
         });
         previous = cursor;
     }
-    Ok((
-        ReadResponse {
+    Ok(Page {
+        response: ReadResponse {
             records,
             cursor: previous,
             state: Vec::new(),
             done: false,
         },
         closed,
-    ))
+        before,
+    })
 }
 
 /// A stored record as a reader delivers it. Fails on bytes that are no record, and on a kind no
