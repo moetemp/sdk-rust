@@ -116,8 +116,13 @@ impl RedisStore {
         let shared = Shared::connect(&options.urls, options.cluster, options.response_timeout)
             .await
             .mapped(Call::Read)?;
-        let blocking = BlockingPool::new(seed, options.blocking_reads_per_node, options.cluster)
-            .mapped(Call::Read)?;
+        let blocking = BlockingPool::new(
+            seed,
+            options.blocking_reads_per_node,
+            options.cluster,
+            options.response_timeout,
+        )
+        .mapped(Call::Read)?;
         Ok(Self {
             shared,
             blocking,
@@ -226,7 +231,7 @@ impl StreamStore for RedisStore {
         let (first_position, last_position): (String, String) = script
             .invoke_async(&mut self.shared.clone())
             .await
-            .mapped(Call::Write)?;
+            .mapped(Call::Append)?;
         Ok(StoreAppendResponse {
             first_position,
             last_position,

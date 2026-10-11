@@ -373,17 +373,23 @@ async fn a_reply_that_refuses_a_write_arrives_as_refused() {
     assert!(error.message.contains("WRONGTYPE"), "{error}");
 }
 
-/// Passes bytes between the store and Redis, and can drop a connection on the next request.
+/// Passes bytes between the store and Redis, and fails one connection on purpose when asked.
 struct Faults {
     port: u16,
     mode: Arc<AtomicU8>,
+    kills: tokio::sync::watch::Sender<u64>,
 }
 
 const PASS: u8 = 0;
-/// Forward the next request, then drop the connection before Redis answers.
+/// Forward the next script call, then drop the connection before Redis answers.
 const LOSE_REPLY: u8 = 1;
 /// Drop the connection instead of forwarding the next request.
 const LOSE_REQUEST: u8 = 2;
+/// Forward the next blocking read, then never answer on that connection, and keep it open, as a
+/// server that died without a reset does.
+const HOLD_BLOCKED: u8 = 3;
+/// Hold the next script call back a while before forwarding it.
+const DELAY_SCRIPT: u8 = 4;
 
 impl Faults {
     async fn start(url: &str) -> Self {
@@ -396,14 +402,16 @@ impl Faults {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let mode = Arc::new(AtomicU8::new(PASS));
+        let (kills, _) = tokio::sync::watch::channel(0);
         let shared = mode.clone();
+        let killer = kills.clone();
         tokio::spawn(async move {
             while let Ok((client, _)) = listener.accept().await {
                 let server = TcpStream::connect(&upstream).await.unwrap();
-                tokio::spawn(relay(client, server, shared.clone()));
+                tokio::spawn(relay(client, server, shared.clone(), killer.subscribe()));
             }
         });
-        Self { port, mode }
+        Self { port, mode, kills }
     }
 
     fn url(&self) -> String {
@@ -413,9 +421,20 @@ impl Faults {
     fn next(&self, mode: u8) {
         self.mode.store(mode, Ordering::SeqCst);
     }
+
+    /// Drops every connection that has carried a blocking read, as a Redis restart does to the
+    /// idle ones in a pool.
+    fn kill_blocking_connections(&self) {
+        self.kills.send_modify(|generation| *generation += 1);
+    }
 }
 
-async fn relay(client: TcpStream, server: TcpStream, mode: Arc<AtomicU8>) {
+async fn relay(
+    client: TcpStream,
+    server: TcpStream,
+    mode: Arc<AtomicU8>,
+    mut kills: tokio::sync::watch::Receiver<u64>,
+) {
     let (mut client_in, mut client_out) = client.into_split();
     let (mut server_in, mut server_out) = server.into_split();
     let muted = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -423,7 +442,10 @@ async fn relay(client: TcpStream, server: TcpStream, mode: Arc<AtomicU8>) {
     let replies = tokio::spawn(async move {
         let mut buffer = vec![0; 64 * 1024];
         while let Ok(read) = server_in.read(&mut buffer).await {
-            if read == 0 || mute.load(Ordering::SeqCst) {
+            if read == 0 {
+                break;
+            }
+            if mute.load(Ordering::SeqCst) {
                 continue;
             }
             if client_out.write_all(&buffer[..read]).await.is_err() {
@@ -431,25 +453,47 @@ async fn relay(client: TcpStream, server: TcpStream, mode: Arc<AtomicU8>) {
             }
         }
     });
+    let mut blocking = false;
     let mut buffer = vec![0; 64 * 1024];
     loop {
-        let Ok(read) = client_in.read(&mut buffer).await else {
-            break;
+        let read = tokio::select! {
+            read = client_in.read(&mut buffer) => read,
+            _ = kills.changed(), if blocking => break,
         };
+        let Ok(read) = read else { break };
         if read == 0 {
             break;
         }
-        match mode.swap(PASS, Ordering::SeqCst) {
+        let chunk = &buffer[..read];
+        let has = |needle: &[u8]| chunk.windows(needle.len()).any(|window| window == needle);
+        let script = has(b"EVAL");
+        blocking |= has(b"BLOCK");
+        let now = match mode.load(Ordering::SeqCst) {
+            LOSE_REPLY | DELAY_SCRIPT if !script => PASS,
+            HOLD_BLOCKED if !has(b"BLOCK") => PASS,
+            _ => mode.swap(PASS, Ordering::SeqCst),
+        };
+        match now {
             LOSE_REQUEST => break,
             LOSE_REPLY => {
                 muted.store(true, Ordering::SeqCst);
-                let _ = server_out.write_all(&buffer[..read]).await;
+                let _ = server_out.write_all(chunk).await;
                 // Long enough for Redis to run the request, so only its answer is lost.
                 tokio::time::sleep(Duration::from_millis(200)).await;
                 break;
             }
+            HOLD_BLOCKED => {
+                muted.store(true, Ordering::SeqCst);
+                let _ = server_out.write_all(chunk).await;
+            }
+            DELAY_SCRIPT => {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if server_out.write_all(chunk).await.is_err() {
+                    break;
+                }
+            }
             _ => {
-                if server_out.write_all(&buffer[..read]).await.is_err() {
+                if server_out.write_all(chunk).await.is_err() {
                     break;
                 }
             }
@@ -790,4 +834,74 @@ async fn rule_18_2_a_large_stage_lands_whole() {
         .await
         .unwrap();
     assert_eq!(length, 10_000);
+}
+
+fn waiting_read(chain: &ChainId, wait: Duration) -> StoreReadRequest {
+    StoreReadRequest {
+        chain: Some(chain.clone()),
+        topic: "events".to_string(),
+        max_records: 10,
+        wait: Some(wait.try_into().unwrap()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn rule_8_2_a_blocked_read_on_a_silent_server_ends_by_its_deadline() {
+    let Some(url) = url() else {
+        return;
+    };
+    let faults = Faults::start(&url).await;
+    let setup = setup_with(&faults.url(), &url, &unique("silent"), |options| {
+        options.blocking_reads_per_node = 1;
+        options.response_timeout = Duration::from_millis(500);
+    })
+    .await;
+    let chain = chain();
+    faults.next(HOLD_BLOCKED);
+    let started = tokio::time::Instant::now();
+    let read = tokio::time::timeout(
+        Duration::from_secs(10),
+        setup
+            .store
+            .read(waiting_read(&chain, Duration::from_millis(300))),
+    )
+    .await
+    .expect("the read must end by its wait plus the response timeout");
+    assert_eq!(read.unwrap_err().kind, StreamFailureKind::Storage);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    // The connection was dropped, so its place in the pool is free for the next read.
+    let next = setup
+        .store
+        .read(waiting_read(&chain, Duration::from_millis(100)))
+        .await
+        .unwrap();
+    assert!(next.records.is_empty());
+}
+
+#[tokio::test]
+async fn rule_8_3_a_dead_idle_connection_is_replaced_in_the_same_read() {
+    let Some(url) = url() else {
+        return;
+    };
+    let faults = Faults::start(&url).await;
+    let setup = setup_at(&faults.url(), &url).await;
+    let chain = chain();
+    // The first waiting read leaves its connection idle in the pool.
+    setup
+        .store
+        .read(waiting_read(&chain, Duration::from_millis(100)))
+        .await
+        .unwrap();
+    faults.kill_blocking_connections();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let read = setup
+        .store
+        .read(waiting_read(&chain, Duration::from_millis(100)))
+        .await;
+    assert!(read.is_ok(), "{read:?}");
 }
