@@ -81,7 +81,7 @@ pub(crate) async fn detach_caller(
 }
 
 fn bad_input(message: &str) -> StreamError {
-    StreamError::refused(message)
+    StreamError::invalid_argument(message)
 }
 
 fn caller_error(error: NotifyError) -> StreamError {
@@ -154,10 +154,10 @@ impl OperationToken {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
     }
 
-    /// Reads a token in `namespace`. Fails as refused when it isn't one a stream operation issued.
+    /// Reads a token in `namespace`. Fails as an invalid argument when it isn't one a stream operation
+    /// issued.
     pub fn decode(namespace: &str, token: &str) -> StreamResult<Self> {
-        let refuse =
-            |why: &str| StreamError::refused(format!("not a stream operation token: {why}"));
+        let refuse = |why: &str| bad_input(&format!("not a stream operation token: {why}"));
         let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(token.trim_end_matches('='))
             .map_err(|_| refuse("not base64url"))?;
@@ -469,9 +469,25 @@ mod tests {
         let failure = attach(&setup.service, attach_request(""))
             .await
             .unwrap_err();
-        assert_eq!(failure.kind, StreamFailureKind::Refused as i32);
+        assert_eq!(failure.kind, StreamFailureKind::InvalidArgument as i32);
         assert!(setup.notifier.attached.lock().unwrap().is_empty());
         assert!(setup.owners.described.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_start_without_a_request_id_is_refused() {
+        let setup = setup();
+        let failure = attach(
+            &setup.service,
+            AttachCallerRequest {
+                request_id: String::new(),
+                ..attach_request("temporal://system")
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(failure.kind, StreamFailureKind::InvalidArgument as i32);
+        assert!(setup.notifier.attached.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -522,7 +538,11 @@ mod tests {
         let setup = setup();
         for token in vectors().refused {
             let failure = detach(&setup.service, &token).await.unwrap_err();
-            assert_eq!(failure.kind, StreamFailureKind::Refused as i32, "{token:?}");
+            assert_eq!(
+                failure.kind,
+                StreamFailureKind::InvalidArgument as i32,
+                "{token:?}"
+            );
         }
         assert!(setup.notifier.detached.lock().unwrap().is_empty());
     }
@@ -642,7 +662,7 @@ mod tests {
             let error = OperationToken::decode("ns", &token).unwrap_err();
             assert_eq!(
                 error.kind,
-                crate::proto::StreamFailureKind::Refused,
+                crate::proto::StreamFailureKind::InvalidArgument,
                 "{token:?}"
             );
         }

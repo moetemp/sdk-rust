@@ -93,8 +93,9 @@ relevant information.
   operation. `AttachCaller` resolves the stream's run chain, mints the operation token and
   attaches the start's callback to the stream's notifier with the token and start time.
   `DetachCaller` decodes the token and detaches from the chain the start attached to. The token
-  format is in `crates/streams/nexus/operation_token_vectors.json`, which every SDK's decoder
-  checks.
+  format is in `crates/streams/nexus/operation_token_vectors.json`, which every SDK's encoder and
+  decoder check. An empty callback URL, an empty request id and a token that names no stream fail
+  as `INVALID_ARGUMENT`, so lang tells them from a server's refusal.
 
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
