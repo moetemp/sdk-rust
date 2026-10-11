@@ -67,6 +67,17 @@ relevant information.
   Worker's `stream_store`, so a Workflow's output and outside producers share it.
 * Experimental: the C bridge has `temporal_core_stream_store_new`, `_call` and `_free` for the
   stream service, built with the Redis store, and a `stream_store` field on its worker options.
+* Experimental: with `StreamStoreConfig.notify_on_append`, Core tells each stream's notifier on
+  the server when the stream moves, after every append and every Workflow batch that becomes
+  visible. That's how a caller of a stream-returning Nexus operation sees progress. Notifications
+  for one stream fold into one call in flight, a failed last notification is tried twice more,
+  and a notification never fails the write. `max_notifiers` caps how many streams the process
+  keeps a notifier for (1000 when zero).
+* Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
+  notifications still out. A Worker flushes at stop on its own, so only a process that holds just
+  a client needs it.
+* Experimental: a server without the stream notifier answers the first notifier call with
+  `UNIMPLEMENTED`. Core then stops notifier calls in that process and logs it once at debug.
 
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
