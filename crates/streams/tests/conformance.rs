@@ -15,8 +15,9 @@ use std::{
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
-    BEGINNING, END, MemoryStore, ReadTarget, StreamResult, StreamStore, mint_cursor, proto::*,
-    read_page, stored_append_record, stored_output_record, stream_hash,
+    BEGINNING, END, MemoryStore, OwnerClient, OwnerDescription, OwnerError, ReadTarget,
+    StreamResult, StreamStore, Streams, StreamsOptions, mint_cursor, proto::*, read_page,
+    stored_append_record, stored_output_record, stream_hash,
 };
 
 #[async_trait::async_trait]
@@ -413,6 +414,55 @@ fn stage_ref(chain: &ChainId, token: &str, topics: &[&str]) -> StageRef {
         chain: Some(chain.clone()),
         token: token.to_string(),
         topics: topics.iter().map(|topic| topic.to_string()).collect(),
+    }
+}
+
+use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
+
+/// Temporal for one chain whose Workflow is still running, for cases that go through [Streams].
+struct RunningChain(ChainId);
+
+#[async_trait::async_trait]
+impl OwnerClient for RunningChain {
+    async fn describe(
+        &self,
+        _namespace: &str,
+        _workflow_id: &str,
+        _run_id: &str,
+    ) -> Result<OwnerDescription, OwnerError> {
+        Ok(OwnerDescription {
+            run_id: self.0.first_run_id.clone(),
+            first_run_id: self.0.first_run_id.clone(),
+            status: WorkflowExecutionStatus::Running,
+        })
+    }
+}
+
+fn streams_over(case: &dyn Case, chain: &ChainId) -> Streams {
+    Streams::new(
+        case.store(),
+        Arc::new(RunningChain(chain.clone())),
+        StreamsOptions {
+            owner_check_min: Duration::from_millis(20),
+            owner_check_max: Duration::from_millis(80),
+            ..StreamsOptions::default()
+        },
+    )
+}
+
+fn stream_read(chain: &ChainId, after: &str, state: &[u8], wait: Duration) -> ReadRequest {
+    ReadRequest {
+        stream: Some(StreamAddress {
+            namespace: chain.namespace.clone(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: chain.workflow_id.clone(),
+            run_id: String::new(),
+            topic: OUT.to_string(),
+        }),
+        after: after.to_string(),
+        state: state.to_vec(),
+        wait: Some(wait.try_into().unwrap()),
+        ..Default::default()
     }
 }
 
@@ -1106,6 +1156,47 @@ mod cases {
         );
     }
 
+    pub(crate) async fn rule_11_1_a_read_ends_only_after_the_chains_last_stage_lands(
+        case: &dyn Case,
+    ) {
+        // A close doesn't prove the chain's output is visible. A stage can still be pending.
+        let store = case.store();
+        let chain = case.chain();
+        store
+            .stage(staged(&chain, &chain.first_run_id, "t1", &[(OUT, "last")]))
+            .await
+            .unwrap();
+        store.close_chain(&chain).await.unwrap();
+        let streams = streams_over(case, &chain);
+        let first = streams
+            .read(stream_read(
+                &chain,
+                BEGINNING,
+                &[],
+                Duration::from_millis(200),
+            ))
+            .await
+            .unwrap();
+        assert!(first.records.is_empty());
+        assert!(!first.done, "a read ended with a stage still pending");
+        store
+            .promote(&stage_ref(&chain, "t1", &[OUT]))
+            .await
+            .unwrap();
+        let mut request = stream_read(&chain, &first.cursor, &first.state, Duration::from_secs(5));
+        let mut delivered = Vec::new();
+        for _ in 0..10 {
+            let page = streams.read(request.clone()).await.unwrap();
+            delivered.extend(values(&page));
+            if page.done {
+                assert_eq!(delivered, ["last"]);
+                return;
+            }
+            request = stream_read(&chain, &page.cursor, &page.state, Duration::from_secs(5));
+        }
+        panic!("the read never ended, and delivered {delivered:?}");
+    }
+
     pub(crate) async fn an_aborted_stage_never_lands(case: &dyn Case) {
         let store = case.store();
         let chain = case.chain();
@@ -1284,6 +1375,7 @@ mod memory {
         a_stage_is_invisible_until_promoted,
         a_repeated_stage_holds_its_records_once,
         an_aborted_stage_never_lands,
+        rule_11_1_a_read_ends_only_after_the_chains_last_stage_lands,
         a_promotion_naming_too_few_topics_writes_nothing,
         a_promotion_lands_on_a_closed_chain,
         rule_19_3_a_reset_run_writes_on_and_keeps_the_chain_open,
@@ -1331,6 +1423,7 @@ macro_rules! redis_cases {
             a_stage_is_invisible_until_promoted,
             a_repeated_stage_holds_its_records_once,
             an_aborted_stage_never_lands,
+            rule_11_1_a_read_ends_only_after_the_chains_last_stage_lands,
             a_promotion_naming_too_few_topics_writes_nothing,
             a_promotion_lands_on_a_closed_chain,
             rule_19_3_a_reset_run_writes_on_and_keeps_the_chain_open,
