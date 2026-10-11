@@ -18,7 +18,11 @@ use conn::{BlockingPool, Shared};
 use errors::{Call, Mapped};
 use keys::{ChainKeys, owner_pattern, session_field};
 use redis::{Cmd, Value, streams::StreamReadReply};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::atomic::{AtomicBool, Ordering},
+    time::Duration,
+};
 use tokio::time::Instant;
 
 const NAME: &str = "redis";
@@ -68,6 +72,7 @@ pub struct RedisStore {
     prefix: String,
     retention_ms: u64,
     grace_ms: u64,
+    topic_set_warned: AtomicBool,
 }
 
 impl std::fmt::Debug for RedisStore {
@@ -110,7 +115,39 @@ impl RedisStore {
             prefix: options.key_prefix,
             retention_ms,
             grace_ms: TOMBSTONE_GRACE.as_millis() as u64,
+            topic_set_warned: AtomicBool::new(false),
         })
+    }
+
+    /// Logs a failed write to a chain's topic set, once per process. The set only tells a chain
+    /// end which notifiers to close, and the notifier's own owner check covers a topic it
+    /// misses, so a write mustn't fail for it.
+    fn topic_set_failed(&self, error: &redis::RedisError) {
+        if !self.topic_set_warned.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                %error,
+                "Could not write a chain's topic set, so a chain end may not close every stream's \
+                 notifier. Allow +sadd and +smembers for the streams user"
+            );
+        }
+    }
+
+    /// Adds `topics` to the chain's topic set, so a chain end lists them without a scan.
+    async fn add_topics(&self, keys: &ChainKeys, topics: &[&str]) {
+        let added: redis::RedisResult<Vec<redis::RedisResult<Value>>> = redis::pipe()
+            .ignore_errors()
+            .sadd(keys.topics(), topics)
+            .pexpire(keys.topics(), (self.retention_ms + self.grace_ms) as i64)
+            .query_async(&mut self.shared.clone())
+            .await;
+        match added {
+            Ok(replies) => {
+                if let Some(Err(error)) = replies.into_iter().find(Result::is_err) {
+                    self.topic_set_failed(&error);
+                }
+            }
+            Err(error) => self.topic_set_failed(&error),
+        }
     }
 
     fn keys(&self, chain: Option<&ChainId>) -> StreamResult<ChainKeys> {
@@ -403,15 +440,22 @@ impl StreamStore for RedisStore {
         // so the script reads it in place of the chain's and still answers a repeat. The topic
         // joins the chain's topic set in the same round trip, before any record lands, so the set
         // holds every topic with records.
-        let (topic_closed,): (Option<String>,) = redis::pipe()
+        let (topic_closed, added, _): (
+            redis::RedisResult<Option<String>>,
+            redis::RedisResult<Value>,
+            redis::RedisResult<Value>,
+        ) = redis::pipe()
+            .ignore_errors()
             .hget(&meta, CLOSED_FIELD)
             .sadd(keys.topics(), &request.topic)
-            .ignore()
             .pexpire(keys.topics(), (self.retention_ms + self.grace_ms) as i64)
-            .ignore()
             .query_async(&mut self.shared.clone())
             .await
             .mapped(Call::BeforeWrite)?;
+        let topic_closed = topic_closed.mapped(Call::BeforeWrite)?;
+        if let Err(error) = added {
+            self.topic_set_failed(&error);
+        }
         let mut script = scripts::APPEND_SCRIPT.prepare_invoke();
         script
             .key(keys.log(&request.topic))
@@ -563,6 +607,8 @@ impl StreamStore for RedisStore {
         for record in &batch.records {
             eval.arg(&record.topic).arg(record.record.as_slice());
         }
+        // Outside the transaction, since a refused write to the set would abort it.
+        self.add_topics(&keys, &topics).await;
         // The script appends to the stage, so a repeat after a lost answer would hold the records
         // twice. Clearing the stage in the same transaction makes a repeat replace it. `EVAL`
         // and not `EVALSHA`, since a transaction can't load a script the server lost.
@@ -572,13 +618,6 @@ impl StreamStore for RedisStore {
             .del(keys.stage(&batch.token))
             .ignore()
             .add_command(eval)
-            .ignore();
-        // The staged topics join the chain's topic set, so a chain end lists them without a scan.
-        for topic in &topics {
-            transaction.sadd(keys.topics(), *topic).ignore();
-        }
-        transaction
-            .pexpire(keys.topics(), (self.retention_ms + self.grace_ms) as i64)
             .ignore()
             .query_async::<()>(&mut self.shared.clone())
             .await

@@ -1449,6 +1449,84 @@ async fn a_delete_without_scan_is_refused_under_the_documented_acl() {
 }
 
 #[tokio::test]
+async fn an_acl_without_the_topic_set_rules_still_appends_and_stages() {
+    // The ACL the Python SDK documented before the move. An upgraded Worker must keep writing
+    // with it, and only the chain end loses the topics it can't list.
+    let Some(url) = url() else {
+        return;
+    };
+    let prefix = unique("acl-earlier");
+    let earlier: Vec<String> = include_str!("../docs/redis.md")
+        .lines()
+        .find_map(|line| line.strip_prefix("ACL SETUSER "))
+        .unwrap()
+        .split_whitespace()
+        .skip(1)
+        .filter(|rule| !matches!(*rule, "+sadd" | "+smembers"))
+        .map(str::to_string)
+        .collect();
+    let name = unique("streams-acl-earlier");
+    let mut admin = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let mut setuser = redis::cmd("ACL");
+    setuser.arg("SETUSER").arg(&name);
+    for rule in &earlier {
+        match rule.as_str() {
+            "~temporal-streams:{my-ns:*" => setuser.arg(format!("~{}:{{ns:*", part(&prefix))),
+            ">secret" => setuser.arg(">pw"),
+            rule => setuser.arg(rule),
+        };
+    }
+    let _: () = setuser.query_async(&mut admin).await.unwrap();
+    let address = url.trim_start_matches("redis://");
+    let mut options = RedisStoreOptions::new(format!("redis://{name}:pw@{address}"));
+    options.key_prefix = prefix;
+    let store = RedisStore::connect(options).await.unwrap();
+
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    let chain = chain();
+    let appended = store.append(append(&chain, "p", 1, 1, b"\x01")).await;
+    let second = store.append(append(&chain, "p", 2, 1, b"\x02")).await;
+    let staged = store.stage(stage_of(&chain, "token", 2)).await;
+    let promoted = store.promote(&stage_ref(&chain, "token")).await;
+    drop(guard);
+    let _: () = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&name)
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    appended.unwrap();
+    second.unwrap();
+    staged.unwrap();
+    promoted.unwrap();
+    let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
+    assert_eq!(logs.matches("topic set").count(), 1, "warned once: {logs}");
+    assert!(logs.contains("'sadd'"), "{logs}");
+}
+
+#[tokio::test]
 async fn a_delete_reaches_every_primary_of_a_cluster() {
     let Ok(url) = std::env::var("STREAMS_REDIS_CLUSTER_URL") else {
         eprintln!("set STREAMS_REDIS_CLUSTER_URL to run the Redis cluster tests");
