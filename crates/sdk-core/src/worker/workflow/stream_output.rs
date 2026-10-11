@@ -250,6 +250,11 @@ fn track(
 
 /// Whether the store can never take the call. Every other failure is retried, since the output
 /// was committed and lives only in this Worker until the store takes it.
+///
+/// `REFUSED` is retried too. The Worker builds its own `StageRef`, so a refusal there is an ACL
+/// or configuration fault that an operator can fix. Skipping the stage would lose its records and
+/// let later stages land ahead of it, while a retry holds the run's backlog until the fault is
+/// fixed or the Worker stops.
 #[cfg(feature = "streams")]
 fn refused_for_good(error: &temporalio_streams::StreamError) -> bool {
     error.kind == temporalio_streams::proto::StreamFailureKind::Unsupported
