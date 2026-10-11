@@ -35,7 +35,9 @@ pub(crate) fn classify(kind: StreamFailureKind) -> (&'static str, &'static str, 
         // The write may have landed. The store deduplicates a repeat, so a retry is safe.
         OutcomeUnknown => ("StreamOutcomeUnknownError", UNAVAILABLE, true),
         Storage => ("StreamStorageError", UNAVAILABLE, true),
-        Record => ("StreamRecordError", INTERNAL, true),
+        // A record that can't be parsed stays that way, so a retry would only loop. The read path
+        // hands one over as `RecordWire.error`, and this row is for any other path.
+        Record => ("StreamRecordError", INTERNAL, false),
         Unspecified => ("StreamError", INTERNAL, true),
     }
 }
@@ -115,9 +117,10 @@ mod tests {
                 true,
             ),
             (Storage, "StreamStorageError", UNAVAILABLE, true),
+            // A record that can't be parsed stays that way, so a retry would loop.
+            (Record, "StreamRecordError", INTERNAL, false),
             // A class the table doesn't name crosses as a retryable internal error, as N0b's
             // table answered any other error.
-            (Record, "StreamRecordError", INTERNAL, true),
             (Unspecified, "StreamError", INTERNAL, true),
         ] {
             let crossed = of_stream(&StreamError::new(kind, "why"));
