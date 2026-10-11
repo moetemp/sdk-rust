@@ -20,11 +20,15 @@ impl Serialize for Base64 {
 impl<'de> Deserialize<'de> for Base64 {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
-        STANDARD
-            .decode(text.as_bytes())
+        base64_bytes(&text)
             .map(Base64)
-            .map_err(|_| D::Error::custom(format!("must be base64-encoded, got {text:?}")))
+            .ok_or_else(|| D::Error::custom("must be base64-encoded"))
     }
+}
+
+/// The bytes `text` holds as padded standard base64.
+pub(crate) fn base64_bytes(text: &str) -> Option<Vec<u8>> {
+    STANDARD.decode(text.as_bytes()).ok()
 }
 
 /// An integer as the contract's JSON carries it, where `1.0` counts and `1.5` doesn't.
@@ -89,8 +93,9 @@ pub(crate) struct ReadInput {
     pub(crate) wait_ms: Option<i64>,
     #[serde(default)]
     pub(crate) latest_only: Option<bool>,
+    /// Left as base64, so an oversized state is refused before it is decoded.
     #[serde(default)]
-    pub(crate) state: Option<Base64>,
+    pub(crate) state: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -126,6 +131,23 @@ pub(crate) fn crossing_size(size: usize) -> usize {
     4 * size.div_ceil(3)
 }
 
+/// The bytes `value` takes as JSON.
+pub(crate) fn json_size(value: &impl Serialize) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, value).expect("a contract model always serializes");
+    count.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,11 +176,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(unknown.to_string().contains("unknown field"), "{unknown}");
-        let bad = serde_json::from_str::<ReadInput>(
-            r#"{"stream":{"kind":"workflow","workflow_id":"wf","topic":"t"},"state":"!!"}"#,
+        let bad = serde_json::from_str::<AppendInput>(
+            r#"{"stream":{"kind":"workflow","workflow_id":"wf","topic":"t"},
+                "producer_id":"p","attempt":1,"sequence":1,"payloads":["!!"]}"#,
         )
         .unwrap_err();
         assert!(bad.to_string().contains("base64"), "{bad}");
+        assert!(!bad.to_string().contains("!!"), "{bad}");
         // Null is what a generated caller sends for an absent optional member.
         let null: ReadInput = serde_json::from_str(
             r#"{"stream":{"kind":"workflow","workflow_id":"wf","run_id":null,"topic":"t"},
