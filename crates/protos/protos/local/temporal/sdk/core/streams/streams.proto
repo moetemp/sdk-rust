@@ -109,6 +109,7 @@ message ReadRequest {
   string after = 2;
   // How long to wait for a record when none is there. Zero answers at once.
   google.protobuf.Duration wait = 3;
+  // How many stored records one answer holds at most. A synthesized supersession comes on top.
   // Zero lets Core choose.
   uint32 max_records = 4;
   // The `state` of the previous answer of the same read. Empty on its first call.
