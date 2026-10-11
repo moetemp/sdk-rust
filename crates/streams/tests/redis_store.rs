@@ -1277,13 +1277,14 @@ async fn an_evicting_primary_of_a_cluster_is_warned_about() {
 }
 
 #[tokio::test]
-async fn the_documented_acl_is_the_python_sdks() {
-    // One rule set for every SDK, so an application's ACL keeps working across the move.
+async fn the_documented_acl_is_the_python_sdks_plus_the_topic_set() {
+    // An application's ACL from before the move keeps working once it adds the topic set's rules.
+    // The Python provider never writes the set, so its page stays as it was.
     let Ok(checkout) = std::env::var("STREAMS_BROOK_PY") else {
         eprintln!("set STREAMS_BROOK_PY to compare the documented ACL with the Python SDK's");
         return;
     };
-    let rules = |page: &str| -> Vec<String> {
+    let rules = |page: &str| -> std::collections::BTreeSet<String> {
         page.lines()
             .find_map(|line| line.strip_prefix("ACL SETUSER "))
             .unwrap()
@@ -1295,7 +1296,16 @@ async fn the_documented_acl_is_the_python_sdks() {
         std::path::Path::new(&checkout).join("temporalio/contrib/streams/docs/redis-guarantees.md"),
     )
     .unwrap();
-    assert_eq!(rules(include_str!("../docs/redis.md")), rules(&python));
+    let (core, python) = (rules(include_str!("../docs/redis.md")), rules(&python));
+    assert!(core.is_superset(&python), "{:?}", python.difference(&core));
+    let topic_set = ["+sadd", "+smembers"].map(str::to_string).into();
+    assert_eq!(
+        core.difference(&python)
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        topic_set,
+        "every rule Core adds needs a reason here"
+    );
 }
 
 fn delete_request(workflow_id: &str) -> temporalio_streams::proto::DeleteOwnerRequest {
