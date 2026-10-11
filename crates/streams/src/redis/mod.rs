@@ -6,7 +6,9 @@
 //!
 //! **Appends.** One script writes a whole batch, so a reader never sees part of one. The topic's
 //! meta hash keeps one field per producer attempt: the newest batch's first sequence, its record
-//! count, its first and last entry ids, and lang's digest of it in hex.
+//! count, its first and last entry ids, and lang's digest of it in hex. The script refuses a
+//! new batch once the chain or the topic is closed, in the same step as the write, so no batch
+//! lands after a close returned. Only that topic check differs from the SDKs' script.
 //!
 //! **Retention.** Every script that writes a log trims it with `XTRIM MINID` to the retention and
 //! slides the expiry of the log and its meta, so a stream dies a retention after its last write
@@ -117,8 +119,13 @@ impl RedisStore {
         let shared = Shared::connect(&options.urls, options.cluster, options.response_timeout)
             .await
             .mapped(Call::Read)?;
-        let blocking = BlockingPool::new(seed, options.blocking_reads_per_node, options.cluster)
-            .mapped(Call::Read)?;
+        let blocking = BlockingPool::new(
+            seed,
+            options.blocking_reads_per_node,
+            options.cluster,
+            options.response_timeout,
+        )
+        .mapped(Call::Read)?;
         Ok(Self {
             shared,
             blocking,
@@ -319,24 +326,11 @@ impl StreamStore for RedisStore {
             return Err(StreamError::refused("an append needs the batch's digest"));
         }
         let keys = self.keys(request.chain.as_ref())?;
-        let meta = keys.meta(&request.topic);
-        // The script reads one close flag. A closed topic's flag refuses new batches on its own,
-        // so the script reads it in place of the chain's and still answers a repeat.
-        let topic_closed: Option<String> = redis::cmd("HGET")
-            .arg(&meta)
-            .arg(CLOSED_FIELD)
-            .query_async(&mut self.shared.clone())
-            .await
-            .mapped(Call::BeforeWrite)?;
         let mut script = scripts::APPEND_SCRIPT.prepare_invoke();
         script
             .key(keys.log(&request.topic))
-            .key(&meta)
-            .key(if topic_closed.is_some() {
-                meta.clone()
-            } else {
-                keys.chain()
-            })
+            .key(keys.meta(&request.topic))
+            .key(keys.chain())
             .arg(self.retention_ms)
             .arg(self.grace_ms)
             .arg(session_field(&request.producer_id, request.attempt))
@@ -348,7 +342,7 @@ impl StreamStore for RedisStore {
         let (first_position, last_position): (String, String) = script
             .invoke_async(&mut self.shared.clone())
             .await
-            .mapped(Call::Write)?;
+            .mapped(Call::Append)?;
         Ok(StoreAppendResponse {
             first_position,
             last_position,
@@ -443,13 +437,37 @@ impl StreamStore for RedisStore {
             }))
     }
 
-    async fn trimmed(&self, chain: &ChainId, topic: &str) -> StreamResult<Option<String>> {
-        redis::cmd("HGET")
+    async fn newest_ever(&self, chain: &ChainId, topic: &str) -> StreamResult<String> {
+        let last: Option<String> = redis::cmd("HGET")
+            .arg(ChainKeys::new(&self.prefix, chain).meta(topic))
+            .arg("last")
+            .query_async(&mut self.shared.clone())
+            .await
+            .mapped(Call::Read)?;
+        Ok(last.unwrap_or_default())
+    }
+
+    async fn dropped_after(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        mark: &str,
+    ) -> StreamResult<Option<String>> {
+        let trimmed: Option<String> = redis::cmd("HGET")
             .arg(ChainKeys::new(&self.prefix, chain).meta(topic))
             .arg("trimmed")
             .query_async(&mut self.shared.clone())
             .await
-            .mapped(Call::Read)
+            .mapped(Call::Read)?;
+        let Some(trimmed) = trimmed else {
+            return Ok(None);
+        };
+        // A log that expired comes back with `trimmed` set to its old `last`, which is the mark
+        // itself, so a revive counts as no loss.
+        if !mark.is_empty() && entry(&trimmed)? <= entry(mark)? {
+            return Ok(None);
+        }
+        Ok(Some(trimmed))
     }
 
     async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {
