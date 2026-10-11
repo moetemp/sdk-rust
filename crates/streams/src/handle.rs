@@ -30,6 +30,17 @@ pub const OWNER_RECHECK: Duration = Duration::from_secs(60);
 
 const MAX_TOPIC_BYTES: usize = 256;
 
+/// Whether a repair takes a stage History couldn't decide lately as still undecided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recent {
+    Trust,
+    /// The owner ended or the stream closed, so History may hold the answer now.
+    Ask,
+}
+
+/// How long a stage History couldn't decide is taken as still undecided without asking again.
+const UNDECIDED_FOR: Duration = Duration::from_secs(5);
+
 /// How the stream layer behaves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamsOptions {
@@ -130,6 +141,9 @@ pub struct Streams {
     options: StreamsOptions,
     producers: Remembered<ProducerKey>,
     chains: Remembered<OwnerKey>,
+    /// Stages History couldn't decide lately, by token. Each new read would otherwise walk the
+    /// staging run's History back to the floor again.
+    undecided: Remembered<String>,
 }
 
 impl std::fmt::Debug for Streams {
@@ -152,6 +166,7 @@ impl Streams {
             store,
             owner,
             producers: Remembered::new(options.remembered),
+            undecided: Remembered::new(options.remembered),
             chains: Remembered::new(options.remembered),
             options,
         }
@@ -256,7 +271,7 @@ impl Streams {
             stream_hash: self.hash(stream),
         };
         if starting {
-            self.repair(&target.chain).await;
+            self.repair(&target.chain, Recent::Trust).await;
         }
         let wait = request
             .wait
@@ -294,14 +309,14 @@ impl Streams {
                 // One more pass after learning of the close, as after learning the owner ended,
                 // with output a Worker committed but never promoted.
                 state.owner_ended = true;
-                self.repair(&target.chain).await;
+                self.repair(&target.chain, Recent::Ask).await;
                 continue;
             }
             if state.owner_ended {
                 // A close doesn't prove the chain's output is visible, since a promotion still
                 // lands after it. The read ends once nothing of the chain is pending.
                 if awaiting_stage {
-                    self.repair(&target.chain).await;
+                    self.repair(&target.chain, Recent::Trust).await;
                 }
                 if self.store.pending_stages(&target.chain).await?.is_empty() {
                     page.done = true;
@@ -322,7 +337,7 @@ impl Streams {
                 // between the read and the describe is delivered, and so is output a Worker
                 // committed but never promoted.
                 if state.owner_ended {
-                    self.repair(&target.chain).await;
+                    self.repair(&target.chain, Recent::Ask).await;
                     continue;
                 }
             }
@@ -338,8 +353,8 @@ impl Streams {
 
     /// Settles the stages a Worker left behind on `chain`, as History decides them. Best effort:
     /// a stage History has not decided stays for the next reader, and a failure only logs.
-    async fn repair(&self, chain: &ChainId) {
-        if let Err(error) = self.try_repair(chain).await {
+    async fn repair(&self, chain: &ChainId, recent: Recent) {
+        if let Err(error) = self.try_repair(chain, recent).await {
             tracing::warn!(
                 workflow_id = %chain.workflow_id,
                 "Could not settle the pending stream stages of the Workflow: {error}"
@@ -347,7 +362,7 @@ impl Streams {
         }
     }
 
-    async fn try_repair(&self, chain: &ChainId) -> StreamResult<()> {
+    async fn try_repair(&self, chain: &ChainId, recent: Recent) -> StreamResult<()> {
         let mut pending = self.store.pending_stages(chain).await?;
         let mut started: HashMap<String, Option<SystemTime>> = HashMap::new();
         for stage in &pending {
@@ -385,6 +400,14 @@ impl Streams {
                 );
                 continue;
             }
+            if recent == Recent::Trust
+                && self
+                    .undecided
+                    .get(&stage.token)
+                    .is_some_and(|checked| checked.at.elapsed() < UNDECIDED_FOR)
+            {
+                return Ok(());
+            }
             let events = match self
                 .owner
                 .history_after(
@@ -419,7 +442,10 @@ impl Streams {
                     }),
                     Decision::Abort => self.store.abort(&reference).await,
                     // A stage History has not decided holds back the ones after it.
-                    Decision::Unknown => return Ok(()),
+                    Decision::Unknown => {
+                        self.undecided.put(stage.token.clone(), "", UNDECIDED_FOR);
+                        return Ok(());
+                    }
                 };
             match settled {
                 Ok(()) => {}
@@ -733,6 +759,7 @@ mod tests {
         failing_runs: Mutex<Vec<String>>,
         described_runs: Mutex<Vec<String>>,
         describes: AtomicUsize,
+        history_reads: AtomicUsize,
     }
 
     impl Owners {
@@ -815,6 +842,7 @@ mod tests {
             run_id: &str,
             floor: i64,
         ) -> Result<Vec<HistoryEvent>, OwnerError> {
+            self.history_reads.fetch_add(1, Ordering::Relaxed);
             let histories = self.histories.lock().unwrap();
             let events = histories
                 .get(run_id)
@@ -1890,5 +1918,25 @@ mod tests {
             .map(|stage| stage.token)
             .collect();
         assert_eq!(left, ["bad"]);
+    }
+
+    #[tokio::test]
+    async fn rule_12_3_an_undecided_stage_is_not_read_again_by_every_new_reader() {
+        // A long Local Activity holds the task open, so History can't decide the stage yet.
+        let setup = setup(quick());
+        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
+        history(
+            &setup.owners,
+            "run-1",
+            vec![event(4, EventType::WorkflowTaskStarted)],
+        );
+        for _ in 0..3 {
+            setup
+                .streams
+                .read(read_after("", &[], Duration::ZERO))
+                .await
+                .unwrap();
+        }
+        assert_eq!(setup.owners.history_reads.load(Ordering::Relaxed), 1);
     }
 }
