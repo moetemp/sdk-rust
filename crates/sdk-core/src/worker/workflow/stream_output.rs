@@ -14,7 +14,7 @@ use temporalio_common::{
         },
         temporal::sdk::streams::v1::StreamRecordKind,
     },
-    streams::{FINGERPRINT_VERSION, FingerprintRecord, fingerprint},
+    streams::{FINGERPRINT_VERSION, FingerprintRecord, check_topic, fingerprint},
 };
 
 /// The marker version Core writes. Readers must accept every version up to this one.
@@ -25,6 +25,11 @@ const STORE_FORMAT_VERSION: u32 = 1;
 /// Keeps one output proof well inside the server's per-event payload limits.
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
 const CONTENT_HASH_BYTES: usize = 32;
+/// The largest record lang may commit, in logical bytes. Lang checks it at the publish call, and
+/// Core checks again, since a store call that fails on size fails every retry of the task too.
+const MAX_RECORD_BYTES: u64 = 3 * 512 * 1024;
+/// The most logical bytes one activation may commit, checked the same way as a record.
+const MAX_COMMIT_BYTES: u64 = 16 * 1024 * 1024;
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 
@@ -55,6 +60,17 @@ pub(super) fn build_output_manifest(
     for (index, record) in records.iter().enumerate() {
         check_record(record, replaying)
             .map_err(|reason| refused(format!("record {index} {reason}")))?;
+    }
+    // Replay takes what History holds.
+    if !replaying {
+        let committed: u64 = records.iter().map(|r| r.logical_size).sum();
+        if committed > MAX_COMMIT_BYTES {
+            return Err(refused(format!(
+                "the commit holds {committed} logical bytes, over the {} MiB budget of one \
+                 activation; publish across activations",
+                MAX_COMMIT_BYTES / 1024 / 1024
+            )));
+        }
     }
     let mut topics: Vec<&str> = vec![];
     let mut by_topic: HashMap<&str, Vec<&OutputRecord>> = HashMap::new();
@@ -148,6 +164,13 @@ pub(super) fn check_output_closes(records: &[OutputRecord], closes: &[OutputClos
 fn check_record(record: &OutputRecord, replaying: bool) -> std::result::Result<(), String> {
     if record.topic.is_empty() {
         return Err("has no topic".to_string());
+    }
+    check_topic(&record.topic)?;
+    if !replaying && record.logical_size > MAX_RECORD_BYTES {
+        return Err(format!(
+            "holds {} logical bytes, over the 1.5 MiB record budget",
+            record.logical_size
+        ));
     }
     match StreamRecordKind::try_from(record.kind) {
         Ok(StreamRecordKind::Data) => {
@@ -309,6 +332,35 @@ mod tests {
             assert!(message.contains(expected), "{expected}: {message}");
         }
         assert!(rejection(&[]).contains("no records"));
+    }
+
+    #[test]
+    fn a_topic_no_store_keys_reliably_is_refused() {
+        // A store joins a stage's topics with a control character.
+        let long = "t".repeat(257);
+        for (topic, expected) in [
+            ("a\u{1f}b", "holds a control character"),
+            (long.as_str(), "at most 256 UTF-8 bytes"),
+        ] {
+            let message = rejection(&[data(topic, 1, 1)]);
+            assert!(message.contains(expected), "{expected}: {message}");
+        }
+        build(&[data(&"t".repeat(256), 1, 1)]).unwrap();
+    }
+
+    #[test]
+    fn a_record_or_commit_over_its_byte_budget_is_refused() {
+        let at_limit = data("t", 1, 3 * 512 * 1024);
+        build(std::slice::from_ref(&at_limit)).unwrap();
+        let message = rejection(&[data("t", 1, 3 * 512 * 1024 + 1)]);
+        assert!(
+            message.contains("over the 1.5 MiB record budget"),
+            "{message}"
+        );
+
+        let commit: Vec<_> = (0..11).map(|i| data("t", i, 3 * 512 * 1024)).collect();
+        let message = rejection(&commit);
+        assert!(message.contains("over the 16 MiB budget"), "{message}");
     }
 
     fn close(topic: &str) -> OutputClose {
