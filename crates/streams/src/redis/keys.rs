@@ -10,6 +10,7 @@
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:chain            the close flag
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:stages           pending stages
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:stage:<token>    one stage
+//! <prefix>:{<namespace>:<workflow id>:<first run id>}:topics           the topic set
 //! ```
 //!
 //! Each part, the prefix included, is percent-encoded, so a `:` or a brace in an id cannot make

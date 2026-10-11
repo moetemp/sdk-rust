@@ -32,11 +32,16 @@ ACL SETUSER streams-app on >secret resetkeys ~temporal-streams:{my-ns:* resetcha
 ```
 
 Deleting an owner's streams also needs `+scan`. `+sadd` and `+smembers` keep and read each
-chain's topic set, which lists the chain's topics when it ends, so stream notifications can close
-every topic's notifier without a scan. Topics written only by an SDK release from before the store
+chain's topic set, which lists the chain's topics when it ends, so a chain end can close every
+topic's notifier without a scan. Topics written only by an SDK release from before the store
 moved into Core aren't in the set, so a chain end doesn't close those notifiers. That gap covers
-only streams written before the upgrade. `+config|get` only reads
-`maxmemory-policy`, and the store goes on when a server refuses it.
+only streams written before the upgrade. `+config|get` only reads `maxmemory-policy`, and the
+store goes on when a server refuses it.
+
+**Upgrading.** The ACL the Python SDK documented before the move has no `+sadd` or
+`+smembers`. Appends and Workflow output keep working with it. The store skips the topic set and
+logs a warning once. But a chain end then can't list the chain's topics, so callers of those
+streams wait for the notifier's owner check. Widen the ACL before or with the upgrade.
 
 **Tests.** The Redis tests run when `STREAMS_REDIS_URL` names a standalone server and
 `STREAMS_REDIS_CLUSTER_URL` a cluster seed. `scripts/redis-test-servers.sh` starts both. The

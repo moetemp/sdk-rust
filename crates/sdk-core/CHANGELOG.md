@@ -78,6 +78,17 @@ relevant information.
   a client needs it.
 * Experimental: a server without the stream notifier answers the first notifier call with
   `UNIMPLEMENTED`. Core then stops notifier calls in that process and logs it once at debug.
+* Experimental: Core closes a stream's notifier after the store closes the stream, whether or
+  not `notify_on_append` is on, so attached operations complete with the close result. A
+  Workflow's topic close and a `CloseRequest` with the new `result` field carry the result. A
+  `CloseRequest` with a result fails when the server doesn't take the close, and Core keeps
+  trying in the background too. When a publishing Workflow's chain ends, its Worker closes the
+  notifier of every topic the store still lists as open, with an empty result. A reader that
+  finds the owner ended closes only the store, since the server keeps the first close.
+* Experimental: `StreamStore` has `open_topics`, `end_chain` and `close_stream`. The Redis store
+  keeps a topic set per chain for `open_topics`, which needs `+sadd` and `+smembers` in the ACL.
+  Without them, writes still work and the store logs a warning once, but a chain end can't close
+  every notifier. Widen the ACL with the upgrade.
 
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom

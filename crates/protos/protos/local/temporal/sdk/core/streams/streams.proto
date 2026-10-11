@@ -40,8 +40,8 @@ message StreamStoreConfig {
   // Tells each stream's notifier on the server when the stream moves, after every append and
   // every Workflow batch that becomes visible. That's what makes a caller of a stream-returning
   // Nexus operation see progress. Off by default, since most streams have no such caller and each
-  // notification costs a call. A server without the stream notifier costs one call, and then the
-  // process stops notifying.
+  // notification costs a call. It turns on progress only. Closes reach the notifier either way. A
+  // server without the stream notifier costs one call, and then the process stops notifying.
   bool notify_on_append = 3;
   // How many streams to keep a notifier for, dropping the least recently used. Zero uses 1000.
   uint32 max_notifiers = 4;
@@ -204,10 +204,10 @@ message LatestResponse {
 message CloseRequest {
   StreamAddress stream = 1;
   // What every stream-returning Nexus operation that handed out the stream completes with, after
-  // lang's payload codec. With the store config's `notify_on_append`, the stream's notifier on
-  // the server closes once the store has. When set, a notifier that doesn't take the close fails
-  // the call. Unset, the operations complete with an empty result, and the notifier close is
-  // retried in the background.
+  // lang's payload codec. The stream's notifier on the server closes once the store has. When
+  // set, a notifier that doesn't take the close fails the call, and Core keeps trying in the
+  // background too. Unset, the operations complete with an empty result, and the notifier close
+  // is retried in the background.
   temporal.api.common.v1.Payload result = 2;
 }
 
