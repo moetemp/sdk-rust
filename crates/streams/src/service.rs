@@ -128,7 +128,10 @@ impl StreamService {
                 .map(|r| r.encode_to_vec()),
             "FlushNotifications" => {
                 decode::<FlushNotificationsRequest>(rpc, request)?;
-                self.store.flush_notifications().await;
+                // A close retries until the server takes it, so a stopping process waits only
+                // so long for one against a server that's down.
+                let _ = tokio::time::timeout(crate::FLUSH_LIMIT, self.store.flush_notifications())
+                    .await;
                 Ok(FlushNotificationsResponse {}.encode_to_vec())
             }
             other => Err(StreamError::unsupported(format!(
@@ -496,5 +499,95 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.kind, StreamFailureKind::Refused);
+    }
+
+    /// A store whose notifications never go out, as when the server is down and a close retries.
+    struct NeverFlushes(crate::MemoryStore);
+
+    #[async_trait::async_trait]
+    impl StreamStore for NeverFlushes {
+        fn name(&self) -> &str {
+            self.0.name()
+        }
+        async fn append(
+            &self,
+            r: crate::proto::StoreAppendRequest,
+        ) -> StreamResult<crate::proto::StoreAppendResponse> {
+            self.0.append(r).await
+        }
+        async fn read(
+            &self,
+            r: crate::proto::StoreReadRequest,
+        ) -> StreamResult<crate::proto::StoreReadResponse> {
+            self.0.read(r).await
+        }
+        async fn latest(
+            &self,
+            r: crate::proto::StoreLatestRequest,
+        ) -> StreamResult<crate::proto::StoreLatestResponse> {
+            self.0.latest(r).await
+        }
+        async fn record_at(
+            &self,
+            c: &crate::proto::ChainId,
+            t: &str,
+            p: &str,
+        ) -> StreamResult<Option<Vec<u8>>> {
+            self.0.record_at(c, t, p).await
+        }
+        async fn stage(&self, b: crate::proto::StagedBatch) -> StreamResult<()> {
+            self.0.stage(b).await
+        }
+        async fn promote(
+            &self,
+            s: &crate::proto::StageRef,
+        ) -> StreamResult<crate::proto::PromoteResult> {
+            self.0.promote(s).await
+        }
+        async fn abort(&self, s: &crate::proto::StageRef) -> StreamResult<()> {
+            self.0.abort(s).await
+        }
+        async fn close_chain(&self, c: &crate::proto::ChainId) -> StreamResult<()> {
+            self.0.close_chain(c).await
+        }
+        async fn close_topic(
+            &self,
+            c: &crate::proto::ChainId,
+            t: &str,
+            r: Option<Payload>,
+        ) -> StreamResult<()> {
+            self.0.close_topic(c, t, r).await
+        }
+        async fn pending_stages(
+            &self,
+            c: &crate::proto::ChainId,
+        ) -> StreamResult<Vec<crate::proto::PendingStage>> {
+            self.0.pending_stages(c).await
+        }
+        async fn delete_owner(
+            &self,
+            r: DeleteOwnerRequest,
+        ) -> StreamResult<crate::proto::DeleteOwnerResponse> {
+            self.0.delete_owner(r).await
+        }
+        async fn flush_notifications(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_waits_only_so_long_for_notifications_that_never_go_out() {
+        let service = StreamService::new(
+            Arc::new(NeverFlushes(crate::MemoryStore::new())),
+            Arc::new(Running),
+            StreamsOptions::default(),
+        );
+        let started = tokio::time::Instant::now();
+        flush(&service).await;
+        assert_eq!(
+            started.elapsed(),
+            crate::FLUSH_LIMIT,
+            "a stopping process mustn't hang on a close retrying against a server that's down"
+        );
     }
 }
