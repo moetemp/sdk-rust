@@ -115,6 +115,10 @@ mod tests {
                 true,
             ),
             (Storage, "StreamStorageError", UNAVAILABLE, true),
+            // A class the table doesn't name crosses as a retryable internal error, as N0b's
+            // table answered any other error.
+            (Record, "StreamRecordError", INTERNAL, true),
+            (Unspecified, "StreamError", INTERNAL, true),
         ] {
             let crossed = of_stream(&StreamError::new(kind, "why"));
             assert_eq!(crossed.handler_error_type, nexus, "{kind:?}");
