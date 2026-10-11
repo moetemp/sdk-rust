@@ -74,6 +74,13 @@ pub trait StreamStore: Send + Sync {
     /// land, since a Workflow's committed output is never refused.
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()>;
 
+    /// Closes a chain whose final Workflow Task its own Worker saw accepted, after that task's
+    /// topic closes. A reader that finds the owner ended calls [StreamStore::close_chain]
+    /// instead, since it can't know whether the Workflow's own closes landed yet.
+    async fn end_chain(&self, chain: &ChainId) -> StreamResult<()> {
+        self.close_chain(chain).await
+    }
+
     /// Marks one topic of a chain closed, like [StreamStore::close_chain] for that topic alone.
     ///
     /// `result` is what the operations that handed the topic out complete with, when the owner
@@ -90,8 +97,8 @@ pub trait StreamStore: Send + Sync {
     async fn pending_stages(&self, chain: &ChainId) -> StreamResult<Vec<PendingStage>>;
 
     /// The topics of a chain that the store knows and that [StreamStore::close_topic] hasn't
-    /// closed, in no particular order. A staged topic shows once its stage is promoted. A store
-    /// that can't list its topics answers none.
+    /// closed, in no particular order. A staged topic shows as soon as it's staged. A store that
+    /// can't list its topics answers none.
     async fn open_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
         let _ = chain;
         Ok(vec![])

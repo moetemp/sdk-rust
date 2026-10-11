@@ -544,20 +544,33 @@ impl NotifierClient for UnlessUnsupported {
     }
 }
 
-/// A store that notifies each stream's notifier after an append lands and after a Workflow's
-/// staged output becomes visible.
+/// A store that closes each stream's notifier after the store closes the stream, and with
+/// progress on, notifies it after an append lands and after a Workflow's staged output becomes
+/// visible.
 ///
 /// Wraps the store a process hands to its stream calls and its Workers, so every write path
 /// notifies without knowing about notifiers.
 pub struct NotifyingStore {
     inner: Arc<dyn StreamStore>,
     notifier: Arc<Notifier>,
+    progress: bool,
 }
 
 impl NotifyingStore {
-    /// Wraps `inner`, notifying through `notifier`.
+    /// Wraps `inner`, notifying through `notifier`, with progress on.
     pub fn new(inner: Arc<dyn StreamStore>, notifier: Arc<Notifier>) -> Self {
-        Self { inner, notifier }
+        Self {
+            inner,
+            notifier,
+            progress: true,
+        }
+    }
+
+    /// Turns progress notifications on or off. Closes reach the notifier either way, since the
+    /// close result completes every attached operation.
+    pub fn with_progress(mut self, progress: bool) -> Self {
+        self.progress = progress;
+        self
     }
 
     /// The notifier this store notifies through.
@@ -652,7 +665,9 @@ impl StreamStore for NotifyingStore {
         let chain = request.chain.clone();
         let topic = request.topic.clone();
         let landed = self.inner.append(request).await?;
-        if let Some(chain) = &chain {
+        if self.progress
+            && let Some(chain) = &chain
+        {
             self.notify_at(chain, &topic, &landed.last_position);
         }
         Ok(landed)
@@ -681,7 +696,8 @@ impl StreamStore for NotifyingStore {
 
     async fn promote(&self, stage: &StageRef) -> StreamResult<PromoteResult> {
         let result = self.inner.promote(stage).await?;
-        if result.outcome() == PromoteOutcome::Promoted
+        if self.progress
+            && result.outcome() == PromoteOutcome::Promoted
             && let Some(chain) = &stage.chain
         {
             for topic in &stage.topics {
@@ -696,7 +712,13 @@ impl StreamStore for NotifyingStore {
     }
 
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {
-        self.inner.close_chain(chain).await?;
+        // A reader that finds the owner ended can't know whether the Workflow's own closes
+        // landed, and the server keeps the first close, so only the store closes here.
+        self.inner.close_chain(chain).await
+    }
+
+    async fn end_chain(&self, chain: &ChainId) -> StreamResult<()> {
+        self.inner.end_chain(chain).await?;
         // A stream ends when its store topic closes. Another process may have written some of the
         // chain's topics, so the store lists them, and each one ends on the server too.
         let (inner, notifier) = (self.inner.clone(), self.notifier.clone());
@@ -760,15 +782,24 @@ impl StreamStore for NotifyingStore {
         self.inner
             .close_topic(chain, topic, Some(result.clone()))
             .await?;
-        let (cursor, counter) = close_position(self.inner.as_ref(), chain, topic).await?;
-        self.notifier
-            .close(chain, topic, cursor, counter, result)
-            .await
-            .map_err(|error| match error {
-                NotifyError::Refused(message) => crate::StreamError::refused(message),
-                NotifyError::Unsupported(message) => crate::StreamError::unsupported(message),
-                NotifyError::Failed(message) => crate::StreamError::storage(message),
-            })
+        let closed = match close_position(self.inner.as_ref(), chain, topic).await {
+            Ok((cursor, counter)) => {
+                self.notifier
+                    .close(chain, topic, cursor, counter, result.clone())
+                    .await
+            }
+            Err(error) => Err(NotifyError::Failed(error.to_string())),
+        };
+        closed.map_err(|error| match error {
+            NotifyError::Refused(message) => crate::StreamError::refused(message),
+            NotifyError::Unsupported(message) => crate::StreamError::unsupported(message),
+            NotifyError::Failed(message) => {
+                // The caller may not try again, and the topic is closed in the store, so no
+                // chain end lists it later.
+                self.close_notifier_in_background(chain, topic, result);
+                crate::StreamError::storage(message)
+            }
+        })
     }
 
     async fn flush_notifications(&self) {
@@ -1320,7 +1351,7 @@ mod tests {
         store.close_topic(&run, "a", None).await.unwrap();
         store.flush_notifications().await;
         assert_eq!(store.notifier().slots.lock().unwrap().len(), 1);
-        store.close_chain(&run).await.unwrap();
+        store.end_chain(&run).await.unwrap();
         store.flush_notifications().await;
         assert_eq!(store.notifier().slots.lock().unwrap().len(), 0);
         let closes: Vec<(String, i64)> = recorder
@@ -1350,7 +1381,7 @@ mod tests {
             .append(append_request(&chain("run-9"), "a", 1))
             .await
             .unwrap();
-        store.close_chain(&chain("run-1")).await.unwrap();
+        store.end_chain(&chain("run-1")).await.unwrap();
         store.flush_notifications().await;
         let closed: Vec<ChainId> = recorder
             .sent
@@ -1563,7 +1594,7 @@ mod tests {
         inner.append(append_request(&run, "a", 1)).await.unwrap();
         inner.append(append_request(&run, "b", 1)).await.unwrap();
         let store = NotifyingStore::new(inner, Arc::new(Notifier::new(recorder.clone(), 10)));
-        store.close_chain(&run).await.unwrap();
+        store.end_chain(&run).await.unwrap();
         store.flush_notifications().await;
         let mut closed: Vec<(String, i64)> = recorder
             .sent
@@ -1588,7 +1619,7 @@ mod tests {
         let run = chain("run-1");
         store.append(append_request(&run, "a", 1)).await.unwrap();
         store.close_topic(&run, "a", Some(summary())).await.unwrap();
-        store.close_chain(&run).await.unwrap();
+        store.end_chain(&run).await.unwrap();
         store.flush_notifications().await;
         let closes: Vec<Option<Payload>> = recorder
             .sent
@@ -1603,5 +1634,43 @@ mod tests {
             [Some(summary())],
             "the server keeps the first close, so the chain end mustn't race the Workflow's"
         );
+    }
+
+    #[tokio::test]
+    async fn a_chain_close_from_a_reader_closes_only_the_store() {
+        let recorder = Arc::new(Recorder::default());
+        let (inner, store) = notifying_store(&recorder);
+        let run = chain("run-1");
+        store.append(append_request(&run, "a", 1)).await.unwrap();
+        store.flush_notifications().await;
+        store.close_chain(&run).await.unwrap();
+        store.flush_notifications().await;
+        assert!(
+            recorder
+                .sent
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|n| n.close_result.is_none()),
+            "the Workflow's own close of the topic may still be on its way"
+        );
+        let error = inner
+            .append(append_request(&run, "a", 2))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, crate::proto::StreamFailureKind::Closed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_outside_close_raises_and_is_retried_in_the_background() {
+        let client = flaky(1, false);
+        let store = closing_through(client.clone()).await;
+        let error = store
+            .close_stream(&chain("run-1"), "t", summary())
+            .await
+            .unwrap_err();
+        assert_ne!(error.kind, crate::proto::StreamFailureKind::Refused);
+        store.flush_notifications().await;
+        assert_eq!(client.at.lock().unwrap().len(), 2, "the retry lands");
     }
 }

@@ -42,8 +42,8 @@ impl StreamService {
         Self::connect_with_notifier(config, owner, None).await
     }
 
-    /// Like [StreamService::connect], sending stream notifications through `notifier` when the
-    /// config turns them on.
+    /// Like [StreamService::connect], closing each stream's notifier through `notifier` after
+    /// the store closes the stream, and sending progress too when the config turns it on.
     pub async fn connect_with_notifier(
         config: StreamStoreConfig,
         owner: Arc<dyn OwnerClient>,
@@ -60,20 +60,23 @@ impl StreamService {
                 ));
             }
         };
-        let store: Arc<dyn StreamStore> = if config.notify_on_append {
-            let client = notifier.ok_or_else(|| {
-                StreamError::refused("stream notifications need a client to send them with")
-            })?;
-            let max_notifiers = match config.max_notifiers {
-                0 => DEFAULT_MAX_NOTIFIERS,
-                max => max as usize,
-            };
-            Arc::new(NotifyingStore::new(
-                store,
-                Arc::new(Notifier::new(client, max_notifiers)),
-            ))
-        } else {
-            store
+        if config.notify_on_append && notifier.is_none() {
+            return Err(StreamError::refused(
+                "stream notifications need a client to send them with",
+            ));
+        }
+        let store: Arc<dyn StreamStore> = match notifier {
+            Some(client) => {
+                let max_notifiers = match config.max_notifiers {
+                    0 => DEFAULT_MAX_NOTIFIERS,
+                    max => max as usize,
+                };
+                Arc::new(
+                    NotifyingStore::new(store, Arc::new(Notifier::new(client, max_notifiers)))
+                        .with_progress(config.notify_on_append),
+                )
+            }
+            None => store,
         };
         Ok(Self::new(
             store,
@@ -499,6 +502,176 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(error.kind, StreamFailureKind::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_close_reaches_the_notifier_with_notifications_off() {
+        let recorder = Arc::new(Recorder::default());
+        let service = service_notifying(false, recorder.clone()).await;
+        service.call("Append", &append(1, &["a"])).await.unwrap();
+        let result = Payload {
+            data: b"summary".to_vec(),
+            ..Default::default()
+        };
+        service
+            .call(
+                "Close",
+                &CloseRequest {
+                    stream: Some(address()),
+                    result: Some(result.clone()),
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap();
+        flush(&service).await;
+        let sent = recorder.0.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "no progress, only the close");
+        assert_eq!(sent[0].close_result, Some(result));
+    }
+
+    /// Answers every notification like a server without the stream notifier.
+    #[derive(Default)]
+    struct Stock(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl NotifierClient for Stock {
+        async fn notify(&self, _: crate::StreamNotification) -> Result<(), crate::NotifyError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(crate::NotifyError::Unsupported("unimplemented".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_server_without_the_notifier_costs_one_call() {
+        let stock = Arc::new(Stock::default());
+        let service = StreamService::connect_with_notifier(
+            StreamStoreConfig {
+                store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+                notify_on_append: true,
+                ..Default::default()
+            },
+            Arc::new(Running),
+            Some(stock.clone()),
+        )
+        .await
+        .unwrap();
+        service.call("Append", &append(1, &["a"])).await.unwrap();
+        flush(&service).await;
+        service.call("Append", &append(2, &["b"])).await.unwrap();
+        service
+            .call(
+                "Close",
+                &CloseRequest {
+                    stream: Some(address()),
+                    result: Some(Payload::default()),
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap();
+        flush(&service).await;
+        assert_eq!(stock.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The Workflow's chain is `run-1`. It runs until `ended` is set, then it's completed.
+    #[derive(Default)]
+    struct Ends(std::sync::atomic::AtomicBool);
+
+    #[async_trait::async_trait]
+    impl OwnerClient for Ends {
+        async fn describe(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<OwnerDescription, OwnerError> {
+            let ended = self.0.load(std::sync::atomic::Ordering::SeqCst);
+            Ok(OwnerDescription {
+                run_id: "run-1".to_string(),
+                first_run_id: "run-1".to_string(),
+                status: if ended {
+                    WorkflowExecutionStatus::Completed
+                } else {
+                    WorkflowExecutionStatus::Running
+                },
+                start_time: None,
+            })
+        }
+
+        async fn history_after(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> Result<Vec<HistoryEvent>, OwnerError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn a_readers_owner_check_right_after_the_final_task_sends_no_notifier_close() {
+        let recorder = Arc::new(Recorder::default());
+        let owner = Arc::new(Ends::default());
+        let store = Arc::new(NotifyingStore::new(
+            Arc::new(crate::MemoryStore::new()),
+            Arc::new(Notifier::new(recorder.clone(), 10)),
+        ));
+        let service = StreamService::new(
+            store,
+            owner.clone(),
+            StreamsOptions {
+                owner_recheck: Duration::ZERO,
+                owner_check_min: Duration::from_millis(1),
+                owner_check_max: Duration::from_millis(1),
+                ..Default::default()
+            },
+        );
+        let appended = AppendResponse::decode(
+            service
+                .call("Append", &append(1, &["a"]))
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        flush(&service).await;
+        // The server accepted the final task, and its Worker hasn't closed the topic yet.
+        owner.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        let read = ReadResponse::decode(
+            service
+                .call(
+                    "Read",
+                    &ReadRequest {
+                        stream: Some(address()),
+                        after: appended.last_cursor,
+                        wait: Some(Duration::from_millis(200).try_into().unwrap()),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert!(read.done, "the reader saw the owner end");
+        let refused = service
+            .call("Append", &append(2, &["b"]))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind, StreamFailureKind::Closed as i32);
+        flush(&service).await;
+        assert!(
+            recorder
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|n| n.close_result.is_none()),
+            "an empty close would beat the Workflow's result"
+        );
     }
 
     #[tokio::test]

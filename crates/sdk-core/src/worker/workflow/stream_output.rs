@@ -347,7 +347,7 @@ impl OutputStore {
             return Ok(());
         }
         self.store
-            .close_chain(&self.chain(&chain.workflow_id, &chain.first_run_id))
+            .end_chain(&self.chain(&chain.workflow_id, &chain.first_run_id))
             .await
             .map_err(|error| error.to_string())
     }
