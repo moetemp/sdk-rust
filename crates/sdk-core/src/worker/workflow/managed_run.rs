@@ -107,9 +107,6 @@ pub(super) struct ManagedRun {
     pending_output: Vec<OutputBatch>,
     /// Stages that replay found committed in History and has not reported yet, in commit order.
     proven_output: Vec<ProvenStage>,
-    /// Whether this run committed stream output, live or replaying, so its chain has streams to
-    /// close when the chain ends.
-    published_output: bool,
     metrics: MetricsContext,
     /// We store the paginator used for our own run's history fetching
     paginator: Option<HistoryPaginator>,
@@ -137,7 +134,6 @@ impl ManagedRun {
             recorded_span_ids: Default::default(),
             pending_output: vec![],
             proven_output: vec![],
-            published_output: false,
             metrics,
             paginator: None,
             completion_waiting_on_page_fetch: None,
@@ -920,7 +916,6 @@ impl ManagedRun {
                 closes: commit.closes.clone(),
             });
             check_replayed_output_manifest(replayed, recorded)?;
-            self.published_output = true;
             // History proves the commit, but the Worker that staged it may have stopped before
             // promoting it.
             self.proven_output.extend(proven);
@@ -976,7 +971,6 @@ impl ManagedRun {
                 output: Some(manifest),
             })?;
         self.pending_output.push(batch);
-        self.published_output = true;
         Ok(())
     }
 
@@ -1287,6 +1281,7 @@ impl ManagedRun {
             workflow_id: self.wfm.machines.workflow_id.clone(),
             first_run_id: self.wfm.machines.first_execution_run_id.clone(),
         };
+        let has_stream_store = self.stream_store_name().is_some();
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
         if data.activation_was_eviction
             && (machines_wft_response.commands().peek().is_some()
@@ -1344,7 +1339,9 @@ impl ManagedRun {
                         | CommandType::CancelWorkflowExecution
                 )
             });
-            let close = (ends_chain && self.published_output).then_some(chain);
+            // Any run of the chain, or its Activities, may have published, so every chain end
+            // closes.
+            let close = (ends_chain && has_stream_store).then_some(chain);
             ActivationCompleteOutcome::ReportWFTSuccess(ServerCommandsWithWorkflowInfo {
                 task_token: data.task_token,
                 action: ActivationAction::WftComplete {

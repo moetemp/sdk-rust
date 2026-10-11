@@ -454,6 +454,14 @@ impl OutputStore {
             loop {
                 match this.close_if_ended(client.as_ref(), &chain).await {
                     Ok(()) => return,
+                    Err(error) if refused_for_good(&error) => {
+                        warn!(
+                            workflow_id = %chain.workflow_id,
+                            %error,
+                            "The store can't close a finished run chain's streams"
+                        );
+                        return;
+                    }
                     Err(error) => warn!(
                         workflow_id = %chain.workflow_id,
                         %error,
@@ -493,13 +501,18 @@ impl OutputStore {
         &self,
         client: &dyn crate::worker::client::WorkerClient,
         chain: &ChainToClose,
-    ) -> std::result::Result<(), String> {
+    ) -> std::result::Result<(), temporalio_streams::StreamError> {
         use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
-        let description = client
+        let latest = match client
             .describe_workflow_execution(chain.workflow_id.clone())
             .await
-            .map_err(|status| status.to_string())?;
-        if let Some(latest) = description.workflow_execution_info
+        {
+            Ok(description) => description.workflow_execution_info,
+            // Retention removed the Workflow, so its chain has ended.
+            Err(status) if status.code() == tonic::Code::NotFound => None,
+            Err(status) => return Err(temporalio_streams::StreamError::storage(status.message())),
+        };
+        if let Some(latest) = latest
             && latest.first_run_id == chain.first_run_id
             && matches!(
                 latest.status(),
@@ -511,7 +524,6 @@ impl OutputStore {
         self.store
             .close_chain(&self.chain(&chain.workflow_id, &chain.first_run_id))
             .await
-            .map_err(|error| error.to_string())
     }
 
     /// Promotes `promotions` of `run_id` in commit order, each followed by its topic closes.
