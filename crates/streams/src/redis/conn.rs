@@ -164,6 +164,9 @@ pub(crate) struct BlockingPool {
     seed: ConnectionInfo,
     per_node: usize,
     cluster: bool,
+    /// How long past its own deadline a blocked read waits for the server's answer. A server
+    /// that died without a reset never answers, and the read must still end.
+    response_timeout: Duration,
     nodes: Mutex<HashMap<Node, Arc<NodePool>>>,
     /// The node that serves each slot, learned from redirects. A cluster moves slots rarely, and
     /// a stale entry costs one redirect.
@@ -174,6 +177,8 @@ pub(crate) struct BlockingPool {
 struct Lease {
     pool: Arc<NodePool>,
     conn: Option<MultiplexedConnection>,
+    /// Taken idle from the pool, so the server may have dropped it since its last use.
+    reused: bool,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -186,11 +191,17 @@ impl Lease {
 }
 
 impl BlockingPool {
-    pub(crate) fn new(seed: &str, per_node: usize, cluster: bool) -> RedisResult<Self> {
+    pub(crate) fn new(
+        seed: &str,
+        per_node: usize,
+        cluster: bool,
+        response_timeout: Duration,
+    ) -> RedisResult<Self> {
         Ok(Self {
             seed: seed.into_connection_info()?,
             per_node: per_node.max(1),
             cluster,
+            response_timeout,
             nodes: Mutex::default(),
             slots: Mutex::default(),
         })
@@ -212,40 +223,76 @@ impl BlockingPool {
             .unwrap_or_else(|| address(&self.seed));
         // One redirect is expected when the slot was unknown or moved. A second means the
         // cluster is resharding, and the caller's next read tries again.
-        for _ in 0..2 {
-            let Some(mut lease) = self.lease(&node, deadline).await? else {
+        let mut redirected = false;
+        let mut fresh = false;
+        loop {
+            let Some(mut lease) = self.lease(&node, deadline, fresh).await? else {
                 return Ok(None);
             };
             let conn = lease.conn.as_mut().expect("a lease holds its connection");
-            match cmd.query_async::<Value>(conn).await {
+            let answer = tokio::time::timeout_at(
+                deadline + self.response_timeout,
+                cmd.query_async::<Value>(conn),
+            )
+            .await;
+            // Dropping the lease drops the connection, which may still get the late answer.
+            let Ok(result) = answer else {
+                return Err(RedisError::from((
+                    redis::ErrorKind::Io,
+                    "Redis did not answer a blocked read by its deadline",
+                )));
+            };
+            match result {
                 Ok(value) => {
                     lease.release();
                     return Ok(Some(value));
                 }
+                // A restart drops every idle connection, so one fresh try tells a dead connection
+                // from a dead server.
+                Err(error)
+                    if lease.reused
+                        && !fresh
+                        && (error.is_io_error() || error.is_connection_dropped()) =>
+                {
+                    fresh = true;
+                }
                 Err(error) => match (slot, redirect(&error)) {
-                    (Some(slot), Some(target)) => {
+                    (Some(slot), Some(target)) if !redirected => {
                         lease.release();
                         self.slots.lock().unwrap().insert(slot, target.clone());
                         node = target;
+                        redirected = true;
+                    }
+                    (Some(_), Some(_)) => {
+                        return Err(RedisError::from((
+                            redis::ErrorKind::Io,
+                            "the cluster moved the stream's slot twice during one read",
+                        )));
                     }
                     _ => return Err(error),
                 },
             }
         }
-        Err(RedisError::from((
-            redis::ErrorKind::Io,
-            "the cluster moved the stream's slot twice during one read",
-        )))
     }
 
-    async fn lease(&self, node: &Node, deadline: Instant) -> RedisResult<Option<Lease>> {
+    async fn lease(
+        &self,
+        node: &Node,
+        deadline: Instant,
+        fresh: bool,
+    ) -> RedisResult<Option<Lease>> {
         let pool = self.node(node);
         let Ok(Ok(permit)) =
             tokio::time::timeout_at(deadline, pool.permits.clone().acquire_owned()).await
         else {
             return Ok(None);
         };
-        let idle = pool.idle.lock().unwrap().pop();
+        let idle = if fresh {
+            None
+        } else {
+            pool.idle.lock().unwrap().pop()
+        };
+        let reused = idle.is_some();
         let conn = match idle {
             Some(conn) => conn,
             None => {
@@ -259,6 +306,7 @@ impl BlockingPool {
         Ok(Some(Lease {
             pool,
             conn: Some(conn),
+            reused,
             _permit: permit,
         }))
     }
@@ -320,6 +368,9 @@ fn at(seed: &ConnectionInfo, (host, port): &Node) -> ConnectionInfo {
 }
 
 fn redirect(error: &RedisError) -> Option<Node> {
+    if error.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::Moved) {
+        return None;
+    }
     error
         .redirect_node()
         .and_then(|(address, _)| address.rsplit_once(':'))
@@ -349,6 +400,22 @@ mod tests {
         // An empty tag hashes the whole key.
         assert_ne!(slot("foo{}{bar}"), slot("bar"));
         assert_eq!(slot("p:{ns:wf:run}:t:a"), slot("p:{ns:wf:run}:chain"));
+    }
+
+    #[test]
+    fn rule_8_4_only_a_moved_slot_is_remembered() {
+        let reply = |text: &str| {
+            redis::parse_redis_value(format!("-{text}\r\n").as_bytes())
+                .unwrap()
+                .extract_error()
+                .unwrap_err()
+        };
+        assert_eq!(
+            redirect(&reply("MOVED 3999 127.0.0.1:7102")),
+            Some(("127.0.0.1".to_string(), 7102))
+        );
+        // An `ASK` target holds the slot only for one command sent after `ASKING`.
+        assert_eq!(redirect(&reply("ASK 3999 127.0.0.1:7102")), None);
     }
 
     #[test]
