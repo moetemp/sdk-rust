@@ -1,16 +1,15 @@
 {
-  "comment": "Token v2 of a stream-returning Nexus operation: base64url JSON, no padding, keys sorted, non-ASCII escaped. An unpinned ref has a null run_id. Core's encoder and every SDK's decoder check these.",
+  "comment": "Token v2 of a stream-returning Nexus operation: base64url JSON, no padding, keys sorted, non-ASCII escaped, and no run_id for an unpinned ref. Core's encoder and every SDK's encoder write the vectors, and every decoder reads them. Decoders also read decode_only, the null run_id that SDK releases before Core wrote.",
   "vectors": [
     {
       "ref": {
         "kind": "workflow",
         "workflow_id": "owner-1",
-        "run_id": null,
         "topic": "tokens"
       },
       "attach": "attach-1",
       "chain": "chain-1",
-      "token": "eyJhdHRhY2giOiJhdHRhY2gtMSIsImNoYWluIjoiY2hhaW4tMSIsInJlZiI6eyJraW5kIjoid29ya2Zsb3ciLCJydW5faWQiOm51bGwsInRvcGljIjoidG9rZW5zIiwid29ya2Zsb3dfaWQiOiJvd25lci0xIn0sInYiOjJ9"
+      "token": "eyJhdHRhY2giOiJhdHRhY2gtMSIsImNoYWluIjoiY2hhaW4tMSIsInJlZiI6eyJraW5kIjoid29ya2Zsb3ciLCJ0b3BpYyI6InRva2VucyIsIndvcmtmbG93X2lkIjoib3duZXItMSJ9LCJ2IjoyfQ"
     },
     {
       "ref": {
@@ -27,23 +26,34 @@
       "ref": {
         "kind": "workflow",
         "workflow_id": "order/42 \"quoted\"",
-        "run_id": null,
         "topic": "t\\back\nline"
       },
       "attach": "req-é",
       "chain": "chain-ü",
-      "token": "eyJhdHRhY2giOiJyZXEtXHUwMGU5IiwiY2hhaW4iOiJjaGFpbi1cdTAwZmMiLCJyZWYiOnsia2luZCI6IndvcmtmbG93IiwicnVuX2lkIjpudWxsLCJ0b3BpYyI6InRcXGJhY2tcbmxpbmUiLCJ3b3JrZmxvd19pZCI6Im9yZGVyLzQyIFwicXVvdGVkXCIifSwidiI6Mn0"
+      "token": "eyJhdHRhY2giOiJyZXEtXHUwMGU5IiwiY2hhaW4iOiJjaGFpbi1cdTAwZmMiLCJyZWYiOnsia2luZCI6IndvcmtmbG93IiwidG9waWMiOiJ0XFxiYWNrXG5saW5lIiwid29ya2Zsb3dfaWQiOiJvcmRlci80MiBcInF1b3RlZFwiIn0sInYiOjJ9"
     },
     {
       "ref": {
         "kind": "workflow",
         "workflow_id": "日本語-wf",
-        "run_id": null,
         "topic": "emoji-😀"
       },
       "attach": "r",
       "chain": "c",
-      "token": "eyJhdHRhY2giOiJyIiwiY2hhaW4iOiJjIiwicmVmIjp7ImtpbmQiOiJ3b3JrZmxvdyIsInJ1bl9pZCI6bnVsbCwidG9waWMiOiJlbW9qaS1cdWQ4M2RcdWRlMDAiLCJ3b3JrZmxvd19pZCI6Ilx1NjVlNVx1NjcyY1x1OGE5ZS13ZiJ9LCJ2IjoyfQ"
+      "token": "eyJhdHRhY2giOiJyIiwiY2hhaW4iOiJjIiwicmVmIjp7ImtpbmQiOiJ3b3JrZmxvdyIsInRvcGljIjoiZW1vamktXHVkODNkXHVkZTAwIiwid29ya2Zsb3dfaWQiOiJcdTY1ZTVcdTY3MmNcdThhOWUtd2YifSwidiI6Mn0"
+    }
+  ],
+  "decode_only": [
+    {
+      "ref": {
+        "kind": "workflow",
+        "workflow_id": "owner-1",
+        "run_id": null,
+        "topic": "tokens"
+      },
+      "attach": "attach-1",
+      "chain": "chain-1",
+      "token": "eyJhdHRhY2giOiJhdHRhY2gtMSIsImNoYWluIjoiY2hhaW4tMSIsInJlZiI6eyJraW5kIjoid29ya2Zsb3ciLCJydW5faWQiOm51bGwsInRvcGljIjoidG9rZW5zIiwid29ya2Zsb3dfaWQiOiJvd25lci0xIn0sInYiOjJ9"
     }
   ],
   "refused": [

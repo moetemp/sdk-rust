@@ -120,7 +120,9 @@ struct TokenBody {
 #[derive(Serialize, Deserialize)]
 struct TokenRef {
     kind: String,
-    // An unpinned ref is null, as SDKs that wrote tokens before Core did write it.
+    // An unpinned ref has none, as the generated SDK writers leave an unset member out. SDK
+    // releases before Core wrote null, which reads the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     run_id: Option<String>,
     topic: String,
     workflow_id: String,
@@ -563,6 +565,7 @@ mod tests {
     #[derive(Deserialize)]
     struct Vectors {
         vectors: Vec<Vector>,
+        decode_only: Vec<Vector>,
         refused: Vec<String>,
     }
 
@@ -616,6 +619,16 @@ mod tests {
                 OperationToken::decode("ns", &padded).unwrap(),
                 token_of(&vector),
                 "padding is optional"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_from_before_core_still_decodes() {
+        for vector in vectors().decode_only {
+            assert_eq!(
+                OperationToken::decode("ns", &vector.token).unwrap(),
+                token_of(&vector)
             );
         }
     }
