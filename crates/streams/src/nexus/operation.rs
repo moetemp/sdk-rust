@@ -218,8 +218,8 @@ impl OperationToken {
     }
 }
 
-/// Writes JSON with every character past ASCII as a `\u` escape, as Python's `json.dumps` does
-/// by default.
+/// Writes JSON with every character past ASCII, and DEL, as a `\u` escape, as Python's
+/// `json.dumps` does by default.
 struct AsciiOnly;
 
 impl serde_json::ser::Formatter for AsciiOnly {
@@ -228,7 +228,7 @@ impl serde_json::ser::Formatter for AsciiOnly {
         W: ?Sized + io::Write,
     {
         for character in fragment.chars() {
-            if character.is_ascii() {
+            if character.is_ascii() && character != '\u{7f}' {
                 writer.write_all(&[character as u8])?;
             } else {
                 let mut units = [0u16; 2];

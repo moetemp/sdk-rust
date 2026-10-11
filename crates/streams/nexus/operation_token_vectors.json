@@ -41,6 +41,16 @@
       "attach": "r",
       "chain": "c",
       "token": "eyJhdHRhY2giOiJyIiwiY2hhaW4iOiJjIiwicmVmIjp7ImtpbmQiOiJ3b3JrZmxvdyIsInRvcGljIjoiZW1vamktXHVkODNkXHVkZTAwIiwid29ya2Zsb3dfaWQiOiJcdTY1ZTVcdTY3MmNcdThhOWUtd2YifSwidiI6Mn0"
+    },
+    {
+      "ref": {
+        "kind": "workflow",
+        "workflow_id": "delwf",
+        "topic": "t"
+      },
+      "attach": "a",
+      "chain": "c",
+      "token": "eyJhdHRhY2giOiJhXHUwMDdmIiwiY2hhaW4iOiJjIiwicmVmIjp7ImtpbmQiOiJ3b3JrZmxvdyIsInRvcGljIjoidFx1MDA3ZiIsIndvcmtmbG93X2lkIjoiZGVsXHUwMDdmd2YifSwidiI6Mn0"
     }
   ],
   "decode_only": [
