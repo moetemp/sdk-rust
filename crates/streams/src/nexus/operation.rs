@@ -130,7 +130,9 @@ fn checked(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
             "a stream needs its namespace and its owner's Workflow id",
         ));
     }
-    temporalio_common::streams::check_topic(&stream.topic).map_err(|reason| bad_input(&reason))?;
+    // The topic is the caller's own value, so the message names the rule and not the topic.
+    temporalio_common::streams::check_topic(&stream.topic)
+        .map_err(|reason| bad_input(&super::failure::without_values(&reason)))?;
     Ok(stream)
 }
 
@@ -649,6 +651,37 @@ mod tests {
             );
         }
         assert!(setup.owners.described.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_input_mistake_leaves_the_callers_value_out_of_its_message() {
+        let setup = setup();
+        let response = AttachCallerResponse::decode(
+            setup
+                .service
+                .call(
+                    "AttachCaller",
+                    &AttachCallerRequest {
+                        stream: Some(StreamAddress {
+                            topic: "secret-value\u{1}".to_string(),
+                            ..stream("")
+                        }),
+                        ..attach_request("temporal://system")
+                    }
+                    .encode_to_vec(),
+                )
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let failure = response.failure.unwrap();
+        assert_eq!(failure.handler_error_type, "BAD_REQUEST");
+        assert!(
+            !failure.message.contains("secret-value"),
+            "{}",
+            failure.message
+        );
     }
 
     #[tokio::test]
