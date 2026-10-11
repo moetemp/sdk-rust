@@ -12,6 +12,10 @@ use temporalio_common::protos::temporal::api::{
 /// The class a caller raises for a mistake in the call's input, the same in every SDK.
 pub(crate) const INPUT_MISTAKE: &str = "ValueError";
 
+/// The most bytes of one error message that cross. A message lands in the caller's History, and
+/// a codec's error may carry any amount of detail.
+pub(crate) const MAX_MESSAGE_BYTES: usize = 512;
+
 /// The Nexus `HandlerErrorType` names this table uses.
 pub(crate) const BAD_REQUEST: &str = "BAD_REQUEST";
 pub(crate) const NOT_FOUND: &str = "NOT_FOUND";
@@ -56,6 +60,7 @@ pub(crate) fn input_mistake(message: impl Into<String>) -> NexusFailure {
 /// A failure of `kind` with the cause class `class`. The message leads with the class, and the
 /// failure carries no stack, so the handler's frames stay on this side.
 pub(crate) fn failure(class: &str, kind: &str, retryable: bool, message: &str) -> NexusFailure {
+    let message = &capped(message);
     let retry_behavior = if retryable {
         NexusHandlerErrorRetryBehavior::Retryable
     } else {
@@ -85,6 +90,57 @@ pub(crate) fn failure(class: &str, kind: &str, retryable: bool, message: &str) -
             )),
             ..Default::default()
         }),
+    }
+}
+
+/// `message`, cut to [MAX_MESSAGE_BYTES].
+pub(crate) fn capped(message: &str) -> String {
+    if message.len() <= MAX_MESSAGE_BYTES {
+        return message.to_string();
+    }
+    let mut end = MAX_MESSAGE_BYTES - 3;
+    while !message.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &message[..end])
+}
+
+/// `message` with each double-quoted value left out. Such a value is the caller's input, which
+/// the failure would carry into History without the codec.
+pub(crate) fn without_values(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut chars = message.chars();
+    while let Some(char) = chars.next() {
+        if char != '"' {
+            out.push(char);
+            continue;
+        }
+        while let Some(char) = chars.next() {
+            match char {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => break,
+                _ => {}
+            }
+        }
+        if out.ends_with(' ') {
+            out.pop();
+        }
+    }
+    out
+}
+
+/// `value` if it reads as a name, so a caller's data in its place stays out of the message.
+pub(crate) fn named(value: &str) -> String {
+    let is_name = value.len() <= 32
+        && value
+            .chars()
+            .all(|char| char.is_ascii_alphanumeric() || char == '_' || char == '-');
+    if is_name {
+        format!("{value:?}")
+    } else {
+        "the call names".to_string()
     }
 }
 
@@ -141,6 +197,21 @@ mod tests {
             assert_eq!(application.non_retryable, !retryable);
             assert_eq!(cause.message, "why");
         }
+    }
+
+    #[test]
+    fn a_message_crosses_without_values_and_cut_short() {
+        assert_eq!(
+            without_values(r#"invalid type: string "a \"secret\"", expected a sequence"#),
+            "invalid type: string, expected a sequence"
+        );
+        assert_eq!(named("activity"), "\"activity\"");
+        assert_eq!(named("card 4111"), "the call names");
+        let long = "é".repeat(400);
+        let cut = capped(&long);
+        assert!(cut.len() <= MAX_MESSAGE_BYTES && cut.ends_with("..."));
+        let crossed = failure(INPUT_MISTAKE, BAD_REQUEST, false, &long);
+        assert!(crossed.failure.unwrap().cause.unwrap().message.len() <= MAX_MESSAGE_BYTES);
     }
 
     #[test]
