@@ -1299,6 +1299,99 @@ mod tests {
             );
         }
 
+        /// A memory store whose first promotion fails for now.
+        struct FailsFirstPromote(temporalio_streams::MemoryStore, Mutex<bool>);
+
+        #[async_trait::async_trait]
+        impl StreamStore for FailsFirstPromote {
+            fn name(&self) -> &str {
+                self.0.name()
+            }
+            async fn append(&self, r: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
+                self.0.append(r).await
+            }
+            async fn read(&self, r: StoreReadRequest) -> StreamResult<StoreReadResponse> {
+                self.0.read(r).await
+            }
+            async fn latest(&self, r: StoreLatestRequest) -> StreamResult<StoreLatestResponse> {
+                self.0.latest(r).await
+            }
+            async fn record_at(
+                &self,
+                c: &ChainId,
+                t: &str,
+                p: &str,
+            ) -> StreamResult<Option<Vec<u8>>> {
+                self.0.record_at(c, t, p).await
+            }
+            async fn stage(&self, b: StagedBatch) -> StreamResult<()> {
+                self.0.stage(b).await
+            }
+            async fn promote(&self, s: &StageRef) -> StreamResult<PromoteResult> {
+                if std::mem::take(&mut *self.1.lock()) {
+                    return Err(StreamError::storage("failing over"));
+                }
+                self.0.promote(s).await
+            }
+            async fn abort(&self, s: &StageRef) -> StreamResult<()> {
+                self.0.abort(s).await
+            }
+            async fn close_chain(&self, c: &ChainId) -> StreamResult<()> {
+                self.0.close_chain(c).await
+            }
+            async fn close_topic(
+                &self,
+                c: &ChainId,
+                t: &str,
+                r: Option<temporalio_streams::proto::Payload>,
+            ) -> StreamResult<()> {
+                self.0.close_topic(c, t, r).await
+            }
+            async fn pending_stages(&self, c: &ChainId) -> StreamResult<Vec<PendingStage>> {
+                self.0.pending_stages(c).await
+            }
+            async fn delete_owner(
+                &self,
+                r: DeleteOwnerRequest,
+            ) -> StreamResult<DeleteOwnerResponse> {
+                self.0.delete_owner(r).await
+            }
+        }
+
+        #[tokio::test]
+        async fn a_retried_promotion_still_ends_the_stream_on_the_server_after_its_output() {
+            let recorder = Arc::new(Recorder::default());
+            let notifying = Arc::new(temporalio_streams::NotifyingStore::new(
+                Arc::new(FailsFirstPromote(
+                    temporalio_streams::MemoryStore::new(),
+                    Mutex::new(true),
+                )),
+                Arc::new(temporalio_streams::Notifier::new(recorder.clone(), 10)),
+            ));
+            let store = OutputStore::new(notifying, "ns".to_string(), Default::default());
+            let mut closed = batch("a");
+            closed.closes = vec![closing("t", "done")];
+            store.stage(std::slice::from_ref(&closed)).await.unwrap();
+            store
+                .settle("run", vec![closed], CompletionOutcome::Accepted)
+                .await;
+            for _ in 0..1000 {
+                if recorder.0.lock().iter().any(|n| n.close_result.is_some()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            store.flush_notifications().await;
+            assert_eq!(
+                progress_and_closes(&recorder),
+                [
+                    ("t".to_string(), 1, None),
+                    ("t".to_string(), 2, Some(b"done".to_vec())),
+                ],
+                "the close waits for the retried promotion and outranks its progress"
+            );
+        }
+
         #[tokio::test]
         async fn a_close_replay_proves_ends_the_stream_on_the_server() {
             let recorder = Arc::new(Recorder::default());
