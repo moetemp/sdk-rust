@@ -178,14 +178,14 @@ impl StreamService {
                 .resume(decode::<NexusResumeRequest>(rpc, request)?)
                 .await
                 .encode_to_vec()),
-            "AttachCaller" => crate::operation::attach_caller(
+            "AttachCaller" => crate::nexus::attach_caller(
                 &self.streams,
                 self.callers.as_ref(),
                 decode::<AttachCallerRequest>(rpc, request)?,
             )
             .await
             .map(|r| r.encode_to_vec()),
-            "DetachCaller" => crate::operation::detach_caller(
+            "DetachCaller" => crate::nexus::detach_caller(
                 self.callers.as_ref(),
                 decode::<DetachCallerRequest>(rpc, request)?,
             )

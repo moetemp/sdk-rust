@@ -582,7 +582,7 @@ mod tests {
     }
 
     fn vectors() -> Vectors {
-        serde_json::from_str(include_str!("../nexus/operation_token_vectors.json")).unwrap()
+        serde_json::from_str(include_str!("../../nexus/operation_token_vectors.json")).unwrap()
     }
 
     fn token_of(vector: &Vector) -> OperationToken {

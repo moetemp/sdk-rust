@@ -7,7 +7,11 @@
 //! stateless, so a read goes on at any handler Worker.
 
 mod failure;
+mod operation;
 mod wire;
+
+pub use operation::{OPERATION_TOKEN_VERSION, OperationToken};
+pub(crate) use operation::{attach_caller, detach_caller};
 
 use crate::{
     StreamError, Streams,
