@@ -24,8 +24,8 @@ service StreamService {
   rpc Close(CloseRequest) returns (CloseResponse);
   // Deletes every stream of one owner.
   rpc DeleteOwner(DeleteOwnerRequest) returns (DeleteOwnerResponse);
-  // Waits until the stream notifications this process sent are out. Call it before the process
-  // stops, since a notification is sent in the background.
+  // Waits until the stream notifications this process sent are out, for at most 10 seconds. Call
+  // it before the process stops, since a notification is sent in the background.
   rpc FlushNotifications(FlushNotificationsRequest) returns (FlushNotificationsResponse);
 }
 
