@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package temporal.sdk.streams.v1;
 
+option ruby_package = "Temporalio::Internal::Bridge::Api::StreamRecord";
+
 import "temporal/api/common/v1/message.proto";
 
 // One entry in a stream. The record is the wire format: stores keep it
@@ -11,8 +13,9 @@ import "temporal/api/common/v1/message.proto";
 // name is not, so this message can move to another package without a data
 // change.
 message StreamRecord {
-    // The value the producer published. A provider runs it through the
-    // payload codec and external storage before it stores the record.
+    // The value the producer published. Lang runs it through the payload
+    // codec and external storage before it reaches any store, so a store and
+    // Core see only the encoded payload.
     temporal.api.common.v1.Payload body = 1;
     // Provenance stamped by the SDK, such as the plaintext content hash.
     map<string, temporal.api.common.v1.Payload> metadata = 2;
