@@ -1635,6 +1635,40 @@ mod tests {
         assert_eq!(described, ["run-1", "run-2"]);
     }
 
+    /// Takes every notification and sends nothing.
+    struct Quiet;
+
+    #[async_trait::async_trait]
+    impl crate::NotifierClient for Quiet {
+        async fn notify(&self, _: crate::StreamNotification) -> Result<(), crate::NotifyError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reader_repairs_through_the_notifying_store() {
+        // Every process with a client wraps its store, so repair must work through the wrapper.
+        let setup = setup(quick());
+        let notifying = Arc::new(crate::NotifyingStore::new(
+            setup.store.clone(),
+            Arc::new(crate::Notifier::new(Arc::new(Quiet), 10)),
+        ));
+        let streams = Streams::new(notifying, setup.owners.clone(), quick());
+        left_behind(&setup.store, "run-1", "t2", 6, "2").await;
+        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
+        history(
+            &setup.owners,
+            "run-1",
+            vec![marker(5, "t1", 3), marker(8, "t2", 6)],
+        );
+        let page = streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(values(&page), ["1", "2"]);
+        assert!(pending(&setup.store).await.is_empty());
+    }
+
     #[tokio::test]
     async fn rule_24_3_a_stage_history_has_not_decided_holds_back_the_ones_after_it() {
         let setup = setup(quick());

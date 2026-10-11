@@ -549,7 +549,8 @@ impl NotifierClient for UnlessUnsupported {
 /// visible.
 ///
 /// Wraps the store a process hands to its stream calls and its Workers, so every write path
-/// notifies without knowing about notifiers.
+/// notifies without knowing about notifiers. It forwards every trait method by name, since a
+/// method left to its default would answer for the inner store.
 pub struct NotifyingStore {
     inner: Arc<dyn StreamStore>,
     notifier: Arc<Notifier>,
@@ -688,6 +689,10 @@ impl StreamStore for NotifyingStore {
         position: &str,
     ) -> StreamResult<Option<Vec<u8>>> {
         self.inner.record_at(chain, topic, position).await
+    }
+
+    async fn trimmed(&self, chain: &ChainId, topic: &str) -> StreamResult<Option<String>> {
+        self.inner.trimmed(chain, topic).await
     }
 
     async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {
