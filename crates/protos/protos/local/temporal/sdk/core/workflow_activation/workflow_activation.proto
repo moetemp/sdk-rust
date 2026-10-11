@@ -147,6 +147,9 @@ message WorkflowActivationJob {
         // in the activation if present.
         RemoveFromCache remove_from_cache = 50;
     }
+    // Earlier fork builds sent a replay job as 17, so a lang built against them must not read a
+    // new job there.
+    reserved 17;
 }
 
 // Initialize a new workflow
