@@ -2032,10 +2032,13 @@ fn make_request_too_large_failure() -> Failure {
 }
 
 /// Whether the server applied a completion that failed with `error`, as far as it says.
+///
+/// `NotFound` proves nothing. The client retries a completion whose answer was lost, and the
+/// server answers the repeat of a completion it applied with `NotFound`.
 #[cfg(feature = "streams")]
 fn completion_outcome(error: &tonic::Status) -> stream_output::CompletionOutcome {
-    let not_applied = error.code() == tonic::Code::NotFound
-        || (error.code() == tonic::Code::InvalidArgument && error.message() == "UnhandledCommand")
+    let not_applied = (error.code() == tonic::Code::InvalidArgument
+        && error.message() == "UnhandledCommand")
         // The worker failed these itself, before sending.
         || error.metadata().contains_key(REQUEST_TOO_LARGE_KEY)
         || error.metadata().contains_key(MESSAGE_TOO_LARGE_KEY)
