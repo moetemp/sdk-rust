@@ -67,6 +67,20 @@ pub extern "C" fn temporal_core_stream_store_free(store: *mut StreamStore) {
     }
 }
 
+/// The failure a call answers with when its caller cancelled it. A write may or may not have
+/// landed, but a read only stopped, so it gets a message that says so.
+fn cancelled(rpc: &str) -> proto::StreamFailure {
+    let message = match rpc {
+        "Read" | "Latest" => "Cancelled before the read answered",
+        _ => "Cancelled",
+    };
+    proto::StreamFailure {
+        kind: proto::StreamFailureKind::OutcomeUnknown as i32,
+        message: message.to_string(),
+        cursor: String::new(),
+    }
+}
+
 /// If success or failure are not null, they must be manually freed when done. Exactly one is
 /// set. Success is the serialized response, and failure a serialized
 /// `coresdk.streams.StreamFailure`.
@@ -98,11 +112,7 @@ pub extern "C" fn temporal_core_stream_store_call(
         let call = service.call(&rpc, &request);
         let result = if let Some(cancel_token) = cancel_token {
             tokio::select! {
-                _ = cancel_token.cancelled() => Err(proto::StreamFailure {
-                    kind: proto::StreamFailureKind::OutcomeUnknown as i32,
-                    message: "Cancelled".to_string(),
-                    cursor: String::new(),
-                }),
+                _ = cancel_token.cancelled() => Err(cancelled(&rpc)),
                 result = call => result,
             }
         } else {
