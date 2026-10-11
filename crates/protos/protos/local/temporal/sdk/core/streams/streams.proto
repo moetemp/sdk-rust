@@ -28,6 +28,12 @@ service StreamService {
   // notification goes in the background, so a process that holds only a client calls it before it
   // stops. A Worker flushes at stop on its own.
   rpc FlushNotifications(FlushNotificationsRequest) returns (FlushNotificationsResponse);
+  // Attaches the caller of a stream-returning Nexus operation's start to the stream's notifier,
+  // and answers with the operation token. The server then delivers the stream's progress and its
+  // close result to the caller's callback. Idempotent by the start's request id.
+  rpc AttachCaller(AttachCallerRequest) returns (AttachCallerResponse);
+  // Detaches the caller a token's start attached, from the chain it attached to.
+  rpc DetachCaller(DetachCallerRequest) returns (DetachCallerResponse);
 }
 
 // Which store holds a process's streams, and how to reach it. Lang builds one store from it and
@@ -219,6 +225,31 @@ message CloseResponse {}
 message FlushNotificationsRequest {}
 
 message FlushNotificationsResponse {}
+
+message AttachCallerRequest {
+  // The stream the operation's start names. An empty run id attaches to the chain that holds the
+  // Workflow id now.
+  StreamAddress stream = 1;
+  // The start's request id. A retried start attaches once.
+  string request_id = 2;
+  // The start's callback URL and headers. An empty URL is refused, since the caller could never
+  // hear about the stream.
+  string callback_url = 3;
+  map<string, string> callback_headers = 4;
+}
+
+message AttachCallerResponse {
+  // The token the start answers with. It names the stream, the attach and the chain.
+  string operation_token = 1;
+}
+
+message DetachCallerRequest {
+  string namespace = 1;
+  // The token the start answered with.
+  string operation_token = 2;
+}
+
+message DetachCallerResponse {}
 
 message DeleteOwnerRequest {
   string namespace = 1;

@@ -74,11 +74,52 @@ pub enum NotifyError {
     Unsupported(String),
 }
 
-/// Sends notifications to the stream notifier on the server.
+/// One caller's callback, to attach to a stream's notifier.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CallerAttachment {
+    /// The run chain whose stream it is. Its first run keys the notifier.
+    pub chain: ChainId,
+    /// The stream's topic.
+    pub topic: String,
+    /// The start's request id. The attach is idempotent by it, and a detach names it.
+    pub request_id: String,
+    /// Where the server delivers progress and the completion.
+    pub callback_url: String,
+    /// Headers the server sends with each delivery.
+    pub callback_headers: std::collections::HashMap<String, String>,
+    /// The operation's token, which the server hands back with each delivery.
+    pub operation_token: String,
+    /// When the operation started, which the server hands back too.
+    pub start_time: std::time::SystemTime,
+}
+
+/// Sends notifications to the stream notifier on the server, and attaches and detaches its
+/// callers.
 #[async_trait::async_trait]
 pub trait NotifierClient: Send + Sync {
     /// Sends one notification.
     async fn notify(&self, notification: StreamNotification) -> Result<(), NotifyError>;
+
+    /// Attaches a caller's callback to a stream's notifier. Idempotent by its request id.
+    async fn attach(&self, attachment: CallerAttachment) -> Result<(), NotifyError> {
+        let _ = attachment;
+        Err(NotifyError::Unsupported(
+            "this client can't attach callers".to_string(),
+        ))
+    }
+
+    /// Detaches the callback that the attach with `request_id` attached.
+    async fn detach(
+        &self,
+        chain: ChainId,
+        topic: String,
+        request_id: String,
+    ) -> Result<(), NotifyError> {
+        let _ = (chain, topic, request_id);
+        Err(NotifyError::Unsupported(
+            "this client can't detach callers".to_string(),
+        ))
+    }
 }
 
 /// The notifier counter for a store position.

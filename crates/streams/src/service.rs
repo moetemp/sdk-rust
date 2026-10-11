@@ -4,9 +4,9 @@ use crate::{
     DEFAULT_MAX_NOTIFIERS, Notifier, NotifierClient, NotifyingStore, OwnerClient, StreamError,
     StreamResult, StreamStore, Streams, StreamsOptions,
     proto::{
-        AppendRequest, CloseRequest, DeleteOwnerRequest, FlushNotificationsRequest,
-        FlushNotificationsResponse, LatestRequest, ReadRequest, StreamFailure, StreamStoreConfig,
-        stream_store_config,
+        AppendRequest, AttachCallerRequest, CloseRequest, DeleteOwnerRequest, DetachCallerRequest,
+        FlushNotificationsRequest, FlushNotificationsResponse, LatestRequest, ReadRequest,
+        StreamFailure, StreamStoreConfig, stream_store_config,
     },
 };
 use prost::Message;
@@ -27,6 +27,7 @@ const MAX_READ_WAIT: Duration = Duration::from_secs(60);
 pub struct StreamService {
     store: Arc<dyn StreamStore>,
     streams: Streams,
+    callers: Option<Arc<dyn NotifierClient>>,
 }
 
 impl std::fmt::Debug for StreamService {
@@ -48,7 +49,8 @@ impl StreamService {
     }
 
     /// Like [StreamService::connect], closing each stream's notifier through `notifier` after
-    /// the store closes the stream, and sending progress too when the config turns it on.
+    /// the store closes the stream, sending progress too when the config turns it on, and
+    /// attaching and detaching stream operation callers through it.
     pub async fn connect_with_notifier(
         config: StreamStoreConfig,
         owner: Arc<dyn OwnerClient>,
@@ -70,24 +72,27 @@ impl StreamService {
                 "stream notifications need a client to send them with",
             ));
         }
-        let store: Arc<dyn StreamStore> = match notifier {
+        let store: Arc<dyn StreamStore> = match &notifier {
             Some(client) => {
                 let max_notifiers = match config.max_notifiers {
                     0 => DEFAULT_MAX_NOTIFIERS,
                     max => max as usize,
                 };
                 Arc::new(
-                    NotifyingStore::new(store, Arc::new(Notifier::new(client, max_notifiers)))
-                        .with_progress(config.notify_on_append),
+                    NotifyingStore::new(
+                        store,
+                        Arc::new(Notifier::new(client.clone(), max_notifiers)),
+                    )
+                    .with_progress(config.notify_on_append),
                 )
             }
             None => store,
         };
-        Ok(Self::new(
-            store,
-            owner,
-            StreamsOptions::for_retention(retention),
-        ))
+        let service = Self::new(store, owner, StreamsOptions::for_retention(retention));
+        Ok(match notifier {
+            Some(client) => service.with_callers(client),
+            None => service,
+        })
     }
 
     /// Serves calls on `store`.
@@ -97,7 +102,17 @@ impl StreamService {
         options: StreamsOptions,
     ) -> Self {
         let streams = Streams::new(store.clone(), owner, options);
-        Self { store, streams }
+        Self {
+            store,
+            streams,
+            callers: None,
+        }
+    }
+
+    /// Attaches and detaches stream operation callers through `client`.
+    pub fn with_callers(mut self, client: Arc<dyn NotifierClient>) -> Self {
+        self.callers = Some(client);
+        self
     }
 
     /// The store, for the Workers that stage and promote Workflow output in it.
@@ -142,6 +157,19 @@ impl StreamService {
                     .await;
                 Ok(FlushNotificationsResponse {}.encode_to_vec())
             }
+            "AttachCaller" => crate::operation::attach_caller(
+                &self.streams,
+                self.callers.as_ref(),
+                decode::<AttachCallerRequest>(rpc, request)?,
+            )
+            .await
+            .map(|r| r.encode_to_vec()),
+            "DetachCaller" => crate::operation::detach_caller(
+                self.callers.as_ref(),
+                decode::<DetachCallerRequest>(rpc, request)?,
+            )
+            .await
+            .map(|r| r.encode_to_vec()),
             other => Err(StreamError::unsupported(format!(
                 "the stream service has no call {other:?}"
             ))),

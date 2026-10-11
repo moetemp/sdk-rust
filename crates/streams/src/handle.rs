@@ -615,6 +615,15 @@ impl Streams {
     }
 
     /// The chain a stream address names now.
+    /// The checked address and the run chain it names now, through the owner cache.
+    pub(crate) async fn resolve<'a>(
+        &self,
+        stream: Option<&'a StreamAddress>,
+    ) -> StreamResult<(&'a StreamAddress, ChainId)> {
+        let stream = address(stream)?;
+        Ok((stream, self.chain(stream).await?))
+    }
+
     async fn chain(&self, stream: &StreamAddress) -> StreamResult<ChainId> {
         let key = owner_key(stream);
         // A pinned run's chain never changes. The latest run's chain changes when a new chain

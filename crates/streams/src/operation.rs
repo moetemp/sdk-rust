@@ -1,0 +1,634 @@
+//! The callers of a stream-returning Nexus operation.
+//!
+//! The operation's start attaches the caller's callback to the stream's notifier on the server,
+//! and answers with a token that names the stream. Its cancel detaches the callback the start
+//! attached. The token format is shared with every SDK, which decodes it on the Workflow side, so
+//! it must stay byte for byte what `crates/streams/nexus/operation_token_vectors.json` holds.
+
+use crate::{
+    CallerAttachment, NotifierClient, NotifyError, StreamError, StreamResult, Streams,
+    proto::{
+        AttachCallerRequest, AttachCallerResponse, ChainId, DetachCallerRequest,
+        DetachCallerResponse, StreamAddress, StreamOwnerKind,
+    },
+};
+use base64::Engine;
+use serde::{Deserialize, Serialize};
+use std::{io, sync::Arc, time::SystemTime};
+
+/// Attaches a start's caller to the stream's notifier and mints the operation token.
+pub(crate) async fn attach_caller(
+    streams: &Streams,
+    client: Option<&Arc<dyn NotifierClient>>,
+    request: AttachCallerRequest,
+) -> StreamResult<AttachCallerResponse> {
+    if request.callback_url.is_empty() {
+        return Err(bad_input(
+            "a stream-returning operation needs a caller callback; start it asynchronously",
+        ));
+    }
+    if request.request_id.is_empty() {
+        return Err(bad_input("an attach needs the start's request id"));
+    }
+    let client = client.ok_or_else(|| {
+        StreamError::unsupported("attaching a caller needs a client connected to the server")
+    })?;
+    let (stream, chain) = streams.resolve(request.stream.as_ref()).await?;
+    let operation_token = OperationToken {
+        stream: stream.clone(),
+        attach_request_id: request.request_id.clone(),
+        chain_first_run_id: chain.first_run_id.clone(),
+    }
+    .encode();
+    // The server hands the token and start time back with progress and the completion, so a
+    // completion that beats the start's response still names the operation.
+    client
+        .attach(CallerAttachment {
+            chain,
+            topic: stream.topic.clone(),
+            request_id: request.request_id,
+            callback_url: request.callback_url,
+            callback_headers: request.callback_headers,
+            operation_token: operation_token.clone(),
+            start_time: SystemTime::now(),
+        })
+        .await
+        .map_err(caller_error)?;
+    Ok(AttachCallerResponse { operation_token })
+}
+
+/// Detaches the caller a token's start attached.
+pub(crate) async fn detach_caller(
+    client: Option<&Arc<dyn NotifierClient>>,
+    request: DetachCallerRequest,
+) -> StreamResult<DetachCallerResponse> {
+    if request.namespace.is_empty() {
+        return Err(bad_input("a detach needs its namespace"));
+    }
+    let token = OperationToken::decode(&request.namespace, &request.operation_token)?;
+    let client = client.ok_or_else(|| {
+        StreamError::unsupported("detaching a caller needs a client connected to the server")
+    })?;
+    client
+        .detach(
+            token.chain(),
+            token.stream.topic.clone(),
+            token.attach_request_id,
+        )
+        .await
+        .map_err(caller_error)?;
+    Ok(DetachCallerResponse {})
+}
+
+fn bad_input(message: &str) -> StreamError {
+    StreamError::refused(message)
+}
+
+fn caller_error(error: NotifyError) -> StreamError {
+    match error {
+        NotifyError::Refused(message) => StreamError::refused(message),
+        NotifyError::Unsupported(message) => StreamError::unsupported(message),
+        NotifyError::Failed(message) => StreamError::storage(message),
+    }
+}
+
+/// The token format version. A later release that carries more tells an old token apart by it.
+pub const OPERATION_TOKEN_VERSION: u32 = 2;
+
+/// What a stream-returning operation's token carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OperationToken {
+    /// The stream, as the operation's `open_stream` named it.
+    pub stream: StreamAddress,
+    /// The start's request id, which the attach was keyed by.
+    pub attach_request_id: String,
+    /// The first run of the chain the start attached to, so a cancel detaches from that chain
+    /// even after the Workflow id moved on to a new one.
+    pub chain_first_run_id: String,
+}
+
+// Fields in name order, since SDKs encode with sorted keys and the bytes must match.
+#[derive(Serialize, Deserialize)]
+struct TokenBody {
+    attach: String,
+    chain: String,
+    #[serde(rename = "ref")]
+    stream: TokenRef,
+    v: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TokenRef {
+    kind: String,
+    // An unpinned ref is null, as SDKs that wrote tokens before Core did write it.
+    run_id: Option<String>,
+    topic: String,
+    workflow_id: String,
+}
+
+const WORKFLOW_KIND: &str = "workflow";
+
+impl OperationToken {
+    /// The token's text: base64url JSON with sorted keys and no padding.
+    pub fn encode(&self) -> String {
+        let body = TokenBody {
+            attach: self.attach_request_id.clone(),
+            chain: self.chain_first_run_id.clone(),
+            stream: TokenRef {
+                kind: WORKFLOW_KIND.to_string(),
+                run_id: (!self.stream.run_id.is_empty()).then(|| self.stream.run_id.clone()),
+                topic: self.stream.topic.clone(),
+                workflow_id: self.stream.workflow_id.clone(),
+            },
+            v: OPERATION_TOKEN_VERSION,
+        };
+        let mut json = Vec::new();
+        let mut serializer = serde_json::Serializer::with_formatter(&mut json, AsciiOnly);
+        body.serialize(&mut serializer)
+            .expect("a token body is plain strings");
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+    }
+
+    /// Reads a token in `namespace`. Fails as refused when it isn't one a stream operation issued.
+    pub fn decode(namespace: &str, token: &str) -> StreamResult<Self> {
+        let refuse =
+            |why: &str| StreamError::refused(format!("not a stream operation token: {why}"));
+        let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token.trim_end_matches('='))
+            .map_err(|_| refuse("not base64url"))?;
+        let version: serde_json::Value =
+            serde_json::from_slice(&json).map_err(|_| refuse("not JSON"))?;
+        if version.get("v").and_then(serde_json::Value::as_u64)
+            != Some(u64::from(OPERATION_TOKEN_VERSION))
+        {
+            return Err(refuse("unknown token version"));
+        }
+        let body: TokenBody =
+            serde_json::from_value(version).map_err(|error| refuse(&error.to_string()))?;
+        if body.stream.kind != WORKFLOW_KIND {
+            return Err(refuse("the stream's owner is not a Workflow"));
+        }
+        Ok(Self {
+            stream: StreamAddress {
+                namespace: namespace.to_string(),
+                owner_kind: StreamOwnerKind::Workflow as i32,
+                workflow_id: body.stream.workflow_id,
+                run_id: body.stream.run_id.unwrap_or_default(),
+                topic: body.stream.topic,
+            },
+            attach_request_id: body.attach,
+            chain_first_run_id: body.chain,
+        })
+    }
+
+    /// The chain the start attached to.
+    pub fn chain(&self) -> ChainId {
+        ChainId {
+            namespace: self.stream.namespace.clone(),
+            workflow_id: self.stream.workflow_id.clone(),
+            first_run_id: self.chain_first_run_id.clone(),
+        }
+    }
+}
+
+/// Writes JSON with every character past ASCII as a `\u` escape, as Python's `json.dumps` does
+/// by default.
+struct AsciiOnly;
+
+impl serde_json::ser::Formatter for AsciiOnly {
+    fn write_string_fragment<W>(&mut self, writer: &mut W, fragment: &str) -> io::Result<()>
+    where
+        W: ?Sized + io::Write,
+    {
+        for character in fragment.chars() {
+            if character.is_ascii() {
+                writer.write_all(&[character as u8])?;
+            } else {
+                let mut units = [0u16; 2];
+                for unit in character.encode_utf16(&mut units) {
+                    write!(writer, "\\u{unit:04x}")?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        MemoryStore, OwnerClient, OwnerDescription, OwnerError, StreamNotification, StreamService,
+        StreamsOptions,
+        proto::{StreamFailure, StreamFailureKind},
+    };
+    use prost::Message;
+    use std::{
+        collections::HashMap,
+        sync::Mutex,
+        time::{Duration, UNIX_EPOCH},
+    };
+    use temporalio_common::protos::temporal::api::{
+        enums::v1::WorkflowExecutionStatus, history::v1::HistoryEvent,
+    };
+
+    /// Answers each Workflow id's chain as `chains` holds it, `chain-1` by default, and records
+    /// the runs it was asked about.
+    #[derive(Default)]
+    struct Owners {
+        chains: Mutex<HashMap<String, String>>,
+        described: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl OwnerClient for Owners {
+        async fn describe(
+            &self,
+            _: &str,
+            workflow_id: &str,
+            run_id: &str,
+        ) -> Result<OwnerDescription, OwnerError> {
+            self.described.lock().unwrap().push(run_id.to_string());
+            let first_run_id = self
+                .chains
+                .lock()
+                .unwrap()
+                .get(workflow_id)
+                .cloned()
+                .unwrap_or_else(|| "chain-1".to_string());
+            Ok(OwnerDescription {
+                run_id: if run_id.is_empty() {
+                    first_run_id.clone()
+                } else {
+                    run_id.to_string()
+                },
+                first_run_id,
+                status: WorkflowExecutionStatus::Running,
+                start_time: None,
+            })
+        }
+
+        async fn history_after(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> Result<Vec<HistoryEvent>, OwnerError> {
+            Ok(vec![])
+        }
+    }
+
+    /// Records the attaches and detaches, and answers each with `answer`.
+    #[derive(Default)]
+    struct Notifier {
+        attached: Mutex<Vec<CallerAttachment>>,
+        detached: Mutex<Vec<(ChainId, String, String)>>,
+        answer: Mutex<Option<NotifyError>>,
+    }
+
+    #[async_trait::async_trait]
+    impl NotifierClient for Notifier {
+        async fn notify(&self, _: StreamNotification) -> Result<(), NotifyError> {
+            Ok(())
+        }
+
+        async fn attach(&self, attachment: CallerAttachment) -> Result<(), NotifyError> {
+            self.attached.lock().unwrap().push(attachment);
+            self.answer.lock().unwrap().clone().map_or(Ok(()), Err)
+        }
+
+        async fn detach(
+            &self,
+            chain: ChainId,
+            topic: String,
+            request_id: String,
+        ) -> Result<(), NotifyError> {
+            self.detached
+                .lock()
+                .unwrap()
+                .push((chain, topic, request_id));
+            self.answer.lock().unwrap().clone().map_or(Ok(()), Err)
+        }
+    }
+
+    struct Setup {
+        owners: Arc<Owners>,
+        notifier: Arc<Notifier>,
+        service: StreamService,
+    }
+
+    fn setup() -> Setup {
+        let owners = Arc::new(Owners::default());
+        let notifier = Arc::new(Notifier::default());
+        let service = StreamService::new(
+            Arc::new(MemoryStore::new()),
+            owners.clone(),
+            StreamsOptions {
+                owner_recheck: Duration::ZERO,
+                ..Default::default()
+            },
+        )
+        .with_callers(notifier.clone());
+        Setup {
+            owners,
+            notifier,
+            service,
+        }
+    }
+
+    fn stream(run_id: &str) -> StreamAddress {
+        StreamAddress {
+            namespace: "default".to_string(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: "owner-1".to_string(),
+            run_id: run_id.to_string(),
+            topic: "tokens".to_string(),
+        }
+    }
+
+    fn attach_request(callback_url: &str) -> AttachCallerRequest {
+        AttachCallerRequest {
+            stream: Some(stream("")),
+            request_id: "attach-1".to_string(),
+            callback_url: callback_url.to_string(),
+            callback_headers: [("nexus-callback-token".to_string(), "abc".to_string())].into(),
+        }
+    }
+
+    async fn attach(
+        service: &StreamService,
+        request: AttachCallerRequest,
+    ) -> Result<String, StreamFailure> {
+        let response = service
+            .call("AttachCaller", &request.encode_to_vec())
+            .await?;
+        Ok(AttachCallerResponse::decode(response.as_slice())
+            .unwrap()
+            .operation_token)
+    }
+
+    async fn detach(service: &StreamService, token: &str) -> Result<(), StreamFailure> {
+        service
+            .call(
+                "DetachCaller",
+                &DetachCallerRequest {
+                    namespace: "default".to_string(),
+                    operation_token: token.to_string(),
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .map(drop)
+    }
+
+    #[tokio::test]
+    async fn a_start_attaches_the_callers_callback_and_hands_back_the_ref() {
+        let setup = setup();
+        let token = attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        assert_eq!(
+            OperationToken::decode("default", &token).unwrap().stream,
+            stream("")
+        );
+        let attached = setup.notifier.attached.lock().unwrap().clone();
+        let [attachment] = attached.as_slice() else {
+            panic!("one attach, not {attached:?}");
+        };
+        assert_eq!(
+            attachment.chain,
+            ChainId {
+                namespace: "default".to_string(),
+                workflow_id: "owner-1".to_string(),
+                first_run_id: "chain-1".to_string(),
+            },
+            "the notifier is keyed by the chain's first run"
+        );
+        assert_eq!(attachment.topic, "tokens");
+        assert_eq!(attachment.request_id, "attach-1");
+        assert_eq!(attachment.callback_url, "temporal://system");
+        assert_eq!(
+            attachment.callback_headers,
+            [("nexus-callback-token".to_string(), "abc".to_string())].into()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_attach_carries_the_start_token_and_time() {
+        let setup = setup();
+        let before = SystemTime::now();
+        let token = attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        let attachment = setup.notifier.attached.lock().unwrap()[0].clone();
+        assert_eq!(attachment.operation_token, token);
+        assert!(attachment.start_time >= before && attachment.start_time <= SystemTime::now());
+        assert!(attachment.start_time > UNIX_EPOCH);
+    }
+
+    #[tokio::test]
+    async fn a_pinned_ref_attaches_by_its_chains_first_run() {
+        let setup = setup();
+        setup
+            .owners
+            .chains
+            .lock()
+            .unwrap()
+            .insert("owner-1".to_string(), "run-1".to_string());
+        let token = attach(
+            &setup.service,
+            AttachCallerRequest {
+                stream: Some(stream("run-2")),
+                ..attach_request("temporal://system")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            OperationToken::decode("default", &token).unwrap().stream,
+            stream("run-2")
+        );
+        assert_eq!(*setup.owners.described.lock().unwrap(), ["run-2"]);
+        assert_eq!(
+            setup.notifier.attached.lock().unwrap()[0]
+                .chain
+                .first_run_id,
+            "run-1"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_start_without_a_callback_is_refused() {
+        let setup = setup();
+        let failure = attach(&setup.service, attach_request(""))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind, StreamFailureKind::Refused as i32);
+        assert!(setup.notifier.attached.lock().unwrap().is_empty());
+        assert!(setup.owners.described.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancel_detaches_the_callback_it_attached() {
+        let setup = setup();
+        let token = attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        detach(&setup.service, &token).await.unwrap();
+        let attachment = setup.notifier.attached.lock().unwrap()[0].clone();
+        assert_eq!(
+            *setup.notifier.detached.lock().unwrap(),
+            [(
+                attachment.chain,
+                "tokens".to_string(),
+                "attach-1".to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_detaches_from_the_chain_it_attached_to() {
+        let setup = setup();
+        let token = attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        // The Workflow id moved on to a new chain since the start.
+        setup
+            .owners
+            .chains
+            .lock()
+            .unwrap()
+            .insert("owner-1".to_string(), "chain-2".to_string());
+        detach(&setup.service, &token).await.unwrap();
+        assert_eq!(
+            setup.notifier.detached.lock().unwrap()[0].0.first_run_id,
+            "chain-1"
+        );
+        assert_eq!(
+            setup.owners.described.lock().unwrap().len(),
+            1,
+            "a cancel describes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancel_with_a_token_that_names_no_stream_is_refused() {
+        let setup = setup();
+        for token in vectors().refused {
+            let failure = detach(&setup.service, &token).await.unwrap_err();
+            assert_eq!(failure.kind, StreamFailureKind::Refused as i32, "{token:?}");
+        }
+        assert!(setup.notifier.detached.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_servers_answer_says_whether_a_retry_can_help() {
+        for (answer, kind) in [
+            (
+                NotifyError::Failed("down".to_string()),
+                StreamFailureKind::Storage,
+            ),
+            (
+                NotifyError::Refused("no".to_string()),
+                StreamFailureKind::Refused,
+            ),
+            (
+                NotifyError::Unsupported("no notifier".to_string()),
+                StreamFailureKind::Unsupported,
+            ),
+        ] {
+            let setup = setup();
+            *setup.notifier.answer.lock().unwrap() = Some(answer);
+            let failure = attach(&setup.service, attach_request("temporal://system"))
+                .await
+                .unwrap_err();
+            assert_eq!(failure.kind, kind as i32);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_service_without_a_client_cant_attach() {
+        let service = StreamService::new(
+            Arc::new(MemoryStore::new()),
+            Arc::new(Owners::default()),
+            StreamsOptions::default(),
+        );
+        let failure = attach(&service, attach_request("temporal://system"))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind, StreamFailureKind::Unsupported as i32);
+    }
+
+    #[derive(Deserialize)]
+    struct Vectors {
+        vectors: Vec<Vector>,
+        refused: Vec<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct Vector {
+        #[serde(rename = "ref")]
+        stream: TokenRef,
+        attach: String,
+        chain: String,
+        token: String,
+    }
+
+    fn vectors() -> Vectors {
+        serde_json::from_str(include_str!("../nexus/operation_token_vectors.json")).unwrap()
+    }
+
+    fn token_of(vector: &Vector) -> OperationToken {
+        OperationToken {
+            stream: StreamAddress {
+                namespace: "ns".to_string(),
+                owner_kind: StreamOwnerKind::Workflow as i32,
+                workflow_id: vector.stream.workflow_id.clone(),
+                run_id: vector.stream.run_id.clone().unwrap_or_default(),
+                topic: vector.stream.topic.clone(),
+            },
+            attach_request_id: vector.attach.clone(),
+            chain_first_run_id: vector.chain.clone(),
+        }
+    }
+
+    #[test]
+    fn a_token_encodes_as_the_shared_vectors_say() {
+        for vector in vectors().vectors {
+            assert_eq!(token_of(&vector).encode(), vector.token, "{}", vector.token);
+        }
+    }
+
+    #[test]
+    fn a_token_decodes_as_the_shared_vectors_say() {
+        for vector in vectors().vectors {
+            assert_eq!(
+                OperationToken::decode("ns", &vector.token).unwrap(),
+                token_of(&vector)
+            );
+            let padded = format!(
+                "{}{}",
+                vector.token,
+                "=".repeat((4 - vector.token.len() % 4) % 4)
+            );
+            assert_eq!(
+                OperationToken::decode("ns", &padded).unwrap(),
+                token_of(&vector),
+                "padding is optional"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_that_names_no_stream_is_refused() {
+        for token in vectors().refused {
+            let error = OperationToken::decode("ns", &token).unwrap_err();
+            assert_eq!(
+                error.kind,
+                crate::proto::StreamFailureKind::Refused,
+                "{token:?}"
+            );
+        }
+    }
+}

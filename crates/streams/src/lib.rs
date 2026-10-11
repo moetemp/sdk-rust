@@ -14,6 +14,7 @@ mod error;
 mod handle;
 mod memory;
 mod notify;
+mod operation;
 mod owner;
 mod reader;
 mod record;
@@ -30,9 +31,10 @@ pub use error::{StreamError, StreamResult};
 pub use handle::{OWNER_RECHECK, Streams, StreamsOptions};
 pub use memory::MemoryStore;
 pub use notify::{
-    CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT, Notifier,
-    NotifierClient, NotifyError, NotifyingStore, StreamNotification, progress_counter,
+    CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, CallerAttachment, DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT,
+    Notifier, NotifierClient, NotifyError, NotifyingStore, StreamNotification, progress_counter,
 };
+pub use operation::{OPERATION_TOKEN_VERSION, OperationToken};
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};
 pub use reader::{DEFAULT_MAX_RECORDS, MAX_TRACKED_PRODUCERS, ReadTarget, read_page};
 pub use record::{

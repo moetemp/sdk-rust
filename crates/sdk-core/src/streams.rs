@@ -4,17 +4,19 @@
 use std::sync::Arc;
 use temporalio_client::Connection;
 use temporalio_common::protos::temporal::api::{
-    common::v1::WorkflowExecution,
+    common::v1::{WorkflowExecution, callback},
     enums::v1::StreamOwnerKind,
     history::v1::HistoryEvent,
     stream::v1::StreamReference,
     workflowservice::v1::{
-        DescribeWorkflowExecutionRequest, DescribeWorkflowExecutionResponse,
+        AttachStreamCallbackRequest, DescribeWorkflowExecutionRequest,
+        DescribeWorkflowExecutionResponse, DetachStreamCallbackRequest,
         GetWorkflowExecutionHistoryReverseRequest, NotifyStreamRequest,
     },
 };
 use temporalio_streams::{
-    NotifierClient, NotifyError, OwnerClient, OwnerDescription, OwnerError, StreamNotification,
+    CallerAttachment, NotifierClient, NotifyError, OwnerClient, OwnerDescription, OwnerError,
+    StreamNotification, proto::ChainId,
 };
 pub use temporalio_streams::{StreamError, StreamResult, StreamService, StreamStore, proto};
 use tonic::IntoRequest;
@@ -51,19 +53,74 @@ impl NotifierClient for ConnectionNotifierClient {
             .map(|_| ())
             .map_err(notify_error)
     }
+
+    async fn attach(&self, attachment: CallerAttachment) -> Result<(), NotifyError> {
+        self.connection
+            .workflow_service()
+            .attach_stream_callback(attach_request(attachment).into_request())
+            .await
+            .map(|_| ())
+            .map_err(notify_error)
+    }
+
+    async fn detach(
+        &self,
+        chain: ChainId,
+        topic: String,
+        request_id: String,
+    ) -> Result<(), NotifyError> {
+        self.connection
+            .workflow_service()
+            .detach_stream_callback(detach_request(chain, topic, request_id).into_request())
+            .await
+            .map(|_| ())
+            .map_err(notify_error)
+    }
+}
+
+fn chain_reference(chain: &ChainId, topic: String) -> StreamReference {
+    // The run chain's first run keys the notifier, so one notifier serves the stream across
+    // Continue-as-New and a new chain on the same Workflow id gets its own.
+    StreamReference {
+        owner_kind: StreamOwnerKind::Workflow as i32,
+        workflow_id: chain.workflow_id.clone(),
+        run_id: chain.first_run_id.clone(),
+        topic,
+    }
+}
+
+fn attach_request(attachment: CallerAttachment) -> AttachStreamCallbackRequest {
+    AttachStreamCallbackRequest {
+        namespace: attachment.chain.namespace.clone(),
+        stream_ref: Some(chain_reference(&attachment.chain, attachment.topic)),
+        request_id: attachment.request_id,
+        callback: Some(callback::Nexus {
+            url: attachment.callback_url,
+            header: attachment.callback_headers,
+        }),
+        operation_token: attachment.operation_token,
+        start_time: Some(attachment.start_time.into()),
+        ..Default::default()
+    }
+}
+
+fn detach_request(
+    chain: ChainId,
+    topic: String,
+    request_id: String,
+) -> DetachStreamCallbackRequest {
+    DetachStreamCallbackRequest {
+        namespace: chain.namespace.clone(),
+        stream_ref: Some(chain_reference(&chain, topic)),
+        request_id,
+        ..Default::default()
+    }
 }
 
 fn notify_request(notification: StreamNotification) -> NotifyStreamRequest {
     NotifyStreamRequest {
+        stream_ref: Some(chain_reference(&notification.chain, notification.topic)),
         namespace: notification.chain.namespace,
-        // The run chain's first run keys the notifier, so one notifier serves the stream across
-        // Continue-as-New and a new chain on the same Workflow id gets its own.
-        stream_ref: Some(StreamReference {
-            owner_kind: StreamOwnerKind::Workflow as i32,
-            workflow_id: notification.chain.workflow_id,
-            run_id: notification.chain.first_run_id,
-            topic: notification.topic,
-        }),
         position: notification.position,
         counter: notification.counter,
         close: notification.close_result.is_some(),
@@ -315,6 +372,52 @@ mod tests {
         assert!(request.close_result.is_none());
     }
 
+    fn chain() -> ChainId {
+        ChainId {
+            namespace: "default".to_string(),
+            workflow_id: "owner-1".to_string(),
+            first_run_id: "chain-1".to_string(),
+        }
+    }
+
+    #[test]
+    fn an_attach_names_the_chains_notifier_and_carries_the_start() {
+        let start_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let request = attach_request(CallerAttachment {
+            chain: chain(),
+            topic: "tokens".to_string(),
+            request_id: "attach-1".to_string(),
+            callback_url: "temporal://system".to_string(),
+            callback_headers: [("nexus-callback-token".to_string(), "abc".to_string())].into(),
+            operation_token: "token".to_string(),
+            start_time,
+        });
+        assert_eq!(request.namespace, "default");
+        assert_eq!(
+            request.stream_ref,
+            Some(StreamReference {
+                owner_kind: StreamOwnerKind::Workflow as i32,
+                workflow_id: "owner-1".to_string(),
+                run_id: "chain-1".to_string(),
+                topic: "tokens".to_string(),
+            })
+        );
+        assert_eq!(request.request_id, "attach-1");
+        let callback = request.callback.unwrap();
+        assert_eq!(callback.url, "temporal://system");
+        assert_eq!(callback.header["nexus-callback-token"], "abc");
+        assert_eq!(request.operation_token, "token");
+        assert_eq!(request.start_time.unwrap().seconds, 1_700_000_000);
+    }
+
+    #[test]
+    fn a_detach_names_the_chains_notifier_and_the_attach() {
+        let request = detach_request(chain(), "tokens".to_string(), "attach-1".to_string());
+        assert_eq!(request.namespace, "default");
+        assert_eq!(request.stream_ref.unwrap().run_id, "chain-1");
+        assert_eq!(request.request_id, "attach-1");
+    }
+
     #[test]
     fn only_answers_a_retry_cant_change_refuse_a_notification() {
         assert!(matches!(
@@ -470,8 +573,7 @@ mod tests {
             common::v1::{Payload, WorkflowType},
             taskqueue::v1::TaskQueue,
             workflowservice::v1::{
-                AttachStreamCallbackRequest, StartWorkflowExecutionRequest,
-                TerminateWorkflowExecutionRequest,
+                StartWorkflowExecutionRequest, TerminateWorkflowExecutionRequest,
             },
         };
         let Ok(server) = std::env::var("STREAMS_NOTIFIER_SERVER") else {
@@ -507,31 +609,6 @@ mod tests {
             .unwrap()
             .into_inner();
         let deliveries = listen("127.0.0.1:7899");
-        connection
-            .workflow_service()
-            .attach_stream_callback(
-                AttachStreamCallbackRequest {
-                    namespace: "default".to_string(),
-                    stream_ref: Some(StreamReference {
-                        owner_kind: StreamOwnerKind::Workflow as i32,
-                        workflow_id: workflow_id.clone(),
-                        run_id: started.run_id.clone(),
-                        topic: "tokens".to_string(),
-                    }),
-                    request_id: "caller".to_string(),
-                    callback: Some(
-                        temporalio_common::protos::temporal::api::common::v1::callback::Nexus {
-                            url: "http://127.0.0.1:7899/callback".to_string(),
-                            ..Default::default()
-                        },
-                    ),
-                    ..Default::default()
-                }
-                .into_request(),
-            )
-            .await
-            .unwrap();
-
         let service = connect_stream_service(
             proto::StreamStoreConfig {
                 store: Some(proto::stream_store_config::Store::Memory(
@@ -572,6 +649,27 @@ mod tests {
             digest: vec![9; 32],
         };
         use prost::Message;
+        let attached = proto::AttachCallerResponse::decode(
+            service
+                .call(
+                    "AttachCaller",
+                    &proto::AttachCallerRequest {
+                        stream: Some(stream.clone()),
+                        request_id: "caller".to_string(),
+                        callback_url: "http://127.0.0.1:7899/callback".to_string(),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let token =
+            temporalio_streams::OperationToken::decode("default", &attached.operation_token)
+                .unwrap();
+        assert_eq!(token.chain_first_run_id, started.run_id);
         service
             .call("Append", &append.encode_to_vec())
             .await

@@ -89,6 +89,12 @@ relevant information.
   keeps a topic set per chain for `open_topics`, which needs `+sadd` and `+smembers` in the ACL.
   Without them, writes still work and the store logs a warning once, but a chain end can't close
   every notifier. Widen the ACL with the upgrade.
+* Experimental: the stream calls `AttachCaller` and `DetachCaller` serve a stream-returning Nexus
+  operation. `AttachCaller` resolves the stream's run chain, mints the operation token and
+  attaches the start's callback to the stream's notifier with the token and start time.
+  `DetachCaller` decodes the token and detaches from the chain the start attached to. The token
+  format is in `crates/streams/nexus/operation_token_vectors.json`, which every SDK's decoder
+  checks.
 
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
