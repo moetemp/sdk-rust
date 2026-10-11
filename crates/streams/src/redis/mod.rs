@@ -107,8 +107,13 @@ impl RedisStore {
             .await
             .mapped(Call::Read)?;
         check_server(&shared).await?;
-        let blocking = BlockingPool::new(seed, options.blocking_reads_per_node, options.cluster)
-            .mapped(Call::Read)?;
+        let blocking = BlockingPool::new(
+            seed,
+            options.blocking_reads_per_node,
+            options.cluster,
+            options.response_timeout,
+        )
+        .mapped(Call::Read)?;
         Ok(Self {
             shared,
             blocking,
@@ -435,36 +440,11 @@ impl StreamStore for RedisStore {
             return Err(StreamError::refused("an append needs the batch's digest"));
         }
         let keys = self.keys(request.chain.as_ref())?;
-        let meta = keys.meta(&request.topic);
-        // The script reads one close flag. A closed topic's flag refuses new batches on its own,
-        // so the script reads it in place of the chain's and still answers a repeat. The topic
-        // joins the chain's topic set in the same round trip, before any record lands, so the set
-        // holds every topic with records.
-        let (topic_closed, added, _): (
-            redis::RedisResult<Option<String>>,
-            redis::RedisResult<Value>,
-            redis::RedisResult<Value>,
-        ) = redis::pipe()
-            .ignore_errors()
-            .hget(&meta, CLOSED_FIELD)
-            .sadd(keys.topics(), &request.topic)
-            .pexpire(keys.topics(), (self.retention_ms + self.grace_ms) as i64)
-            .query_async(&mut self.shared.clone())
-            .await
-            .mapped(Call::BeforeWrite)?;
-        let topic_closed = topic_closed.mapped(Call::BeforeWrite)?;
-        if let Err(error) = added {
-            self.topic_set_failed(&error);
-        }
         let mut script = scripts::APPEND_SCRIPT.prepare_invoke();
         script
             .key(keys.log(&request.topic))
-            .key(&meta)
-            .key(if topic_closed.is_some() {
-                meta.clone()
-            } else {
-                keys.chain()
-            })
+            .key(keys.meta(&request.topic))
+            .key(keys.chain())
             .arg(self.retention_ms)
             .arg(self.grace_ms)
             .arg(session_field(&request.producer_id, request.attempt))
@@ -473,10 +453,35 @@ impl StreamStore for RedisStore {
         for record in &request.records {
             script.arg(record.as_slice());
         }
-        let (first_position, last_position): (String, String) = script
-            .invoke_async(&mut self.shared.clone())
+        // The topic joins the chain's topic set in the same round trip, ahead of the script, so
+        // the set holds every topic with records. Its reply is read on its own, so a user without
+        // `+sadd` still appends.
+        let (added, _, appended): (
+            redis::RedisResult<Value>,
+            redis::RedisResult<Value>,
+            redis::RedisResult<(String, String)>,
+        ) = redis::pipe()
+            .ignore_errors()
+            .sadd(keys.topics(), &request.topic)
+            .pexpire(keys.topics(), (self.retention_ms + self.grace_ms) as i64)
+            .invoke_script(&script)
+            .query_async(&mut self.shared.clone())
             .await
-            .mapped(Call::Write)?;
+            .mapped(Call::Append)?;
+        if let Err(error) = added {
+            self.topic_set_failed(&error);
+        }
+        let (first_position, last_position) = match appended {
+            // A server that lost its scripts runs this one alone, which loads it first. The set
+            // already took the topic.
+            Err(error)
+                if error.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::NoScript) =>
+            {
+                script.invoke_async(&mut self.shared.clone()).await
+            }
+            appended => appended,
+        }
+        .mapped(Call::Append)?;
         Ok(StoreAppendResponse {
             first_position,
             last_position,
@@ -571,13 +576,37 @@ impl StreamStore for RedisStore {
             }))
     }
 
-    async fn trimmed(&self, chain: &ChainId, topic: &str) -> StreamResult<Option<String>> {
-        redis::cmd("HGET")
+    async fn newest_ever(&self, chain: &ChainId, topic: &str) -> StreamResult<String> {
+        let last: Option<String> = redis::cmd("HGET")
+            .arg(ChainKeys::new(&self.prefix, chain).meta(topic))
+            .arg("last")
+            .query_async(&mut self.shared.clone())
+            .await
+            .mapped(Call::Read)?;
+        Ok(last.unwrap_or_default())
+    }
+
+    async fn dropped_after(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        mark: &str,
+    ) -> StreamResult<Option<String>> {
+        let trimmed: Option<String> = redis::cmd("HGET")
             .arg(ChainKeys::new(&self.prefix, chain).meta(topic))
             .arg("trimmed")
             .query_async(&mut self.shared.clone())
             .await
-            .mapped(Call::Read)
+            .mapped(Call::Read)?;
+        let Some(trimmed) = trimmed else {
+            return Ok(None);
+        };
+        // A log that expired comes back with `trimmed` set to its old `last`, which is the mark
+        // itself, so a revive counts as no loss.
+        if !mark.is_empty() && entry(&trimmed)? <= entry(mark)? {
+            return Ok(None);
+        }
+        Ok(Some(trimmed))
     }
 
     async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {
@@ -642,7 +671,7 @@ impl StreamStore for RedisStore {
             .invoke_async(&mut self.shared.clone())
             .await
             .map_err(|error| match error.code() {
-                Some("STREAMS_TOPIC") => StreamError::storage(error.detail().unwrap_or_default()),
+                Some("STREAMS_TOPIC") => StreamError::refused(error.detail().unwrap_or_default()),
                 _ => errors::stream_error(&error, Call::Write),
             })?;
         let (outcome, records) = match added {

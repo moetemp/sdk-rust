@@ -14,6 +14,27 @@ pub const RUN_ID_KEY: &str = "temporal.io/run-id";
 /// The encoding of the payloads stored under [CONTENT_HASH_KEY] and [RUN_ID_KEY].
 pub const METADATA_ENCODING: &[u8] = b"binary/plain";
 
+/// The longest topic, in UTF-8 bytes, every store keys reliably.
+pub const MAX_TOPIC_BYTES: usize = 256;
+
+/// Refuses a topic no store keys reliably, with the reason. A control character could be a
+/// separator a store uses, such as the one between a stage's topics.
+pub fn check_topic(topic: &str) -> Result<(), String> {
+    if topic.is_empty() {
+        return Err("a stream needs a topic".to_string());
+    }
+    if topic.len() > MAX_TOPIC_BYTES {
+        return Err(format!(
+            "a topic is at most {MAX_TOPIC_BYTES} UTF-8 bytes, not {}",
+            topic.len()
+        ));
+    }
+    if topic.chars().any(char::is_control) {
+        return Err(format!("topic {topic:?} holds a control character"));
+    }
+    Ok(())
+}
+
 /// The fingerprint version [fingerprint] computes.
 pub const FINGERPRINT_VERSION: u32 = 2;
 
