@@ -76,14 +76,35 @@ fn notify_request(notification: StreamNotification) -> NotifyStreamRequest {
 fn notify_error(status: tonic::Status) -> NotifyError {
     use tonic::Code;
     match status.code() {
-        Code::Unimplemented
-        | Code::InvalidArgument
+        Code::Unimplemented => NotifyError::Unsupported(status.to_string()),
+        Code::FailedPrecondition if namespace_in_transition(&status) => {
+            NotifyError::Failed(status.to_string())
+        }
+        Code::InvalidArgument
         | Code::NotFound
         | Code::PermissionDenied
         | Code::Unauthenticated
         | Code::FailedPrecondition => NotifyError::Refused(status.to_string()),
         _ => NotifyError::Failed(status.to_string()),
     }
+}
+
+/// A namespace that's failing over answers `FailedPrecondition` too, but only until the
+/// redirection sees the active cluster, so a close mustn't stop on it.
+fn namespace_in_transition(status: &tonic::Status) -> bool {
+    use temporalio_common::protos::{
+        google::rpc::Status as RpcStatus,
+        temporal::api::errordetails::v1::{
+            NamespaceInvalidStateFailure, NamespaceNotActiveFailure,
+        },
+    };
+    let Ok(details) = <RpcStatus as prost::Message>::decode(status.details()) else {
+        return false;
+    };
+    details.details.iter().any(|detail| {
+        detail.to_msg::<NamespaceNotActiveFailure>().is_ok()
+            || detail.to_msg::<NamespaceInvalidStateFailure>().is_ok()
+    })
 }
 
 /// Asks a Temporal server about owners through a client connection.
@@ -296,8 +317,11 @@ mod tests {
 
     #[test]
     fn only_answers_a_retry_cant_change_refuse_a_notification() {
+        assert!(matches!(
+            notify_error(tonic::Status::new(tonic::Code::Unimplemented, "")),
+            NotifyError::Unsupported(_)
+        ));
         for code in [
-            tonic::Code::Unimplemented,
             tonic::Code::InvalidArgument,
             tonic::Code::NotFound,
             tonic::Code::PermissionDenied,
@@ -325,6 +349,32 @@ mod tests {
                 ),
                 "{code:?}"
             );
+        }
+    }
+
+    fn failed_precondition_with<T: prost::Message + prost::Name>(detail: &T) -> tonic::Status {
+        let status = temporalio_common::protos::google::rpc::Status {
+            code: tonic::Code::FailedPrecondition as i32,
+            message: "namespace".to_string(),
+            details: vec![prost_types::Any::from_msg(detail).unwrap()],
+        };
+        tonic::Status::with_details(
+            tonic::Code::FailedPrecondition,
+            "namespace",
+            prost::Message::encode_to_vec(&status).into(),
+        )
+    }
+
+    #[test]
+    fn a_namespace_in_failover_fails_a_notification_for_now() {
+        use temporalio_common::protos::temporal::api::errordetails::v1::{
+            NamespaceInvalidStateFailure, NamespaceNotActiveFailure,
+        };
+        for status in [
+            failed_precondition_with(&NamespaceNotActiveFailure::default()),
+            failed_precondition_with(&NamespaceInvalidStateFailure::default()),
+        ] {
+            assert!(matches!(notify_error(status), NotifyError::Failed(_)));
         }
     }
 

@@ -34,23 +34,11 @@ relevant information.
 ## Unreleased
 
 ### Added
-* Experimental: a workflow can commit output it staged in an external stream store with the new
-  `WorkflowOutputStreamCommit` command. Core records the output manifest in a
-  `core_external_stream` marker ahead of the completion's other commands, so the output becomes
-  visible only when the workflow task is accepted. Activations now carry
-  `history_floor_event_id`, which the manifest must match. On replay, Core hands the recorded
-  manifest back in a `ReplayExternalStreams` job. Lang must commit each recorded manifest again
-  while replaying, and each commit must match it (the stage token and run id aside), or the task
-  fails as nondeterministic.
 * Experimental: progress of a started Nexus operation reaches lang as a
   `ResolveNexusOperationProgress` job, at most one per operation per workflow task, with the
   highest counter the server folded onto the task's scheduled event. Replay delivers the same jobs
   in the same activations. Progress for an operation that is unknown, not started, already
   resolved, or below a counter already delivered is dropped.
-  while replaying, and each commit must match it (the stage token, run id and provider id
-  aside), or the task fails as nondeterministic. A workflow that wrote this marker can only move
-  forward. A Worker on an older Core, or one whose lang does not commit the output again on
-  replay, fails that workflow's next task, so don't roll such a fleet back.
 * Experimental: a workflow can commit the stream records it published with the new
   `WorkflowOutputStreamCommit` command, each with its plaintext content hash and size. Core
   builds the output manifest from them and records it in a `core_external_stream` marker ahead
@@ -79,6 +67,17 @@ relevant information.
   Worker's `stream_store`, so a Workflow's output and outside producers share it.
 * Experimental: the C bridge has `temporal_core_stream_store_new`, `_call` and `_free` for the
   stream service, built with the Redis store, and a `stream_store` field on its worker options.
+* Experimental: with `StreamStoreConfig.notify_on_append`, Core tells each stream's notifier on
+  the server when the stream moves, after every append and every Workflow batch that becomes
+  visible. That's how a caller of a stream-returning Nexus operation sees progress. Notifications
+  for one stream fold into one call in flight, a failed last notification is tried twice more,
+  and a notification never fails the write. `max_notifiers` caps how many streams the process
+  keeps a notifier for (1000 when zero).
+* Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
+  notifications still out. A Worker flushes at stop on its own, so only a process that holds just
+  a client needs it.
+* Experimental: a server without the stream notifier answers the first notifier call with
+  `UNIMPLEMENTED`. Core then stops notifier calls in that process and logs it once at debug.
 
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom

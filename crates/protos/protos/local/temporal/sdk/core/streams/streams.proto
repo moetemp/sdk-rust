@@ -24,8 +24,9 @@ service StreamService {
   rpc Close(CloseRequest) returns (CloseResponse);
   // Deletes every stream of one owner.
   rpc DeleteOwner(DeleteOwnerRequest) returns (DeleteOwnerResponse);
-  // Waits until the stream notifications this process sent are out, for at most 10 seconds. Call
-  // it before the process stops, since a notification is sent in the background.
+  // Waits until the stream notifications this process sent are out, for at most 10 seconds. A
+  // notification goes in the background, so a process that holds only a client calls it before it
+  // stops. A Worker flushes at stop on its own.
   rpc FlushNotifications(FlushNotificationsRequest) returns (FlushNotificationsResponse);
 }
 
@@ -39,7 +40,8 @@ message StreamStoreConfig {
   // Tells each stream's notifier on the server when the stream moves, after every append and
   // every Workflow batch that becomes visible. That's what makes a caller of a stream-returning
   // Nexus operation see progress. Off by default, since most streams have no such caller and each
-  // notification costs a call. Needs a server with the stream notifier.
+  // notification costs a call. A server without the stream notifier costs one call, and then the
+  // process stops notifying.
   bool notify_on_append = 3;
   // How many streams to keep a notifier for, dropping the least recently used. Zero uses 1000.
   uint32 max_notifiers = 4;

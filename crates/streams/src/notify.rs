@@ -13,8 +13,12 @@ use crate::{
     stream_hash,
 };
 use std::{
+    future::Future,
     num::NonZeroUsize,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
@@ -30,6 +34,11 @@ pub const FLUSH_LIMIT: Duration = Duration::from_secs(10);
 pub const CLOSE_RETRY_FIRST: Duration = Duration::from_secs(1);
 /// The longest wait between two tries of a notifier close.
 pub const CLOSE_RETRY_CAP: Duration = Duration::from_secs(60);
+
+// A stream that goes quiet after a failed notification leaves its reader parked until the next
+// write, so the last one is tried again a few times. A newer one replaces the retry.
+const NOTIFY_RETRIES: u32 = 2;
+const NOTIFY_RETRY_FIRST: Duration = Duration::from_millis(250);
 
 // Redis entry ids are `<ms>-<seq>`. Twenty bits hold the sequence, far more entries than one
 // stream takes in a millisecond, and the milliseconds stay below 2^43 until the year 2248, so the
@@ -60,6 +69,9 @@ pub enum NotifyError {
     /// It may take it later.
     #[error("the notification failed: {0}")]
     Failed(String),
+    /// The server has no stream notifier.
+    #[error("the server has no stream notifier: {0}")]
+    Unsupported(String),
 }
 
 /// Sends notifications to the stream notifier on the server.
@@ -127,10 +139,12 @@ impl StreamKey {
 struct SlotState {
     pending: Option<(String, i64)>,
     sending: bool,
+    /// Positions still being looked up, which the slot sends once found.
+    resolving: usize,
     closed: bool,
 }
 
-/// One stream's notifications: folded, with one call in flight.
+/// One stream's notifications: folded, with one call in flight per slot.
 #[derive(Debug)]
 struct Slot {
     key: StreamKey,
@@ -151,6 +165,42 @@ impl Slot {
     /// notifications fold into the one that goes next, so a burst costs at most two calls.
     fn notify(self: &Arc<Self>, client: &Arc<dyn NotifierClient>, position: String, counter: i64) {
         let mut state = self.state.lock().unwrap();
+        self.hold(&mut state, client, position, counter);
+    }
+
+    /// Like [Slot::notify] with the position `lookup` finds, without waiting for it. The slot
+    /// counts as busy until the lookup ends, so a close or a flush waits for it.
+    fn notify_found<F>(self: &Arc<Self>, client: &Arc<dyn NotifierClient>, lookup: F)
+    where
+        F: Future<Output = Option<(String, i64)>> + Send + 'static,
+    {
+        {
+            let mut state = self.state.lock().unwrap();
+            if state.closed {
+                return;
+            }
+            state.resolving += 1;
+            self.idle.send_replace(false);
+        }
+        let (slot, client) = (self.clone(), client.clone());
+        tokio::spawn(async move {
+            let found = lookup.await;
+            let mut state = slot.state.lock().unwrap();
+            state.resolving -= 1;
+            if let Some((position, counter)) = found {
+                slot.hold(&mut state, &client, position, counter);
+            }
+            slot.mark_idle_if_done(&state);
+        });
+    }
+
+    fn hold(
+        self: &Arc<Self>,
+        state: &mut SlotState,
+        client: &Arc<dyn NotifierClient>,
+        position: String,
+        counter: i64,
+    ) {
         if state.closed {
             return;
         }
@@ -168,6 +218,12 @@ impl Slot {
         }
     }
 
+    fn mark_idle_if_done(&self, state: &SlotState) {
+        if !state.sending && state.resolving == 0 {
+            self.idle.send_replace(true);
+        }
+    }
+
     async fn send_pending(self: Arc<Self>, client: Arc<dyn NotifierClient>) {
         loop {
             let (position, counter) = {
@@ -176,7 +232,7 @@ impl Slot {
                     Some(next) => next,
                     None => {
                         state.sending = false;
-                        self.idle.send_replace(true);
+                        self.mark_idle_if_done(&state);
                         return;
                     }
                 }
@@ -188,17 +244,48 @@ impl Slot {
                 counter,
                 close_result: None,
             };
-            // A notification is only a hint: the next one tells the reader again, and the reader
-            // reads from its own cursor.
-            if let Err(error) = client.notify(notification).await {
-                tracing::warn!(
-                    workflow_id = %self.key.workflow_id,
-                    topic = %self.key.topic,
-                    %error,
-                    "A stream notification failed. The next one tells the reader again"
-                );
+            self.send(&client, notification).await;
+        }
+    }
+
+    async fn send(&self, client: &Arc<dyn NotifierClient>, notification: StreamNotification) {
+        let mut delay = NOTIFY_RETRY_FIRST;
+        for tries_left in (0..=NOTIFY_RETRIES).rev() {
+            // A notification is only a hint, and the reader reads from its own cursor, so a
+            // notification that can't go never fails the write.
+            match client.notify(notification.clone()).await {
+                Ok(()) => return,
+                Err(NotifyError::Failed(error)) if tries_left > 0 && !self.superseded() => {
+                    tracing::debug!(
+                        workflow_id = %self.key.workflow_id,
+                        topic = %self.key.topic,
+                        %error,
+                        "A stream notification failed; trying again in {delay:?}"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        workflow_id = %self.key.workflow_id,
+                        topic = %self.key.topic,
+                        %error,
+                        "A stream notification failed. The next write tells the reader again"
+                    );
+                    return;
+                }
+            }
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+            if self.superseded() {
+                return;
             }
         }
+    }
+
+    /// Whether something newer will reach the notifier anyway: a later notification, or the
+    /// close.
+    fn superseded(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.pending.is_some() || state.closed
     }
 
     /// Stops new notifications and waits for the one in flight, so a close is the last thing the
@@ -244,7 +331,10 @@ impl Notifier {
     /// Notifies through `client`, keeping at most `max_notifiers` streams' slots.
     pub fn new(client: Arc<dyn NotifierClient>, max_notifiers: usize) -> Self {
         Self {
-            client,
+            client: Arc::new(UnlessUnsupported {
+                client,
+                unsupported: AtomicBool::new(false),
+            }),
             slots: Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(max_notifiers).unwrap_or(NonZeroUsize::MIN),
             )),
@@ -271,7 +361,7 @@ impl Notifier {
             loop {
                 match attempt().await {
                     Ok(()) => break,
-                    Err(NotifyError::Refused(error)) => {
+                    Err(NotifyError::Refused(error) | NotifyError::Unsupported(error)) => {
                         tracing::warn!(
                             workflow_id = %chain.workflow_id,
                             topic,
@@ -299,6 +389,16 @@ impl Notifier {
     pub fn notify(&self, chain: &ChainId, topic: &str, position: String, counter: i64) {
         self.slot(StreamKey::new(chain, topic))
             .notify(&self.client, position, counter);
+    }
+
+    /// Like [Notifier::notify] with the cursor and counter `lookup` finds, without waiting for
+    /// it. A close of the stream and [Notifier::flush] wait for the lookup.
+    pub fn notify_found<F>(&self, chain: &ChainId, topic: &str, lookup: F)
+    where
+        F: Future<Output = Option<(String, i64)>> + Send + 'static,
+    {
+        self.slot(StreamKey::new(chain, topic))
+            .notify_found(&self.client, lookup);
     }
 
     /// Closes the stream on the server with `result`, after the notification in flight, and
@@ -366,16 +466,6 @@ impl Notifier {
     }
 }
 
-fn cursor_of(store: &dyn StreamStore, chain: &ChainId, topic: &str, position: &str) -> String {
-    let hash = stream_hash(
-        &chain.namespace,
-        WORKFLOW_OWNER_KIND,
-        &chain.workflow_id,
-        topic,
-    );
-    mint_cursor(store.name(), &hash, position)
-}
-
 /// The cursor and counter a close carries: the newest record's cursor, and one above its
 /// counter, so the close outranks every notification of the stream.
 async fn close_position(
@@ -425,6 +515,35 @@ fn close_notifier_in_background(
     });
 }
 
+/// Stops every call once the server answers that it has no stream notifier. The answer can't
+/// change while the process runs, and each call would cost a round trip.
+struct UnlessUnsupported {
+    client: Arc<dyn NotifierClient>,
+    unsupported: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl NotifierClient for UnlessUnsupported {
+    async fn notify(&self, notification: StreamNotification) -> Result<(), NotifyError> {
+        if self.unsupported.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match self.client.notify(notification).await {
+            // No caller can be attached to a notifier the server doesn't have.
+            Err(NotifyError::Unsupported(error)) => {
+                if !self.unsupported.swap(true, Ordering::Relaxed) {
+                    tracing::debug!(
+                        %error,
+                        "The server has no stream notifier, so this process stops notifying"
+                    );
+                }
+                Ok(())
+            }
+            other => other,
+        }
+    }
+}
+
 /// A store that notifies each stream's notifier after an append lands and after a Workflow's
 /// staged output becomes visible.
 ///
@@ -446,10 +565,6 @@ impl NotifyingStore {
         &self.notifier
     }
 
-    fn cursor(&self, chain: &ChainId, topic: &str, position: &str) -> String {
-        cursor_of(self.inner.as_ref(), chain, topic, position)
-    }
-
     /// Closes the stream's notifier in the background, after the store closed the topic. It never
     /// fails the store close: the topic is closed, and only the callers wait for the notifier.
     fn close_notifier_in_background(&self, chain: &ChainId, topic: &str, result: Payload) {
@@ -457,43 +572,74 @@ impl NotifyingStore {
     }
 
     fn notify_at(&self, chain: &ChainId, topic: &str, position: &str) {
-        // The write landed, so a notification that can't go must not turn it into an error the
-        // caller might retry with other content.
-        let Some(counter) = progress_counter(position) else {
-            tracing::warn!(
-                workflow_id = %chain.workflow_id,
-                topic,
-                position,
-                "No notifier counter comes from this position, so the write isn't notified"
-            );
-            return;
-        };
-        let cursor = self.cursor(chain, topic, position);
-        self.notifier.notify(chain, topic, cursor, counter);
-    }
-
-    async fn notify_latest(&self, chain: &ChainId, topic: &str) {
-        // A promotion has no position of its own, so the newest record's is told.
-        match self
-            .inner
-            .latest(StoreLatestRequest {
-                chain: Some(chain.clone()),
-                topic: topic.to_string(),
-            })
-            .await
+        if let Some((cursor, counter)) =
+            notification_at(self.inner.as_ref(), chain, topic, position)
         {
-            Ok(latest) if !latest.position.is_empty() => {
-                self.notify_at(chain, topic, &latest.position)
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(
-                workflow_id = %chain.workflow_id,
-                topic,
-                %error,
-                "Could not find the newest record to notify"
-            ),
+            self.notifier.notify(chain, topic, cursor, counter);
         }
     }
+
+    /// Notifies the newest record of `chain`'s stream on `topic` without waiting for the read,
+    /// since a promotion sits on the Worker's report path and has no position of its own.
+    fn notify_latest(&self, chain: &ChainId, topic: &str) {
+        let inner = self.inner.clone();
+        let (found_chain, found_topic) = (chain.clone(), topic.to_string());
+        self.notifier.notify_found(chain, topic, async move {
+            let (chain, topic) = (found_chain, found_topic);
+            match inner
+                .latest(StoreLatestRequest {
+                    chain: Some(chain.clone()),
+                    topic: topic.clone(),
+                })
+                .await
+            {
+                Ok(latest) if !latest.position.is_empty() => {
+                    notification_at(inner.as_ref(), &chain, &topic, &latest.position)
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    tracing::warn!(
+                        workflow_id = %chain.workflow_id,
+                        topic,
+                        %error,
+                        "Could not find the newest record to notify"
+                    );
+                    None
+                }
+            }
+        });
+    }
+}
+
+fn cursor_of(store: &dyn StreamStore, chain: &ChainId, topic: &str, position: &str) -> String {
+    let hash = stream_hash(
+        &chain.namespace,
+        WORKFLOW_OWNER_KIND,
+        &chain.workflow_id,
+        topic,
+    );
+    mint_cursor(store.name(), &hash, position)
+}
+
+/// The cursor and counter that tell a reader about the record at `position`.
+fn notification_at(
+    store: &dyn StreamStore,
+    chain: &ChainId,
+    topic: &str,
+    position: &str,
+) -> Option<(String, i64)> {
+    // The write landed, so a notification that can't go must not turn it into an error the
+    // caller might retry with other content.
+    let Some(counter) = progress_counter(position) else {
+        tracing::warn!(
+            workflow_id = %chain.workflow_id,
+            topic,
+            position,
+            "No notifier counter comes from this position, so the write isn't notified"
+        );
+        return None;
+    };
+    Some((cursor_of(store, chain, topic, position), counter))
 }
 
 #[async_trait::async_trait]
@@ -539,7 +685,7 @@ impl StreamStore for NotifyingStore {
             && let Some(chain) = &stage.chain
         {
             for topic in &stage.topics {
-                self.notify_latest(chain, topic).await;
+                self.notify_latest(chain, topic);
             }
         }
         Ok(result)
@@ -620,6 +766,7 @@ impl StreamStore for NotifyingStore {
             .await
             .map_err(|error| match error {
                 NotifyError::Refused(message) => crate::StreamError::refused(message),
+                NotifyError::Unsupported(message) => crate::StreamError::unsupported(message),
                 NotifyError::Failed(message) => crate::StreamError::storage(message),
             })
     }
@@ -636,7 +783,7 @@ mod tests {
         MemoryStore,
         proto::{StagedRecord, StoreAppendRequest},
     };
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
 
     /// Records what it was sent. While `holding`, each call waits for a permit, so a test
@@ -646,6 +793,9 @@ mod tests {
         holding: AtomicBool,
         gate: Semaphore,
         fail: AtomicBool,
+        /// How many of the next calls fail.
+        failures: AtomicUsize,
+        unsupported: AtomicBool,
     }
 
     impl Default for Recorder {
@@ -655,6 +805,8 @@ mod tests {
                 holding: AtomicBool::new(false),
                 gate: Semaphore::new(0),
                 fail: AtomicBool::new(false),
+                failures: AtomicUsize::new(0),
+                unsupported: AtomicBool::new(false),
             }
         }
     }
@@ -687,7 +839,14 @@ mod tests {
             if self.holding.load(Ordering::SeqCst) {
                 self.gate.acquire().await.unwrap().forget();
             }
-            if self.fail.load(Ordering::SeqCst) {
+            if self.unsupported.load(Ordering::SeqCst) {
+                return Err(NotifyError::Unsupported("unimplemented".to_string()));
+            }
+            let failing = self
+                .failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if failing || self.fail.load(Ordering::SeqCst) {
                 return Err(NotifyError::Failed("down".to_string()));
             }
             Ok(())
@@ -752,20 +911,65 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_failed_notification_leaves_the_next_one_to_tell_the_reader() {
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_last_notification_is_tried_twice_more() {
         let recorder = Arc::new(Recorder::default());
-        recorder.fail.store(true, Ordering::SeqCst);
+        recorder.failures.store(1, Ordering::SeqCst);
         let notifier = Notifier::new(recorder.clone(), 10);
         notifier.notify(&chain("run-1"), "t", "c1".to_string(), 1);
         notifier.flush().await;
-        recorder.fail.store(false, Ordering::SeqCst);
+        assert_eq!(
+            recorder.sent(),
+            vec![("c1".to_string(), 1), ("c1".to_string(), 1)],
+            "a quiet stream gets its last notification again"
+        );
+
+        recorder.fail.store(true, Ordering::SeqCst);
+        notifier.notify(&chain("run-1"), "t", "c2".to_string(), 2);
+        notifier.flush().await;
+        assert_eq!(
+            recorder.sent().len(),
+            5,
+            "two more tries, then it's dropped"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_newer_notification_goes_instead_of_a_retry() {
+        let recorder = Arc::new(Recorder::default());
+        recorder.failures.store(1, Ordering::SeqCst);
+        let notifier = Notifier::new(recorder.clone(), 10);
+        notifier.notify(&chain("run-1"), "t", "c1".to_string(), 1);
+        settle().await;
         notifier.notify(&chain("run-1"), "t", "c2".to_string(), 2);
         notifier.flush().await;
         assert_eq!(
             recorder.sent(),
             vec![("c1".to_string(), 1), ("c2".to_string(), 2)]
         );
+    }
+
+    #[tokio::test]
+    async fn a_server_without_the_notifier_costs_one_call() {
+        let recorder = Arc::new(Recorder::default());
+        recorder.unsupported.store(true, Ordering::SeqCst);
+        let notifier = Notifier::new(recorder.clone(), 10);
+        notifier.notify(&chain("run-1"), "a", "a1".to_string(), 1);
+        notifier.flush().await;
+        notifier.notify(&chain("run-1"), "b", "b1".to_string(), 1);
+        notifier.notify(&chain("run-2"), "a", "a1".to_string(), 1);
+        notifier.flush().await;
+        notifier
+            .close(
+                &chain("run-1"),
+                "a",
+                "a1".to_string(),
+                2,
+                Payload::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recorder.sent().len(), 1);
     }
 
     #[tokio::test]
@@ -1012,7 +1216,9 @@ mod tests {
             .unwrap();
         store.flush_notifications().await;
         let sent = recorder.sent.lock().unwrap().clone();
-        let topics: Vec<(&str, i64)> = sent.iter().map(|n| (n.topic.as_str(), n.counter)).collect();
+        let mut topics: Vec<(&str, i64)> =
+            sent.iter().map(|n| (n.topic.as_str(), n.counter)).collect();
+        topics.sort();
         assert_eq!(
             topics,
             vec![("a", 2), ("b", 1)],
@@ -1034,6 +1240,74 @@ mod tests {
             2,
             "a repeated promotion and an abort make nothing visible"
         );
+    }
+
+    /// A memory store whose `latest` waits for a permit.
+    struct HeldLatest(MemoryStore, Semaphore);
+
+    #[async_trait::async_trait]
+    impl StreamStore for HeldLatest {
+        fn name(&self) -> &str {
+            self.0.name()
+        }
+        async fn append(&self, r: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
+            self.0.append(r).await
+        }
+        async fn read(&self, r: StoreReadRequest) -> StreamResult<StoreReadResponse> {
+            self.0.read(r).await
+        }
+        async fn latest(&self, r: StoreLatestRequest) -> StreamResult<StoreLatestResponse> {
+            self.1.acquire().await.unwrap().forget();
+            self.0.latest(r).await
+        }
+        async fn record_at(&self, c: &ChainId, t: &str, p: &str) -> StreamResult<Option<Vec<u8>>> {
+            self.0.record_at(c, t, p).await
+        }
+        async fn stage(&self, b: StagedBatch) -> StreamResult<()> {
+            self.0.stage(b).await
+        }
+        async fn promote(&self, s: &StageRef) -> StreamResult<PromoteResult> {
+            self.0.promote(s).await
+        }
+        async fn abort(&self, s: &StageRef) -> StreamResult<()> {
+            self.0.abort(s).await
+        }
+        async fn close_chain(&self, c: &ChainId) -> StreamResult<()> {
+            self.0.close_chain(c).await
+        }
+        async fn close_topic(&self, c: &ChainId, t: &str, r: Option<Payload>) -> StreamResult<()> {
+            self.0.close_topic(c, t, r).await
+        }
+        async fn pending_stages(&self, c: &ChainId) -> StreamResult<Vec<PendingStage>> {
+            self.0.pending_stages(c).await
+        }
+        async fn delete_owner(&self, r: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
+            self.0.delete_owner(r).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_promotion_returns_before_it_reads_the_newest_positions() {
+        let recorder = Arc::new(Recorder::default());
+        let inner = Arc::new(HeldLatest(MemoryStore::new(), Semaphore::new(0)));
+        let store =
+            NotifyingStore::new(inner.clone(), Arc::new(Notifier::new(recorder.clone(), 10)));
+        let run = chain("run-1");
+        store
+            .stage(staged(&run, "token", &["a", "b"]))
+            .await
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            store.promote(&stage_ref(&run, "token", &["a", "b"])),
+        )
+        .await
+        .expect("the promotion waited for the newest positions")
+        .unwrap();
+        assert!(recorder.sent().is_empty());
+        inner.1.add_permits(2);
+        store.flush_notifications().await;
+        assert_eq!(recorder.sent().len(), 2);
     }
 
     #[tokio::test]
