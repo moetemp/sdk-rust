@@ -34,23 +34,11 @@ relevant information.
 ## Unreleased
 
 ### Added
-* Experimental: a workflow can commit output it staged in an external stream store with the new
-  `WorkflowOutputStreamCommit` command. Core records the output manifest in a
-  `core_external_stream` marker ahead of the completion's other commands, so the output becomes
-  visible only when the workflow task is accepted. Activations now carry
-  `history_floor_event_id`, which the manifest must match. On replay, Core hands the recorded
-  manifest back in a `ReplayExternalStreams` job. Lang must commit each recorded manifest again
-  while replaying, and each commit must match it (the stage token and run id aside), or the task
-  fails as nondeterministic.
 * Experimental: progress of a started Nexus operation reaches lang as a
   `ResolveNexusOperationProgress` job, at most one per operation per workflow task, with the
   highest counter the server folded onto the task's scheduled event. Replay delivers the same jobs
   in the same activations. Progress for an operation that is unknown, not started, already
   resolved, or below a counter already delivered is dropped.
-  while replaying, and each commit must match it (the stage token, run id and provider id
-  aside), or the task fails as nondeterministic. A workflow that wrote this marker can only move
-  forward. A Worker on an older Core, or one whose lang does not commit the output again on
-  replay, fails that workflow's next task, so don't roll such a fleet back.
 * Experimental: a workflow can commit the stream records it published with the new
   `WorkflowOutputStreamCommit` command, each with its plaintext content hash and size. Core
   builds the output manifest from them and records it in a `core_external_stream` marker ahead
