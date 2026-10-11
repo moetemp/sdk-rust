@@ -589,6 +589,45 @@ fn test_stream_store_appends_and_reads_through_the_c_bridge() {
 }
 
 #[test]
+fn test_a_cancelled_stream_read_says_it_only_stopped_reading() {
+    use temporalio_sdk_core::streams::proto::{
+        ReadRequest, StreamAddress, StreamFailure, StreamOwnerKind,
+    };
+    Context::with(|context| {
+        context.runtime_new().unwrap();
+        context
+            .client_connect_with_override(
+                Box::new(default_connection_options("127.0.0.1:4567")),
+                Some(streams_callback_override),
+                std::ptr::null_mut(),
+            )
+            .unwrap();
+        let store = context.stream_store_new(memory_store_config()).unwrap();
+        let token = crate::temporal_core_cancellation_token_new();
+        crate::temporal_core_cancellation_token_cancel(token);
+        let read = ReadRequest {
+            stream: Some(StreamAddress {
+                namespace: "ns".to_string(),
+                owner_kind: StreamOwnerKind::Workflow as i32,
+                workflow_id: "wf".to_string(),
+                run_id: String::new(),
+                topic: "out".to_string(),
+            }),
+            after: "$end".to_string(),
+            wait: Some(std::time::Duration::from_secs(30).try_into().unwrap()),
+            ..Default::default()
+        };
+        let failure = context
+            .stream_store_call_with_token(&store, "Read", read.encode_to_vec(), token)
+            .unwrap()
+            .unwrap_err();
+        crate::temporal_core_cancellation_token_free(token);
+        let failure = StreamFailure::decode(failure.as_slice()).unwrap();
+        assert_eq!(failure.message, "Cancelled before the read answered");
+    });
+}
+
+#[test]
 fn test_stream_store_failures_cross_the_c_bridge_as_stream_failures() {
     use temporalio_sdk_core::streams::proto::{StreamFailure, StreamFailureKind};
     Context::with(|context| {

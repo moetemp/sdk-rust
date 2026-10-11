@@ -481,6 +481,17 @@ impl Context {
         rpc: &str,
         request: Vec<u8>,
     ) -> anyhow::Result<Result<Vec<u8>, Vec<u8>>> {
+        self.stream_store_call_with_token(store, rpc, request, std::ptr::null())
+    }
+
+    /// Makes a stream call that `cancellation_token`, when not null, can cancel.
+    pub fn stream_store_call_with_token(
+        self: &Arc<Self>,
+        store: &StreamStorePtr,
+        rpc: &str,
+        request: Vec<u8>,
+        cancellation_token: *const crate::CancellationToken,
+    ) -> anyhow::Result<Result<Vec<u8>, Vec<u8>>> {
         let runtime = {
             let mut guard = self.wait_for_available()?;
             guard.operation_state = ContextOperationState::InProgress;
@@ -498,7 +509,7 @@ impl Context {
             store.0,
             rpc_ref,
             request_ref,
-            std::ptr::null(),
+            cancellation_token,
             user_data,
             stream_store_call_callback,
         );
