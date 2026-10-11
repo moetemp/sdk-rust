@@ -684,6 +684,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_nexus_append_notifies_its_streams_notifier() {
+        use crate::proto::{NexusCall, NexusStep, nexus_step};
+        let recorder = Arc::new(Recorder::default());
+        let service = service_notifying(true, recorder.clone()).await;
+        let input = serde_json::json!({
+            "stream": {"kind": "workflow", "workflow_id": "wf", "topic": "t"},
+            "producer_id": "p",
+            "attempt": 1,
+            "sequence": 1,
+            "finish": true,
+        });
+        let answer = service
+            .call(
+                "NexusAppend",
+                &NexusCall {
+                    input: serde_json::to_vec(&input).unwrap(),
+                    namespace: "ns".to_string(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap();
+        let step = NexusStep::decode(answer.as_slice()).unwrap();
+        let Some(nexus_step::Step::Output(output)) = step.step else {
+            panic!("a finish needs no codec work, so it answers at once");
+        };
+        let output: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        flush(&service).await;
+        let sent = recorder.0.lock().unwrap().clone();
+        assert_eq!(
+            sent.len(),
+            1,
+            "the Nexus append goes through the notifying store"
+        );
+        assert_eq!(sent[0].chain.first_run_id, "run-1");
+        assert_eq!(sent[0].topic, "t");
+        assert_eq!(sent[0].position, output["cursor"].as_str().unwrap());
+    }
+
+    #[tokio::test]
     async fn the_nexus_calls_go_through_the_one_call_entry() {
         use crate::proto::{NexusCall, NexusResumeRequest, NexusStep, nexus_step};
         let service = service().await;
