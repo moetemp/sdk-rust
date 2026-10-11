@@ -592,6 +592,19 @@ impl StreamStore for NotifyingStore {
         self.inner.record_at(chain, topic, position).await
     }
 
+    async fn newest_ever(&self, chain: &ChainId, topic: &str) -> StreamResult<String> {
+        self.inner.newest_ever(chain, topic).await
+    }
+
+    async fn dropped_after(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        mark: &str,
+    ) -> StreamResult<Option<String>> {
+        self.inner.dropped_after(chain, topic, mark).await
+    }
+
     async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {
         self.inner.stage(batch).await
     }
