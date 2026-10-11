@@ -13,6 +13,7 @@ mod cursor;
 mod error;
 mod handle;
 mod memory;
+pub mod nexus;
 mod notify;
 mod owner;
 mod reader;
