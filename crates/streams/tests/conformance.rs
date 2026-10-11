@@ -417,10 +417,13 @@ fn stage_ref(chain: &ChainId, token: &str, topics: &[&str]) -> StageRef {
     }
 }
 
-use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
+use temporalio_common::protos::temporal::api::{
+    enums::v1::WorkflowExecutionStatus, history::v1::HistoryEvent,
+};
 
-/// Temporal for one chain whose Workflow is still running, for cases that go through [Streams].
-struct RunningChain(ChainId);
+/// Temporal for one chain whose Workflow is still running, for cases that go through [Streams],
+/// with the History its first run holds.
+struct RunningChain(ChainId, Vec<HistoryEvent>);
 
 #[async_trait::async_trait]
 impl OwnerClient for RunningChain {
@@ -434,14 +437,30 @@ impl OwnerClient for RunningChain {
             run_id: self.0.first_run_id.clone(),
             first_run_id: self.0.first_run_id.clone(),
             status: WorkflowExecutionStatus::Running,
+            start_time: None,
         })
+    }
+
+    async fn history_after(
+        &self,
+        _namespace: &str,
+        _workflow_id: &str,
+        _run_id: &str,
+        floor: i64,
+    ) -> Result<Vec<HistoryEvent>, OwnerError> {
+        Ok(self
+            .1
+            .iter()
+            .filter(|event| event.event_id > floor)
+            .cloned()
+            .collect())
     }
 }
 
-fn streams_over(case: &dyn Case, chain: &ChainId) -> Streams {
+fn streams_over(case: &dyn Case, chain: &ChainId, history: Vec<HistoryEvent>) -> Streams {
     Streams::new(
         case.store(),
-        Arc::new(RunningChain(chain.clone())),
+        Arc::new(RunningChain(chain.clone(), history)),
         StreamsOptions {
             owner_check_min: Duration::from_millis(20),
             owner_check_max: Duration::from_millis(80),
@@ -1167,7 +1186,7 @@ mod cases {
             .await
             .unwrap();
         store.close_chain(&chain).await.unwrap();
-        let streams = streams_over(case, &chain);
+        let streams = streams_over(case, &chain, Vec::new());
         let first = streams
             .read(stream_read(
                 &chain,
