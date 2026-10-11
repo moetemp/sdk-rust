@@ -34,7 +34,7 @@ message NexusCall {
 }
 
 message NexusLimits {
-  // The most record bytes one read answer carries past its first record, as they cross in base64.
+  // The most bytes one read answer takes as JSON past its first record, with its tokens and state.
   // Zero takes the default of 1 MiB, which keeps an answer below the server's blob size limit.
   uint64 max_answer_bytes = 1;
   // The most bytes one record may take in an answer. A record above it can never be read, so an

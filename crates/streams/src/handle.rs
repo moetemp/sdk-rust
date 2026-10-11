@@ -388,6 +388,11 @@ impl Streams {
         })
     }
 
+    /// The first run of the chain `stream` names now, as the last read resolved it.
+    pub(crate) async fn first_run_of(&self, stream: &StreamAddress) -> StreamResult<String> {
+        Ok(self.chain(stream).await?.first_run_id)
+    }
+
     /// Refuses a carried state whose chain is not one of the Workflow's. A caller outside the
     /// process could otherwise point a read at another run's chain by editing its state. Asked
     /// once per chain in a process.
