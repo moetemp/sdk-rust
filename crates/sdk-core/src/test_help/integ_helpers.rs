@@ -845,8 +845,8 @@ pub fn build_mock_pollers(mut cfg: MockPollCfg) -> MocksHolder {
         .expect_describe_namespace()
         .times(0..)
         .returning(|| Ok(DescribeNamespaceResponse::default()));
-    // Fallback for the chain check after a publishing workflow's final task. It names no chain, so
-    // the stream store closes the run's chain.
+    // Fallback for the chain check after a workflow's final task. It names no chain, so the stream
+    // store closes the run's chain.
     cfg.mock_client
         .expect_describe_workflow_execution()
         .times(0..)
