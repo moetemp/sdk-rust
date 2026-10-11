@@ -33,7 +33,10 @@ pub(crate) async fn attach_caller(
     let client = client.ok_or_else(|| {
         StreamError::unsupported("attaching a caller needs a client connected to the server")
     })?;
-    let (stream, chain) = streams.resolve(request.stream.as_ref()).await?;
+    let stream = checked(request.stream.as_ref())?;
+    // Fresh for the latest run, since the Workflow id may have moved on to a new chain since a
+    // read warmed the cache, and an attach to the ended chain would never hear the new stream.
+    let chain = streams.chain_now(stream).await?;
     let operation_token = OperationToken {
         stream: stream.clone(),
         attach_request_id: request.request_id.clone(),
@@ -78,6 +81,25 @@ pub(crate) async fn detach_caller(
         .await
         .map_err(caller_error)?;
     Ok(DetachCallerResponse {})
+}
+
+/// The stream an attach names, checked as the Nexus calls check theirs, so a mistake in it
+/// crosses as the caller's input mistake.
+fn checked(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
+    let stream = stream.ok_or_else(|| bad_input("an attach needs its stream"))?;
+    if stream.owner_kind != StreamOwnerKind::Workflow as i32 {
+        return Err(StreamError::unsupported(format!(
+            "this release opens streams of Workflows only, not owner kind {}",
+            stream.owner_kind
+        )));
+    }
+    if stream.namespace.is_empty() || stream.workflow_id.is_empty() {
+        return Err(bad_input(
+            "a stream needs its namespace and its owner's Workflow id",
+        ));
+    }
+    temporalio_common::streams::check_topic(&stream.topic).map_err(|reason| bad_input(&reason))?;
+    Ok(stream)
 }
 
 fn bad_input(message: &str) -> StreamError {
@@ -228,11 +250,7 @@ mod tests {
         proto::{StreamFailure, StreamFailureKind},
     };
     use prost::Message;
-    use std::{
-        collections::HashMap,
-        sync::Mutex,
-        time::{Duration, UNIX_EPOCH},
-    };
+    use std::{collections::HashMap, sync::Mutex, time::UNIX_EPOCH};
     use temporalio_common::protos::temporal::api::{
         enums::v1::WorkflowExecutionStatus, history::v1::HistoryEvent,
     };
@@ -329,10 +347,8 @@ mod tests {
         let service = StreamService::new(
             Arc::new(MemoryStore::new()),
             owners.clone(),
-            StreamsOptions {
-                owner_recheck: Duration::ZERO,
-                ..Default::default()
-            },
+            // The default recheck, so a start that read the owner cache would see a stale chain.
+            StreamsOptions::default(),
         )
         .with_callers(notifier.clone());
         Setup {
@@ -433,6 +449,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_start_after_the_workflow_id_moved_to_a_new_chain_attaches_to_the_new_one() {
+        let setup = setup();
+        let first = attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        // The first chain ended, and the app started a new one on the same Workflow id.
+        setup
+            .owners
+            .chains
+            .lock()
+            .unwrap()
+            .insert("owner-1".to_string(), "chain-2".to_string());
+        let second = attach(
+            &setup.service,
+            AttachCallerRequest {
+                request_id: "attach-2".to_string(),
+                ..attach_request("temporal://system")
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            OperationToken::decode("default", &first)
+                .unwrap()
+                .chain_first_run_id,
+            "chain-1"
+        );
+        assert_eq!(
+            OperationToken::decode("default", &second)
+                .unwrap()
+                .chain_first_run_id,
+            "chain-2"
+        );
+        assert_eq!(
+            setup.notifier.attached.lock().unwrap()[1]
+                .chain
+                .first_run_id,
+            "chain-2"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retried_start_gets_the_same_token() {
+        let setup = setup();
+        let first = attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        let again = attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        assert_eq!(first, again);
+        let attached = setup.notifier.attached.lock().unwrap().clone();
+        assert_eq!(
+            attached[0],
+            CallerAttachment {
+                start_time: attached[0].start_time,
+                ..attached[1].clone()
+            },
+            "the server keys the attach by the request id, so the second changes nothing"
+        );
+    }
+
+    #[tokio::test]
     async fn a_pinned_ref_attaches_by_its_chains_first_run() {
         let setup = setup();
         setup
@@ -471,6 +550,31 @@ mod tests {
             .unwrap_err();
         assert_eq!(failure.kind, StreamFailureKind::InvalidArgument as i32);
         assert!(setup.notifier.attached.lock().unwrap().is_empty());
+        assert!(setup.owners.described.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_start_whose_stream_names_no_topic_is_an_input_mistake() {
+        let setup = setup();
+        for topic in ["", "a\u{0}b"] {
+            let failure = attach(
+                &setup.service,
+                AttachCallerRequest {
+                    stream: Some(StreamAddress {
+                        topic: topic.to_string(),
+                        ..stream("")
+                    }),
+                    ..attach_request("temporal://system")
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(
+                failure.kind,
+                StreamFailureKind::InvalidArgument as i32,
+                "{topic:?}"
+            );
+        }
         assert!(setup.owners.described.lock().unwrap().is_empty());
     }
 
