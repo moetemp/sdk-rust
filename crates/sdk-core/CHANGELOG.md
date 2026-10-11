@@ -94,8 +94,10 @@ relevant information.
   attaches the start's callback to the stream's notifier with the token and start time.
   `DetachCaller` decodes the token and detaches from the chain the start attached to. The token
   format is in `crates/streams/nexus/operation_token_vectors.json`, which every SDK's encoder and
-  decoder check. An empty callback URL, an empty request id and a token that names no stream fail
-  as `INVALID_ARGUMENT`, so lang tells them from a server's refusal.
+  decoder check. Both answer a failure in the response as a `NexusFailure`, from the same table as
+  the Nexus calls, so lang's handler raises it as it is. A mistake in the stream, an empty callback
+  URL or request id, and a token that names no stream are `BAD_REQUEST`. An attach for the latest
+  run describes the Workflow fresh, so it never lands on a chain that already ended.
 
 ### Fixed
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom

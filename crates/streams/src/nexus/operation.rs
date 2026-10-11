@@ -17,11 +17,42 @@ use serde::{Deserialize, Serialize};
 use std::{io, sync::Arc, time::SystemTime};
 
 /// Attaches a start's caller to the stream's notifier and mints the operation token.
+/// Answers a failure as the Nexus calls do, so lang's handler raises it with Core's one table.
 pub(crate) async fn attach_caller(
     streams: &Streams,
     client: Option<&Arc<dyn NotifierClient>>,
     request: AttachCallerRequest,
-) -> StreamResult<AttachCallerResponse> {
+) -> AttachCallerResponse {
+    match attach(streams, client, request).await {
+        Ok(operation_token) => AttachCallerResponse {
+            operation_token,
+            failure: None,
+        },
+        Err(error) => AttachCallerResponse {
+            operation_token: String::new(),
+            failure: Some(super::failure::of_stream(&error)),
+        },
+    }
+}
+
+/// Detaches the caller a token's start attached. Answers a failure as the Nexus calls do.
+pub(crate) async fn detach_caller(
+    client: Option<&Arc<dyn NotifierClient>>,
+    request: DetachCallerRequest,
+) -> DetachCallerResponse {
+    DetachCallerResponse {
+        failure: detach(client, request)
+            .await
+            .err()
+            .map(|error| super::failure::of_stream(&error)),
+    }
+}
+
+async fn attach(
+    streams: &Streams,
+    client: Option<&Arc<dyn NotifierClient>>,
+    request: AttachCallerRequest,
+) -> StreamResult<String> {
     if request.callback_url.is_empty() {
         return Err(bad_input(
             "a stream-returning operation needs a caller callback; start it asynchronously",
@@ -57,14 +88,13 @@ pub(crate) async fn attach_caller(
         })
         .await
         .map_err(caller_error)?;
-    Ok(AttachCallerResponse { operation_token })
+    Ok(operation_token)
 }
 
-/// Detaches the caller a token's start attached.
-pub(crate) async fn detach_caller(
+async fn detach(
     client: Option<&Arc<dyn NotifierClient>>,
     request: DetachCallerRequest,
-) -> StreamResult<DetachCallerResponse> {
+) -> StreamResult<()> {
     if request.namespace.is_empty() {
         return Err(bad_input("a detach needs its namespace"));
     }
@@ -72,6 +102,8 @@ pub(crate) async fn detach_caller(
     let client = client.ok_or_else(|| {
         StreamError::unsupported("detaching a caller needs a client connected to the server")
     })?;
+    // The server's detach changes nothing for an attach that's gone, so a retried cancel lands as
+    // the first did.
     client
         .detach(
             token.chain(),
@@ -80,7 +112,7 @@ pub(crate) async fn detach_caller(
         )
         .await
         .map_err(caller_error)?;
-    Ok(DetachCallerResponse {})
+    Ok(())
 }
 
 /// The stream an attach names, checked as the Nexus calls check theirs, so a mistake in it
@@ -176,8 +208,8 @@ impl OperationToken {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
     }
 
-    /// Reads a token in `namespace`. Fails as an invalid argument when it isn't one a stream operation
-    /// issued.
+    /// Reads a token in `namespace`. Fails as an invalid argument when it isn't one a stream
+    /// operation issued.
     pub fn decode(namespace: &str, token: &str) -> StreamResult<Self> {
         let refuse = |why: &str| bad_input(&format!("not a stream operation token: {why}"));
         let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -246,8 +278,7 @@ mod tests {
     use super::*;
     use crate::{
         MemoryStore, OwnerClient, OwnerDescription, OwnerError, StreamNotification, StreamService,
-        StreamsOptions,
-        proto::{StreamFailure, StreamFailureKind},
+        StreamsOptions, proto::NexusFailure,
     };
     use prost::Message;
     use std::{collections::HashMap, sync::Mutex, time::UNIX_EPOCH};
@@ -261,6 +292,7 @@ mod tests {
     struct Owners {
         chains: Mutex<HashMap<String, String>>,
         described: Mutex<Vec<String>>,
+        missing: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait::async_trait]
@@ -272,6 +304,9 @@ mod tests {
             run_id: &str,
         ) -> Result<OwnerDescription, OwnerError> {
             self.described.lock().unwrap().push(run_id.to_string());
+            if self.missing.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(OwnerError::NotFound(workflow_id.to_string()));
+            }
             let first_run_id = self
                 .chains
                 .lock()
@@ -377,30 +412,68 @@ mod tests {
         }
     }
 
+    /// A failure as the start's Nexus handler raises it: its type, whether a retry may help, and
+    /// the class its message leads with.
+    #[derive(Debug, PartialEq)]
+    struct Raised {
+        kind: String,
+        retryable: bool,
+        class: String,
+    }
+
+    fn raised(failure: NexusFailure) -> Raised {
+        Raised {
+            kind: failure.handler_error_type,
+            retryable: failure.retryable,
+            class: failure.message.split(':').next().unwrap().to_string(),
+        }
+    }
+
+    fn expect(kind: &str, retryable: bool, class: &str) -> Raised {
+        Raised {
+            kind: kind.to_string(),
+            retryable,
+            class: class.to_string(),
+        }
+    }
+
     async fn attach(
         service: &StreamService,
         request: AttachCallerRequest,
-    ) -> Result<String, StreamFailure> {
-        let response = service
-            .call("AttachCaller", &request.encode_to_vec())
-            .await?;
-        Ok(AttachCallerResponse::decode(response.as_slice())
-            .unwrap()
-            .operation_token)
+    ) -> Result<String, Raised> {
+        let response = AttachCallerResponse::decode(
+            service
+                .call("AttachCaller", &request.encode_to_vec())
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        match response.failure {
+            Some(failure) => Err(raised(failure)),
+            None => Ok(response.operation_token),
+        }
     }
 
-    async fn detach(service: &StreamService, token: &str) -> Result<(), StreamFailure> {
-        service
-            .call(
-                "DetachCaller",
-                &DetachCallerRequest {
-                    namespace: "default".to_string(),
-                    operation_token: token.to_string(),
-                }
-                .encode_to_vec(),
-            )
-            .await
-            .map(drop)
+    async fn detach(service: &StreamService, token: &str) -> Result<(), Raised> {
+        let response = DetachCallerResponse::decode(
+            service
+                .call(
+                    "DetachCaller",
+                    &DetachCallerRequest {
+                        namespace: "default".to_string(),
+                        operation_token: token.to_string(),
+                    }
+                    .encode_to_vec(),
+                )
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        response
+            .failure
+            .map_or(Ok(()), |failure| Err(raised(failure)))
     }
 
     #[tokio::test]
@@ -548,7 +621,7 @@ mod tests {
         let failure = attach(&setup.service, attach_request(""))
             .await
             .unwrap_err();
-        assert_eq!(failure.kind, StreamFailureKind::InvalidArgument as i32);
+        assert_eq!(failure, expect("BAD_REQUEST", false, "ValueError"));
         assert!(setup.notifier.attached.lock().unwrap().is_empty());
         assert!(setup.owners.described.lock().unwrap().is_empty());
     }
@@ -570,8 +643,8 @@ mod tests {
             .await
             .unwrap_err();
             assert_eq!(
-                failure.kind,
-                StreamFailureKind::InvalidArgument as i32,
+                failure,
+                expect("BAD_REQUEST", false, "ValueError"),
                 "{topic:?}"
             );
         }
@@ -590,7 +663,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(failure.kind, StreamFailureKind::InvalidArgument as i32);
+        assert_eq!(failure, expect("BAD_REQUEST", false, "ValueError"));
         assert!(setup.notifier.attached.lock().unwrap().is_empty());
     }
 
@@ -643,8 +716,8 @@ mod tests {
         for token in vectors().refused {
             let failure = detach(&setup.service, &token).await.unwrap_err();
             assert_eq!(
-                failure.kind,
-                StreamFailureKind::InvalidArgument as i32,
+                failure,
+                expect("BAD_REQUEST", false, "ValueError"),
                 "{token:?}"
             );
         }
@@ -652,28 +725,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_servers_answer_says_whether_a_retry_can_help() {
-        for (answer, kind) in [
+    async fn the_servers_answer_crosses_as_the_nexus_calls_cross_it() {
+        for (answer, crossed) in [
             (
                 NotifyError::Failed("down".to_string()),
-                StreamFailureKind::Storage,
+                expect("UNAVAILABLE", true, "StreamStorageError"),
             ),
             (
                 NotifyError::Refused("no".to_string()),
-                StreamFailureKind::Refused,
+                expect("INTERNAL", false, "StreamRefusedError"),
             ),
             (
                 NotifyError::Unsupported("no notifier".to_string()),
-                StreamFailureKind::Unsupported,
+                expect("NOT_IMPLEMENTED", false, "StreamUnsupportedError"),
             ),
         ] {
             let setup = setup();
-            *setup.notifier.answer.lock().unwrap() = Some(answer);
+            *setup.notifier.answer.lock().unwrap() = Some(answer.clone());
             let failure = attach(&setup.service, attach_request("temporal://system"))
                 .await
                 .unwrap_err();
-            assert_eq!(failure.kind, kind as i32);
+            assert_eq!(failure, crossed);
+            *setup.notifier.answer.lock().unwrap() = Some(answer);
+            let token = OperationToken {
+                stream: stream(""),
+                attach_request_id: "attach-1".to_string(),
+                chain_first_run_id: "chain-1".to_string(),
+            }
+            .encode();
+            assert_eq!(detach(&setup.service, &token).await.unwrap_err(), crossed);
         }
+    }
+
+    #[tokio::test]
+    async fn a_missing_owner_crosses_as_not_found() {
+        let setup = setup();
+        setup
+            .owners
+            .missing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let failure = attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap_err();
+        assert_eq!(failure, expect("NOT_FOUND", false, "StreamNotFoundError"));
     }
 
     #[tokio::test]
@@ -686,7 +780,10 @@ mod tests {
         let failure = attach(&service, attach_request("temporal://system"))
             .await
             .unwrap_err();
-        assert_eq!(failure.kind, StreamFailureKind::Unsupported as i32);
+        assert_eq!(
+            failure,
+            expect("NOT_IMPLEMENTED", false, "StreamUnsupportedError")
+        );
     }
 
     #[derive(Deserialize)]

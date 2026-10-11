@@ -178,19 +178,20 @@ impl StreamService {
                 .resume(decode::<NexusResumeRequest>(rpc, request)?)
                 .await
                 .encode_to_vec()),
-            "AttachCaller" => crate::nexus::attach_caller(
+            // Like the Nexus calls, a caller call answers its failure in the response.
+            "AttachCaller" => Ok(crate::nexus::attach_caller(
                 &self.streams,
                 self.callers.as_ref(),
                 decode::<AttachCallerRequest>(rpc, request)?,
             )
             .await
-            .map(|r| r.encode_to_vec()),
-            "DetachCaller" => crate::nexus::detach_caller(
+            .encode_to_vec()),
+            "DetachCaller" => Ok(crate::nexus::detach_caller(
                 self.callers.as_ref(),
                 decode::<DetachCallerRequest>(rpc, request)?,
             )
             .await
-            .map(|r| r.encode_to_vec()),
+            .encode_to_vec()),
             other => Err(StreamError::unsupported(format!(
                 "the stream service has no call {other:?}"
             ))),
