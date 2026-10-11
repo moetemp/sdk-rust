@@ -78,10 +78,12 @@ struct RecordingStore {
     close_attempts: Mutex<usize>,
     /// How long each topic close takes.
     close_topic_delay: Mutex<Option<Duration>>,
-    /// Topic and chain closes as they start and finish, in order.
+    /// Promotions, and topic and chain closes as they start and finish, in order.
     closes: Mutex<Vec<String>>,
     /// Refuses every topic close for good.
     refuse_topic_closes: Mutex<bool>,
+    /// How many promotions to fail for now before taking one.
+    promote_failures: Mutex<usize>,
 }
 
 impl RecordingStore {
@@ -149,6 +151,15 @@ impl StreamStore for RecordingStore {
     }
 
     async fn promote(&self, stage: &StageRef) -> StreamResult<PromoteResult> {
+        {
+            let mut failures = self.promote_failures.lock();
+            if *failures > 0 {
+                *failures -= 1;
+                self.closes.lock().push("promote failed".to_string());
+                return Err(StreamError::storage("redis failed over"));
+            }
+        }
+        self.closes.lock().push("promote".to_string());
         self.log.lock().push(format!("promote {}", stage.token));
         Ok(PromoteResult {
             outcome: PromoteOutcome::Promoted as i32,
@@ -2399,6 +2410,26 @@ async fn the_chain_closes_after_the_final_task_closes_its_topics() {
     assert_eq!(
         *store.closes.lock(),
         [
+            "promote".to_string(),
+            format!("close_topic {TOPIC} started"),
+            format!("close_topic {TOPIC} done"),
+            "close_chain".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_chain_closes_after_a_failed_final_promotion_lands_and_closes_its_topics() {
+    let store = Arc::new(RecordingStore::default());
+    *store.promote_failures.lock() = 1;
+    let worker = final_task_closing_its_topic(store.clone()).await;
+    store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        *store.closes.lock(),
+        [
+            "promote failed".to_string(),
+            "promote".to_string(),
             format!("close_topic {TOPIC} started"),
             format!("close_topic {TOPIC} done"),
             "close_chain".to_string(),
@@ -2416,6 +2447,7 @@ async fn the_chain_still_closes_after_a_topic_close_is_refused() {
     assert_eq!(
         *store.closes.lock(),
         [
+            "promote".to_string(),
             format!("close_topic {TOPIC} started"),
             format!("close_topic {TOPIC} refused"),
             "close_chain".to_string(),
