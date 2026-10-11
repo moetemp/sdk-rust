@@ -18,13 +18,14 @@ use crate::{
         StreamAddress, StreamOwnerKind, StreamRecord, StreamRecordKind, append_request::Producer,
         codec_result, nexus_step, read_record,
     },
+    reader::ReadState,
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, Weak,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
@@ -33,12 +34,12 @@ use temporalio_common::protos::temporal::api::common::v1::Payload;
 use tokio::time::Instant;
 use wire::{
     AppendInput, AppendOutput, Base64, ReadInput, ReadOutput, RecordWire, StreamRef, Supersession,
-    crossing_size,
+    crossing_size, json_size,
 };
 
-/// The most record bytes one read answer carries past its first record, as they cross. A read
-/// answer is a sync Nexus result recorded in the caller's History, so it stays well below the
-/// server's blob size limit (2 MiB by default).
+/// The most bytes one read answer takes as JSON past its first record, with its tokens and state.
+/// A read answer is a sync Nexus result recorded in the caller's History, so it stays well below
+/// the server's blob size limit (2 MiB by default).
 pub const DEFAULT_MAX_ANSWER_BYTES: u64 = 1 << 20;
 /// The most bytes one record may take in an answer. One record must fit an answer on its own, so
 /// a larger one can never be read through the service.
@@ -67,6 +68,9 @@ pub struct NexusOptions {
     pub continuation_ttl: Duration,
     /// How many calls may wait for lang's codec at once.
     pub max_continuations: usize,
+    /// How many body bytes the calls waiting for lang's codec may hold together. One call goes
+    /// on alone whatever its size, so no call is refused for good.
+    pub max_continuation_bytes: usize,
 }
 
 impl Default for NexusOptions {
@@ -74,6 +78,7 @@ impl Default for NexusOptions {
         Self {
             continuation_ttl: Duration::from_secs(60),
             max_continuations: 1024,
+            max_continuation_bytes: 256 << 20,
         }
     }
 }
@@ -82,7 +87,7 @@ impl Default for NexusOptions {
 pub struct NexusCalls {
     streams: Arc<Streams>,
     options: NexusOptions,
-    pending: Mutex<HashMap<u64, Pending>>,
+    waiting: Arc<Mutex<Waiting>>,
     next: AtomicU64,
 }
 
@@ -94,9 +99,25 @@ impl std::fmt::Debug for NexusCalls {
     }
 }
 
+/// The calls waiting for lang's codec.
+#[derive(Default)]
+struct Waiting {
+    calls: HashMap<u64, Pending>,
+    /// Set while a task drops the calls that wait too long.
+    sweeping: bool,
+}
+
+impl Waiting {
+    fn purge(&mut self) {
+        let now = Instant::now();
+        self.calls.retain(|_, pending| pending.expires > now);
+    }
+}
+
 /// A call waiting for lang's codec.
 struct Pending {
     expires: Instant,
+    bytes: usize,
     work: Work,
 }
 
@@ -111,8 +132,11 @@ enum Work {
     Read {
         read: Box<CarriedRead>,
         limits: Limits,
-        /// Which records have a body, in the order the codec work lists them.
+        /// Which records have a body, in the order the codec work lists them. Their bodies
+        /// went to the codec, so the records hold none.
         bodies: Vec<usize>,
+        /// The answer's byte budget left out records of the page before the codec step.
+        cut: bool,
     },
 }
 
@@ -143,9 +167,14 @@ impl NexusCalls {
         Self {
             streams,
             options,
-            pending: Mutex::default(),
+            waiting: Arc::default(),
             next: AtomicU64::new(1),
         }
+    }
+
+    /// How many calls wait for lang's codec now.
+    pub fn waiting_calls(&self) -> usize {
+        self.waiting.lock().unwrap().calls.len()
     }
 
     /// Serves the `append` operation: one batch for one producer attempt, or its finish.
@@ -210,6 +239,7 @@ impl NexusCalls {
                 }
             }
         }
+        let bytes = payloads.iter().map(Vec::len).sum();
         let work = Work::Append {
             address,
             producer_id: input.producer_id,
@@ -222,6 +252,7 @@ impl NexusCalls {
         }
         self.ask_codec(
             work,
+            bytes,
             true,
             &call.namespace,
             &input.stream.workflow_id,
@@ -280,46 +311,99 @@ impl NexusCalls {
                 Err(error) => failed(failure::of_stream(&error)),
             };
         }
-        let deadline = call.deadline.as_ref().map(|deadline| {
-            SystemTime::UNIX_EPOCH
-                + Duration::new(
-                    u64::try_from(deadline.seconds).unwrap_or(0),
-                    u32::try_from(deadline.nanos).unwrap_or(0),
-                )
+        // A deadline past what the clock holds is as good as none.
+        let deadline = call.deadline.as_ref().and_then(|deadline| {
+            SystemTime::UNIX_EPOCH.checked_add(Duration::new(
+                u64::try_from(deadline.seconds).unwrap_or(0),
+                u32::try_from(deadline.nanos).unwrap_or(0),
+            ))
         });
         let wait = shortened(Duration::from_millis(wait_ms as u64), deadline);
-        let state = input.state.map(|state| state.0).unwrap_or_default();
+        let state = match input.state {
+            None => Vec::new(),
+            Some(text) if text.len() > crossing_size(MAX_STATE_BYTES) => {
+                return failed(failure::of_stream(&StreamError::cursor(format!(
+                    "the read state takes {} bytes, above the {} of any state a read answers, so \
+                     no earlier call of this read returned it",
+                    text.len(),
+                    crossing_size(MAX_STATE_BYTES)
+                ))));
+            }
+            Some(text) => match wire::base64_bytes(&text) {
+                Some(state) => state,
+                None => return failed(failure::input_mistake("state must be base64-encoded")),
+            },
+        };
         let request = ReadRequest {
-            stream: Some(address),
+            stream: Some(address.clone()),
             after,
             wait: wait.try_into().ok(),
             max_records: max_records as u32,
             state: state.clone(),
         };
-        let read = match self.streams.read_carried(request).await {
+        let mut read = match self.streams.read_carried(request).await {
             Ok(read) => read,
-            Err(error) => return read_failure(error, state),
+            Err(error) => {
+                let state = if state.is_empty() {
+                    self.first_state(&address).await
+                } else {
+                    state
+                };
+                return read_failure(error, state);
+            }
         };
+        // Cut by the stored bodies first, so the codec decodes only what can cross. A codec that
+        // grows a body is caught by the cut after the decode.
+        let mut budget = Budget::new(limits, &read);
+        let mut keep = read.response.records.len();
+        for (index, record) in read.response.records.iter().enumerate() {
+            let size = match &record.record {
+                Some(read_record::Record::Stored(stored)) => {
+                    json_size(&stored_wire(
+                        record.cursor.clone(),
+                        Base64::default(),
+                        record.stale,
+                    )) + crossing_size(stored.encoded_len())
+                }
+                Some(read_record::Record::Superseded(superseded)) => {
+                    json_size(&superseded_wire(record.cursor.clone(), superseded))
+                }
+                None => continue,
+            };
+            if !budget.admits(
+                size,
+                matches!(record.record, Some(read_record::Record::Stored(_))),
+            ) {
+                keep = index;
+                break;
+            }
+        }
+        let cut = keep < read.response.records.len();
+        read.response.records.truncate(keep);
         let mut bodies = Vec::new();
         let mut payloads = Vec::new();
-        for (index, record) in read.response.records.iter().enumerate() {
-            if let Some(read_record::Record::Stored(stored)) = &record.record
-                && let Some(body) = &stored.body
+        let mut bytes = 0;
+        for (index, record) in read.response.records.iter_mut().enumerate() {
+            if let Some(read_record::Record::Stored(stored)) = &mut record.record
+                && let Some(body) = stored.body.take()
             {
+                bytes += body.encoded_len();
                 bodies.push(index);
-                payloads.push(body.clone());
+                payloads.push(body);
             }
         }
         let work = Work::Read {
             read: Box::new(read),
             limits,
             bodies,
+            cut,
         };
         if payloads.is_empty() {
             return self.finish(work, Vec::new()).await;
         }
         self.ask_codec(
             work,
+            bytes,
             false,
             &call.namespace,
             &input.stream.workflow_id,
@@ -327,12 +411,21 @@ impl NexusCalls {
         )
     }
 
+    /// The state of a first call that failed, so the reader's next call follows the chain this
+    /// one resolved, not one that took the Workflow id since.
+    async fn first_state(&self, address: &StreamAddress) -> Vec<u8> {
+        match self.streams.first_run_of(address).await {
+            Ok(first_run_id) => ReadState::of_chain(first_run_id).encode_to_vec(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Goes on with a call that asked for codec work, with lang's results.
     pub async fn resume(&self, request: NexusResumeRequest) -> NexusStep {
         let pending = {
-            let mut pending = self.pending.lock().unwrap();
-            purge(&mut pending);
-            pending.remove(&request.continuation)
+            let mut waiting = self.waiting.lock().unwrap();
+            waiting.purge();
+            waiting.calls.remove(&request.continuation)
         };
         let Some(pending) = pending else {
             // The call waited too long, or lang resumed it twice. Nothing was written, so the
@@ -350,16 +443,21 @@ impl NexusCalls {
     fn ask_codec(
         &self,
         work: Work,
+        bytes: usize,
         encode: bool,
         namespace: &str,
         workflow_id: &str,
         payloads: Vec<Payload>,
     ) -> NexusStep {
         let continuation = self.next.fetch_add(1, Ordering::Relaxed);
-        {
-            let mut pending = self.pending.lock().unwrap();
-            purge(&mut pending);
-            if pending.len() >= self.options.max_continuations {
+        let start_sweep = {
+            let mut waiting = self.waiting.lock().unwrap();
+            waiting.purge();
+            let held: usize = waiting.calls.values().map(|pending| pending.bytes).sum();
+            let full = waiting.calls.len() >= self.options.max_continuations
+                || (!waiting.calls.is_empty()
+                    && held.saturating_add(bytes) > self.options.max_continuation_bytes);
+            if full {
                 return failed(failure::failure(
                     "StreamStorageError",
                     failure::UNAVAILABLE,
@@ -367,13 +465,18 @@ impl NexusCalls {
                     "too many stream calls are waiting for the payload codec",
                 ));
             }
-            pending.insert(
+            waiting.calls.insert(
                 continuation,
                 Pending {
                     expires: Instant::now() + self.options.continuation_ttl,
+                    bytes,
                     work,
                 },
             );
+            !std::mem::replace(&mut waiting.sweeping, true)
+        };
+        if start_sweep {
+            tokio::spawn(sweep(Arc::downgrade(&self.waiting)));
         }
         NexusStep {
             step: Some(nexus_step::Step::Codec(CodecWork {
@@ -402,7 +505,8 @@ impl NexusCalls {
                 read,
                 limits,
                 bodies,
-            } => finish_read(*read, limits, &bodies, results),
+                cut,
+            } => finish_read(*read, limits, &bodies, cut, results),
         }
     }
 
@@ -416,16 +520,7 @@ impl NexusCalls {
         results: Vec<CodecResult>,
     ) -> NexusStep {
         if results.len() != plaintext.len() {
-            return failed(failure::failure(
-                CODEC_FAILURE,
-                failure::INTERNAL,
-                true,
-                &format!(
-                    "the payload codec answered {} results for {} payloads",
-                    results.len(),
-                    plaintext.len()
-                ),
-            ));
+            return failed(wrong_count(results.len(), plaintext.len()));
         }
         let mut records = Vec::with_capacity(plaintext.len().max(1));
         for (index, (plain, result)) in plaintext.iter().zip(results).enumerate() {
@@ -492,23 +587,61 @@ fn digest(records: &[AppendRecord], plaintext: &[Vec<u8>]) -> Vec<u8> {
     digest.finalize().to_vec()
 }
 
+/// A codec answer with the wrong number of results is a fault of lang's codec loop, and it fails
+/// the same way on each retry.
+fn wrong_count(results: usize, payloads: usize) -> NexusFailure {
+    failure::failure(
+        CODEC_FAILURE,
+        failure::INTERNAL,
+        false,
+        &format!("the payload codec answered {results} results for {payloads} payloads"),
+    )
+}
+
+/// What is left of a read answer's bytes for its records, after the members every answer has.
+struct Budget {
+    left: usize,
+    /// Set once a stored record is in, since the first one crosses whatever its size.
+    stored: bool,
+}
+
+impl Budget {
+    fn new(limits: Limits, read: &CarriedRead) -> Self {
+        let envelope = json_size(&ReadOutput {
+            records: Vec::new(),
+            next_token: read.response.cursor.clone(),
+            done: false,
+            state: Some(Base64::default()),
+        });
+        let state = crossing_size(read.state.encoded_len().min(MAX_STATE_BYTES));
+        Self {
+            left: limits.answer.saturating_sub(envelope + state),
+            stored: false,
+        }
+    }
+
+    /// Takes a wire of `size` bytes, or answers that the answer is cut before it.
+    fn admits(&mut self, size: usize, stored: bool) -> bool {
+        // One more for the comma between records.
+        let size = size + 1;
+        if self.stored && size > self.left {
+            return false;
+        }
+        self.left = self.left.saturating_sub(size);
+        self.stored |= stored;
+        true
+    }
+}
+
 fn finish_read(
     read: CarriedRead,
     limits: Limits,
     bodies: &[usize],
+    cut: bool,
     results: Vec<CodecResult>,
 ) -> NexusStep {
     if results.len() != bodies.len() {
-        return failed(failure::failure(
-            CODEC_FAILURE,
-            failure::INTERNAL,
-            true,
-            &format!(
-                "the payload codec answered {} results for {} payloads",
-                results.len(),
-                bodies.len()
-            ),
-        ));
+        return failed(wrong_count(results.len(), bodies.len()));
     }
     let mut decoded: HashMap<usize, Result<Payload, String>> = HashMap::new();
     for (index, result) in bodies.iter().zip(results) {
@@ -521,15 +654,15 @@ fn finish_read(
             },
         );
     }
+    let mut budget = Budget::new(limits, &read);
     let CarriedRead {
         response,
         mut state,
         before,
     } = read;
+    let mut cut = cut;
     let mut wires: Vec<RecordWire> = Vec::with_capacity(response.records.len());
     let mut kept: Vec<StreamRecord> = Vec::new();
-    let mut size = 0;
-    let mut cut = false;
     for (index, record) in response.records.into_iter().enumerate() {
         let ReadRecord {
             cursor,
@@ -537,33 +670,19 @@ fn finish_read(
             stale,
         } = record;
         let (wire, stored) = match record {
-            Some(read_record::Record::Superseded(superseded)) => (
-                RecordWire {
-                    token: cursor,
-                    record: Base64::default(),
-                    error: None,
-                    stale: None,
-                    superseded: Some(Supersession {
-                        producer_id: superseded.producer_id,
-                        previous_attempt: superseded.previous_attempt,
-                        attempt: superseded.attempt,
-                    }),
-                },
-                None,
-            ),
+            Some(read_record::Record::Superseded(superseded)) => {
+                (superseded_wire(cursor, &superseded), None)
+            }
             Some(read_record::Record::Stored(stored)) => {
                 let wire = record_wire(cursor, &stored, decoded.remove(&index), stale, limits);
                 (wire, Some(stored))
             }
             None => continue,
         };
-        let wire_size = crossing_size(wire.record.0.len());
-        let only_supersessions = wires.iter().all(|wire| wire.superseded.is_some());
-        if !only_supersessions && size + wire_size > limits.answer {
+        if !budget.admits(json_size(&wire), stored.is_some()) {
             cut = true;
             break;
         }
-        size += wire_size;
         wires.push(wire);
         kept.extend(stored);
     }
@@ -590,7 +709,32 @@ fn finish_read(
     })
 }
 
-/// One stored record as it crosses, with its body decoded, or the reason it can't cross.
+fn superseded_wire(token: String, superseded: &crate::proto::Supersession) -> RecordWire {
+    RecordWire {
+        token,
+        record: Base64::default(),
+        error: None,
+        stale: None,
+        superseded: Some(Supersession {
+            producer_id: superseded.producer_id.clone(),
+            previous_attempt: superseded.previous_attempt,
+            attempt: superseded.attempt,
+        }),
+    }
+}
+
+fn stored_wire(token: String, record: Base64, stale: bool) -> RecordWire {
+    RecordWire {
+        token,
+        record,
+        error: None,
+        stale: stale.then_some(true),
+        superseded: None,
+    }
+}
+
+/// One stored record as it crosses, with its body decoded, or the reason it can't cross. An
+/// error keeps the `stale` mark, so a reader can skip a stale record it can't decode.
 fn record_wire(
     token: String,
     stored: &StreamRecord,
@@ -599,11 +743,8 @@ fn record_wire(
     limits: Limits,
 ) -> RecordWire {
     let error = |message: String| RecordWire {
-        token: token.clone(),
-        record: Base64::default(),
-        error: Some(message),
-        stale: None,
-        superseded: None,
+        error: Some(failure::capped(&message)),
+        ..stored_wire(token.clone(), Base64::default(), stale)
     };
     let mut crossing = stored.clone();
     match decoded {
@@ -623,13 +764,7 @@ fn record_wire(
             limits.record
         ));
     }
-    RecordWire {
-        token: token.clone(),
-        record: Base64(bytes),
-        error: None,
-        stale: stale.then_some(true),
-        superseded: None,
-    }
+    stored_wire(token, Base64(bytes), stale)
 }
 
 /// How a read's failure crosses. A record the store's reader can't parse ends no read: it
@@ -638,11 +773,8 @@ fn read_failure(error: StreamError, state: Vec<u8>) -> NexusStep {
     match (error.kind, error.cursor.clone()) {
         (crate::proto::StreamFailureKind::Record, Some(cursor)) => output(&ReadOutput {
             records: vec![RecordWire {
-                token: cursor.clone(),
-                record: Base64::default(),
-                error: Some(error.message),
-                stale: None,
-                superseded: None,
+                error: Some(failure::capped(&error.message)),
+                ..stored_wire(cursor.clone(), Base64::default(), false)
             }],
             next_token: cursor,
             done: false,
@@ -658,13 +790,15 @@ fn address(namespace: &str, stream: &StreamRef) -> Result<StreamAddress, Box<Nex
     if stream.kind != "workflow" {
         return Err(Box::new(failure::of_stream(&StreamError::unsupported(
             format!(
-                "this release opens streams of Workflows only, not of kind {:?}",
-                stream.kind
+                "this release opens streams of Workflows only, not of kind {}",
+                failure::named(&stream.kind)
             ),
         ))));
     }
     if let Err(reason) = temporalio_common::streams::check_topic(&stream.topic) {
-        return Err(Box::new(failure::input_mistake(reason)));
+        return Err(Box::new(failure::input_mistake(failure::without_values(
+            &reason,
+        ))));
     }
     if stream.workflow_id.is_empty() {
         return Err(Box::new(failure::input_mistake(
@@ -692,13 +826,33 @@ fn shortened(wait: Duration, deadline: Option<SystemTime>) -> Duration {
     wait.min(left)
 }
 
-fn purge(pending: &mut HashMap<u64, Pending>) {
-    let now = Instant::now();
-    pending.retain(|_, pending| pending.expires > now);
+/// Drops the calls that waited too long for lang's codec, also while no other call comes in, so
+/// their plaintext doesn't outlive the wait.
+async fn sweep(waiting: Weak<Mutex<Waiting>>) {
+    loop {
+        let next = {
+            let Some(waiting) = waiting.upgrade() else {
+                return;
+            };
+            let mut waiting = waiting.lock().unwrap();
+            waiting.purge();
+            match waiting.calls.values().map(|pending| pending.expires).min() {
+                Some(next) => next,
+                None => {
+                    waiting.sweeping = false;
+                    return;
+                }
+            }
+        };
+        tokio::time::sleep_until(next).await;
+    }
 }
 
 fn input_error(operation: &str, error: serde_json::Error) -> String {
-    format!("the {operation} input doesn't match the contract: {error}")
+    format!(
+        "the {operation} input doesn't match the contract: {}",
+        failure::without_values(&error.to_string())
+    )
 }
 
 fn output(value: &impl serde::Serialize) -> NexusStep {
