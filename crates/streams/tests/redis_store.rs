@@ -687,7 +687,7 @@ async fn retention_must_be_positive() {
 
 #[tokio::test]
 async fn appends_trim_to_retention_and_slide_the_expiry() {
-    let Some(mut setup) = retained_for(Duration::from_millis(500)).await else {
+    let Some(mut setup) = retained_for(Duration::from_millis(200)).await else {
         return;
     };
     let chain = chain();
@@ -699,11 +699,11 @@ async fn appends_trim_to_retention_and_slide_the_expiry() {
     let log = log_key(&setup.prefix, &chain, "events");
     let meta = format!("{log}:meta");
     let ttl: i64 = setup.raw.pttl(&log).await.unwrap();
-    assert!(0 < ttl && ttl <= 500, "{ttl}");
+    assert!(0 < ttl && ttl <= 200, "{ttl}");
     // The meta outlives the log by the tombstone grace.
     let ttl: i64 = setup.raw.pttl(&meta).await.unwrap();
     assert!(ttl > GRACE_MS - 60_000, "{ttl}");
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     let landed = setup
         .store
         .append(append(&chain, "p", 3, 1, b"\x02"))
@@ -727,7 +727,7 @@ async fn appends_trim_to_retention_and_slide_the_expiry() {
 async fn rule_18_1_a_session_older_than_the_retention_leaves_the_meta() {
     // One field per session would otherwise grow the meta for as long as the topic is written,
     // long after the records it guards are gone.
-    let Some(mut setup) = retained_for(Duration::from_millis(300)).await else {
+    let Some(mut setup) = retained_for(Duration::from_millis(200)).await else {
         return;
     };
     let chain = chain();
@@ -736,7 +736,7 @@ async fn rule_18_1_a_session_older_than_the_retention_leaves_the_meta() {
         .append(append(&chain, "old", 1, 1, b"\x01"))
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
     setup
         .store
         .append(append(&chain, "new", 1, 1, b"\x02"))
