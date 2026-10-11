@@ -29,7 +29,16 @@ use tokio::time::Instant;
 /// The longest a producer writes without asking whether its owner's chain ended.
 pub const OWNER_RECHECK: Duration = Duration::from_secs(60);
 
-const MAX_TOPIC_BYTES: usize = 256;
+/// Whether a repair takes a stage History couldn't decide lately as still undecided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Recent {
+    Trust,
+    /// The owner ended or the stream closed, so History may hold the answer now.
+    Ask,
+}
+
+/// How long a stage History couldn't decide is taken as still undecided without asking again.
+const UNDECIDED_FOR: Duration = Duration::from_secs(5);
 
 /// How the stream layer behaves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +140,9 @@ pub struct Streams {
     options: StreamsOptions,
     producers: Remembered<ProducerKey>,
     chains: Remembered<OwnerKey>,
+    /// Stages History couldn't decide lately, by token. Each new read would otherwise walk the
+    /// staging run's History back to the floor again.
+    undecided: Remembered<String>,
 }
 
 impl std::fmt::Debug for Streams {
@@ -153,6 +165,7 @@ impl Streams {
             store,
             owner,
             producers: Remembered::new(options.remembered),
+            undecided: Remembered::new(options.remembered),
             chains: Remembered::new(options.remembered),
             options,
         }
@@ -257,7 +270,7 @@ impl Streams {
             stream_hash: self.hash(stream),
         };
         if starting {
-            self.repair(&target.chain).await;
+            self.repair(&target.chain, Recent::Trust).await;
         }
         let wait = request
             .wait
@@ -266,6 +279,9 @@ impl Streams {
         let deadline = Instant::now() + wait;
         let minimum = self.options.owner_check_min;
         let mut page_request = request.clone();
+        // Set once the read found a stage of the chain still pending after the end, so it waits
+        // for the promotion rather than reading as fast as it can.
+        let mut awaiting_stage = false;
         let response = loop {
             let now = unix_ms();
             if state.check_interval_ms == 0 {
@@ -274,9 +290,12 @@ impl Streams {
             }
             let until_check = Duration::from_millis(state.next_check_ms.saturating_sub(now));
             let remaining = deadline.saturating_duration_since(Instant::now());
-            page_request.wait = (!state.owner_ended)
-                .then(|| remaining.min(until_check).try_into().ok())
-                .flatten();
+            let wait = match (state.owner_ended, awaiting_stage) {
+                (false, _) => remaining.min(until_check),
+                (true, false) => Duration::ZERO,
+                (true, true) => remaining.min(minimum),
+            };
+            page_request.wait = wait.try_into().ok();
             let (mut page, closed) =
                 read_with(&*self.store, &target, &page_request, &mut state).await?;
             page_request.after = page.cursor.clone();
@@ -285,10 +304,28 @@ impl Streams {
                 state.next_check_ms = unix_ms() + state.check_interval_ms;
                 break page;
             }
-            if state.owner_ended || closed {
+            if closed && !state.owner_ended {
+                // One more pass after learning of the close, as after learning the owner ended,
+                // with output a Worker committed but never promoted.
                 state.owner_ended = true;
-                page.done = true;
-                break page;
+                self.repair(&target.chain, Recent::Ask).await;
+                continue;
+            }
+            if state.owner_ended {
+                // A close doesn't prove the chain's output is visible, since a promotion still
+                // lands after it. The read ends once nothing of the chain is pending.
+                if awaiting_stage {
+                    self.repair(&target.chain, Recent::Trust).await;
+                }
+                if self.store.pending_stages(&target.chain).await?.is_empty() {
+                    page.done = true;
+                    break page;
+                }
+                awaiting_stage = true;
+                if Instant::now() >= deadline {
+                    break page;
+                }
+                continue;
             }
             if unix_ms() >= state.next_check_ms {
                 state.owner_ended = self.owner_ended(stream, &target.chain).await?;
@@ -299,7 +336,7 @@ impl Streams {
                 // between the read and the describe is delivered, and so is output a Worker
                 // committed but never promoted.
                 if state.owner_ended {
-                    self.repair(&target.chain).await;
+                    self.repair(&target.chain, Recent::Ask).await;
                     continue;
                 }
             }
@@ -315,8 +352,8 @@ impl Streams {
 
     /// Settles the stages a Worker left behind on `chain`, as History decides them. Best effort:
     /// a stage History has not decided stays for the next reader, and a failure only logs.
-    async fn repair(&self, chain: &ChainId) {
-        if let Err(error) = self.try_repair(chain).await {
+    async fn repair(&self, chain: &ChainId, recent: Recent) {
+        if let Err(error) = self.try_repair(chain, recent).await {
             tracing::warn!(
                 workflow_id = %chain.workflow_id,
                 "Could not settle the pending stream stages of the Workflow: {error}"
@@ -324,7 +361,7 @@ impl Streams {
         }
     }
 
-    async fn try_repair(&self, chain: &ChainId) -> StreamResult<()> {
+    async fn try_repair(&self, chain: &ChainId, recent: Recent) -> StreamResult<()> {
         let mut pending = self.store.pending_stages(chain).await?;
         let mut started: HashMap<String, Option<SystemTime>> = HashMap::new();
         for stage in &pending {
@@ -362,6 +399,14 @@ impl Streams {
                 );
                 continue;
             }
+            if recent == Recent::Trust
+                && self
+                    .undecided
+                    .get(&stage.token)
+                    .is_some_and(|checked| checked.at.elapsed() < UNDECIDED_FOR)
+            {
+                return Ok(());
+            }
             let events = match self
                 .owner
                 .history_after(
@@ -382,21 +427,37 @@ impl Streams {
                 topics: stage.topics,
             };
             // A reader never holds an attempt in flight, so the same-floor rule always holds.
-            match decide_token(&events, &stage.token, stage.history_floor_event_id, true) {
-                Decision::Promote => {
-                    let promoted = self.store.promote(&reference).await?;
-                    if promoted.outcome == PromoteOutcome::Lost as i32 {
-                        tracing::warn!(
-                            token = %stage.token,
-                            workflow_id = %chain.workflow_id,
-                            "Stream output the Workflow committed was dropped by retention \
-                             before it was promoted"
-                        );
+            let settled =
+                match decide_token(&events, &stage.token, stage.history_floor_event_id, true) {
+                    Decision::Promote => self.store.promote(&reference).await.map(|promoted| {
+                        if promoted.outcome == PromoteOutcome::Lost as i32 {
+                            tracing::warn!(
+                                token = %stage.token,
+                                workflow_id = %chain.workflow_id,
+                                "Stream output the Workflow committed was dropped by retention \
+                                 before it was promoted"
+                            );
+                        }
+                    }),
+                    Decision::Abort => self.store.abort(&reference).await,
+                    // A stage History has not decided holds back the ones after it.
+                    Decision::Unknown => {
+                        self.undecided.put(stage.token.clone(), "", UNDECIDED_FOR);
+                        return Ok(());
                     }
+                };
+            match settled {
+                Ok(()) => {}
+                // A stage the store refuses for good would hold back every later stage on every
+                // read, so it is left to its expiry and the repair goes on.
+                Err(error) if error.kind == crate::proto::StreamFailureKind::Refused => {
+                    tracing::warn!(
+                        token = %stage.token,
+                        workflow_id = %chain.workflow_id,
+                        "Leaving a stream stage the store refuses to settle: {error}"
+                    )
                 }
-                Decision::Abort => self.store.abort(&reference).await?,
-                // A stage History has not decided holds back the ones after it.
-                Decision::Unknown => return Ok(()),
+                Err(error) => return Err(error),
             }
         }
         Ok(())
@@ -603,24 +664,9 @@ fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
     Ok(stream)
 }
 
-/// Refuses a topic no store keys reliably. A control character could be a separator a store
-/// uses, such as the one between a stage's topics.
+/// Refuses a topic no store keys reliably, by the rules Core's Workflow path also applies.
 fn check_topic(topic: &str) -> StreamResult<()> {
-    if topic.is_empty() {
-        return Err(StreamError::refused("a stream needs a topic"));
-    }
-    if topic.len() > MAX_TOPIC_BYTES {
-        return Err(StreamError::refused(format!(
-            "a topic is at most {MAX_TOPIC_BYTES} UTF-8 bytes, not {}",
-            topic.len()
-        )));
-    }
-    if topic.chars().any(char::is_control) {
-        return Err(StreamError::refused(format!(
-            "topic {topic:?} holds a control character"
-        )));
-    }
-    Ok(())
+    temporalio_common::streams::check_topic(topic).map_err(StreamError::refused)
 }
 
 fn unix_ms() -> u64 {
@@ -718,6 +764,7 @@ mod tests {
         failing_runs: Mutex<Vec<String>>,
         described_runs: Mutex<Vec<String>>,
         describes: AtomicUsize,
+        history_reads: AtomicUsize,
     }
 
     impl Owners {
@@ -800,6 +847,7 @@ mod tests {
             run_id: &str,
             floor: i64,
         ) -> Result<Vec<HistoryEvent>, OwnerError> {
+            self.history_reads.fetch_add(1, Ordering::Relaxed);
             let histories = self.histories.lock().unwrap();
             let events = histories
                 .get(run_id)
@@ -986,7 +1034,11 @@ mod tests {
         for (request, expected) in cases {
             assert_eq!(kind(setup.streams.append(request).await), expected);
         }
-        for topic in ["", "a\u{1f}b", &"t".repeat(MAX_TOPIC_BYTES + 1)] {
+        for topic in [
+            "",
+            "a\u{1f}b",
+            &"t".repeat(temporalio_common::streams::MAX_TOPIC_BYTES + 1),
+        ] {
             let request = AppendRequest {
                 stream: Some(stream(topic)),
                 ..append("p", 1, "1")
@@ -1850,5 +1902,128 @@ mod tests {
             );
         }
         assert_eq!(setup.owners.describes(), 0);
+    }
+
+    /// A memory store that refuses for good to promote one stage.
+    struct Refusing {
+        inner: MemoryStore,
+        token: String,
+    }
+
+    #[async_trait::async_trait]
+    impl StreamStore for Refusing {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        async fn append(
+            &self,
+            r: crate::proto::StoreAppendRequest,
+        ) -> StreamResult<crate::proto::StoreAppendResponse> {
+            self.inner.append(r).await
+        }
+        async fn read(
+            &self,
+            r: crate::proto::StoreReadRequest,
+        ) -> StreamResult<crate::proto::StoreReadResponse> {
+            self.inner.read(r).await
+        }
+        async fn latest(
+            &self,
+            r: crate::proto::StoreLatestRequest,
+        ) -> StreamResult<crate::proto::StoreLatestResponse> {
+            self.inner.latest(r).await
+        }
+        async fn record_at(&self, c: &ChainId, t: &str, p: &str) -> StreamResult<Option<Vec<u8>>> {
+            self.inner.record_at(c, t, p).await
+        }
+        async fn stage(&self, b: StagedBatch) -> StreamResult<()> {
+            self.inner.stage(b).await
+        }
+        async fn promote(&self, s: &StageRef) -> StreamResult<crate::proto::PromoteResult> {
+            if s.token == self.token {
+                return Err(StreamError::refused(
+                    "the stage names a topic the store can't key",
+                ));
+            }
+            self.inner.promote(s).await
+        }
+        async fn abort(&self, s: &StageRef) -> StreamResult<()> {
+            self.inner.abort(s).await
+        }
+        async fn close_chain(&self, c: &ChainId) -> StreamResult<()> {
+            self.inner.close_chain(c).await
+        }
+        async fn close_topic(
+            &self,
+            c: &ChainId,
+            t: &str,
+            result: Option<crate::proto::Payload>,
+        ) -> StreamResult<()> {
+            self.inner.close_topic(c, t, result).await
+        }
+        async fn pending_stages(
+            &self,
+            c: &ChainId,
+        ) -> StreamResult<Vec<crate::proto::PendingStage>> {
+            self.inner.pending_stages(c).await
+        }
+        async fn delete_owner(
+            &self,
+            r: crate::proto::DeleteOwnerRequest,
+        ) -> StreamResult<crate::proto::DeleteOwnerResponse> {
+            self.inner.delete_owner(r).await
+        }
+    }
+
+    #[tokio::test]
+    async fn rule_12_2_repair_goes_past_a_stage_the_store_refuses_for_good() {
+        let store = Arc::new(Refusing {
+            inner: MemoryStore::new(),
+            token: "bad".to_string(),
+        });
+        let owners = Arc::new(Owners::default());
+        owners.run("wf", "run-1", "run-1");
+        let streams = Streams::new(store.clone(), owners.clone(), quick());
+        left_behind(&store.inner, "run-1", "bad", 3, "0").await;
+        left_behind(&store.inner, "run-1", "t1", 6, "1").await;
+        history(
+            &owners,
+            "run-1",
+            vec![marker(5, "bad", 3), marker(8, "t1", 6)],
+        );
+        let page = streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(values(&page), ["1"]);
+        let left: Vec<_> = store
+            .inner
+            .pending_stages(&chain("run-1"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|stage| stage.token)
+            .collect();
+        assert_eq!(left, ["bad"]);
+    }
+
+    #[tokio::test]
+    async fn rule_12_3_an_undecided_stage_is_not_read_again_by_every_new_reader() {
+        // A long Local Activity holds the task open, so History can't decide the stage yet.
+        let setup = setup(quick());
+        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
+        history(
+            &setup.owners,
+            "run-1",
+            vec![event(4, EventType::WorkflowTaskStarted)],
+        );
+        for _ in 0..3 {
+            setup
+                .streams
+                .read(read_after("", &[], Duration::ZERO))
+                .await
+                .unwrap();
+        }
+        assert_eq!(setup.owners.history_reads.load(Ordering::Relaxed), 1);
     }
 }

@@ -14,6 +14,11 @@ use std::{sync::Arc, time::Duration};
 
 /// How long a store keeps records when its configuration doesn't say.
 const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// The most records one read answers with, as the stream service contract allows.
+const MAX_READ_RECORDS: u32 = 1000;
+/// The longest one read waits, as the stream service contract allows. A longer wait would hold a
+/// store connection that other reads need.
+const MAX_READ_WAIT: Duration = Duration::from_secs(60);
 
 /// One process's stream store and the calls lang makes on it.
 ///
@@ -108,7 +113,7 @@ impl StreamService {
                 .map(|r| r.encode_to_vec()),
             "Read" => self
                 .streams
-                .read(decode::<ReadRequest>(rpc, request)?)
+                .read(capped(decode::<ReadRequest>(rpc, request)?))
                 .await
                 .map(|r| r.encode_to_vec()),
             "Latest" => self
@@ -140,6 +145,19 @@ impl StreamService {
         };
         response.map_err(StreamFailure::from)
     }
+}
+
+/// `request` with its record count and wait cut to what Core allows.
+fn capped(mut request: ReadRequest) -> ReadRequest {
+    request.max_records = request.max_records.min(MAX_READ_RECORDS);
+    let too_long = request
+        .wait
+        .and_then(|wait| Duration::try_from(wait).ok())
+        .is_some_and(|wait| wait > MAX_READ_WAIT);
+    if too_long {
+        request.wait = MAX_READ_WAIT.try_into().ok();
+    }
+    request
 }
 
 fn decode<T: Message + Default>(rpc: &str, request: &[u8]) -> Result<T, StreamFailure> {
@@ -334,6 +352,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(latest.cursor, appended.last_cursor);
+    }
+
+    fn read(request: ReadRequest) -> Vec<u8> {
+        ReadRequest {
+            stream: Some(address()),
+            ..request
+        }
+        .encode_to_vec()
+    }
+
+    #[tokio::test]
+    async fn a_read_answers_at_most_a_thousand_records() {
+        let service = service().await;
+        let values: Vec<String> = (0..1001).map(|i| format!("v{i}")).collect();
+        let values: Vec<&str> = values.iter().map(String::as_str).collect();
+        service.call("Append", &append(1, &values)).await.unwrap();
+        let answer = service
+            .call(
+                "Read",
+                &read(ReadRequest {
+                    max_records: 1_000_000,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let read = ReadResponse::decode(answer.as_slice()).unwrap();
+        assert_eq!(read.records.len(), 1000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_read_waits_at_most_a_minute() {
+        let service = service().await;
+        let started = tokio::time::Instant::now();
+        service
+            .call(
+                "Read",
+                &read(ReadRequest {
+                    after: "$end".to_string(),
+                    wait: Some(Duration::from_secs(3600).try_into().unwrap()),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert!(
+            started.elapsed() <= Duration::from_secs(61),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

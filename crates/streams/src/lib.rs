@@ -34,7 +34,7 @@ pub use notify::{
     StreamNotification, progress_counter,
 };
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};
-pub use reader::{DEFAULT_MAX_RECORDS, ReadTarget, read_page};
+pub use reader::{DEFAULT_MAX_RECORDS, MAX_TRACKED_PRODUCERS, ReadTarget, read_page};
 pub use record::{
     WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, stored_append_record,
     stored_output_record,

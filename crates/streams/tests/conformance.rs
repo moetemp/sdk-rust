@@ -15,9 +15,10 @@ use std::{
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
-    BEGINNING, END, MemoryStore, Notifier, NotifierClient, NotifyError, NotifyingStore, ReadTarget,
-    StreamNotification, StreamResult, StreamStore, mint_cursor, proto::*, read_page,
-    stored_append_record, stored_output_record, stream_hash,
+    BEGINNING, END, MemoryStore, Notifier, NotifierClient, NotifyError, NotifyingStore,
+    OwnerClient, OwnerDescription, OwnerError, ReadTarget, StreamNotification, StreamResult,
+    StreamStore, Streams, StreamsOptions, mint_cursor, proto::*, read_page, stored_append_record,
+    stored_output_record, stream_hash,
 };
 
 #[async_trait::async_trait]
@@ -29,6 +30,10 @@ trait Case: Send + Sync {
 
     /// Drops all but the newest `keep` records of a topic, as retention does.
     async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize);
+
+    /// Lets a quiet topic's records expire whole, as a log does after a retention with no
+    /// write. What the store knows about the topic stays.
+    async fn expire_log(&self, chain: &ChainId, topic: &str);
 }
 
 static CHAINS: AtomicUsize = AtomicUsize::new(0);
@@ -59,6 +64,10 @@ impl Case for Memory {
 
     async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize) {
         self.0.truncate(chain, topic, keep);
+    }
+
+    async fn expire_log(&self, chain: &ChainId, topic: &str) {
+        self.0.truncate(chain, topic, 0);
     }
 }
 
@@ -106,6 +115,10 @@ impl<C: Case> Case for Notifying<C> {
 
     async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize) {
         self.inner.drop_oldest(chain, topic, keep).await;
+    }
+
+    async fn expire_log(&self, chain: &ChainId, topic: &str) {
+        self.inner.expire_log(chain, topic).await;
     }
 }
 
@@ -201,7 +214,7 @@ mod on_redis {
     /// A Redis user with exactly the documented rules, for one prefix and namespace. The page's
     /// key pattern and password are swapped for the test's own, and nothing else changes.
     pub(crate) struct DocumentedUser {
-        admin_url: String,
+        admin_urls: Vec<String>,
         name: String,
         pub(crate) url: String,
     }
@@ -234,11 +247,15 @@ mod on_redis {
             for rule in extra {
                 setuser.arg(*rule);
             }
-            let mut admin = Raw::connect(url, false).await;
-            let _: () = admin.query(&setuser).await;
+            // An ACL user lives on one node, so a cluster needs it on every node.
+            let admins = nodes(url).await;
+            for admin in &admins {
+                let mut admin = Raw::connect(admin, false).await;
+                let _: () = admin.query(&setuser).await;
+            }
             let address = url.trim_start_matches("redis://");
             Self {
-                admin_url: url.to_string(),
+                admin_urls: admins,
                 url: format!("redis://{name}:{password}@{address}"),
                 name,
             }
@@ -247,29 +264,51 @@ mod on_redis {
 
     impl Drop for DocumentedUser {
         fn drop(&mut self) {
-            if let Ok(mut admin) = redis::Client::open(self.admin_url.as_str())
-                .and_then(|client| client.get_connection())
-            {
-                let _: redis::RedisResult<()> = redis::cmd("ACL")
-                    .arg("DELUSER")
-                    .arg(&self.name)
-                    .query(&mut admin);
+            for url in &self.admin_urls {
+                if let Ok(mut admin) =
+                    redis::Client::open(url.as_str()).and_then(|client| client.get_connection())
+                {
+                    let _: redis::RedisResult<()> = redis::cmd("ACL")
+                        .arg("DELUSER")
+                        .arg(&self.name)
+                        .query(&mut admin);
+                }
             }
         }
     }
 
-    pub(crate) async fn redis_as_documented_user(extra: &[&str]) -> Option<Redis> {
-        let Ok(url) = std::env::var("STREAMS_REDIS_URL") else {
-            eprintln!("set STREAMS_REDIS_URL to run the Redis store cases");
+    /// Every node of the server at `url`: the server itself, or each node of a cluster.
+    async fn nodes(url: &str) -> Vec<String> {
+        let mut admin = Raw::connect(url, false).await;
+        let info: String = admin.query(redis::cmd("INFO").arg("cluster")).await;
+        if !info.contains("cluster_enabled:1") {
+            return vec![url.to_string()];
+        }
+        let nodes: String = admin.query(redis::cmd("CLUSTER").arg("NODES")).await;
+        nodes
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .map(|address| format!("redis://{}/0", address.split('@').next().unwrap()))
+            .collect()
+    }
+
+    pub(crate) async fn redis_as_documented_user(
+        variable: &str,
+        cluster: bool,
+        extra: &[&str],
+    ) -> Option<Redis> {
+        let Ok(url) = std::env::var(variable) else {
+            eprintln!("set {variable} to run the Redis store cases");
             return None;
         };
         let prefix = unique("conformance-acl");
         let user = DocumentedUser::create(&url, &prefix, "default", extra).await;
         let mut options = RedisStoreOptions::new(user.url.clone());
         options.key_prefix = prefix.clone();
+        options.cluster = cluster;
         Some(Redis {
             store: Arc::new(RedisStore::connect(options).await.unwrap()),
-            raw: Raw::connect(&url, false).await,
+            raw: Raw::connect(&url, cluster).await,
             prefix,
             _user: Some(user),
         })
@@ -321,6 +360,14 @@ mod on_redis {
                 .query(redis::cmd("XTRIM").arg(&log).arg("MAXLEN").arg(keep))
                 .await;
             raw.hset(&format!("{log}:meta"), "trimmed", &entries[doomed - 1].0)
+                .await;
+        }
+
+        async fn expire_log(&self, chain: &ChainId, topic: &str) {
+            // The log key expires and its meta stays, as the tombstone.
+            let mut raw = self.raw.clone();
+            let _: i64 = raw
+                .query(redis::cmd("DEL").arg(log_key(&self.prefix, chain, topic)))
                 .await;
         }
     }
@@ -541,6 +588,114 @@ fn stage_ref(chain: &ChainId, token: &str, topics: &[&str]) -> StageRef {
         chain: Some(chain.clone()),
         token: token.to_string(),
         topics: topics.iter().map(|topic| topic.to_string()).collect(),
+    }
+}
+
+use temporalio_common::protos::temporal::api::{
+    enums::v1::WorkflowExecutionStatus, history::v1::HistoryEvent,
+};
+
+/// Temporal for one chain whose Workflow is still running, for cases that go through [Streams],
+/// with the History its first run holds.
+struct RunningChain(ChainId, std::sync::Mutex<Vec<HistoryEvent>>);
+
+#[async_trait::async_trait]
+impl OwnerClient for RunningChain {
+    async fn describe(
+        &self,
+        _namespace: &str,
+        _workflow_id: &str,
+        _run_id: &str,
+    ) -> Result<OwnerDescription, OwnerError> {
+        Ok(OwnerDescription {
+            run_id: self.0.first_run_id.clone(),
+            first_run_id: self.0.first_run_id.clone(),
+            status: WorkflowExecutionStatus::Running,
+            start_time: None,
+        })
+    }
+
+    async fn history_after(
+        &self,
+        _namespace: &str,
+        _workflow_id: &str,
+        _run_id: &str,
+        floor: i64,
+    ) -> Result<Vec<HistoryEvent>, OwnerError> {
+        Ok(self
+            .1
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.event_id > floor)
+            .cloned()
+            .collect())
+    }
+}
+
+fn streams_over(case: &dyn Case, chain: &ChainId) -> (Streams, Arc<RunningChain>) {
+    let owner = Arc::new(RunningChain(chain.clone(), Default::default()));
+    let streams = Streams::new(
+        case.store(),
+        owner.clone(),
+        StreamsOptions {
+            owner_check_min: Duration::from_millis(20),
+            owner_check_max: Duration::from_millis(80),
+            ..StreamsOptions::default()
+        },
+    );
+    (streams, owner)
+}
+
+fn stream_read(chain: &ChainId, after: &str, state: &[u8], wait: Duration) -> ReadRequest {
+    ReadRequest {
+        stream: Some(StreamAddress {
+            namespace: chain.namespace.clone(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: chain.workflow_id.clone(),
+            run_id: String::new(),
+            topic: OUT.to_string(),
+        }),
+        after: after.to_string(),
+        state: state.to_vec(),
+        wait: Some(wait.try_into().unwrap()),
+        ..Default::default()
+    }
+}
+
+/// The marker a Workflow Task writes when it commits the stage `token` made at `floor`.
+fn marker(event_id: i64, token: &str, floor: i64) -> HistoryEvent {
+    use temporalio_common::protos::{
+        constants::EXTERNAL_STREAM_MARKER_NAME,
+        coresdk::external_data::{
+            ExternalOutputStreamManifest, ExternalStreamMarkerData,
+            build_external_stream_marker_details,
+        },
+        temporal::api::{
+            enums::v1::EventType,
+            history::v1::{MarkerRecordedEventAttributes, history_event::Attributes},
+        },
+    };
+    let data = ExternalStreamMarkerData {
+        schema_version: 1,
+        output: Some(ExternalOutputStreamManifest {
+            stage_token: token.to_string(),
+            history_floor_event_id: floor,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    HistoryEvent {
+        event_id,
+        event_type: EventType::MarkerRecorded as i32,
+        attributes: Some(Attributes::MarkerRecordedEventAttributes(
+            MarkerRecordedEventAttributes {
+                marker_name: EXTERNAL_STREAM_MARKER_NAME.to_string(),
+                details: build_external_stream_marker_details(&data),
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
     }
 }
 
@@ -768,6 +923,34 @@ mod cases {
             values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
             ["2"]
         );
+    }
+
+    pub(crate) async fn rule_11_2_an_empty_read_goes_on_when_a_quiet_log_comes_back(
+        case: &dyn Case,
+    ) {
+        // A log that expired comes back with its next write, and nothing the read could have
+        // seen was lost.
+        let chain = case.chain();
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        case.expire_log(&chain, OUT).await;
+        let first = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert!(first.records.is_empty());
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer.sequence = 2;
+        producer.append(&["2"]).await;
+        let next = read_with(
+            case,
+            &chain,
+            OUT,
+            &first.cursor,
+            Duration::ZERO,
+            &first.state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values(&next), ["2"]);
     }
 
     pub(crate) async fn an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on(
@@ -1068,6 +1251,28 @@ mod cases {
         assert_eq!(read.records.len(), 1);
     }
 
+    pub(crate) async fn a_refused_append_leaves_no_trace_of_its_topic(case: &dyn Case) {
+        // Every store must answer a resume on a topic that never held a record the same way.
+        let chain = case.chain();
+        let landed = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        case.store().close_chain(&chain).await.unwrap();
+        assert_eq!(
+            kind(
+                Producer::new(case, &chain, OTHER, "p", 1)
+                    .send(&[data("2")])
+                    .await
+            ),
+            StreamFailureKind::Closed
+        );
+        let after = cursor(case, &chain, OTHER, &landed.last_position);
+        assert_eq!(
+            kind(read(case, &chain, OTHER, &after).await),
+            StreamFailureKind::NotFound
+        );
+    }
+
     pub(crate) async fn a_closed_topic_leaves_the_others_open(case: &dyn Case) {
         let chain = case.chain();
         case.store().close_topic(&chain, OUT, None).await.unwrap();
@@ -1184,6 +1389,81 @@ mod cases {
         );
     }
 
+    pub(crate) async fn rule_11_1_a_read_ends_only_after_the_chains_last_stage_lands(
+        case: &dyn Case,
+    ) {
+        // A close doesn't prove the chain's output is visible. A stage can still be pending.
+        let store = case.store();
+        let chain = case.chain();
+        store
+            .stage(staged(&chain, &chain.first_run_id, "t1", &[(OUT, "last")]))
+            .await
+            .unwrap();
+        store.close_chain(&chain).await.unwrap();
+        let (streams, _) = streams_over(case, &chain);
+        let first = streams
+            .read(stream_read(
+                &chain,
+                BEGINNING,
+                &[],
+                Duration::from_millis(200),
+            ))
+            .await
+            .unwrap();
+        assert!(first.records.is_empty());
+        assert!(!first.done, "a read ended with a stage still pending");
+        store
+            .promote(&stage_ref(&chain, "t1", &[OUT]))
+            .await
+            .unwrap();
+        let mut request = stream_read(&chain, &first.cursor, &first.state, Duration::from_secs(5));
+        let mut delivered = Vec::new();
+        for _ in 0..10 {
+            let page = streams.read(request.clone()).await.unwrap();
+            delivered.extend(values(&page));
+            if page.done {
+                assert_eq!(delivered, ["last"]);
+                return;
+            }
+            request = stream_read(&chain, &page.cursor, &page.state, Duration::from_secs(5));
+        }
+        panic!("the read never ended, and delivered {delivered:?}");
+    }
+
+    pub(crate) async fn rule_12_1_a_read_that_ends_on_a_close_repairs_the_chain(case: &dyn Case) {
+        // A Worker that stopped after the final commit leaves its stage pending, and only the
+        // read that sees the close is there to promote it.
+        let store = case.store();
+        let chain = case.chain();
+        let (streams, owner) = streams_over(case, &chain);
+        let first = streams
+            .read(stream_read(&chain, BEGINNING, &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert!(first.records.is_empty() && !first.done);
+        store
+            .stage(staged(&chain, &chain.first_run_id, "t1", &[(OUT, "last")]))
+            .await
+            .unwrap();
+        owner.1.lock().unwrap().push(marker(5, "t1", 3));
+        store.close_chain(&chain).await.unwrap();
+        let mut request = stream_read(&chain, &first.cursor, &first.state, Duration::from_secs(5));
+        let mut delivered = Vec::new();
+        for _ in 0..5 {
+            let page = tokio::time::timeout(Duration::from_secs(10), streams.read(request.clone()))
+                .await
+                .expect("the read waited for a stage nothing would promote")
+                .unwrap();
+            delivered.extend(values(&page));
+            if page.done {
+                assert_eq!(delivered, ["last"]);
+                return;
+            }
+            request = stream_read(&chain, &page.cursor, &page.state, Duration::from_secs(5));
+        }
+        panic!("the read never ended, and delivered {delivered:?}");
+    }
+
     pub(crate) async fn an_aborted_stage_never_lands(case: &dyn Case) {
         let store = case.store();
         let chain = case.chain();
@@ -1212,6 +1492,8 @@ mod cases {
             .await
             .unwrap_err();
         assert!(error.message.contains(OTHER), "{error}");
+        // A retry names the same topics, so the store refuses it for good.
+        assert_eq!(error.kind, StreamFailureKind::Refused);
         assert_eq!(latest(case, &chain, OUT).await, "");
         assert_eq!(store.pending_stages(&chain).await.unwrap().len(), 1);
     }
@@ -1343,6 +1625,8 @@ macro_rules! store_cases {
             a_reader_that_falls_behind_retention_is_told,
             an_empty_read_from_the_beginning_learns_of_a_trim,
             an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on,
+            rule_11_2_an_empty_read_goes_on_when_a_quiet_log_comes_back,
+            a_refused_append_leaves_no_trace_of_its_topic,
             a_retried_append_returns_the_original_positions,
             a_retry_with_other_ciphertext_still_deduplicates,
             a_divergent_retry_is_refused,
@@ -1362,6 +1646,8 @@ macro_rules! store_cases {
             a_stage_is_invisible_until_promoted,
             a_repeated_stage_holds_its_records_once,
             an_aborted_stage_never_lands,
+            rule_11_1_a_read_ends_only_after_the_chains_last_stage_lands,
+            rule_12_1_a_read_that_ends_on_a_close_repairs_the_chain,
             a_promotion_naming_too_few_topics_writes_nothing,
             a_promotion_lands_on_a_closed_chain,
             rule_19_3_a_reset_run_writes_on_and_keeps_the_chain_open,
@@ -1408,9 +1694,30 @@ mod notifying_redis {
 
 #[cfg(feature = "redis")]
 mod documented_acl_redis {
-    store_cases!(super::on_redis::redis_as_documented_user(&[]));
+    store_cases!(super::on_redis::redis_as_documented_user(
+        "STREAMS_REDIS_URL",
+        false,
+        &[]
+    ));
     // The page names the one rule a delete needs beyond the others.
-    conformance!(super::on_redis::redis_as_documented_user(&["+scan"]);
+    conformance!(super::on_redis::redis_as_documented_user("STREAMS_REDIS_URL", false, &["+scan"]);
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
+#[cfg(feature = "redis")]
+mod documented_acl_cluster_redis {
+    // A cluster client asks the topology first, so the documented rules must allow it.
+    store_cases!(super::on_redis::redis_as_documented_user(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true,
+        &[]
+    ));
+    conformance!(super::on_redis::redis_as_documented_user(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true,
+        &["+scan"]
+    );
         deleting_an_owner_drops_every_chain_of_it,
     );
 }

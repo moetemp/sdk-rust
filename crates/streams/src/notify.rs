@@ -592,10 +592,6 @@ impl StreamStore for NotifyingStore {
         self.inner.record_at(chain, topic, position).await
     }
 
-    async fn trimmed(&self, chain: &ChainId, topic: &str) -> StreamResult<Option<String>> {
-        self.inner.trimmed(chain, topic).await
-    }
-
     async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {
         self.inner.stage(batch).await
     }
