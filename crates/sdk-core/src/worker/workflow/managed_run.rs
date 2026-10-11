@@ -951,6 +951,8 @@ impl ManagedRun {
             records: commit.records,
             closes: commit.closes,
         };
+        // It covers this activation's commands only. With a Local Activity, an earlier activation
+        // of the same task may have produced commands, and nothing reads the field yet.
         let terminal_boundary = if commands.iter().any(|c| c.variant.is_terminal()) {
             ExternalStreamBoundary::WorkflowCompleted
         } else if commands.iter().any(|c| {
