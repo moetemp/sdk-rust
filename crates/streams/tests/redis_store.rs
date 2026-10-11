@@ -1317,8 +1317,8 @@ async fn an_admin_deletes_one_workflows_stream_keys() {
         ..chain.clone()
     };
     let bystander = self::chain();
-    // A log, its meta, a stage, the pending list and a close flag on one chain, and a log on the
-    // next chain of the same Workflow id.
+    // A log, its meta, a stage, the pending list, a close flag and the topic set on one chain,
+    // and a log, its meta and the topic set on the next chain of the same Workflow id.
     setup
         .store
         .append(append(&chain, "p", 1, 1, b"\x01"))
@@ -1342,13 +1342,13 @@ async fn an_admin_deletes_one_workflows_stream_keys() {
         .query_async(&mut setup.raw)
         .await
         .unwrap();
-    assert_eq!(before.len(), 7, "{before:?}");
+    assert_eq!(before.len(), 9, "{before:?}");
     let deleted = setup
         .store
         .delete_owner(delete_request(&chain.workflow_id))
         .await
         .unwrap();
-    assert_eq!(deleted.deleted, 7);
+    assert_eq!(deleted.deleted, 9);
     let after: Vec<String> = redis::cmd("KEYS")
         .arg(&pattern)
         .query_async(&mut setup.raw)

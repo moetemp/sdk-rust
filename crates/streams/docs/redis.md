@@ -28,12 +28,14 @@ percent-encoded. A Redis ACL user for one namespace's applications, with the rul
 conformance suite runs as:
 
 ```text
-ACL SETUSER streams-app on >secret resetkeys ~temporal-streams:{my-ns:* resetchannels -@all +evalsha +eval +script|load +multi +exec +xadd +xread +xrevrange +xrange +xtrim +xlen +hget +hset +hgetall +hincrby +hdel +hscan +rpush +lrange +exists +del +unlink +pexpire +pttl +time +info +config|get +ping +hello +client|setinfo
+ACL SETUSER streams-app on >secret resetkeys ~temporal-streams:{my-ns:* resetchannels -@all +evalsha +eval +script|load +multi +exec +xadd +xread +xrevrange +xrange +xtrim +xlen +hget +hset +hgetall +hincrby +hdel +hscan +sadd +smembers +rpush +lrange +exists +del +unlink +pexpire +pttl +time +info +config|get +ping +hello +client|setinfo
 ```
 
-Deleting an owner's streams also needs `+scan`, and so does ending a run chain when stream
-notifications are on, since the store lists the chain's open topics to close their notifiers. A
-chain end scans each primary's keyspace once. `+config|get` only reads
+Deleting an owner's streams also needs `+scan`. `+sadd` and `+smembers` keep and read each
+chain's topic set, which lists the chain's topics when it ends, so stream notifications can close
+every topic's notifier without a scan. Topics written only by an SDK release from before the store
+moved into Core aren't in the set, so a chain end doesn't close those notifiers. That gap covers
+only streams written before the upgrade. `+config|get` only reads
 `maxmemory-policy`, and the store goes on when a server refuses it.
 
 **Tests.** The Redis tests run when `STREAMS_REDIS_URL` names a standalone server and

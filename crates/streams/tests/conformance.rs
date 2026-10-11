@@ -1086,30 +1086,38 @@ mod cases {
             .stage(staged(&chain, "run-1", "t1", &[("staged", "1")]))
             .await
             .unwrap();
+        store
+            .stage(staged(&chain, "run-1", "t2", &[("aborted", "1")]))
+            .await
+            .unwrap();
+        store
+            .abort(&stage_ref(&chain, "t2", &["aborted"]))
+            .await
+            .unwrap();
         assert_eq!(
             open(chain.clone()).await,
-            [odd, OUT],
-            "a staged topic isn't listed before its promotion"
+            [odd, "aborted", OUT, "staged"],
+            "a staged topic is known once staged, and an abort doesn't forget it"
         );
         store
             .promote(&stage_ref(&chain, "t1", &["staged"]))
             .await
             .unwrap();
         store.close_topic(&chain, OUT, None).await.unwrap();
-        assert_eq!(open(chain.clone()).await, [odd, "staged"]);
+        assert_eq!(open(chain.clone()).await, [odd, "aborted", "staged"]);
         let other = case.chain();
         Producer::new(case, &other, OTHER, "p", 1)
             .append(&["1"])
             .await;
         assert_eq!(
             open(chain.clone()).await,
-            [odd, "staged"],
+            [odd, "aborted", "staged"],
             "chains are apart"
         );
         store.close_chain(&chain).await.unwrap();
         assert_eq!(
             open(chain).await,
-            [odd, "staged"],
+            [odd, "aborted", "staged"],
             "a chain close leaves its topics to be listed"
         );
     }
@@ -1414,6 +1422,9 @@ macro_rules! redis_cases {
             a_promotion_naming_too_few_topics_writes_nothing,
             a_promotion_lands_on_a_closed_chain,
             rule_19_3_a_reset_run_writes_on_and_keeps_the_chain_open,
+            // Also run by the documented ACL user, which has no `+scan`, so a chain end never
+            // scans the keyspace.
+            a_chain_lists_its_open_topics,
         );
     };
 }
@@ -1423,7 +1434,6 @@ mod standalone_redis {
     redis_cases!(super::on_redis::redis("STREAMS_REDIS_URL", false));
     conformance!(super::on_redis::redis("STREAMS_REDIS_URL", false);
         deleting_an_owner_drops_every_chain_of_it,
-        a_chain_lists_its_open_topics,
     );
 }
 
@@ -1433,7 +1443,6 @@ mod cluster_redis {
     // A Workflow id's chains hash to different slots, so the delete reaches every primary.
     conformance!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true);
         deleting_an_owner_drops_every_chain_of_it,
-        a_chain_lists_its_open_topics,
     );
 }
 
@@ -1443,6 +1452,5 @@ mod documented_acl_redis {
     // The page names the one rule a delete needs beyond the others.
     conformance!(super::on_redis::redis_as_documented_user(&["+scan"]);
         deleting_an_owner_drops_every_chain_of_it,
-        a_chain_lists_its_open_topics,
     );
 }

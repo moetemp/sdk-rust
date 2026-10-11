@@ -27,8 +27,9 @@ pub(crate) fn stream_error(error: &RedisError, call: Call) -> StreamError {
             }
         };
     }
-    let detail = error.detail().unwrap_or_default().to_string();
-    match error.code() {
+    let (code, detail) = server_reply(error).unzip();
+    let detail = detail.unwrap_or_default();
+    match code.as_deref() {
         Some("STREAMS_DIVERGENT") => StreamError::new(StreamFailureKind::ProducerDivergent, detail),
         Some("STREAMS_STALE") => StreamError::new(StreamFailureKind::ProducerStale, detail),
         Some("STREAMS_CLOSED") => StreamError::closed(detail),
@@ -39,6 +40,23 @@ pub(crate) fn stream_error(error: &RedisError, call: Call) -> StreamError {
         Some(code) => StreamError::storage(format!("Redis refused the read: {code} {detail}")),
         None => StreamError::storage(format!("Redis failed: {error}")),
     }
+}
+
+/// The code and detail of the reply the server refused with. A pipeline reports its failed
+/// commands together, and the first one names the refusal.
+fn server_reply(error: &RedisError) -> Option<(String, String)> {
+    if let Some(code) = error.code() {
+        return Some((
+            code.to_string(),
+            error.detail().unwrap_or_default().to_string(),
+        ));
+    }
+    let failed = error.clone().into_server_errors()?;
+    let (_, first) = failed.first()?;
+    Some((
+        first.code().to_string(),
+        first.details().unwrap_or_default().to_string(),
+    ))
 }
 
 /// Maps a Redis result for a call.

@@ -72,6 +72,9 @@ impl Topic {
 #[derive(Debug, Default)]
 struct Chain {
     topics: HashMap<String, Topic>,
+    /// Topics a stage named, kept after the stage is aborted, as the Redis store's topic set
+    /// keeps them.
+    staged_topics: std::collections::HashSet<String>,
     closed: bool,
     /// In staging order, which is the order a Worker commits them in.
     stages: Vec<StagedBatch>,
@@ -325,6 +328,9 @@ impl StreamStore for MemoryStore {
         let chain = chains
             .entry(chain_key(chain_of(batch.chain.as_ref())?))
             .or_default();
+        chain
+            .staged_topics
+            .extend(batch.records.iter().map(|record| record.topic.clone()));
         chain.stages.retain(|held| held.token != batch.token);
         chain.stages.push(batch);
         Ok(())
@@ -422,12 +428,16 @@ impl StreamStore for MemoryStore {
         Ok(chains
             .get(&chain_key(chain))
             .map(|chain| {
-                chain
+                let mut open: Vec<String> = chain
                     .topics
-                    .iter()
-                    .filter(|(_, topic)| !topic.closed)
-                    .map(|(name, _)| name.clone())
-                    .collect()
+                    .keys()
+                    .chain(&chain.staged_topics)
+                    .filter(|name| !chain.topics.get(*name).is_some_and(|topic| topic.closed))
+                    .cloned()
+                    .collect();
+                open.sort();
+                open.dedup();
+                open
             })
             .unwrap_or_default())
     }

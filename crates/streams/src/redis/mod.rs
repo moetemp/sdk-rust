@@ -400,10 +400,15 @@ impl StreamStore for RedisStore {
         let keys = self.keys(request.chain.as_ref())?;
         let meta = keys.meta(&request.topic);
         // The script reads one close flag. A closed topic's flag refuses new batches on its own,
-        // so the script reads it in place of the chain's and still answers a repeat.
-        let topic_closed: Option<String> = redis::cmd("HGET")
-            .arg(&meta)
-            .arg(CLOSED_FIELD)
+        // so the script reads it in place of the chain's and still answers a repeat. The topic
+        // joins the chain's topic set in the same round trip, before any record lands, so the set
+        // holds every topic with records.
+        let (topic_closed,): (Option<String>,) = redis::pipe()
+            .hget(&meta, CLOSED_FIELD)
+            .sadd(keys.topics(), &request.topic)
+            .ignore()
+            .pexpire(keys.topics(), (self.retention_ms + self.grace_ms) as i64)
+            .ignore()
             .query_async(&mut self.shared.clone())
             .await
             .mapped(Call::BeforeWrite)?;
@@ -542,7 +547,7 @@ impl StreamStore for RedisStore {
         let floor = batch.history_floor_event_id.to_string();
         let description = [batch.run_id.as_str(), floor.as_str()]
             .into_iter()
-            .chain(topics)
+            .chain(topics.iter().copied())
             .collect::<Vec<_>>()
             .join(&STAGE_SEPARATOR.to_string());
         let mut eval = redis::cmd("EVAL");
@@ -561,11 +566,19 @@ impl StreamStore for RedisStore {
         // The script appends to the stage, so a repeat after a lost answer would hold the records
         // twice. Clearing the stage in the same transaction makes a repeat replace it. `EVAL`
         // and not `EVALSHA`, since a transaction can't load a script the server lost.
-        redis::pipe()
+        let mut transaction = redis::pipe();
+        transaction
             .atomic()
             .del(keys.stage(&batch.token))
             .ignore()
             .add_command(eval)
+            .ignore();
+        // The staged topics join the chain's topic set, so a chain end lists them without a scan.
+        for topic in &topics {
+            transaction.sadd(keys.topics(), *topic).ignore();
+        }
+        transaction
+            .pexpire(keys.topics(), (self.retention_ms + self.grace_ms) as i64)
             .ignore()
             .query_async::<()>(&mut self.shared.clone())
             .await
@@ -672,45 +685,26 @@ impl StreamStore for RedisStore {
     }
 
     async fn open_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
-        // The chain's keys share one hash tag, so on a cluster they all sit on one primary. Each
-        // primary is scanned anyway, since the store doesn't track which one owns the slot. A
-        // scan walks the whole keyspace of a node, so it runs only when a chain ends.
         let keys = ChainKeys::new(&self.prefix, chain);
-        let pattern = keys.meta_pattern();
-        let mut topics = vec![];
-        for node in self.shared.primaries().await.mapped(Call::Read)? {
-            let mut cursor = "0".to_string();
-            loop {
-                let (next, found) = self
-                    .shared
-                    .scan(node.as_ref(), &cursor, &pattern)
-                    .await
-                    .mapped(Call::Read)?;
-                if !found.is_empty() {
-                    let mut flags = redis::pipe();
-                    for key in &found {
-                        flags.hget(key, CLOSED_FIELD);
-                    }
-                    let closed: Vec<Option<String>> = flags
-                        .query_async(&mut self.shared.clone())
-                        .await
-                        .mapped(Call::Read)?;
-                    topics.extend(
-                        found
-                            .iter()
-                            .zip(closed)
-                            .filter(|(_, closed)| closed.is_none())
-                            .filter_map(|(key, _)| keys.topic_of_meta(key)),
-                    );
-                }
-                if next == "0" {
-                    break;
-                }
-                cursor = next;
-            }
+        let mut topics: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(keys.topics())
+            .query_async(&mut self.shared.clone())
+            .await
+            .mapped(Call::Read)?;
+        if topics.is_empty() {
+            return Ok(topics);
         }
+        let mut flags = redis::pipe();
+        for topic in &topics {
+            flags.hget(keys.meta(topic), CLOSED_FIELD);
+        }
+        let closed: Vec<Option<String>> = flags
+            .query_async(&mut self.shared.clone())
+            .await
+            .mapped(Call::Read)?;
+        let mut closed = closed.into_iter();
+        topics.retain(|_| closed.next().flatten().is_none());
         topics.sort();
-        topics.dedup();
         Ok(topics)
     }
 
