@@ -54,7 +54,7 @@ message RedisStoreConfig {
 }
 
 // Streams in this process's memory, for tests and local development. Nothing survives the
-// process.
+// process, and each connect makes a store of its own that shares no streams with another.
 message MemoryStoreConfig {}
 
 // What owns a stream. The owner decides when the stream closes.
