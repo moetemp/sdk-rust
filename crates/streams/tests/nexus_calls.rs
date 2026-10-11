@@ -16,9 +16,12 @@ use std::{
     time::Duration,
 };
 use temporalio_streams::{
-    StreamStore,
+    MAX_TRACKED_PRODUCERS, StreamStore,
     nexus::{MAX_STATE_BYTES, NexusOptions},
-    proto::{ChainId, NexusFailure, StoreAppendRequest, StreamRecord, StreamRecordKind},
+    proto::{
+        ChainId, CodecResult, NexusFailure, NexusResumeRequest, StoreAppendRequest, StreamRecord,
+        StreamRecordKind, codec_result, nexus_step,
+    },
 };
 
 static IDS: AtomicUsize = AtomicUsize::new(0);
@@ -482,6 +485,324 @@ mod cases {
             );
         }
     }
+
+    pub(crate) async fn a_state_above_its_budget_is_refused_before_it_decodes(
+        store: Arc<dyn StreamStore>,
+    ) {
+        // A state crosses as caller input, so a forged or buggy one must not stall Core.
+        let calls = service(store, NexusOptions::default());
+        let wf = workflow();
+        write(&calls, &wf, "p", 1, 1, &["one"]).await;
+        let first = read(&calls, read_input(&wf, "", &Value::Null))
+            .await
+            .unwrap();
+        let after = first["next_token"].as_str().unwrap();
+        let real = decode_state(&first["state"]);
+        let too_many = forged_state(&real, MAX_TRACKED_PRODUCERS + 1, 4);
+        let too_large = forged_state(&real, 600, 120);
+        let huge = forged_state(&real, 60_000, 6);
+        assert!(huge.as_str().unwrap().len() > 1_300_000);
+        for (name, state) in [
+            ("too many producers", too_many),
+            ("too many bytes", too_large),
+            ("1.3 MB", huge),
+        ] {
+            let started = tokio::time::Instant::now();
+            let failure = read(&calls, read_input(&wf, after, &state))
+                .await
+                .expect_err(name);
+            assert_eq!(
+                kind_of(&failure),
+                ("BAD_REQUEST", false, "StreamCursorError"),
+                "{name}"
+            );
+            assert!(started.elapsed() < Duration::from_secs(2), "{name}");
+        }
+    }
+
+    pub(crate) async fn a_cut_read_asks_the_codec_only_for_what_fits(store: Arc<dyn StreamStore>) {
+        // Each record crosses at about 267 KB, so the default 1 MiB budget fits three.
+        let calls = service(store, NexusOptions::default());
+        let wf = workflow();
+        let big = "x".repeat(200_000);
+        for sequence in 1..=10 {
+            write(&calls, &wf, "p", 1, sequence, &[&big]).await;
+        }
+        let (mut after, mut state) = (String::new(), Value::Null);
+        let mut read_count = 0;
+        while read_count < 10 {
+            let step = calls.read(call(read_input(&wf, &after, &state))).await;
+            let asked = match &step.step {
+                Some(nexus_step::Step::Codec(work)) => work.payloads.len(),
+                _ => panic!("no codec step"),
+            };
+            let answer = drive(&calls, step, Codec::Sealing).await.unwrap();
+            let kept = answer["records"].as_array().unwrap().len();
+            assert_eq!(asked, kept, "the codec decoded records the answer left out");
+            assert_eq!(kept, 3.min(10 - read_count));
+            read_count += kept;
+            after = answer["next_token"].as_str().unwrap().to_string();
+            state = answer["state"].clone();
+        }
+    }
+
+    pub(crate) async fn an_error_wire_counts_in_the_answer_budget(store: Arc<dyn StreamStore>) {
+        // A codec error with much detail, on every record of a long page, must not grow the
+        // answer past the server's blob limit.
+        let calls = service(store.clone(), NexusOptions::default());
+        let wf = workflow();
+        for _ in 0..20 {
+            raw_entry(&store, &wf, unsealed("raw", 1).encode_to_vec()).await;
+        }
+        let detail = "d".repeat(2_000);
+        let mut input = read_input(&wf, "", &Value::Null);
+        input["max_records"] = json!(1000);
+        let step = calls
+            .read(call_with(input, 2_000, 0, Duration::from_secs(60)))
+            .await;
+        let answer = drive_answering(&calls, step, |_| {
+            codec_result::Result::Error(detail.clone())
+        })
+        .await
+        .unwrap();
+        let records = answer["records"].as_array().unwrap();
+        assert!(
+            !records.is_empty() && records.len() < 20,
+            "{}",
+            records.len()
+        );
+        for wire in records {
+            assert!(wire["error"].as_str().unwrap().len() <= 512);
+        }
+        let size = serde_json::to_vec(&answer).unwrap().len();
+        assert!(size <= 2_000, "{size}");
+    }
+
+    pub(crate) async fn an_error_wire_can_end_a_cut_answer(store: Arc<dyn StreamStore>) {
+        let calls = service(store.clone(), NexusOptions::default());
+        let wf = workflow();
+        write(&calls, &wf, "a", 1, 1, &["a1"]).await;
+        raw_entry(&store, &wf, unsealed("b", 1).encode_to_vec()).await;
+        write(&calls, &wf, "a", 2, 1, &[&"x".repeat(4000)]).await;
+        let first = drive(
+            &calls,
+            calls
+                .read(call_with(
+                    read_input(&wf, "", &Value::Null),
+                    2000,
+                    0,
+                    Duration::from_secs(60),
+                ))
+                .await,
+            Codec::Sealing,
+        )
+        .await
+        .unwrap();
+        let seen = values(&first);
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0], "a@1 a1");
+        assert!(seen[1].starts_with("ERROR "), "{seen:?}");
+        assert_eq!(first["next_token"], first["records"][1]["token"]);
+        assert_eq!(first["done"], false);
+        let next = read(
+            &calls,
+            read_input(&wf, first["next_token"].as_str().unwrap(), &first["state"]),
+        )
+        .await
+        .unwrap();
+        let seen = values(&next);
+        assert_eq!(seen[0], "SUPERSEDED a 1->2");
+        assert!(seen[1].starts_with("a@2 xxx"), "{seen:?}");
+    }
+
+    pub(crate) async fn a_stale_record_the_codec_refuses_keeps_its_mark(
+        store: Arc<dyn StreamStore>,
+    ) {
+        // The reader skips a stale record it can't decode rather than failing on it.
+        let calls = service(store.clone(), NexusOptions::default());
+        let wf = workflow();
+        write(&calls, &wf, "chat", 1, 1, &["a"]).await;
+        write(&calls, &wf, "chat", 2, 1, &["a2"]).await;
+        raw_entry(&store, &wf, unsealed("chat", 1).encode_to_vec()).await;
+        let answer = read(&calls, read_input(&wf, "", &Value::Null))
+            .await
+            .unwrap();
+        let wire = &answer["records"][3];
+        assert!(wire["error"].is_string(), "{wire}");
+        assert_eq!(wire["stale"], true, "{wire}");
+    }
+
+    pub(crate) async fn a_first_read_that_meets_an_unparsable_record_carries_its_chain(
+        store: Arc<dyn StreamStore>,
+    ) {
+        let calls = service(store.clone(), NexusOptions::default());
+        let wf = workflow();
+        raw_entry(&store, &wf, b"\xff not a record".to_vec()).await;
+        let first = read(&calls, read_input(&wf, "", &Value::Null))
+            .await
+            .unwrap();
+        assert!(first["records"][0]["error"].is_string());
+        assert!(first["state"].is_string(), "{first}");
+        write(&calls, &wf, "p", 1, 1, &["after"]).await;
+        let next = read(
+            &calls,
+            read_input(&wf, first["next_token"].as_str().unwrap(), &first["state"]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(values(&next), ["p@1 after"]);
+    }
+
+    pub(crate) async fn a_wrong_codec_result_count_is_not_retried(store: Arc<dyn StreamStore>) {
+        // A lang codec loop that drops a result fails the same way each time.
+        let calls = service(store, NexusOptions::default());
+        let wf = workflow();
+        write(&calls, &wf, "p", 1, 1, &["one"]).await;
+        let appending = calls
+            .append(call(json!({
+                "stream": stream(&wf, TOPIC),
+                "producer_id": "p",
+                "attempt": 1,
+                "sequence": 2,
+                "payloads": [body("two")],
+            })))
+            .await;
+        let reading = calls.read(call(read_input(&wf, "", &Value::Null))).await;
+        for step in [appending, reading] {
+            let Some(nexus_step::Step::Codec(work)) = step.step else {
+                panic!("no codec step");
+            };
+            let answer = calls
+                .resume(NexusResumeRequest {
+                    continuation: work.continuation,
+                    results: Vec::new(),
+                })
+                .await;
+            let Some(nexus_step::Step::Failure(failure)) = answer.step else {
+                panic!("a short codec answer went on");
+            };
+            assert_eq!(kind_of(&failure), ("INTERNAL", false, "PayloadCodecError"));
+        }
+    }
+
+    pub(crate) async fn an_input_mistake_leaves_the_input_value_out(store: Arc<dyn StreamStore>) {
+        // The failure message lands in the caller's History without the codec.
+        let calls = service(store, NexusOptions::default());
+        let wf = workflow();
+        let secret = "card 4111 1111 1111 1111";
+        let mut wrong_kind = stream(&wf, TOPIC);
+        wrong_kind["kind"] = json!(secret);
+        let mut control = stream(&wf, &format!("{secret}\u{7}"));
+        control["kind"] = json!("workflow");
+        for input in [
+            json!({"stream": stream(&wf, TOPIC), "producer_id": "p", "attempt": 1,
+                   "sequence": 1, "payloads": [secret]}),
+            json!({"stream": stream(&wf, TOPIC), "producer_id": "p", "attempt": 1,
+                   "sequence": 1, "payloads": secret}),
+            json!({"stream": wrong_kind, "producer_id": "p", "attempt": 1, "sequence": 1,
+                   "payloads": [body("one")]}),
+            json!({"stream": control, "producer_id": "p", "attempt": 1, "sequence": 1,
+                   "payloads": [body("one")]}),
+        ] {
+            let failure = append(&calls, input).await.unwrap_err();
+            assert!(!failure.message.contains("4111"), "{}", failure.message);
+            let cause = failure.failure.unwrap().cause.unwrap();
+            assert!(!cause.message.contains("4111"), "{}", cause.message);
+        }
+    }
+
+    pub(crate) async fn a_deadline_past_any_clock_reads_without_one(store: Arc<dyn StreamStore>) {
+        let calls = service(store, NexusOptions::default());
+        let wf = workflow();
+        write(&calls, &wf, "p", 1, 1, &["one"]).await;
+        let mut far = call(read_input(&wf, "", &Value::Null));
+        far.deadline = Some(prost_types::Timestamp {
+            seconds: i64::MAX,
+            nanos: 999_999_999,
+        });
+        let answer = drive(&calls, calls.read(far).await, Codec::Sealing)
+            .await
+            .unwrap();
+        assert_eq!(values(&answer), ["p@1 one"]);
+    }
+}
+
+/// A stored record by `producer` whose body the handler's codec can't decode, written past it.
+fn unsealed(producer: &str, attempt: i64) -> StreamRecord {
+    temporalio_streams::stored_append_record(
+        TOPIC,
+        producer,
+        attempt,
+        IDS.fetch_add(1, Ordering::Relaxed) as i64 + 1,
+        &temporalio_streams::proto::AppendRecord {
+            kind: StreamRecordKind::Data as i32,
+            body: Some(Default::default()),
+            content_hash: vec![1; 32],
+        },
+    )
+    .unwrap()
+}
+
+/// Runs `step` through lang's side with `codec` answering each body.
+async fn drive_answering(
+    calls: &temporalio_streams::nexus::NexusCalls,
+    step: temporalio_streams::proto::NexusStep,
+    codec: impl Fn(
+        temporalio_common::protos::temporal::api::common::v1::Payload,
+    ) -> codec_result::Result,
+) -> Result<Value, NexusFailure> {
+    let mut step = step;
+    loop {
+        match step.step.expect("a step") {
+            nexus_step::Step::Output(output) => return Ok(serde_json::from_slice(&output).unwrap()),
+            nexus_step::Step::Failure(failure) => return Err(failure),
+            nexus_step::Step::Codec(work) => {
+                let results = work
+                    .payloads
+                    .into_iter()
+                    .map(|payload| CodecResult {
+                        result: Some(codec(payload)),
+                    })
+                    .collect();
+                step = calls
+                    .resume(NexusResumeRequest {
+                        continuation: work.continuation,
+                        results,
+                    })
+                    .await;
+            }
+        }
+    }
+}
+
+fn decode_state(state: &Value) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(state.as_str().unwrap())
+        .unwrap()
+}
+
+/// The fields of a read state that grow with its producers, as its proto declares them.
+#[derive(Clone, PartialEq, prost::Message)]
+struct Producers {
+    #[prost(map = "string, int64", tag = "1")]
+    attempts: std::collections::HashMap<String, i64>,
+    #[prost(map = "string, uint64", tag = "9")]
+    last_seen: std::collections::HashMap<String, u64>,
+}
+
+/// `real` with `count` more producers of `id_bytes`-byte ids, as a caller could forge it.
+fn forged_state(real: &[u8], count: usize, id_bytes: usize) -> Value {
+    use base64::Engine;
+    let mut producers = Producers::default();
+    for index in 0..count {
+        let id = format!("{index:0id_bytes$}");
+        producers.attempts.insert(id.clone(), 1);
+        producers.last_seen.insert(id, index as u64 + 1);
+    }
+    let mut forged = real.to_vec();
+    forged.extend(producers.encode_to_vec());
+    Value::String(base64::engine::general_purpose::STANDARD.encode(forged))
 }
 
 macro_rules! lanes {
@@ -514,6 +835,15 @@ macro_rules! all_cases {
             a_supersession_seen_across_two_calls_crosses_once,
             a_stale_record_crosses_marked,
             the_state_stays_within_its_budget,
+            a_state_above_its_budget_is_refused_before_it_decodes,
+            a_cut_read_asks_the_codec_only_for_what_fits,
+            an_error_wire_counts_in_the_answer_budget,
+            an_error_wire_can_end_a_cut_answer,
+            a_stale_record_the_codec_refuses_keeps_its_mark,
+            a_first_read_that_meets_an_unparsable_record_carries_its_chain,
+            a_wrong_codec_result_count_is_not_retried,
+            an_input_mistake_leaves_the_input_value_out,
+            a_deadline_past_any_clock_reads_without_one,
         );
     };
 }
@@ -640,4 +970,61 @@ async fn the_store_holds_only_bodies_the_codec_sealed() {
     };
     let body: &StreamRecord = stored;
     assert!(body.body.as_ref().unwrap().data.starts_with(SEALED));
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_call_that_waits_too_long_for_the_codec_is_dropped_on_a_quiet_process() {
+    // Plaintext lives in Core during a call only, also when no later call comes in.
+    let calls = service(memory(), NexusOptions::default());
+    let wf = workflow();
+    let step = calls
+        .append(call(json!({
+            "stream": stream(&wf, TOPIC),
+            "producer_id": "p",
+            "attempt": 1,
+            "sequence": 1,
+            "payloads": [body("secret")],
+        })))
+        .await;
+    assert!(matches!(step.step, Some(nexus_step::Step::Codec(_))));
+    assert_eq!(calls.waiting_calls(), 1);
+    tokio::time::advance(Duration::from_secs(61)).await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(calls.waiting_calls(), 0);
+}
+
+#[tokio::test]
+async fn bytes_waiting_for_the_codec_are_bounded() {
+    let calls = service(
+        memory(),
+        NexusOptions {
+            max_continuation_bytes: 1_000,
+            ..NexusOptions::default()
+        },
+    );
+    let wf = workflow();
+    let input = |sequence: i64| {
+        call(json!({
+            "stream": stream(&wf, TOPIC),
+            "producer_id": "p",
+            "attempt": 1,
+            "sequence": sequence,
+            "payloads": [body(&"x".repeat(600))],
+        }))
+    };
+    // One call goes on alone whatever its size, so no call is refused for good.
+    let waiting = calls.append(input(1)).await;
+    let refused = drive(&calls, calls.append(input(2)).await, Codec::Sealing)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        kind_of(&refused),
+        ("UNAVAILABLE", true, "StreamStorageError")
+    );
+    drive(&calls, waiting, Codec::Sealing).await.unwrap();
+    drive(&calls, calls.append(input(2)).await, Codec::Sealing)
+        .await
+        .unwrap();
 }
