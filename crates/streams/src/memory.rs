@@ -205,9 +205,9 @@ impl StreamStore for MemoryStore {
             .entry(chain_key(chain_of(request.chain.as_ref())?))
             .or_default();
         let chain_closed = chain.closed;
-        let topic = chain.topics.entry(request.topic.clone()).or_default();
         let session = (request.producer_id.clone(), request.attempt);
-        if let Some(held) = topic.held.get(&session) {
+        let existing = chain.topics.get(&request.topic);
+        if let Some(held) = existing.and_then(|topic| topic.held.get(&session)) {
             if request.sequence == held.sequence {
                 if request.digest != held.digest {
                     return Err(StreamError::new(
@@ -235,11 +235,13 @@ impl StreamStore for MemoryStore {
                 ));
             }
         }
-        if chain_closed || topic.closed {
+        // Checked before the topic exists, so a refused batch leaves no trace of it.
+        if chain_closed || existing.is_some_and(|topic| topic.closed) {
             return Err(StreamError::closed(
                 "the Workflow that owns this stream has closed",
             ));
         }
+        let topic = chain.topics.entry(request.topic.clone()).or_default();
         let count = request.records.len() as i64;
         let mut positions = request.records.into_iter().map(|record| topic.push(record));
         let first = positions.next().unwrap_or_default();
