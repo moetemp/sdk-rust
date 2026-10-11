@@ -90,8 +90,9 @@ message AppendRequest {
   repeated AppendRecord records = 5;
   // The batch's identity, which the store compares when the producer repeats its newest batch.
   // Lang takes it before the codec, as the SHA-256 over each converted record as its length in 8
-  // bytes big-endian, then its deterministic serialization. Every SDK takes it this way, so a
-  // retry through another SDK or release still dedupes. Required.
+  // bytes big-endian, then its deterministic serialization. Deterministic serialization is stable
+  // within one protobuf library only, so only the SDK that made a digest can repeat the batch and
+  // dedupe. Another SDK's retry of the same batch fails as PRODUCER_DIVERGENT. Required.
   bytes digest = 6;
 }
 
@@ -107,9 +108,10 @@ message ReadRequest {
   // Read strictly after this cursor. Empty starts at the oldest record the stream retains, and
   // `$end` at whatever is appended after the read starts.
   string after = 2;
-  // How long to wait for a record when none is there. Zero answers at once.
+  // How long to wait for a record when none is there. Zero answers at once. Core waits at most
+  // 60 seconds, the stream service contract's long-poll maximum.
   google.protobuf.Duration wait = 3;
-  // Zero lets Core choose.
+  // Zero lets Core choose. Core answers with at most 1,000 records.
   uint32 max_records = 4;
   // The `state` of the previous answer of the same read. Empty on its first call.
   bytes state = 5;
