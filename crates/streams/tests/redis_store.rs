@@ -1431,5 +1431,9 @@ async fn the_documented_acl_is_the_python_sdks() {
         std::path::Path::new(&checkout).join("temporalio/contrib/streams/docs/redis-guarantees.md"),
     )
     .unwrap();
-    assert_eq!(rules(include_str!("../docs/redis.md")), rules(&python));
+    // A cluster client asks the topology with `CLUSTER SLOTS`, which the Python SDK's page left
+    // out. It is the one rule Core adds.
+    let mut expected = rules(&python);
+    expected.push("+cluster|slots".to_string());
+    assert_eq!(rules(include_str!("../docs/redis.md")), expected);
 }

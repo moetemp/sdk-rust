@@ -30,10 +30,12 @@ percent-encoded. A Redis ACL user for one namespace's applications, with the rul
 conformance suite runs as:
 
 ```text
-ACL SETUSER streams-app on >secret resetkeys ~temporal-streams:{my-ns:* resetchannels -@all +evalsha +eval +script|load +multi +exec +xadd +xread +xrevrange +xrange +xtrim +xlen +hget +hset +hgetall +hincrby +hdel +hscan +rpush +lrange +exists +del +unlink +pexpire +pttl +time +info +config|get +ping +hello +client|setinfo
+ACL SETUSER streams-app on >secret resetkeys ~temporal-streams:{my-ns:* resetchannels -@all +evalsha +eval +script|load +multi +exec +xadd +xread +xrevrange +xrange +xtrim +xlen +hget +hset +hgetall +hincrby +hdel +hscan +rpush +lrange +exists +del +unlink +pexpire +pttl +time +info +config|get +ping +hello +client|setinfo +cluster|slots
 ```
 
-Deleting an owner's streams also needs `+scan`. `+config|get` only reads
+A cluster client reads the topology with `CLUSTER SLOTS` first. An ACL user lives on one node,
+so on a cluster the user must exist on every node. Deleting an owner's streams also needs
+`+scan`. `+config|get` only reads
 `maxmemory-policy`, and the store goes on when a server refuses it.
 
 **Tests.** The Redis tests run when `STREAMS_REDIS_URL` names a standalone server and

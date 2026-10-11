@@ -166,7 +166,7 @@ mod on_redis {
     /// A Redis user with exactly the documented rules, for one prefix and namespace. The page's
     /// key pattern and password are swapped for the test's own, and nothing else changes.
     pub(crate) struct DocumentedUser {
-        admin_url: String,
+        admin_urls: Vec<String>,
         name: String,
         pub(crate) url: String,
     }
@@ -199,11 +199,15 @@ mod on_redis {
             for rule in extra {
                 setuser.arg(*rule);
             }
-            let mut admin = Raw::connect(url, false).await;
-            let _: () = admin.query(&setuser).await;
+            // An ACL user lives on one node, so a cluster needs it on every node.
+            let admins = nodes(url).await;
+            for admin in &admins {
+                let mut admin = Raw::connect(admin, false).await;
+                let _: () = admin.query(&setuser).await;
+            }
             let address = url.trim_start_matches("redis://");
             Self {
-                admin_url: url.to_string(),
+                admin_urls: admins,
                 url: format!("redis://{name}:{password}@{address}"),
                 name,
             }
@@ -212,29 +216,47 @@ mod on_redis {
 
     impl Drop for DocumentedUser {
         fn drop(&mut self) {
-            if let Ok(mut admin) = redis::Client::open(self.admin_url.as_str())
-                .and_then(|client| client.get_connection())
-            {
-                let _: redis::RedisResult<()> = redis::cmd("ACL")
-                    .arg("DELUSER")
-                    .arg(&self.name)
-                    .query(&mut admin);
+            for url in &self.admin_urls {
+                if let Ok(mut admin) =
+                    redis::Client::open(url.as_str()).and_then(|client| client.get_connection())
+                {
+                    let _: redis::RedisResult<()> = redis::cmd("ACL")
+                        .arg("DELUSER")
+                        .arg(&self.name)
+                        .query(&mut admin);
+                }
             }
         }
     }
 
-    pub(crate) async fn redis_as_documented_user() -> Option<Redis> {
-        let Ok(url) = std::env::var("STREAMS_REDIS_URL") else {
-            eprintln!("set STREAMS_REDIS_URL to run the Redis store cases");
+    /// Every node of the server at `url`: the server itself, or each node of a cluster.
+    async fn nodes(url: &str) -> Vec<String> {
+        let mut admin = Raw::connect(url, false).await;
+        let info: String = admin.query(redis::cmd("INFO").arg("cluster")).await;
+        if !info.contains("cluster_enabled:1") {
+            return vec![url.to_string()];
+        }
+        let nodes: String = admin.query(redis::cmd("CLUSTER").arg("NODES")).await;
+        nodes
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(1))
+            .map(|address| format!("redis://{}/0", address.split('@').next().unwrap()))
+            .collect()
+    }
+
+    pub(crate) async fn redis_as_documented_user(variable: &str, cluster: bool) -> Option<Redis> {
+        let Ok(url) = std::env::var(variable) else {
+            eprintln!("set {variable} to run the Redis store cases");
             return None;
         };
         let prefix = unique("conformance-acl");
         let user = DocumentedUser::create(&url, &prefix, "default", &[]).await;
         let mut options = RedisStoreOptions::new(user.url.clone());
         options.key_prefix = prefix.clone();
+        options.cluster = cluster;
         Some(Redis {
             store: Arc::new(RedisStore::connect(options).await.unwrap()),
-            raw: Raw::connect(&url, false).await,
+            raw: Raw::connect(&url, cluster).await,
             prefix,
             _user: Some(user),
         })
@@ -1640,5 +1662,17 @@ mod cluster_redis {
 
 #[cfg(feature = "redis")]
 mod documented_acl_redis {
-    redis_cases!(super::on_redis::redis_as_documented_user());
+    redis_cases!(super::on_redis::redis_as_documented_user(
+        "STREAMS_REDIS_URL",
+        false
+    ));
+}
+
+#[cfg(feature = "redis")]
+mod documented_acl_cluster_redis {
+    // A cluster client asks the topology first, so the documented rules must allow it.
+    redis_cases!(super::on_redis::redis_as_documented_user(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    ));
 }
