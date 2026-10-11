@@ -27,8 +27,6 @@ use tokio::time::Instant;
 /// The longest a producer writes without asking whether its owner's chain ended.
 pub const OWNER_RECHECK: Duration = Duration::from_secs(60);
 
-const MAX_TOPIC_BYTES: usize = 256;
-
 /// How the stream layer behaves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamsOptions {
@@ -504,24 +502,9 @@ fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
     Ok(stream)
 }
 
-/// Refuses a topic no store keys reliably. A control character could be a separator a store
-/// uses, such as the one between a stage's topics.
+/// Refuses a topic no store keys reliably, by the rules Core's Workflow path also applies.
 fn check_topic(topic: &str) -> StreamResult<()> {
-    if topic.is_empty() {
-        return Err(StreamError::refused("a stream needs a topic"));
-    }
-    if topic.len() > MAX_TOPIC_BYTES {
-        return Err(StreamError::refused(format!(
-            "a topic is at most {MAX_TOPIC_BYTES} UTF-8 bytes, not {}",
-            topic.len()
-        )));
-    }
-    if topic.chars().any(char::is_control) {
-        return Err(StreamError::refused(format!(
-            "topic {topic:?} holds a control character"
-        )));
-    }
-    Ok(())
+    temporalio_common::streams::check_topic(topic).map_err(StreamError::refused)
 }
 
 fn unix_ms() -> u64 {
@@ -846,7 +829,11 @@ mod tests {
         for (request, expected) in cases {
             assert_eq!(kind(setup.streams.append(request).await), expected);
         }
-        for topic in ["", "a\u{1f}b", &"t".repeat(MAX_TOPIC_BYTES + 1)] {
+        for topic in [
+            "",
+            "a\u{1f}b",
+            &"t".repeat(temporalio_common::streams::MAX_TOPIC_BYTES + 1),
+        ] {
             let request = AppendRequest {
                 stream: Some(stream(topic)),
                 ..append("p", 1, "1")
