@@ -291,13 +291,18 @@ impl Streams {
                 break page;
             }
             if closed && !state.owner_ended {
-                // One more pass after learning of the close, as after learning the owner ended.
+                // One more pass after learning of the close, as after learning the owner ended,
+                // with output a Worker committed but never promoted.
                 state.owner_ended = true;
+                self.repair(&target.chain).await;
                 continue;
             }
             if state.owner_ended {
                 // A close doesn't prove the chain's output is visible, since a promotion still
                 // lands after it. The read ends once nothing of the chain is pending.
+                if awaiting_stage {
+                    self.repair(&target.chain).await;
+                }
                 if self.store.pending_stages(&target.chain).await?.is_empty() {
                     page.done = true;
                     break page;

@@ -423,7 +423,7 @@ use temporalio_common::protos::temporal::api::{
 
 /// Temporal for one chain whose Workflow is still running, for cases that go through [Streams],
 /// with the History its first run holds.
-struct RunningChain(ChainId, Vec<HistoryEvent>);
+struct RunningChain(ChainId, std::sync::Mutex<Vec<HistoryEvent>>);
 
 #[async_trait::async_trait]
 impl OwnerClient for RunningChain {
@@ -450,6 +450,8 @@ impl OwnerClient for RunningChain {
     ) -> Result<Vec<HistoryEvent>, OwnerError> {
         Ok(self
             .1
+            .lock()
+            .unwrap()
             .iter()
             .filter(|event| event.event_id > floor)
             .cloned()
@@ -457,16 +459,18 @@ impl OwnerClient for RunningChain {
     }
 }
 
-fn streams_over(case: &dyn Case, chain: &ChainId, history: Vec<HistoryEvent>) -> Streams {
-    Streams::new(
+fn streams_over(case: &dyn Case, chain: &ChainId) -> (Streams, Arc<RunningChain>) {
+    let owner = Arc::new(RunningChain(chain.clone(), Default::default()));
+    let streams = Streams::new(
         case.store(),
-        Arc::new(RunningChain(chain.clone(), history)),
+        owner.clone(),
         StreamsOptions {
             owner_check_min: Duration::from_millis(20),
             owner_check_max: Duration::from_millis(80),
             ..StreamsOptions::default()
         },
-    )
+    );
+    (streams, owner)
 }
 
 fn stream_read(chain: &ChainId, after: &str, state: &[u8], wait: Duration) -> ReadRequest {
@@ -481,6 +485,42 @@ fn stream_read(chain: &ChainId, after: &str, state: &[u8], wait: Duration) -> Re
         after: after.to_string(),
         state: state.to_vec(),
         wait: Some(wait.try_into().unwrap()),
+        ..Default::default()
+    }
+}
+
+/// The marker a Workflow Task writes when it commits the stage `token` made at `floor`.
+fn marker(event_id: i64, token: &str, floor: i64) -> HistoryEvent {
+    use temporalio_common::protos::{
+        constants::EXTERNAL_STREAM_MARKER_NAME,
+        coresdk::external_data::{
+            ExternalOutputStreamManifest, ExternalStreamMarkerData,
+            build_external_stream_marker_details,
+        },
+        temporal::api::{
+            enums::v1::EventType,
+            history::v1::{MarkerRecordedEventAttributes, history_event::Attributes},
+        },
+    };
+    let data = ExternalStreamMarkerData {
+        schema_version: 1,
+        output: Some(ExternalOutputStreamManifest {
+            stage_token: token.to_string(),
+            history_floor_event_id: floor,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    HistoryEvent {
+        event_id,
+        event_type: EventType::MarkerRecorded as i32,
+        attributes: Some(Attributes::MarkerRecordedEventAttributes(
+            MarkerRecordedEventAttributes {
+                marker_name: EXTERNAL_STREAM_MARKER_NAME.to_string(),
+                details: build_external_stream_marker_details(&data),
+                ..Default::default()
+            },
+        )),
         ..Default::default()
     }
 }
@@ -1186,7 +1226,7 @@ mod cases {
             .await
             .unwrap();
         store.close_chain(&chain).await.unwrap();
-        let streams = streams_over(case, &chain, Vec::new());
+        let (streams, _) = streams_over(case, &chain);
         let first = streams
             .read(stream_read(
                 &chain,
@@ -1206,6 +1246,40 @@ mod cases {
         let mut delivered = Vec::new();
         for _ in 0..10 {
             let page = streams.read(request.clone()).await.unwrap();
+            delivered.extend(values(&page));
+            if page.done {
+                assert_eq!(delivered, ["last"]);
+                return;
+            }
+            request = stream_read(&chain, &page.cursor, &page.state, Duration::from_secs(5));
+        }
+        panic!("the read never ended, and delivered {delivered:?}");
+    }
+
+    pub(crate) async fn rule_12_1_a_read_that_ends_on_a_close_repairs_the_chain(case: &dyn Case) {
+        // A Worker that stopped after the final commit leaves its stage pending, and only the
+        // read that sees the close is there to promote it.
+        let store = case.store();
+        let chain = case.chain();
+        let (streams, owner) = streams_over(case, &chain);
+        let first = streams
+            .read(stream_read(&chain, BEGINNING, &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert!(first.records.is_empty() && !first.done);
+        store
+            .stage(staged(&chain, &chain.first_run_id, "t1", &[(OUT, "last")]))
+            .await
+            .unwrap();
+        owner.1.lock().unwrap().push(marker(5, "t1", 3));
+        store.close_chain(&chain).await.unwrap();
+        let mut request = stream_read(&chain, &first.cursor, &first.state, Duration::from_secs(5));
+        let mut delivered = Vec::new();
+        for _ in 0..5 {
+            let page = tokio::time::timeout(Duration::from_secs(10), streams.read(request.clone()))
+                .await
+                .expect("the read waited for a stage nothing would promote")
+                .unwrap();
             delivered.extend(values(&page));
             if page.done {
                 assert_eq!(delivered, ["last"]);
@@ -1395,6 +1469,7 @@ mod memory {
         a_repeated_stage_holds_its_records_once,
         an_aborted_stage_never_lands,
         rule_11_1_a_read_ends_only_after_the_chains_last_stage_lands,
+        rule_12_1_a_read_that_ends_on_a_close_repairs_the_chain,
         a_promotion_naming_too_few_topics_writes_nothing,
         a_promotion_lands_on_a_closed_chain,
         rule_19_3_a_reset_run_writes_on_and_keeps_the_chain_open,
@@ -1443,6 +1518,7 @@ macro_rules! redis_cases {
             a_repeated_stage_holds_its_records_once,
             an_aborted_stage_never_lands,
             rule_11_1_a_read_ends_only_after_the_chains_last_stage_lands,
+            rule_12_1_a_read_that_ends_on_a_close_repairs_the_chain,
             a_promotion_naming_too_few_topics_writes_nothing,
             a_promotion_lands_on_a_closed_chain,
             rule_19_3_a_reset_run_writes_on_and_keeps_the_chain_open,
