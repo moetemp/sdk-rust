@@ -146,12 +146,13 @@ pub(super) fn check_replayed_output_manifest(
         ));
     };
     // Only the logical output must replay the same. A reset run replays markers that name its
-    // base run, a stage token is new on every attempt, and a provider can be renamed or swapped
-    // for a Replayer without changing what the Workflow published.
+    // base run, a stage token is new on every attempt, and a provider can be renamed, swapped for
+    // a Replayer or change its stage layout without changing what the Workflow published.
     for manifest in [&mut replayed, &mut recorded] {
         manifest.stage_token.clear();
         manifest.run_id.clear();
         manifest.provider_id.clear();
+        manifest.provider_format_version = 0;
     }
     if replayed != recorded {
         return Err(WFMachinesError::Nondeterminism(format!(
@@ -393,13 +394,12 @@ mod tests {
     }
 
     #[test]
-    fn a_replayed_commit_in_another_store_format_is_nondeterministic() {
+    fn a_replayed_commit_matches_a_manifest_recorded_under_another_store_format() {
+        // A later Core may lay out stages differently. That is the store's concern, not output
+        // the Workflow published.
         let mut recorded = manifest();
         recorded.provider_format_version = 2;
-        assert!(matches!(
-            check_replayed_output_manifest(manifest(), Some(recorded)),
-            Err(WFMachinesError::Nondeterminism(message)) if message.contains("differs")
-        ));
+        check_replayed_output_manifest(manifest(), Some(recorded)).unwrap();
     }
 
     #[test]
