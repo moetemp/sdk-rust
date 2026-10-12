@@ -101,15 +101,18 @@ async fn attach(
 /// sent before were dropped. It goes through the notifier the appends use, so a failed send is
 /// tried again and a flush waits for it. A notification the retries can't send is lost as an
 /// append's is, and the caller still hears of every record from the next append or the close.
+///
+/// On an empty stream it arms the stream instead, in the same store step that finds it empty,
+/// since a caller that waits only for progress must hear of the first append.
 async fn announce_newest(
     streams: &Streams,
     notifier: &crate::Notifier,
     chain: ChainId,
     topic: &str,
 ) {
-    let position = match streams.newest_position(&chain, topic).await {
-        Ok(position) if !position.is_empty() => position,
-        Ok(_) => return,
+    let position = match streams.store().newest_or_arm(&chain, topic).await {
+        Ok(crate::NewestOrArm::Newest(position)) => position,
+        Ok(crate::NewestOrArm::Armed(_) | crate::NewestOrArm::Unarmed) => return,
         Err(error) => {
             tracing::warn!(
                 workflow_id = %chain.workflow_id,
@@ -618,6 +621,71 @@ mod tests {
         let notified = notified(&setup.notifier, 1).await;
         assert_eq!(notified.len(), 1, "the retry went out: {notified:?}");
         assert_eq!(notified[0].counter, 1);
+    }
+
+    /// Appends one record to the stream through the store, answering the arm it reported.
+    async fn arm_reported(service: &StreamService) -> Option<u64> {
+        service
+            .store()
+            .append(crate::proto::StoreAppendRequest {
+                chain: Some(ChainId {
+                    namespace: "default".to_string(),
+                    workflow_id: "owner-1".to_string(),
+                    first_run_id: "chain-1".to_string(),
+                }),
+                topic: "tokens".to_string(),
+                producer_id: "p".to_string(),
+                attempt: 1,
+                sequence: 1,
+                digest: vec![1],
+                records: vec![b"record".to_vec()],
+            })
+            .await
+            .unwrap()
+            .arm
+    }
+
+    #[tokio::test]
+    async fn an_attach_to_an_empty_stream_arms_it_for_the_first_append() {
+        // A follower waits only for progress, so the first append must notify it.
+        let setup = announcing();
+        attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        assert!(
+            arm_reported(&setup.service)
+                .await
+                .is_some_and(|arm| arm > 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attach_to_a_stream_with_records_announces_without_arming() {
+        let setup = announcing();
+        setup.service.call("Append", &append(&["a"])).await.unwrap();
+        attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        assert_eq!(notified(&setup.notifier, 1).await.len(), 1);
+        let landed = setup
+            .service
+            .store()
+            .append(crate::proto::StoreAppendRequest {
+                chain: Some(ChainId {
+                    namespace: "default".to_string(),
+                    workflow_id: "owner-1".to_string(),
+                    first_run_id: "chain-1".to_string(),
+                }),
+                topic: "tokens".to_string(),
+                producer_id: "other".to_string(),
+                attempt: 1,
+                sequence: 1,
+                digest: vec![1],
+                records: vec![b"record".to_vec()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(landed.arm, Some(0));
     }
 
     #[tokio::test]

@@ -124,7 +124,8 @@ impl StreamService {
     /// records already there. A notification before the first attach starts no notifier on the
     /// server, so without this a caller that only waits for progress hears nothing until the next
     /// append. It goes through `notifier`, the one that sends the appends' notifications, so it
-    /// is retried and flushed as they are. `None` turns it off, as the config's progress setting
+    /// is retried and flushed as they are. On an empty stream the attach arms the stream instead,
+    /// so the first append notifies. `None` turns both off, as the config's progress setting
     /// does.
     pub fn with_attach_progress(mut self, notifier: Option<Arc<Notifier>>) -> Self {
         self.attach_progress = notifier;
