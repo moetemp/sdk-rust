@@ -10935,11 +10935,23 @@ components:
              There are restrictions on the maxium payload size a single callback can carry, as well as the
              total sum of all source context payloads attached to an execution. See dynamic configuration:
              "callback.nexusHandler.sourceContext.maxSize", "callback.nexusHandler.sourceContext.aggregateMaxSize".
+        progressOperation:
+          type: string
+          description: |-
+            Target operation for progress of the source operation, e.g. "OnProgress". Empty means the
+             callback takes the completion only.
       description: |-
         NexusHandler callbacks are requests to invoke a specific shape of Nexus operation on a Temporal worker.
          The specified Nexus operation must have the following:
          - Input:  temporal.api.notificationservice.v1.OnCompleteRequest
          - Output: temporal.api.notificationservice.v1.OnCompleteResponse
+
+         When `progress_operation` is set, the server also invokes that operation of the same service for
+         the source operation's progress. That operation must have the following:
+         - Input:  temporal.api.notificationservice.v1.OnProgressRequest
+         - Output: temporal.api.notificationservice.v1.OnProgressResponse
+         It may be invoked any number of times before, during or after the single completion. It must
+         complete synchronously.
 
          The targeted Nexus service must be registered within the same namespace as the source operation
          the callback is attached to. (While Nexus allows for cross-namespace operations, NexusHandler callbacks

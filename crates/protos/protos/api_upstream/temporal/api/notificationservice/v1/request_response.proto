@@ -32,6 +32,10 @@ message OnCompleteRequest {
 
     // User-supplied data which was added to the source invocation. (As applicable.)
     temporal.api.common.v1.Payload source_context = 3;
+
+    // The `receiver_state` of the last OnProgressResponse that the server accepted for this
+    // callback. Empty when no progress was accepted.
+    bytes receiver_state = 4;
 }
 
 // OnCompleteResponse is the return type of the OnComplete operation.
@@ -48,7 +52,24 @@ message OnProgressRequest {
 
     // User-supplied data which was added to the source invocation. (As applicable.)
     temporal.api.common.v1.Payload source_context = 2;
+
+    // The handler token of the source operation, when the source is a standalone Nexus operation
+    // that has started. Empty otherwise.
+    string operation_token = 3;
+
+    // The `receiver_state` of the last OnProgressResponse that the server accepted for this
+    // callback. Empty when no progress was accepted.
+    bytes receiver_state = 4;
 }
 
 // OnProgressResponse is the return type of the OnProgress operation.
-message OnProgressResponse {}
+message OnProgressResponse {
+    // Opaque state for the handler, such as a read cursor. The server stores it on the callback
+    // and sends it in the next OnProgressRequest and in the OnCompleteRequest. The server refuses
+    // further progress for the callback when the state is larger than its configured limit.
+    bytes receiver_state = 1;
+
+    // Set when the handler did not reach `progress.position`. The server then sends the same
+    // progress again at once, unless newer progress replaced it.
+    bool behind = 2;
+}
