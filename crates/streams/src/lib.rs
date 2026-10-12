@@ -33,7 +33,8 @@ pub use memory::MemoryStore;
 pub use nexus::{OPERATION_TOKEN_VERSION, OperationToken};
 pub use notify::{
     Arm, CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, CallerAttachment, DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT,
-    Notifier, NotifierClient, NotifyError, NotifyingStore, StreamNotification, progress_counter,
+    NOTIFIER_REFRESH, Notifier, NotifierClient, NotifyError, NotifyingStore, StreamNotification,
+    progress_counter,
 };
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};
 pub use reader::{DEFAULT_MAX_RECORDS, MAX_TRACKED_PRODUCERS, ReadTarget, read_page};
