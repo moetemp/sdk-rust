@@ -1282,6 +1282,8 @@ impl ManagedRun {
         let chain = ChainToClose {
             workflow_id: self.wfm.machines.workflow_id.clone(),
             first_run_id: self.wfm.machines.first_execution_run_id.clone(),
+            failure: None,
+            cancel_details: None,
         };
         let has_stream_store = self.stream_store_name().is_some();
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
@@ -1343,7 +1345,7 @@ impl ManagedRun {
             });
             // Any run of the chain, or its Activities, may have published, so every chain end
             // closes.
-            let close = (ends_chain && has_stream_store).then_some(chain);
+            let close = (ends_chain && has_stream_store).then(|| ending(chain, &commands));
             ActivationCompleteOutcome::ReportWFTSuccess(ServerCommandsWithWorkflowInfo {
                 task_token: data.task_token,
                 action: ActivationAction::WftComplete {
@@ -1445,6 +1447,28 @@ impl ManagedRun {
     fn run_id(&self) -> &str {
         &self.wfm.machines.run_id
     }
+}
+
+/// `chain` with the failure or the cancel details the final task ended the Workflow with. Lang has
+/// already encoded both, and the chain's streams close with them.
+fn ending(
+    chain: ChainToClose,
+    commands: &[temporalio_common::protos::temporal::api::command::v1::Command],
+) -> ChainToClose {
+    use temporalio_common::protos::temporal::api::command::v1::command::Attributes;
+    let mut chain = chain;
+    for command in commands {
+        match &command.attributes {
+            Some(Attributes::FailWorkflowExecutionCommandAttributes(failed)) => {
+                chain.failure = failed.failure.clone();
+            }
+            Some(Attributes::CancelWorkflowExecutionCommandAttributes(canceled)) => {
+                chain.cancel_details = canceled.details.clone();
+            }
+            _ => {}
+        }
+    }
+    chain
 }
 
 /// Removes lang's output commit from `commands`, if it sent one.

@@ -29,7 +29,7 @@ use temporalio_common::{
             },
             workflow_activation::{WorkflowActivation, workflow_activation_job},
             workflow_commands::{
-                ActivityCancellationType, CompleteWorkflowExecution,
+                ActivityCancellationType, CancelWorkflowExecution, CompleteWorkflowExecution,
                 ContinueAsNewWorkflowExecution, FailWorkflowExecution, OutputClose, OutputRecord,
                 WorkflowOutputStreamCommit, workflow_command,
             },
@@ -38,11 +38,11 @@ use temporalio_common::{
         temporal::{
             api::{
                 command::v1::{Command, command},
-                common::v1::Payload,
+                common::v1::{Payload, Payloads},
                 enums::v1::{
                     CommandType, EventType, WorkflowExecutionStatus, WorkflowTaskFailedCause,
                 },
-                failure::v1::Failure,
+                failure::v1::{Failure, failure::FailureInfo},
                 workflow::v1::WorkflowExecutionInfo,
                 workflowservice::v1::{
                     DescribeWorkflowExecutionResponse, RespondWorkflowTaskCompletedResponse,
@@ -55,7 +55,7 @@ use temporalio_common::{
     worker::WorkerTaskTypes,
 };
 use temporalio_streams::{
-    StreamError, StreamResult, StreamStore,
+    CloseOutcome, StreamError, StreamResult, StreamStore,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteOutcome,
         PromoteResult, StageRef, StagedBatch, StoreAppendRequest, StoreAppendResponse,
@@ -86,6 +86,8 @@ struct RecordingStore {
     unsupported_chain_closes: Mutex<bool>,
     /// How many promotions to fail for now before taking one.
     promote_failures: Mutex<usize>,
+    /// What each chain end and each topic close carried, in call order.
+    outcomes: Mutex<Vec<(String, CloseOutcome)>>,
 }
 
 impl RecordingStore {
@@ -172,6 +174,23 @@ impl StreamStore for RecordingStore {
     async fn abort(&self, stage: &StageRef) -> StreamResult<()> {
         self.log.lock().push(format!("abort {}", stage.token));
         Ok(())
+    }
+
+    async fn end_chain_with(&self, chain: &ChainId, outcome: CloseOutcome) -> StreamResult<()> {
+        self.outcomes.lock().push(("chain".to_string(), outcome));
+        self.end_chain(chain).await
+    }
+
+    async fn close_topic_with(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        outcome: CloseOutcome,
+    ) -> StreamResult<()> {
+        self.outcomes
+            .lock()
+            .push((topic.to_string(), outcome.clone()));
+        self.close_topic(chain, topic, outcome.result()).await
     }
 
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {
@@ -2213,6 +2232,117 @@ async fn a_final_task_closes_its_chain_after_the_completion_is_accepted() {
     );
 }
 
+/// A chain whose latest run is its first, ended with `STATUS`.
+fn ended<const STATUS: i32>(first_run_id: &str) -> DescribeAnswer {
+    Ok(DescribeWorkflowExecutionResponse {
+        workflow_execution_info: Some(WorkflowExecutionInfo {
+            first_run_id: first_run_id.to_string(),
+            status: STATUS,
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+fn chain_end_of(store: &RecordingStore) -> CloseOutcome {
+    store
+        .outcomes
+        .lock()
+        .iter()
+        .find(|(what, _)| what == "chain")
+        .map(|(_, outcome)| outcome.clone())
+        .expect("the chain end carried no outcome")
+}
+
+fn failure_info(outcome: &CloseOutcome) -> (&str, &Option<FailureInfo>) {
+    match outcome {
+        CloseOutcome::Failure(failure) => (failure.message.as_str(), &failure.failure_info),
+        CloseOutcome::Result(result) => panic!("expected a failure, got the result {result:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_completed_chain_ends_with_an_empty_result() {
+    let store = Arc::new(RecordingStore::default());
+    let completed = ended::<{ WorkflowExecutionStatus::Completed as i32 }>;
+    let (worker, _) = final_task(store.clone(), true, complete(), Some(completed)).await;
+    store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        chain_end_of(&store),
+        CloseOutcome::Result(Payload::default())
+    );
+}
+
+#[tokio::test]
+async fn a_failed_chain_ends_with_the_failure_its_final_task_failed_with() {
+    // A caller of a failed owner saw success, since the chain end closed with an empty result.
+    let store = Arc::new(RecordingStore::default());
+    let failed = ended::<{ WorkflowExecutionStatus::Failed as i32 }>;
+    let fail = FailWorkflowExecution {
+        failure: Some(Failure {
+            message: "the agent gave up".to_string(),
+            ..Default::default()
+        }),
+    };
+    let (worker, _) = final_task(store.clone(), true, fail.into(), Some(failed)).await;
+    store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    let outcome = chain_end_of(&store);
+    assert_eq!(failure_info(&outcome).0, "the agent gave up");
+}
+
+#[tokio::test]
+async fn a_canceled_chain_ends_as_canceled_with_its_details() {
+    let store = Arc::new(RecordingStore::default());
+    let canceled = ended::<{ WorkflowExecutionStatus::Canceled as i32 }>;
+    let cancel = CancelWorkflowExecution {
+        details: Some(Payloads {
+            payloads: vec![Payload {
+                data: b"why".to_vec(),
+                ..Default::default()
+            }],
+        }),
+    };
+    let (worker, _) = final_task(store.clone(), true, cancel.into(), Some(canceled)).await;
+    store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    let outcome = chain_end_of(&store);
+    let (message, info) = failure_info(&outcome);
+    assert_eq!(message, "operation canceled");
+    let Some(FailureInfo::CanceledFailureInfo(canceled)) = info else {
+        panic!("expected canceled info, got {info:?}");
+    };
+    assert_eq!(canceled.details.as_ref().unwrap().payloads[0].data, b"why");
+}
+
+#[tokio::test]
+async fn a_terminated_chain_ends_with_a_terminated_failure() {
+    let store = Arc::new(RecordingStore::default());
+    let terminated = ended::<{ WorkflowExecutionStatus::Terminated as i32 }>;
+    let (worker, _) = final_task(store.clone(), true, complete(), Some(terminated)).await;
+    store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    let outcome = chain_end_of(&store);
+    let (message, info) = failure_info(&outcome);
+    assert_eq!(message, "operation terminated");
+    assert!(matches!(info, Some(FailureInfo::TerminatedFailureInfo(_))));
+}
+
+#[tokio::test]
+async fn a_chain_the_server_no_longer_knows_ends_without_a_close_of_its_own() {
+    // The server's owner check closes such a chain with the same failure.
+    let store = Arc::new(RecordingStore::default());
+    let (worker, _) = final_task(store.clone(), true, complete(), None).await;
+    store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    let outcome = chain_end_of(&store);
+    assert_eq!(
+        failure_info(&outcome).0,
+        "the owner Workflow ended without closing the stream"
+    );
+}
+
 #[tokio::test]
 async fn the_chain_close_is_retried_until_it_lands() {
     let store = Arc::new(RecordingStore::default());
@@ -2369,6 +2499,7 @@ async fn a_close_without_its_finish_fails_the_task() {
         closes: vec![OutputClose {
             topic: TOPIC.to_string(),
             result: Some(Payload::default()),
+            failure: None,
         }],
     };
     worker
@@ -2421,6 +2552,7 @@ async fn a_workflow_close_closes_its_topic_after_the_output_is_promoted() {
                 data: b"done".to_vec(),
                 ..Default::default()
             }),
+            failure: None,
         }],
     };
     worker
@@ -2488,6 +2620,7 @@ async fn final_task_closing_its_topic(store: Arc<RecordingStore>) -> crate::Work
                 data: b"done".to_vec(),
                 ..Default::default()
             }),
+            failure: None,
         }],
     };
     worker
@@ -2552,6 +2685,7 @@ async fn the_chain_closes_after_an_earlier_task_closes_its_topics() {
                 data: b"done".to_vec(),
                 ..Default::default()
             }),
+            failure: None,
         }],
     };
     worker

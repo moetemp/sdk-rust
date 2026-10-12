@@ -84,6 +84,9 @@ message OutputClose {
     // After lang's payload codec. Sent again while replaying, since a close that History proves
     // may still need sending.
     temporal.api.common.v1.Payload result = 2;
+    // Closes the stream with a failure instead of `result`, after lang's failure converter and
+    // codec. A close carries a result or a failure, never both.
+    temporal.api.failure.v1.Failure failure = 3;
 }
 
 // One record a Workflow published, in publish order across topics.

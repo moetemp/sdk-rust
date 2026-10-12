@@ -215,6 +215,7 @@ interface workflow-service {
     close-result: option<payload>,
     /// @nexus.omit
     identity: placeholder,
+    close-failure: option<failure>,
   }
 
   /// @nexus.proto "temporal.api.workflowservice.v1.NotifyStreamResponse"
@@ -229,4 +230,7 @@ interface workflow-service {
     seconds: option<s64>,
     nanos: option<s32>,
   }
+  use nexus:temporal-types/model@1.0.0.{
+    failure,
+  };
 }

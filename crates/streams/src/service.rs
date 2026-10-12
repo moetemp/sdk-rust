@@ -637,6 +637,7 @@ mod tests {
                 &CloseRequest {
                     stream: Some(address()),
                     result: Some(result.clone()),
+                    failure: None,
                 }
                 .encode_to_vec(),
             )
@@ -645,7 +646,7 @@ mod tests {
         flush(&service).await;
         let sent = recorder.0.lock().unwrap().clone();
         assert_eq!(sent.len(), 1, "no progress, only the close");
-        assert_eq!(sent[0].close_result, Some(result));
+        assert_eq!(sent[0].close_result(), Some(result));
     }
 
     /// Answers every notification like a server without the stream notifier.
@@ -683,6 +684,7 @@ mod tests {
                 &CloseRequest {
                     stream: Some(address()),
                     result: Some(Payload::default()),
+                    failure: None,
                 }
                 .encode_to_vec(),
             )
@@ -787,7 +789,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .all(|n| n.close_result.is_none()),
+                .all(|n| n.close_result().is_none()),
             "an empty close would beat the Workflow's result"
         );
     }
@@ -811,6 +813,7 @@ mod tests {
                 &CloseRequest {
                     stream: Some(address()),
                     result: Some(result.clone()),
+                    failure: None,
                 }
                 .encode_to_vec(),
             )
@@ -818,7 +821,7 @@ mod tests {
             .unwrap();
         let sent = recorder.0.lock().unwrap().clone();
         assert_eq!(sent.len(), 2);
-        assert_eq!(sent[1].close_result, Some(result));
+        assert_eq!(sent[1].close_result(), Some(result));
         assert_eq!(sent[1].counter, 3, "above the newest record's counter");
         let refused = service
             .call("Append", &append(3, &["c"]))
@@ -837,6 +840,7 @@ mod tests {
                 &CloseRequest {
                     stream: Some(address()),
                     result: None,
+                    failure: None,
                 }
                 .encode_to_vec(),
             )
@@ -845,7 +849,7 @@ mod tests {
         flush(&service).await;
         let sent = recorder.0.lock().unwrap().clone();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].close_result, Some(Payload::default()));
+        assert_eq!(sent[0].close_result(), Some(Payload::default()));
     }
 
     /// A store whose notifications never go out, as when the server is down and a close retries.
