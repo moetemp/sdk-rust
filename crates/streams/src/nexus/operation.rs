@@ -6,7 +6,8 @@
 //! it must stay byte for byte what `crates/streams/nexus/operation_token_vectors.json` holds.
 
 use crate::{
-    CallerAttachment, NotifierClient, NotifyError, StreamError, StreamResult, Streams,
+    CallerAttachment, NotifierClient, NotifyError, StreamError, StreamNotification, StreamResult,
+    Streams,
     proto::{
         AttachCallerRequest, AttachCallerResponse, ChainId, DetachCallerRequest,
         DetachCallerResponse, StreamAddress, StreamOwnerKind,
@@ -21,9 +22,10 @@ use std::{io, sync::Arc, time::SystemTime};
 pub(crate) async fn attach_caller(
     streams: &Streams,
     client: Option<&Arc<dyn NotifierClient>>,
+    announce: bool,
     request: AttachCallerRequest,
 ) -> AttachCallerResponse {
-    match attach(streams, client, request).await {
+    match attach(streams, client, announce, request).await {
         Ok(operation_token) => AttachCallerResponse {
             operation_token,
             failure: None,
@@ -51,6 +53,7 @@ pub(crate) async fn detach_caller(
 async fn attach(
     streams: &Streams,
     client: Option<&Arc<dyn NotifierClient>>,
+    announce: bool,
     request: AttachCallerRequest,
 ) -> StreamResult<String> {
     if request.callback_url.is_empty() {
@@ -78,7 +81,7 @@ async fn attach(
     // completion that beats the start's response still names the operation.
     client
         .attach(CallerAttachment {
-            chain,
+            chain: chain.clone(),
             topic: stream.topic.clone(),
             request_id: request.request_id,
             callback_url: request.callback_url,
@@ -88,7 +91,57 @@ async fn attach(
         })
         .await
         .map_err(caller_error)?;
+    if announce {
+        announce_newest(streams, client.as_ref(), chain, &stream.topic).await;
+    }
     Ok(operation_token)
+}
+
+/// Notifies the newest record on `topic`, so a caller that just attached hears of the records
+/// already there. The server keeps a notifier only once a caller attached, so the notifications
+/// sent before were dropped. The attach landed, so a notification that can't go fails nothing.
+async fn announce_newest(
+    streams: &Streams,
+    client: &dyn NotifierClient,
+    chain: ChainId,
+    topic: &str,
+) {
+    let position = match streams.newest_position(&chain, topic).await {
+        Ok(position) if !position.is_empty() => position,
+        Ok(_) => return,
+        Err(error) => {
+            tracing::warn!(
+                workflow_id = %chain.workflow_id,
+                topic,
+                %error,
+                "Could not find the newest record to tell a new caller about"
+            );
+            return;
+        }
+    };
+    let Some((cursor, counter)) =
+        crate::notify::notification_at(streams.store(), &chain, topic, &position)
+    else {
+        return;
+    };
+    let workflow_id = chain.workflow_id.clone();
+    if let Err(error) = client
+        .notify(StreamNotification {
+            chain,
+            topic: topic.to_string(),
+            position: cursor,
+            counter,
+            close: None,
+        })
+        .await
+    {
+        tracing::warn!(
+            workflow_id = %workflow_id,
+            topic,
+            %error,
+            "Could not tell a new caller about the records already there"
+        );
+    }
 }
 
 async fn detach(
@@ -344,12 +397,14 @@ mod tests {
     struct Notifier {
         attached: Mutex<Vec<CallerAttachment>>,
         detached: Mutex<Vec<(ChainId, String, String)>>,
+        notified: Mutex<Vec<StreamNotification>>,
         answer: Mutex<Option<NotifyError>>,
     }
 
     #[async_trait::async_trait]
     impl NotifierClient for Notifier {
-        async fn notify(&self, _: StreamNotification) -> Result<(), NotifyError> {
+        async fn notify(&self, notification: StreamNotification) -> Result<(), NotifyError> {
+            self.notified.lock().unwrap().push(notification);
             Ok(())
         }
 
@@ -476,6 +531,82 @@ mod tests {
         response
             .failure
             .map_or(Ok(()), |failure| Err(raised(failure)))
+    }
+
+    fn append(values: &[&str]) -> Vec<u8> {
+        use crate::proto::{AppendRecord, AppendRequest, NamedProducer, append_request};
+        use temporalio_common::protos::temporal::{
+            api::common::v1::Payload, sdk::streams::v1::StreamRecordKind,
+        };
+        AppendRequest {
+            stream: Some(stream("")),
+            producer: Some(append_request::Producer::Named(NamedProducer {
+                producer_id: "p".to_string(),
+                attempt: 1,
+            })),
+            sequence: 1,
+            digest: vec![1; 32],
+            records: values
+                .iter()
+                .map(|value| AppendRecord {
+                    kind: StreamRecordKind::Data as i32,
+                    body: Some(Payload {
+                        data: value.as_bytes().to_vec(),
+                        ..Default::default()
+                    }),
+                    content_hash: vec![value.as_bytes()[0]; 32],
+                })
+                .collect(),
+        }
+        .encode_to_vec()
+    }
+
+    #[tokio::test]
+    async fn an_attach_announces_the_records_already_there_when_progress_is_on() {
+        let mut setup = setup();
+        setup.service = setup.service.with_attach_progress(true);
+        setup
+            .service
+            .call("Append", &append(&["a", "b"]))
+            .await
+            .unwrap();
+        attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        let notified = setup.notifier.notified.lock().unwrap().clone();
+        let [notification] = notified.as_slice() else {
+            panic!("one notification after the attach, not {notified:?}");
+        };
+        assert_eq!(
+            notification.chain,
+            setup.notifier.attached.lock().unwrap()[0].chain
+        );
+        assert_eq!(notification.topic, "tokens");
+        // The memory store's second record is at offset 1, so its counter is 2.
+        assert_eq!(notification.counter, 2);
+        assert!(
+            notification.position.ends_with(":1"),
+            "{}",
+            notification.position
+        );
+        assert!(notification.close.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_attach_announces_nothing_on_an_empty_stream_or_with_progress_off() {
+        let mut setup = setup();
+        setup.service = setup.service.with_attach_progress(true);
+        attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        assert!(setup.notifier.notified.lock().unwrap().is_empty());
+
+        let setup = self::setup();
+        setup.service.call("Append", &append(&["a"])).await.unwrap();
+        attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        assert!(setup.notifier.notified.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

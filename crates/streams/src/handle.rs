@@ -566,6 +566,27 @@ impl Streams {
         }
     }
 
+    /// The store position of the newest record on `topic` of `chain`, empty when it holds none.
+    pub(crate) async fn newest_position(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+    ) -> StreamResult<String> {
+        Ok(self
+            .store
+            .latest(StoreLatestRequest {
+                chain: Some(chain.clone()),
+                topic: topic.to_string(),
+            })
+            .await?
+            .position)
+    }
+
+    /// The store the handles serve.
+    pub(crate) fn store(&self) -> &dyn StreamStore {
+        self.store.as_ref()
+    }
+
     /// The cursor of a stream's newest record, empty when it holds none.
     pub async fn latest(&self, request: LatestRequest) -> StreamResult<LatestResponse> {
         let stream = address(request.stream.as_ref())?;
