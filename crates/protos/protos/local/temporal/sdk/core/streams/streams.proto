@@ -5,6 +5,7 @@ option ruby_package = "Temporalio::Internal::Bridge::Api::Streams";
 
 import "google/protobuf/duration.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/failure/v1/message.proto";
 import "temporal/sdk/streams/v1/message.proto";
 
 // The stream calls lang makes, served in process by Core against the configured store.
@@ -212,6 +213,10 @@ message CloseRequest {
   // background too. Unset, the operations complete with an empty result, and the notifier close
   // is retried in the background.
   temporal.api.common.v1.Payload result = 2;
+  // Closes the stream with a failure instead of `result`, after lang's failure converter and
+  // codec. The operations complete as failed, or as canceled for a failure with canceled info.
+  // A close carries a result or a failure, never both.
+  temporal.api.failure.v1.Failure failure = 3;
 }
 
 message CloseResponse {}

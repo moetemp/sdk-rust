@@ -7,6 +7,27 @@ use crate::{
     },
 };
 
+/// What a closed stream's operations complete with.
+// One is built per close, so the size of a failure doesn't matter.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum CloseOutcome {
+    /// They complete successfully with this payload, after lang's codec.
+    Result(crate::proto::Payload),
+    /// They complete as failed with this failure, or as canceled when it has canceled info.
+    Failure(temporalio_common::protos::temporal::api::failure::v1::Failure),
+}
+
+impl CloseOutcome {
+    /// The result, for a store that keeps no failure.
+    pub fn result(&self) -> Option<crate::proto::Payload> {
+        match self {
+            CloseOutcome::Result(result) => Some(result.clone()),
+            CloseOutcome::Failure(_) => None,
+        }
+    }
+}
+
 /// A store that holds streams, keyed by their owner's run chain.
 ///
 /// A store moves serialized `temporal.sdk.streams.v1.StreamRecord`s with encoded bodies and deals
@@ -93,6 +114,13 @@ pub trait StreamStore: Send + Sync {
         self.close_chain(chain).await
     }
 
+    /// Like [StreamStore::end_chain], for a chain whose owner closed with `outcome`. A store keeps
+    /// no outcome, but a wrapper that completes the streams' operations needs it.
+    async fn end_chain_with(&self, chain: &ChainId, outcome: CloseOutcome) -> StreamResult<()> {
+        let _ = outcome;
+        self.end_chain(chain).await
+    }
+
     /// Marks one topic of a chain closed, like [StreamStore::close_chain] for that topic alone.
     ///
     /// `result` is what the operations that handed the topic out complete with, when the owner
@@ -104,6 +132,17 @@ pub trait StreamStore: Send + Sync {
         topic: &str,
         result: Option<crate::proto::Payload>,
     ) -> StreamResult<()>;
+
+    /// Like [StreamStore::close_topic], with a failure as well as a result for the operations that
+    /// handed the topic out. A store keeps neither.
+    async fn close_topic_with(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        outcome: CloseOutcome,
+    ) -> StreamResult<()> {
+        self.close_topic(chain, topic, outcome.result()).await
+    }
 
     /// The chain's stages that no one has promoted or aborted yet, for crash repair.
     async fn pending_stages(&self, chain: &ChainId) -> StreamResult<Vec<PendingStage>>;
@@ -120,7 +159,7 @@ pub trait StreamStore: Send + Sync {
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse>;
 
     /// Closes one topic of a chain in the store, then tells the topic's notifier on the server,
-    /// which completes every attached operation with `result`. The store closes first, so a
+    /// which completes every attached operation with `outcome`. The store closes first, so a
     /// reader the completion reaches always finds the stream's end. A store that sends no
     /// notifications only closes the topic. Fails as refused when the server will never take the
     /// close, and with another kind when trying again may help.
@@ -128,9 +167,9 @@ pub trait StreamStore: Send + Sync {
         &self,
         chain: &ChainId,
         topic: &str,
-        result: temporalio_common::protos::temporal::api::common::v1::Payload,
+        outcome: CloseOutcome,
     ) -> StreamResult<()> {
-        self.close_topic(chain, topic, Some(result)).await
+        self.close_topic_with(chain, topic, outcome).await
     }
 
     /// Waits until the notifications this store sent are out. A store that sends none returns at

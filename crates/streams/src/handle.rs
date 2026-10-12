@@ -4,8 +4,8 @@
 //! where the contract says so, and mints and checks cursors. Stores only move records.
 
 use crate::{
-    ReadTarget, StreamError, StreamResult, StreamStore, WORKFLOW_OWNER_KIND, activity_producer_id,
-    check_append_digest, mint_cursor,
+    CloseOutcome, ReadTarget, StreamError, StreamResult, StreamStore, WORKFLOW_OWNER_KIND,
+    activity_producer_id, check_append_digest, mint_cursor,
     owner::{OwnerClient, OwnerDescription, OwnerError},
     proto::{
         AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse, DeleteOwnerRequest,
@@ -586,16 +586,26 @@ impl Streams {
         })
     }
 
-    /// Closes one stream, so producers' new batches are refused and reads end. With a result, the
-    /// stream's notifier closes too, and fails the call when the server doesn't take it, since
-    /// the close completes every caller's operation.
+    /// Closes one stream, so producers' new batches are refused and reads end. With a result or a
+    /// failure, the stream's notifier closes too, and fails the call when the server doesn't take
+    /// it, since the close completes every caller's operation.
     pub async fn close(&self, request: CloseRequest) -> StreamResult<CloseResponse> {
         let stream = address(request.stream.as_ref())?;
         let chain = self.chain(stream).await?;
-        match request.result {
-            Some(result) => {
+        let outcome = match (request.result, request.failure) {
+            (Some(_), Some(_)) => {
+                return Err(StreamError::invalid_argument(
+                    "a close carries a result or a failure, not both",
+                ));
+            }
+            (Some(result), None) => Some(CloseOutcome::Result(result)),
+            (None, Some(failure)) => Some(CloseOutcome::Failure(failure)),
+            (None, None) => None,
+        };
+        match outcome {
+            Some(outcome) => {
                 self.store
-                    .close_stream(&chain, &stream.topic, result)
+                    .close_stream(&chain, &stream.topic, outcome)
                     .await?
             }
             None => self.store.close_topic(&chain, &stream.topic, None).await?,
@@ -1378,6 +1388,7 @@ mod tests {
             .close(CloseRequest {
                 stream: Some(stream("out")),
                 result: None,
+                failure: None,
             })
             .await
             .unwrap();
@@ -1618,6 +1629,7 @@ mod tests {
             .close(CloseRequest {
                 stream: Some(stream("out")),
                 result: None,
+                failure: None,
             })
             .await
             .unwrap();

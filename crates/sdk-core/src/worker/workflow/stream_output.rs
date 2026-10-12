@@ -64,6 +64,11 @@ pub(crate) struct ReportedOutput {
 pub(crate) struct ChainToClose {
     pub(crate) workflow_id: String,
     pub(crate) first_run_id: String,
+    /// The failure the final task failed the Workflow with, after lang's codec.
+    pub(crate) failure: Option<temporalio_common::protos::temporal::api::failure::v1::Failure>,
+    /// The details the final task canceled the Workflow with, after lang's codec.
+    pub(crate) cancel_details:
+        Option<temporalio_common::protos::temporal::api::common::v1::Payloads>,
 }
 
 impl ReportedOutput {
@@ -182,6 +187,88 @@ fn note_promoted(
     settled.lock().put(stage.token.clone(), ());
 }
 
+/// What a chain's streams close with when its owner ended without closing them itself, and its ID
+/// is gone or in another chain. The server's owner check closes with the same failure.
+#[cfg(feature = "streams")]
+const OWNER_ENDED_FAILURE: &str = "the owner Workflow ended without closing the stream";
+
+/// What a chain's streams close with when its owner's latest run ended with `status`, as a
+/// Workflow-run Nexus operation completes for the same status, so a caller sees the same outcome
+/// whichever side closes the stream.
+#[cfg(feature = "streams")]
+fn chain_end_outcome(
+    status: temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus,
+    chain: &ChainToClose,
+) -> temporalio_streams::CloseOutcome {
+    use temporalio_common::protos::temporal::api::{
+        enums::v1::WorkflowExecutionStatus,
+        failure::v1::{
+            CanceledFailureInfo, Failure, TerminatedFailureInfo, TimeoutFailureInfo,
+            failure::FailureInfo,
+        },
+    };
+    use temporalio_streams::CloseOutcome;
+    let with_info = |message: &str, info: FailureInfo| {
+        CloseOutcome::Failure(Failure {
+            message: message.to_string(),
+            failure_info: Some(info),
+            ..Default::default()
+        })
+    };
+    match status {
+        WorkflowExecutionStatus::Completed => CloseOutcome::Result(Default::default()),
+        WorkflowExecutionStatus::Failed => match &chain.failure {
+            Some(failure) => CloseOutcome::Failure(failure.clone()),
+            // Another Worker's task may have failed the run.
+            None => stream_failure("the owner Workflow failed", "StreamOwnerFailed"),
+        },
+        WorkflowExecutionStatus::Canceled => with_info(
+            "operation canceled",
+            FailureInfo::CanceledFailureInfo(CanceledFailureInfo {
+                details: chain.cancel_details.clone(),
+                ..Default::default()
+            }),
+        ),
+        WorkflowExecutionStatus::Terminated => with_info(
+            "operation terminated",
+            FailureInfo::TerminatedFailureInfo(TerminatedFailureInfo::default()),
+        ),
+        WorkflowExecutionStatus::TimedOut => with_info(
+            "operation exceeded internal timeout",
+            FailureInfo::TimeoutFailureInfo(TimeoutFailureInfo::default()),
+        ),
+        _ => stream_failure(OWNER_ENDED_FAILURE, ""),
+    }
+}
+
+/// A non-retryable application failure of type `failure_type`.
+#[cfg(feature = "streams")]
+fn stream_failure(message: &str, failure_type: &str) -> temporalio_streams::CloseOutcome {
+    use temporalio_common::protos::temporal::api::failure::v1::{
+        ApplicationFailureInfo, Failure, failure::FailureInfo,
+    };
+    temporalio_streams::CloseOutcome::Failure(Failure {
+        message: message.to_string(),
+        failure_info: Some(FailureInfo::ApplicationFailureInfo(
+            ApplicationFailureInfo {
+                r#type: failure_type.to_string(),
+                non_retryable: true,
+                ..Default::default()
+            },
+        )),
+        ..Default::default()
+    })
+}
+
+/// What the operations that handed out `close`'s topic complete with.
+#[cfg(feature = "streams")]
+fn close_outcome(close: &OutputClose) -> temporalio_streams::CloseOutcome {
+    match &close.failure {
+        Some(failure) => temporalio_streams::CloseOutcome::Failure(failure.clone()),
+        None => temporalio_streams::CloseOutcome::Result(close.result.clone().unwrap_or_default()),
+    }
+}
+
 /// Closes `closes` on `chain` one after another, each retried with backoff until it lands or
 /// `shutdown` fires. A store that can't close topics is logged and given up on.
 #[cfg(feature = "streams")]
@@ -195,7 +282,7 @@ async fn close_in_order(
         let mut delay = RETRY_FIRST;
         loop {
             let error = match store
-                .close_topic(chain, &close.topic, close.result.clone())
+                .close_topic_with(chain, &close.topic, close_outcome(close))
                 .await
             {
                 Ok(()) => break,
@@ -522,17 +609,20 @@ impl OutputStore {
             Err(status) if status.code() == tonic::Code::NotFound => None,
             Err(status) => return Err(temporalio_streams::StreamError::storage(status.message())),
         };
-        if let Some(latest) = latest
-            && latest.first_run_id == chain.first_run_id
-            && matches!(
-                latest.status(),
-                WorkflowExecutionStatus::Running | WorkflowExecutionStatus::ContinuedAsNew
-            )
-        {
-            return Ok(());
-        }
+        let outcome = match latest.filter(|latest| latest.first_run_id == chain.first_run_id) {
+            Some(latest) => match latest.status() {
+                WorkflowExecutionStatus::Running
+                | WorkflowExecutionStatus::ContinuedAsNew
+                | WorkflowExecutionStatus::Paused => return Ok(()),
+                status => chain_end_outcome(status, chain),
+            },
+            None => stream_failure(OWNER_ENDED_FAILURE, ""),
+        };
         self.store
-            .end_chain(&self.chain(&chain.workflow_id, &chain.first_run_id))
+            .end_chain_with(
+                &self.chain(&chain.workflow_id, &chain.first_run_id),
+                outcome,
+            )
             .await
     }
 
@@ -859,8 +949,8 @@ pub(super) fn check_replayed_output_manifest(
     Ok(())
 }
 
-/// Refuses closes the marker could not prove. Each close names a topic once, carries its result,
-/// and has its topic's FINISH record among the committed records.
+/// Refuses closes the marker could not prove. Each close names a topic once, carries a result or
+/// a failure but not both, and has its topic's FINISH record among the committed records.
 pub(super) fn check_output_closes(records: &[OutputRecord], closes: &[OutputClose]) -> Result<()> {
     let mut seen = std::collections::HashSet::new();
     for close in closes {
@@ -868,9 +958,14 @@ pub(super) fn check_output_closes(records: &[OutputRecord], closes: &[OutputClos
             Some("a close names no topic".to_string())
         } else if !seen.insert(close.topic.as_str()) {
             Some(format!("topic {:?} is closed twice", close.topic))
-        } else if close.result.is_none() {
+        } else if close.result.is_none() && close.failure.is_none() {
             Some(format!(
-                "the close of topic {:?} has no result",
+                "the close of topic {:?} has no result or failure",
+                close.topic
+            ))
+        } else if close.result.is_some() && close.failure.is_some() {
+            Some(format!(
+                "the close of topic {:?} carries both a result and a failure",
                 close.topic
             ))
         } else if !records
@@ -1148,6 +1243,7 @@ mod tests {
         OutputClose {
             topic: topic.to_string(),
             result: Some(Payload::default()),
+            failure: None,
         }
     }
 
@@ -1168,6 +1264,25 @@ mod tests {
                 .to_string();
             assert!(message.contains(expected), "{expected}: {message}");
         }
+    }
+
+    #[test]
+    fn a_close_carries_a_result_or_a_failure() {
+        let records = [data("a", 1, 1), finish("a")];
+        let failed = OutputClose {
+            topic: "a".to_string(),
+            result: None,
+            failure: Some(Default::default()),
+        };
+        check_output_closes(&records, std::slice::from_ref(&failed)).unwrap();
+        let both = OutputClose {
+            result: Some(Payload::default()),
+            ..failed
+        };
+        let message = check_output_closes(&records, &[both])
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("both a result and a failure"), "{message}");
     }
 
     #[test]
@@ -1322,6 +1437,21 @@ mod tests {
             }
             async fn close_chain(&self, _: &ChainId) -> StreamResult<()> {
                 Err(StreamError::unsupported("close_chain"))
+            }
+            async fn close_topic_with(
+                &self,
+                chain: &ChainId,
+                topic: &str,
+                outcome: temporalio_streams::CloseOutcome,
+            ) -> StreamResult<()> {
+                if let temporalio_streams::CloseOutcome::Failure(failure) = &outcome {
+                    self.entries.lock().push(format!(
+                        "close {} {topic} failed {}",
+                        chain.first_run_id, failure.message
+                    ));
+                    return Ok(());
+                }
+                self.close_topic(chain, topic, outcome.result()).await
             }
             async fn close_topic(
                 &self,
@@ -1484,7 +1614,7 @@ mod tests {
         /// notification is out.
         async fn closed_on_the_server(store: &OutputStore, recorder: &Recorder) {
             for _ in 0..500 {
-                if recorder.0.lock().iter().any(|n| n.close_result.is_some()) {
+                if recorder.0.lock().iter().any(|n| n.close_result().is_some()) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -1498,7 +1628,7 @@ mod tests {
                 .lock()
                 .iter()
                 .map(|n| {
-                    let result = n.close_result.as_ref().map(|result| result.data.clone());
+                    let result = n.close_result().as_ref().map(|result| result.data.clone());
                     (n.topic.clone(), n.counter, result)
                 })
                 .collect()
@@ -1602,7 +1732,7 @@ mod tests {
                 .settle("run", vec![closed], CompletionOutcome::Accepted)
                 .await;
             for _ in 0..1000 {
-                if recorder.0.lock().iter().any(|n| n.close_result.is_some()) {
+                if recorder.0.lock().iter().any(|n| n.close_result().is_some()) {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
@@ -1688,6 +1818,7 @@ mod tests {
                     data: result.as_bytes().to_vec(),
                     ..Default::default()
                 }),
+                failure: None,
             }
         }
 
@@ -1711,6 +1842,30 @@ mod tests {
             assert_eq!(
                 log.entries(3).await,
                 ["promote a", "close run t done", "close run u also done"]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_close_with_a_failure_closes_its_topic_with_it() {
+            let log = Arc::new(Log::default());
+            let store = store_on(&log);
+            let mut closed = batch("a");
+            closed.closes = vec![OutputClose {
+                topic: "t".to_string(),
+                result: None,
+                failure: Some(
+                    temporalio_common::protos::temporal::api::failure::v1::Failure {
+                        message: "the agent gave up".to_string(),
+                        ..Default::default()
+                    },
+                ),
+            }];
+            store
+                .settle("run", vec![closed], CompletionOutcome::Accepted)
+                .await;
+            assert_eq!(
+                log.entries(2).await,
+                ["promote a", "close run t failed the agent gave up"]
             );
         }
 

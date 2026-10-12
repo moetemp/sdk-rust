@@ -3292,6 +3292,7 @@ mod sdk_helpers {
                         closes: vec![OutputClose {
                             topic: "t".to_string(),
                             result: Some(Payload::default()),
+                            ..Default::default()
                         }],
                     },
                 );
