@@ -311,6 +311,7 @@ impl NexusCalls {
                     next_token: latest.cursor,
                     done: false,
                     state: None,
+                    armed: false,
                 }),
                 Err(error) => failed(failure::of_stream(&error)),
             };
@@ -344,6 +345,7 @@ impl NexusCalls {
             wait: wait.try_into().ok(),
             max_records: max_records as u32,
             state: state.clone(),
+            arm: input.arm.unwrap_or(false),
         };
         let mut read = match self.streams.read_carried(request).await {
             Ok(read) => read,
@@ -616,6 +618,7 @@ impl Budget {
             next_token: read.response.cursor.clone(),
             done: false,
             state: Some(Base64::default()),
+            armed: false,
         });
         let state = crossing_size(read.state.encoded_len().min(MAX_STATE_BYTES));
         Self {
@@ -690,6 +693,8 @@ fn finish_read(
         wires.push(wire);
         kept.extend(stored);
     }
+    // An answer the budget cut holds records, so only a whole empty answer stays armed.
+    let armed = response.armed && !cut && wires.is_empty();
     let (next_token, done) = if cut {
         // A supersession belongs to the record after it, so it goes into the next answer too.
         if wires.last().is_some_and(|wire| wire.superseded.is_some()) {
@@ -710,6 +715,7 @@ fn finish_read(
         next_token,
         done,
         state: Some(Base64(state.encode_to_vec())),
+        armed,
     })
 }
 
@@ -783,6 +789,7 @@ fn read_failure(error: StreamError, state: Vec<u8>) -> NexusStep {
             next_token: cursor,
             done: false,
             state: (!state.is_empty()).then_some(Base64(state)),
+            armed: false,
         }),
         _ => failed(failure::of_stream(&error)),
     }

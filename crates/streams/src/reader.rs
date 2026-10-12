@@ -334,10 +334,10 @@ pub(crate) async fn read_with(
                 0 => DEFAULT_MAX_RECORDS,
                 max => max,
             },
-            arm: false,
+            arm: request.arm,
         })
         .await?;
-    let closed = page.closed;
+    let (closed, armed) = (page.closed, page.armed);
     let before = state.attempts();
     let mut records = Vec::with_capacity(page.records.len());
     let mut previous = start;
@@ -383,6 +383,7 @@ pub(crate) async fn read_with(
             cursor: previous,
             state: Vec::new(),
             done: false,
+            armed,
         },
         closed,
         before,
