@@ -42,7 +42,7 @@ pub use record::{
 };
 pub use repair::{Decision, decide_token};
 pub use service::StreamService;
-pub use store::{CloseOutcome, StreamStore};
+pub use store::{CloseOutcome, StreamStore, empty_close_result};
 
 /// The protos stores and lang exchange.
 pub mod proto {

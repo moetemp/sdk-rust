@@ -216,7 +216,9 @@ fn chain_end_outcome(
         })
     };
     match status {
-        WorkflowExecutionStatus::Completed => CloseOutcome::Result(Default::default()),
+        WorkflowExecutionStatus::Completed => {
+            CloseOutcome::Result(temporalio_streams::empty_close_result())
+        }
         WorkflowExecutionStatus::Failed => match &chain.failure {
             Some(failure) => CloseOutcome::Failure(failure.clone()),
             // Another Worker's task may have failed the run.
@@ -265,7 +267,12 @@ fn stream_failure(message: &str, failure_type: &str) -> temporalio_streams::Clos
 fn close_outcome(close: &OutputClose) -> temporalio_streams::CloseOutcome {
     match &close.failure {
         Some(failure) => temporalio_streams::CloseOutcome::Failure(failure.clone()),
-        None => temporalio_streams::CloseOutcome::Result(close.result.clone().unwrap_or_default()),
+        None => temporalio_streams::CloseOutcome::Result(
+            close
+                .result
+                .clone()
+                .unwrap_or_else(temporalio_streams::empty_close_result),
+        ),
     }
 }
 
@@ -1264,6 +1271,20 @@ mod tests {
                 .to_string();
             assert!(message.contains(expected), "{expected}: {message}");
         }
+    }
+
+    #[cfg(feature = "streams")]
+    #[test]
+    fn a_close_without_a_result_carries_a_null_payload() {
+        let outcome = close_outcome(&OutputClose {
+            topic: "a".to_string(),
+            result: None,
+            failure: None,
+        });
+        let temporalio_streams::CloseOutcome::Result(result) = outcome else {
+            panic!("a close without a failure carries a result");
+        };
+        assert_eq!(result.metadata["encoding"], b"binary/null");
     }
 
     #[test]

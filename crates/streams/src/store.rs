@@ -7,6 +7,16 @@ use crate::{
     },
 };
 
+/// The result a stream closes with when its owner gave none: a `binary/null` payload, which every
+/// SDK's converter reads as no value. A payload with no encoding fails a caller that expects a
+/// typed result, and its Workflow Task fails on every retry.
+pub fn empty_close_result() -> crate::proto::Payload {
+    crate::proto::Payload {
+        metadata: [("encoding".to_string(), b"binary/null".to_vec())].into(),
+        ..Default::default()
+    }
+}
+
 /// What a closed stream's operations complete with.
 // One is built per close, so the size of a failure doesn't matter.
 #[allow(clippy::large_enum_variant)]

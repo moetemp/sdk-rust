@@ -823,7 +823,12 @@ mod tests {
         flush(&service).await;
         let sent = recorder.0.lock().unwrap().clone();
         assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].close_result(), Some(Payload::default()));
+        // A caller with a typed result decodes it as None, which an empty payload can't give.
+        assert_eq!(sent[0].close_result(), Some(crate::empty_close_result()));
+        assert_eq!(
+            sent[0].close_result().unwrap().metadata["encoding"],
+            b"binary/null"
+        );
     }
 
     /// A store whose notifications never go out, as when the server is down and a close retries.
