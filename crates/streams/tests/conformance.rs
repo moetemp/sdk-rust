@@ -1871,6 +1871,7 @@ mod notifying_memory {
 #[cfg(feature = "redis")]
 mod standalone_redis {
     store_cases!(super::on_redis::redis("STREAMS_REDIS_URL", false));
+    arm_cases!(super::on_redis::redis("STREAMS_REDIS_URL", false));
     conformance!(super::on_redis::redis("STREAMS_REDIS_URL", false);
         deleting_an_owner_drops_every_chain_of_it,
     );
@@ -1879,6 +1880,7 @@ mod standalone_redis {
 #[cfg(feature = "redis")]
 mod cluster_redis {
     store_cases!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
+    arm_cases!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
     // A Workflow id's chains hash to different slots, so the delete reaches every primary.
     conformance!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true);
         deleting_an_owner_drops_every_chain_of_it,
@@ -1891,11 +1893,20 @@ mod notifying_redis {
         "STREAMS_REDIS_URL",
         false
     )));
+    arm_cases!(super::notifying(super::on_redis::redis(
+        "STREAMS_REDIS_URL",
+        false
+    )));
 }
 
 #[cfg(feature = "redis")]
 mod documented_acl_redis {
     store_cases!(super::on_redis::redis_as_documented_user(
+        "STREAMS_REDIS_URL",
+        false,
+        &[]
+    ));
+    arm_cases!(super::on_redis::redis_as_documented_user(
         "STREAMS_REDIS_URL",
         false,
         &[]
@@ -1910,6 +1921,11 @@ mod documented_acl_redis {
 mod documented_acl_cluster_redis {
     // A cluster client asks the topology first, so the documented rules must allow it.
     store_cases!(super::on_redis::redis_as_documented_user(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true,
+        &[]
+    ));
+    arm_cases!(super::on_redis::redis_as_documented_user(
         "STREAMS_REDIS_CLUSTER_URL",
         true,
         &[]

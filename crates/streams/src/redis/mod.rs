@@ -6,7 +6,7 @@ mod keys;
 mod scripts;
 
 use crate::{
-    StreamError, StreamResult, StreamStore,
+    NewestOrArm, StreamError, StreamResult, StreamStore,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteOutcome,
         PromoteResult, StageRef, StagedBatch, StoreAppendRequest, StoreAppendResponse,
@@ -155,6 +155,28 @@ impl RedisStore {
             .arg(keys.meta(topic))
             .arg(CLOSED_FIELD);
         eval
+    }
+
+    /// The newest record after `after`, or, when the log holds none, an arm set in the same
+    /// script. The arm keeps the meta's expiry, or sets one on a meta it creates.
+    async fn arm(&self, keys: &ChainKeys, topic: &str, after: &str) -> StreamResult<NewestOrArm> {
+        let found: Value = scripts::ARM_SCRIPT
+            .key(keys.log(topic))
+            .key(keys.meta(topic))
+            .arg(after)
+            .arg(self.retention_ms + self.grace_ms)
+            .invoke_async(&mut self.shared.clone())
+            .await
+            .mapped(Call::Write)?;
+        match found {
+            Value::Int(generation) if generation > 0 => Ok(NewestOrArm::Armed(generation as u64)),
+            Value::BulkString(id) => Ok(NewestOrArm::Newest(
+                String::from_utf8_lossy(&id).into_owned(),
+            )),
+            other => Err(StreamError::storage(format!(
+                "Redis answered the arm with {other:?}"
+            ))),
+        }
     }
 
     fn xread(
@@ -404,6 +426,12 @@ fn wait_of(request: &StoreReadRequest) -> Duration {
     })
 }
 
+/// A topic's arm as a script answered it, zero when none.
+fn generation(arm: &str) -> StreamResult<u64> {
+    arm.parse()
+        .map_err(|_| StreamError::storage(format!("a topic's arm is {arm:?}, not a generation")))
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -441,7 +469,7 @@ impl StreamStore for RedisStore {
         let (added, _, appended): (
             redis::RedisResult<Value>,
             redis::RedisResult<Value>,
-            redis::RedisResult<(String, String)>,
+            redis::RedisResult<(String, String, String)>,
         ) = redis::pipe()
             .ignore_errors()
             .sadd(keys.topics(), &request.topic)
@@ -453,7 +481,7 @@ impl StreamStore for RedisStore {
         if let Err(error) = added {
             self.topic_set_failed(&error);
         }
-        let (first_position, last_position) = match appended {
+        let (first_position, last_position, arm) = match appended {
             // A server that lost its scripts runs this one alone, which loads it first. The set
             // already took the topic.
             Err(error)
@@ -467,7 +495,7 @@ impl StreamStore for RedisStore {
         Ok(StoreAppendResponse {
             first_position,
             last_position,
-            arm: None,
+            arm: Some(generation(&arm)?),
         })
     }
 
@@ -509,10 +537,30 @@ impl StreamStore for RedisStore {
         if let Some(error) = state.lost(topic, position, &found)? {
             return Err(error);
         }
+        let closed = state.chain_closed || state.topic_closed;
+        let mut armed = false;
+        if request.arm && found.is_empty() && !closed {
+            match self.arm(&keys, topic, after).await? {
+                NewestOrArm::Armed(_) => armed = true,
+                // A record landed between the read and the arm, so the answer carries it.
+                _ => {
+                    let xread = Self::xread(&keys, topic, after, request.max_records, None);
+                    found = records(
+                        xread
+                            .query_async(&mut self.shared.clone())
+                            .await
+                            .mapped(Call::Read)?,
+                    )?;
+                    if let Some(error) = state.lost(topic, position, &found)? {
+                        return Err(error);
+                    }
+                }
+            }
+        }
         Ok(StoreReadResponse {
             records: found,
-            closed: state.chain_closed || state.topic_closed,
-            armed: false,
+            closed,
+            armed,
         })
     }
 
@@ -670,22 +718,44 @@ impl StreamStore for RedisStore {
         for topic in &stage.topics {
             script.arg(topic);
         }
-        let added: i64 = script
+        let reply: Value = script
             .invoke_async(&mut self.shared.clone())
             .await
             .map_err(|error| match error.code() {
                 Some("STREAMS_TOPIC") => StreamError::refused(error.detail().unwrap_or_default()),
                 _ => errors::stream_error(&error, Call::Write),
             })?;
-        let (outcome, records) = match added {
-            -1 => (PromoteOutcome::Lost, 0),
-            0 => (PromoteOutcome::Settled, 0),
-            added => (PromoteOutcome::Promoted, added as u32),
+        let unexpected = |reply: &Value| {
+            StreamError::storage(format!("Redis answered the promotion with {reply:?}"))
+        };
+        let (outcome, records, arms) = match reply {
+            Value::Int(-1) => (PromoteOutcome::Lost, 0, HashMap::new()),
+            Value::Int(0) => (PromoteOutcome::Settled, 0, HashMap::new()),
+            Value::Array(values) => {
+                let [Value::Int(added), arms @ ..] = values.as_slice() else {
+                    return Err(unexpected(&Value::Array(values)));
+                };
+                if arms.len() != stage.topics.len() {
+                    return Err(unexpected(&Value::Array(values)));
+                }
+                let arms = stage
+                    .topics
+                    .iter()
+                    .zip(arms)
+                    .map(|(topic, arm)| {
+                        let arm: String =
+                            redis::from_redis_value_ref(arm).map_err(|_| unexpected(arm))?;
+                        Ok((topic.clone(), generation(&arm)?))
+                    })
+                    .collect::<StreamResult<_>>()?;
+                (PromoteOutcome::Promoted, *added as u32, arms)
+            }
+            other => return Err(unexpected(&other)),
         };
         Ok(PromoteResult {
             outcome: outcome as i32,
             records,
-            arms: HashMap::new(),
+            arms,
         })
     }
 
@@ -778,6 +848,22 @@ impl StreamStore for RedisStore {
         topics.retain(|_| closed.next().flatten().is_none());
         topics.sort();
         Ok(topics)
+    }
+
+    async fn disarm(&self, chain: &ChainId, topic: &str, generation: u64) -> StreamResult<()> {
+        let meta = ChainKeys::new(&self.prefix, chain).meta(topic);
+        scripts::DISARM_SCRIPT
+            .key(meta)
+            .arg(generation)
+            .invoke_async::<i64>(&mut self.shared.clone())
+            .await
+            .mapped(Call::Write)
+            .map(drop)
+    }
+
+    async fn newest_or_arm(&self, chain: &ChainId, topic: &str) -> StreamResult<NewestOrArm> {
+        self.arm(&ChainKeys::new(&self.prefix, chain), topic, "0-0")
+            .await
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {

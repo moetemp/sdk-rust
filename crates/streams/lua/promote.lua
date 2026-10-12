@@ -32,4 +32,8 @@ for _, slot in pairs(slots) do
   end
 end
 redis.call('DEL', KEYS[1])
-return #items / 2
+local reply = {#items / 2}
+for i = 4, #ARGV do
+  reply[#reply + 1] = redis.call('HGET', KEYS[2 * (i - 3) + 2], 'arm') or '0'
+end
+return reply
