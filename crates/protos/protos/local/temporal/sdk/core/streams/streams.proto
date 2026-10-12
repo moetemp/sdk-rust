@@ -38,11 +38,13 @@ message StreamStoreConfig {
     RedisStoreConfig redis = 1;
     MemoryStoreConfig memory = 2;
   }
-  // Tells each stream's notifier on the server when the stream moves, after every append and
-  // every Workflow batch that becomes visible. That's what makes a caller of a stream-returning
-  // Nexus operation see progress. Off by default, since most streams have no such caller and each
-  // notification costs a call. It turns on progress only. Closes reach the notifier either way. A
-  // server without the stream notifier costs one call, and then the process stops notifying.
+  // Tells each stream's notifier on the server when the stream moves while a reader sleeps on
+  // it: after an append or a Workflow batch that becomes visible, when a reader armed the stream
+  // with an empty read. That's what makes a caller of a stream-returning Nexus operation see
+  // progress. A busy stream, whose readers find records on each read, costs no notification. Off
+  // by default, since most streams have no such caller. It turns on progress only. Closes reach
+  // the notifier either way. A server without the stream notifier costs one call, and then the
+  // process stops notifying.
   bool notify_on_append = 3;
   // How many streams to keep a notifier for, dropping the least recently used. Zero uses 1000.
   uint32 max_notifiers = 4;

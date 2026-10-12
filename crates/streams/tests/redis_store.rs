@@ -1811,8 +1811,14 @@ async fn notification_counters_come_from_redis_entry_ids_and_grow_with_the_strea
         Arc::new(temporalio_streams::Notifier::new(recorder.clone(), 10)),
     );
     let chain = chain();
-    let mut positions = vec![];
+    let mut positions: Vec<String> = vec![];
+    // A reader sleeps before each write, and each landed notification clears its arm.
+    let rearm = async |after: &str| {
+        let read = store.read(arming_read(&chain, after)).await.unwrap();
+        assert!(read.armed);
+    };
     for sequence in [1, 3] {
+        rearm(positions.last().map_or("", String::as_str)).await;
         let digest = [sequence as u8];
         let landed = store
             .append(append(&chain, "p", sequence, 2, &digest))
@@ -1821,6 +1827,7 @@ async fn notification_counters_come_from_redis_entry_ids_and_grow_with_the_strea
         positions.push(landed.last_position);
         store.flush_notifications().await;
     }
+    rearm(&positions[1]).await;
     store
         .stage(StagedBatch {
             chain: Some(chain.clone()),

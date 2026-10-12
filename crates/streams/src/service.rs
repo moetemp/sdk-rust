@@ -588,10 +588,35 @@ mod tests {
         FlushNotificationsResponse::decode(response.as_slice()).unwrap();
     }
 
+    /// Reads `topic` with `arm`, as a reader that sleeps until its caller hears of progress.
+    async fn armed_read(service: &StreamService, topic: &str) {
+        let read = ReadResponse::decode(
+            service
+                .call(
+                    "Read",
+                    &ReadRequest {
+                        stream: Some(StreamAddress {
+                            topic: topic.to_string(),
+                            ..address()
+                        }),
+                        arm: true,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert!(read.armed);
+    }
+
     #[tokio::test]
     async fn an_append_notifies_its_streams_notifier_once_notifications_are_on() {
         let recorder = Arc::new(Recorder::default());
         let service = service_notifying(true, recorder.clone()).await;
+        armed_read(&service, "out").await;
         let appended = AppendResponse::decode(
             service
                 .call("Append", &append(1, &["a", "b"]))
@@ -812,6 +837,7 @@ mod tests {
     async fn a_close_with_a_result_closes_the_store_and_then_the_notifier() {
         let recorder = Arc::new(Recorder::default());
         let service = service_notifying(true, recorder.clone()).await;
+        armed_read(&service, "out").await;
         service
             .call("Append", &append(1, &["a", "b"]))
             .await
@@ -966,6 +992,7 @@ mod tests {
         use crate::proto::{NexusCall, NexusStep, nexus_step};
         let recorder = Arc::new(Recorder::default());
         let service = service_notifying(true, recorder.clone()).await;
+        armed_read(&service, "t").await;
         let input = serde_json::json!({
             "stream": {"kind": "workflow", "workflow_id": "wf", "topic": "t"},
             "producer_id": "p",

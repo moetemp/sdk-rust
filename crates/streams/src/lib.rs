@@ -32,7 +32,7 @@ pub use handle::{OWNER_RECHECK, Streams, StreamsOptions};
 pub use memory::MemoryStore;
 pub use nexus::{OPERATION_TOKEN_VERSION, OperationToken};
 pub use notify::{
-    CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, CallerAttachment, DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT,
+    Arm, CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, CallerAttachment, DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT,
     Notifier, NotifierClient, NotifyError, NotifyingStore, StreamNotification, progress_counter,
 };
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};

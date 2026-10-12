@@ -1603,11 +1603,32 @@ mod tests {
             }
         }
 
+        /// Arms topic `t` of the batches' chain, as a reader that sleeps on progress does, so its
+        /// output notifies.
+        async fn armed(store: &temporalio_streams::MemoryStore) {
+            let read = store
+                .read(StoreReadRequest {
+                    chain: Some(ChainId {
+                        namespace: "ns".to_string(),
+                        workflow_id: "wf".to_string(),
+                        first_run_id: "run".to_string(),
+                    }),
+                    topic: "t".to_string(),
+                    arm: true,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert!(read.armed);
+        }
+
         #[tokio::test]
         async fn an_accepted_completion_notifies_each_topic_it_made_visible() {
             let recorder = Arc::new(Recorder::default());
+            let memory = Arc::new(temporalio_streams::MemoryStore::new());
+            armed(&memory).await;
             let notifying = Arc::new(temporalio_streams::NotifyingStore::new(
-                Arc::new(temporalio_streams::MemoryStore::new()),
+                memory,
                 Arc::new(temporalio_streams::Notifier::new(recorder.clone(), 10)),
             ));
             let store = OutputStore::new(notifying.clone(), "ns".to_string(), Default::default());
@@ -1624,9 +1645,11 @@ mod tests {
         }
 
         /// A Worker's output store over memory that notifies `recorder`.
-        fn notifying_output(recorder: &Arc<Recorder>) -> OutputStore {
+        async fn notifying_output(recorder: &Arc<Recorder>) -> OutputStore {
+            let memory = Arc::new(temporalio_streams::MemoryStore::new());
+            armed(&memory).await;
             let notifying = Arc::new(temporalio_streams::NotifyingStore::new(
-                Arc::new(temporalio_streams::MemoryStore::new()),
+                memory,
                 Arc::new(temporalio_streams::Notifier::new(recorder.clone(), 10)),
             ));
             OutputStore::new(notifying, "ns".to_string(), Default::default())
@@ -1659,7 +1682,7 @@ mod tests {
         #[tokio::test]
         async fn a_workflow_close_ends_the_stream_on_the_server_after_its_output() {
             let recorder = Arc::new(Recorder::default());
-            let store = notifying_output(&recorder);
+            let store = notifying_output(&recorder).await;
             let mut closed = batch("a");
             closed.closes = vec![closing("t", "done")];
             store.stage(std::slice::from_ref(&closed)).await.unwrap();
@@ -1739,11 +1762,13 @@ mod tests {
         #[tokio::test]
         async fn a_retried_promotion_still_ends_the_stream_on_the_server_after_its_output() {
             let recorder = Arc::new(Recorder::default());
+            let inner = Arc::new(FailsFirstPromote(
+                temporalio_streams::MemoryStore::new(),
+                Mutex::new(true),
+            ));
+            armed(&inner.0).await;
             let notifying = Arc::new(temporalio_streams::NotifyingStore::new(
-                Arc::new(FailsFirstPromote(
-                    temporalio_streams::MemoryStore::new(),
-                    Mutex::new(true),
-                )),
+                inner,
                 Arc::new(temporalio_streams::Notifier::new(recorder.clone(), 10)),
             ));
             let store = OutputStore::new(notifying, "ns".to_string(), Default::default());
@@ -1773,7 +1798,7 @@ mod tests {
         #[tokio::test]
         async fn a_close_replay_proves_ends_the_stream_on_the_server() {
             let recorder = Arc::new(Recorder::default());
-            let store = notifying_output(&recorder);
+            let store = notifying_output(&recorder).await;
             store.stage(&[batch("a")]).await.unwrap();
             let mut replayed = proven("a");
             replayed.closes = vec![closing("t", "done")];
