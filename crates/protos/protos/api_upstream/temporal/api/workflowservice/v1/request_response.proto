@@ -3746,13 +3746,17 @@ message NotifyStreamRequest {
     // Small details passed on to the callbacks. The server rejects metadata whose keys and values
     // exceed 2 KiB in total, counted as UTF-8 bytes.
     map<string, string> metadata = 5;
-    // Closes the stream: the notifier completes every attached callback with `close_result`, and
-    // completes callbacks attached later right away.
+    // Closes the stream: the notifier completes every attached callback with `close_result`, or
+    // with `close_failure`, and completes callbacks attached later right away.
     bool close = 6;
     // The completion result when `close` is set, such as a summary of the stream. Optional.
     temporal.api.common.v1.Payload close_result = 7;
     // The identity of the producer.
     string identity = 8;
+    // Closes the stream with a failure instead of `close_result`. The notifier completes every
+    // callback as failed, or as canceled when the failure has canceled info. Needs `close`, and
+    // the server rejects a request that sets both `close_result` and `close_failure`.
+    temporal.api.failure.v1.Failure close_failure = 9;
 }
 
 message NotifyStreamResponse {
@@ -3772,4 +3776,6 @@ message DescribeStreamNotifierResponse {
     bool closed = 3;
     // The callbacks the notifier holds, in the order they were attached.
     repeated temporal.api.stream.v1.StreamCallbackInfo callbacks = 4;
+    // The failure the stream closed with, when it closed with one.
+    temporal.api.failure.v1.Failure close_failure = 5;
 }
