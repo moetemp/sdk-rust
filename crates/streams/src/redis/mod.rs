@@ -467,6 +467,7 @@ impl StreamStore for RedisStore {
         Ok(StoreAppendResponse {
             first_position,
             last_position,
+            arm: None,
         })
     }
 
@@ -511,6 +512,7 @@ impl StreamStore for RedisStore {
         Ok(StoreReadResponse {
             records: found,
             closed: state.chain_closed || state.topic_closed,
+            armed: false,
         })
     }
 
@@ -683,6 +685,7 @@ impl StreamStore for RedisStore {
         Ok(PromoteResult {
             outcome: outcome as i32,
             records,
+            arms: HashMap::new(),
         })
     }
 

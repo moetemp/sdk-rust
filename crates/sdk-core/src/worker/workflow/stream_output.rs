@@ -1450,6 +1450,7 @@ mod tests {
                 Ok(PromoteResult {
                     outcome: PromoteOutcome::Promoted as i32,
                     records: 1,
+                    ..Default::default()
                 })
             }
             async fn abort(&self, stage: &StageRef) -> StreamResult<()> {

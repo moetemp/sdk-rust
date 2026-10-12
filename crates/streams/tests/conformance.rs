@@ -15,10 +15,10 @@ use std::{
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
-    BEGINNING, END, MemoryStore, Notifier, NotifierClient, NotifyError, NotifyingStore,
-    OwnerClient, OwnerDescription, OwnerError, ReadTarget, StreamNotification, StreamResult,
-    StreamStore, Streams, StreamsOptions, mint_cursor, proto::*, read_page, stored_append_record,
-    stored_output_record, stream_hash,
+    BEGINNING, END, MemoryStore, NewestOrArm, Notifier, NotifierClient, NotifyError,
+    NotifyingStore, OwnerClient, OwnerDescription, OwnerError, ReadTarget, StreamNotification,
+    StreamResult, StreamStore, Streams, StreamsOptions, mint_cursor, proto::*, read_page,
+    stored_append_record, stored_output_record, stream_hash,
 };
 
 #[async_trait::async_trait]
@@ -1650,6 +1650,130 @@ mod cases {
             ["1"]
         );
     }
+    /// A store read that asks to arm when it finds nothing, as a reader that sleeps on progress
+    /// makes it.
+    async fn arming_read(
+        case: &dyn Case,
+        chain: &ChainId,
+        topic: &str,
+        after: &str,
+    ) -> StoreReadResponse {
+        case.store()
+            .read(StoreReadRequest {
+                chain: Some(chain.clone()),
+                topic: topic.to_string(),
+                after_position: after.to_string(),
+                max_records: 10,
+                arm: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+    }
+
+    pub(crate) async fn an_empty_read_that_asks_arms_and_the_next_append_reports_it(
+        case: &dyn Case,
+    ) {
+        let chain = case.chain();
+        let read = arming_read(case, &chain, OUT, "").await;
+        assert!(read.records.is_empty());
+        assert!(read.armed, "an empty read that asks arms");
+        let landed = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        assert!(landed.arm.is_some_and(|arm| arm > 0), "{landed:?}");
+    }
+
+    pub(crate) async fn an_append_with_nothing_armed_reports_zero(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        assert_eq!(producer.append(&["1"]).await.arm, Some(0));
+        // A read that doesn't ask never arms.
+        let read = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        let after = &read.records[0].cursor;
+        let empty = read_with(case, &chain, OUT, after, Duration::ZERO, &read.state)
+            .await
+            .unwrap();
+        assert!(empty.records.is_empty());
+        assert_eq!(producer.append(&["2"]).await.arm, Some(0));
+    }
+
+    pub(crate) async fn an_arm_that_finds_a_newer_record_stays_unarmed(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let first = producer.append(&["1"]).await;
+        producer.append(&["2"]).await;
+        let read = arming_read(case, &chain, OUT, &first.last_position).await;
+        assert_eq!(read.records.len(), 1);
+        assert!(!read.armed, "an answer with records never arms");
+        assert_eq!(producer.append(&["3"]).await.arm, Some(0));
+    }
+
+    pub(crate) async fn a_disarm_of_an_older_generation_keeps_the_newer_arm(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        assert!(arming_read(case, &chain, OUT, "").await.armed);
+        let landed = producer.append(&["1"]).await;
+        let older = landed.arm.unwrap();
+        assert!(
+            arming_read(case, &chain, OUT, &landed.last_position)
+                .await
+                .armed
+        );
+        let landed = producer.append(&["2"]).await;
+        let newer = landed.arm.unwrap();
+        assert!(newer > older, "a new arm gets a higher generation");
+        store.disarm(&chain, OUT, older).await.unwrap();
+        assert_eq!(producer.append(&["3"]).await.arm, Some(newer));
+        store.disarm(&chain, OUT, newer).await.unwrap();
+        assert_eq!(producer.append(&["4"]).await.arm, Some(0));
+        // A disarm of a topic that holds no arm changes nothing.
+        store.disarm(&chain, OTHER, newer).await.unwrap();
+    }
+
+    pub(crate) async fn a_promotion_reports_each_topics_arm(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        assert!(arming_read(case, &chain, OUT, "").await.armed);
+        store
+            .stage(staged(&chain, "run-1", "t1", &[(OUT, "1"), (OTHER, "2")]))
+            .await
+            .unwrap();
+        let promoted = store
+            .promote(&stage_ref(&chain, "t1", &[OUT, OTHER]))
+            .await
+            .unwrap();
+        assert_eq!(promoted.outcome(), PromoteOutcome::Promoted);
+        assert!(promoted.arms[OUT] > 0, "{promoted:?}");
+        assert_eq!(promoted.arms[OTHER], 0, "{promoted:?}");
+    }
+
+    pub(crate) async fn newest_or_arm_arms_only_an_empty_topic(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        let NewestOrArm::Armed(generation) = store.newest_or_arm(&chain, OUT).await.unwrap() else {
+            panic!("an empty topic arms");
+        };
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let landed = producer.append(&["1"]).await;
+        assert_eq!(landed.arm, Some(generation));
+        store.disarm(&chain, OUT, generation).await.unwrap();
+        assert_eq!(
+            store.newest_or_arm(&chain, OUT).await.unwrap(),
+            NewestOrArm::Newest(landed.last_position)
+        );
+        assert_eq!(producer.append(&["2"]).await.arm, Some(0));
+    }
+
+    pub(crate) async fn a_closed_topic_never_arms(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        store.close_topic(&chain, OUT, None).await.unwrap();
+        let read = arming_read(case, &chain, OUT, "").await;
+        assert!(read.closed);
+        assert!(!read.armed, "a closed answer never arms");
+    }
 }
 
 macro_rules! conformance {
@@ -1715,13 +1839,30 @@ macro_rules! store_cases {
     };
 }
 
+/// The arm a reader sets for the append notifications, for a store that arms.
+macro_rules! arm_cases {
+    ($case:expr) => {
+        conformance!($case;
+            an_empty_read_that_asks_arms_and_the_next_append_reports_it,
+            an_append_with_nothing_armed_reports_zero,
+            an_arm_that_finds_a_newer_record_stays_unarmed,
+            a_disarm_of_an_older_generation_keeps_the_newer_arm,
+            a_promotion_reports_each_topics_arm,
+            newest_or_arm_arms_only_an_empty_topic,
+            a_closed_topic_never_arms,
+        );
+    };
+}
+
 mod memory {
     store_cases!(super::memory());
+    arm_cases!(super::memory());
     conformance!(super::memory(); deleting_an_owner_drops_every_chain_of_it);
 }
 
 mod notifying_memory {
     store_cases!(super::notifying(super::memory()));
+    arm_cases!(super::notifying(super::memory()));
     conformance!(super::notifying(super::memory());
         deleting_an_owner_drops_every_chain_of_it,
     );

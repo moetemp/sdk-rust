@@ -4,7 +4,7 @@
 //! notification is a hint that there is something new to read. The records stay on the read path.
 
 use crate::{
-    CloseOutcome, StreamResult, StreamStore, WORKFLOW_OWNER_KIND, mint_cursor,
+    CloseOutcome, NewestOrArm, StreamResult, StreamStore, WORKFLOW_OWNER_KIND, mint_cursor,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteOutcome,
         PromoteResult, StageRef, StagedBatch, StoreAppendRequest, StoreAppendResponse,
@@ -889,6 +889,14 @@ impl StreamStore for NotifyingStore {
     async fn flush_notifications(&self) {
         self.notifier.flush().await;
     }
+
+    async fn disarm(&self, chain: &ChainId, topic: &str, generation: u64) -> StreamResult<()> {
+        self.inner.disarm(chain, topic, generation).await
+    }
+
+    async fn newest_or_arm(&self, chain: &ChainId, topic: &str) -> StreamResult<NewestOrArm> {
+        self.inner.newest_or_arm(chain, topic).await
+    }
 }
 
 #[cfg(test)]
@@ -1249,6 +1257,7 @@ mod tests {
             Ok(StoreAppendResponse {
                 first_position: "odd".to_string(),
                 last_position: "odd".to_string(),
+                arm: None,
             })
         }
         async fn read(&self, r: StoreReadRequest) -> StreamResult<StoreReadResponse> {

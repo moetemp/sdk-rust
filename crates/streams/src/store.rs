@@ -59,6 +59,7 @@ pub trait StreamStore: Send + Sync {
     /// positions and writes nothing. The same first sequence with another digest fails as
     /// producer divergent, and a first sequence below the end of the newest batch as producer
     /// stale. A closed chain or topic refuses a new batch as closed, but still answers a repeat.
+    /// The answer, a repeat's too, reports the topic's arm, so a lost notification goes again.
     async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse>;
 
     /// Reads the records of a topic after a position, waiting up to the request's `wait` for one
@@ -67,6 +68,10 @@ pub trait StreamStore: Send + Sync {
     /// Fails as expired when the position names a record retention dropped, or when retention
     /// dropped records the read had not delivered yet. Fails as not found when nothing is known
     /// about the topic and the position is not empty.
+    ///
+    /// A read that asks to arm and ends with no record on an open topic arms the topic in the
+    /// same step that finds it empty. The next append or promotion then reports the arm, and
+    /// the producer notifies the topic's callers.
     async fn read(&self, request: StoreReadRequest) -> StreamResult<StoreReadResponse>;
 
     /// The position of the newest record of a topic, or empty when it holds none.
@@ -107,7 +112,7 @@ pub trait StreamStore: Send + Sync {
     async fn stage(&self, batch: StagedBatch) -> StreamResult<()>;
 
     /// Moves a stage's records into their topics in one step, so readers see all or none of
-    /// them. Idempotent, and the records become visible once.
+    /// them. Idempotent, and the records become visible once. Reports each promoted topic's arm.
     async fn promote(&self, stage: &StageRef) -> StreamResult<PromoteResult>;
 
     /// Drops a stage whose Workflow Task never committed. Idempotent.
@@ -185,6 +190,43 @@ pub trait StreamStore: Send + Sync {
     /// Waits until the notifications this store sent are out. A store that sends none returns at
     /// once.
     async fn flush_notifications(&self) {}
+
+    /// Clears the arm of a topic when it still holds `generation`, once the notification that
+    /// generation asked for landed. A reader that armed again since holds a higher generation,
+    /// and its arm stays for the next append. A store that can't arm keeps the default.
+    async fn disarm(&self, chain: &ChainId, topic: &str, generation: u64) -> StreamResult<()> {
+        let _ = (chain, topic, generation);
+        Ok(())
+    }
+
+    /// The position of the newest record of a topic, or, when it holds none, an arm set in the
+    /// same step that finds it empty, so the first append reports the arm. A store that can't
+    /// arm keeps the default, which answers [NewestOrArm::Unarmed] for an empty topic.
+    async fn newest_or_arm(&self, chain: &ChainId, topic: &str) -> StreamResult<NewestOrArm> {
+        let position = self
+            .latest(StoreLatestRequest {
+                chain: Some(chain.clone()),
+                topic: topic.to_string(),
+            })
+            .await?
+            .position;
+        Ok(if position.is_empty() {
+            NewestOrArm::Unarmed
+        } else {
+            NewestOrArm::Newest(position)
+        })
+    }
+}
+
+/// What [StreamStore::newest_or_arm] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewestOrArm {
+    /// The position of the topic's newest record.
+    Newest(String),
+    /// The topic held no record, and the store armed it with this generation.
+    Armed(u64),
+    /// The topic held no record, and the store can't arm.
+    Unarmed,
 }
 
 #[cfg(test)]

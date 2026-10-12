@@ -168,6 +168,7 @@ impl StreamStore for RecordingStore {
         Ok(PromoteResult {
             outcome: PromoteOutcome::Promoted as i32,
             records: 1,
+            ..Default::default()
         })
     }
 

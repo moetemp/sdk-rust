@@ -334,6 +334,7 @@ pub(crate) async fn read_with(
                 0 => DEFAULT_MAX_RECORDS,
                 max => max,
             },
+            arm: false,
         })
         .await?;
     let closed = page.closed;
@@ -494,7 +495,7 @@ mod tests {
                 .collect();
             Ok(StoreReadResponse {
                 records,
-                closed: false,
+                ..Default::default()
             })
         }
 
