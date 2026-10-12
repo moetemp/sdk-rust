@@ -2268,10 +2268,12 @@ async fn a_completed_chain_ends_with_an_empty_result() {
     let (worker, _) = final_task(store.clone(), true, complete(), Some(completed)).await;
     store.wait_for_closes(1).await;
     worker.drain_pollers_and_shutdown().await;
-    assert_eq!(
-        chain_end_of(&store),
-        CloseOutcome::Result(Payload::default())
-    );
+    let CloseOutcome::Result(result) = chain_end_of(&store) else {
+        panic!("a completed chain ends with a result");
+    };
+    // A caller with a typed result decodes it as None, which an empty payload can't give.
+    assert_eq!(result.metadata["encoding"], b"binary/null");
+    assert!(result.data.is_empty());
 }
 
 #[tokio::test]

@@ -780,7 +780,7 @@ impl StreamStore for NotifyingStore {
     }
 
     async fn end_chain(&self, chain: &ChainId) -> StreamResult<()> {
-        self.end_chain_with(chain, CloseOutcome::Result(Payload::default()))
+        self.end_chain_with(chain, CloseOutcome::Result(crate::empty_close_result()))
             .await
     }
 
@@ -827,7 +827,7 @@ impl StreamStore for NotifyingStore {
         self.close_topic_with(
             chain,
             topic,
-            CloseOutcome::Result(result.unwrap_or_default()),
+            CloseOutcome::Result(result.unwrap_or_else(crate::empty_close_result)),
         )
         .await
     }
@@ -1533,6 +1533,37 @@ mod tests {
             message: "the agent gave up".to_string(),
             ..Default::default()
         }
+    }
+
+    fn is_null(outcome: &Option<CloseOutcome>) -> bool {
+        matches!(
+            outcome,
+            Some(CloseOutcome::Result(result))
+                if result.metadata.get("encoding").map(Vec::as_slice) == Some(b"binary/null")
+                    && result.data.is_empty()
+        )
+    }
+
+    #[tokio::test]
+    async fn a_topic_closed_without_a_result_closes_its_notifier_with_a_null_payload() {
+        let (client, store) = sees_the_store(None);
+        let run = chain("run-1");
+        store.append(append_request(&run, "t", 1)).await.unwrap();
+        store.close_topic(&run, "t", None).await.unwrap();
+        store.flush_notifications().await;
+        let close = client.sent.lock().unwrap().last().cloned().unwrap();
+        assert!(is_null(&close.close), "{close:?}");
+    }
+
+    #[tokio::test]
+    async fn a_chain_end_closes_each_open_notifier_with_a_null_payload() {
+        let (client, store) = sees_the_store(None);
+        let run = chain("run-1");
+        store.append(append_request(&run, "t", 1)).await.unwrap();
+        store.end_chain(&run).await.unwrap();
+        store.flush_notifications().await;
+        let close = client.sent.lock().unwrap().last().cloned().unwrap();
+        assert!(is_null(&close.close), "{close:?}");
     }
 
     #[tokio::test]
