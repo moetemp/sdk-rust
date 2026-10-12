@@ -84,7 +84,9 @@ impl StreamService {
         });
         let store: Arc<dyn StreamStore> = match &folding {
             Some(folding) => Arc::new(
-                NotifyingStore::new(store, folding.clone()).with_progress(config.notify_on_append),
+                NotifyingStore::new(store, folding.clone())
+                    .with_progress(config.notify_on_append)
+                    .with_every_append(config.notify_every_append),
             ),
             None => store,
         };
@@ -635,6 +637,43 @@ mod tests {
         assert_eq!(sent[0].topic, "out");
         assert_eq!(sent[0].position, appended.last_cursor);
         assert_eq!(sent[0].counter, 2);
+    }
+
+    #[tokio::test]
+    async fn with_every_append_on_an_append_with_nothing_armed_notifies() {
+        let recorder = Arc::new(Recorder::default());
+        let service = StreamService::connect_with_notifier(
+            StreamStoreConfig {
+                store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+                notify_on_append: true,
+                notify_every_append: true,
+                ..Default::default()
+            },
+            Arc::new(Running),
+            Some(recorder.clone()),
+        )
+        .await
+        .unwrap();
+        service.call("Append", &append(1, &["a"])).await.unwrap();
+        service.call("Append", &append(2, &["b"])).await.unwrap();
+        flush(&service).await;
+        let counters: Vec<i64> = recorder
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|n| n.counter)
+            .collect();
+        assert_eq!(counters.last(), Some(&2), "{counters:?}");
+    }
+
+    #[tokio::test]
+    async fn without_every_append_an_append_with_nothing_armed_sends_nothing() {
+        let recorder = Arc::new(Recorder::default());
+        let service = service_notifying(true, recorder.clone()).await;
+        service.call("Append", &append(1, &["a"])).await.unwrap();
+        flush(&service).await;
+        assert!(recorder.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
