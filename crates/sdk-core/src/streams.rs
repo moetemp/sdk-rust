@@ -16,7 +16,7 @@ pub use temporalio_streams::{StreamError, StreamResult, StreamService, StreamSto
 use tonic::IntoRequest;
 
 /// Connects to the store `config` names. The service asks `connection`'s server about streams'
-/// owners.
+/// owners, and its [StreamService::store] goes to each Worker's `stream_store`.
 pub async fn connect_stream_service(
     config: proto::StreamStoreConfig,
     connection: Connection,

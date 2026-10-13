@@ -58,9 +58,10 @@ relevant information.
   Worker stops.
 * Experimental: behind `streams`, `streams::connect_stream_service` builds one stream store from
   a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in process: append, read,
-  latest, close and owner delete, as serialized `coresdk.streams` requests.
+  latest, close and owner delete, as serialized `coresdk.streams` requests. Its store goes to each
+  Worker's `stream_store`, so a Workflow's output and outside producers share it.
 * Experimental: the C bridge has `temporal_core_stream_store_new`, `_call` and `_free` for the
-  stream service, built with the Redis store.
+  stream service, built with the Redis store, and a `stream_store` field on its worker options.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

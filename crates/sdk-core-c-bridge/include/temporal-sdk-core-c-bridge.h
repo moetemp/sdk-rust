@@ -109,7 +109,8 @@ typedef struct TemporalCoreRuntime TemporalCoreRuntime;
 typedef struct TemporalCoreSlotReserveCompletionCtx TemporalCoreSlotReserveCompletionCtx;
 
 /**
- * One process's stream store, serving the stream calls lang makes.
+ * One process's stream store, serving the stream calls lang makes. Workers take it in their
+ * options, so a Workflow's output and outside producers share it.
  */
 typedef struct TemporalCoreStreamStore TemporalCoreStreamStore;
 
@@ -912,6 +913,12 @@ typedef struct TemporalCoreWorkerOptions {
    * a workflow task. Zero disables eager activity execution.
    */
   uint32_t max_eager_activity_reservations_per_workflow_task;
+  /**
+   * The store this worker stages and promotes workflow stream output in, or null for none. It
+   * must outlive the worker.
+   * NOTE: Experimental
+   */
+  const struct TemporalCoreStreamStore *stream_store;
 } TemporalCoreWorkerOptions;
 
 /**

@@ -61,6 +61,10 @@ pub struct WorkerOptions {
     /// Maximum number of activity slots that may be reserved for eager execution when completing
     /// a workflow task. Zero disables eager activity execution.
     pub max_eager_activity_reservations_per_workflow_task: u32,
+    /// The store this worker stages and promotes workflow stream output in, or null for none. It
+    /// must outlive the worker.
+    /// NOTE: Experimental
+    pub stream_store: *const crate::streams::StreamStore,
 }
 
 #[repr(C)]
@@ -1304,6 +1308,9 @@ impl TryFrom<&WorkerOptions> for temporalio_sdk_core::WorkerConfig {
                     .collect::<HashSet<_>>(),
             )
             .disable_payload_error_limit(opt.disable_payload_error_limit)
+            .maybe_stream_store(
+                unsafe { opt.stream_store.as_ref() }.map(|store| store.service.store()),
+            )
             .build()
             .map_err(|err| anyhow::anyhow!(err))
     }
@@ -1510,6 +1517,7 @@ mod tests {
             storage_drivers: crate::ByteArrayRefArray::empty(),
             disable_payload_error_limit: false,
             max_eager_activity_reservations_per_workflow_task: 3,
+            stream_store: std::ptr::null(),
         }
     }
 
