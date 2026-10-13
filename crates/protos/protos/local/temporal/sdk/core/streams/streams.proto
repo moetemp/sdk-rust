@@ -174,7 +174,8 @@ message DeleteOwnerRequest {
 }
 
 message DeleteOwnerResponse {
-  // How many store keys the delete removed.
+  // How much the delete removed, counted the store's own way, such as Redis keys. Only zero
+  // means the same on every store: nothing was left to delete.
   uint64 deleted = 1;
 }
 

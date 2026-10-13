@@ -1,0 +1,828 @@
+//! The store contract, run against every store.
+//!
+//! Each case goes through [StreamStore] and [read_page] only, so a new store proves the contract
+//! by passing this file. A store joins with one `conformance!` line and a [Case] that makes its
+//! chains and drops its oldest records. Cases that need a Worker or the owner's History live with
+//! the Worker and the owner checks.
+
+use prost::Message;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
+use temporalio_common::protos::temporal::api::common::v1::Payload;
+use temporalio_streams::{
+    BEGINNING, END, MemoryStore, ReadTarget, StreamResult, StreamStore, mint_cursor, proto::*,
+    read_page, stored_append_record, stream_hash,
+};
+
+#[async_trait::async_trait]
+trait Case: Send + Sync {
+    fn store(&self) -> Arc<dyn StreamStore>;
+
+    /// A chain no other case uses.
+    fn chain(&self) -> ChainId;
+
+    /// Drops all but the newest `keep` records of a topic, as retention does.
+    async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize);
+}
+
+static CHAINS: AtomicUsize = AtomicUsize::new(0);
+
+fn unique(prefix: &str) -> String {
+    format!(
+        "{prefix}-{}-{}",
+        std::process::id(),
+        CHAINS.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+struct Memory(Arc<MemoryStore>);
+
+#[async_trait::async_trait]
+impl Case for Memory {
+    fn store(&self) -> Arc<dyn StreamStore> {
+        self.0.clone()
+    }
+
+    fn chain(&self) -> ChainId {
+        ChainId {
+            namespace: "default".to_string(),
+            workflow_id: unique("conformance"),
+            first_run_id: unique("run"),
+        }
+    }
+
+    async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize) {
+        self.0.truncate(chain, topic, keep);
+    }
+}
+
+fn memory() -> Memory {
+    Memory(Arc::new(MemoryStore::new()))
+}
+
+const OUT: &str = "out";
+const OTHER: &str = "other";
+
+/// One producer attempt on one topic, numbering its records as a producer in lang does.
+struct Producer {
+    store: Arc<dyn StreamStore>,
+    chain: ChainId,
+    topic: String,
+    id: String,
+    attempt: i64,
+    sequence: i64,
+}
+
+impl Producer {
+    fn new(case: &dyn Case, chain: &ChainId, topic: &str, id: &str, attempt: i64) -> Self {
+        Self {
+            store: case.store(),
+            chain: chain.clone(),
+            topic: topic.to_string(),
+            id: id.to_string(),
+            attempt,
+            sequence: 1,
+        }
+    }
+
+    fn request(&self, records: &[AppendRecord]) -> StoreAppendRequest {
+        StoreAppendRequest {
+            chain: Some(self.chain.clone()),
+            topic: self.topic.clone(),
+            producer_id: self.id.clone(),
+            attempt: self.attempt,
+            sequence: self.sequence,
+            digest: digest(records),
+            records: records
+                .iter()
+                .enumerate()
+                .map(|(index, record)| {
+                    stored_append_record(
+                        &self.topic,
+                        &self.id,
+                        self.attempt,
+                        self.sequence + index as i64,
+                        record,
+                    )
+                    .unwrap()
+                    .encode_to_vec()
+                })
+                .collect(),
+        }
+    }
+
+    async fn send(&mut self, records: &[AppendRecord]) -> StreamResult<StoreAppendResponse> {
+        let response = self.store.append(self.request(records)).await?;
+        self.sequence += records.len() as i64;
+        Ok(response)
+    }
+
+    async fn append(&mut self, values: &[&str]) -> StoreAppendResponse {
+        let records: Vec<_> = values.iter().map(|value| data(value)).collect();
+        self.send(&records).await.unwrap()
+    }
+}
+
+/// A record as lang hands it over: the body already encoded, the hash taken before the codec.
+fn data(value: &str) -> AppendRecord {
+    encoded(value, value.as_bytes())
+}
+
+fn encoded(value: &str, ciphertext: &[u8]) -> AppendRecord {
+    AppendRecord {
+        kind: StreamRecordKind::Data as i32,
+        body: Some(Payload {
+            metadata: [("encoding".to_string(), b"binary/test".to_vec())].into(),
+            data: ciphertext.to_vec(),
+            ..Default::default()
+        }),
+        content_hash: hash(value),
+    }
+}
+
+fn finish() -> AppendRecord {
+    AppendRecord {
+        kind: StreamRecordKind::Finish as i32,
+        ..Default::default()
+    }
+}
+
+fn hash(value: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(value.as_bytes()).to_vec()
+}
+
+/// Stands in for lang's batch digest, which a store keeps and compares as opaque bytes.
+fn digest(records: &[AppendRecord]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for record in records {
+        digest.update(record.kind.to_be_bytes());
+        digest.update((record.content_hash.len() as u64).to_be_bytes());
+        digest.update(&record.content_hash);
+    }
+    digest.finalize().to_vec()
+}
+
+fn target(chain: &ChainId, topic: &str) -> ReadTarget {
+    ReadTarget {
+        chain: chain.clone(),
+        topic: topic.to_string(),
+        stream_hash: stream_hash(&chain.namespace, "workflow", &chain.workflow_id, topic),
+    }
+}
+
+fn cursor(case: &dyn Case, chain: &ChainId, topic: &str, position: &str) -> String {
+    mint_cursor(
+        case.store().name(),
+        &target(chain, topic).stream_hash,
+        position,
+    )
+}
+
+async fn read(
+    case: &dyn Case,
+    chain: &ChainId,
+    topic: &str,
+    after: &str,
+) -> StreamResult<ReadResponse> {
+    read_with(case, chain, topic, after, Duration::ZERO, &[]).await
+}
+
+async fn read_with(
+    case: &dyn Case,
+    chain: &ChainId,
+    topic: &str,
+    after: &str,
+    wait: Duration,
+    state: &[u8],
+) -> StreamResult<ReadResponse> {
+    read_page(
+        &*case.store(),
+        &target(chain, topic),
+        &ReadRequest {
+            after: after.to_string(),
+            wait: Some(wait.try_into().unwrap()),
+            state: state.to_vec(),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+fn stored(record: &ReadRecord) -> &StreamRecord {
+    match record.record.as_ref().unwrap() {
+        read_record::Record::Stored(stored) => stored,
+        other => panic!("not a stored record: {other:?}"),
+    }
+}
+
+/// The body of each stored record, and `SUPERSEDED` for a supersession.
+fn values(response: &ReadResponse) -> Vec<String> {
+    response
+        .records
+        .iter()
+        .map(|record| match record.record.as_ref().unwrap() {
+            read_record::Record::Stored(stored) => match &stored.body {
+                Some(body) => String::from_utf8(body.data.clone()).unwrap(),
+                None => "FINISH".to_string(),
+            },
+            read_record::Record::Superseded(_) => "SUPERSEDED".to_string(),
+        })
+        .collect()
+}
+
+async fn latest(case: &dyn Case, chain: &ChainId, topic: &str) -> String {
+    case.store()
+        .latest(StoreLatestRequest {
+            chain: Some(chain.clone()),
+            topic: topic.to_string(),
+        })
+        .await
+        .unwrap()
+        .position
+}
+
+fn kind(result: StreamResult<impl std::fmt::Debug>) -> StreamFailureKind {
+    result.unwrap_err().kind
+}
+
+mod cases {
+    use super::*;
+
+    pub(crate) async fn append_read_roundtrip(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer.append(&["1"]).await;
+        producer.append(&["2"]).await;
+        let read = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert_eq!(values(&read), ["1", "2"]);
+        let identity: Vec<_> = read
+            .records
+            .iter()
+            .map(|record| {
+                let stored = stored(record);
+                (
+                    stored.topic.as_str(),
+                    stored.kind,
+                    stored.producer_id.as_str(),
+                    stored.attempt,
+                    stored.sequence,
+                )
+            })
+            .collect();
+        let data = StreamRecordKind::Data as i32;
+        assert_eq!(identity, [(OUT, data, "p", 1, 1), (OUT, data, "p", 1, 2)]);
+    }
+
+    pub(crate) async fn a_batch_lands_in_order_and_names_its_last_record(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let landed = producer.append(&["1", "2", "3"]).await;
+        let read = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert_eq!(values(&read), ["1", "2", "3"]);
+        let sequences: Vec<_> = read.records.iter().map(|r| stored(r).sequence).collect();
+        assert_eq!(sequences, [1, 2, 3]);
+        assert_eq!(
+            read.records[0].cursor,
+            cursor(case, &chain, OUT, &landed.first_position)
+        );
+        assert_eq!(
+            read.records[2].cursor,
+            cursor(case, &chain, OUT, &landed.last_position)
+        );
+        assert_eq!(latest(case, &chain, OUT).await, landed.last_position);
+    }
+
+    pub(crate) async fn an_empty_append_is_refused(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        assert_eq!(kind(producer.send(&[]).await), StreamFailureKind::Refused);
+        assert_eq!(latest(case, &chain, OUT).await, "");
+    }
+
+    pub(crate) async fn latest_is_empty_on_an_empty_topic(case: &dyn Case) {
+        assert_eq!(latest(case, &case.chain(), OUT).await, "");
+    }
+
+    pub(crate) async fn a_cursor_resumes_strictly_after_its_record(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let first = producer.append(&["1"]).await;
+        producer.append(&["2", "3"]).await;
+        let after = cursor(case, &chain, OUT, &first.last_position);
+        let read = read(case, &chain, OUT, &after).await.unwrap();
+        assert_eq!(values(&read), ["2", "3"]);
+        // A cursor a reader saw resumes the same way as one an append returned.
+        let again = super::read(case, &chain, OUT, &read.records[0].cursor)
+            .await
+            .unwrap();
+        assert_eq!(values(&again), ["3"]);
+        assert_eq!(read.cursor, read.records[1].cursor);
+    }
+
+    pub(crate) async fn latest_positions_a_reader_at_the_end(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer.append(&["1"]).await;
+        let end = cursor(case, &chain, OUT, &latest(case, &chain, OUT).await);
+        producer.append(&["2"]).await;
+        assert_eq!(values(&read(case, &chain, OUT, &end).await.unwrap()), ["2"]);
+    }
+
+    pub(crate) async fn end_reads_only_what_arrives_after_the_read_starts(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer.append(&["1"]).await;
+        let mut later = Producer::new(case, &chain, OUT, "p", 1);
+        later.sequence = 2;
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            later.append(&["2"]).await;
+        });
+        let read = read_with(case, &chain, OUT, END, Duration::from_secs(5), &[])
+            .await
+            .unwrap();
+        writer.await.unwrap();
+        assert_eq!(values(&read), ["2"]);
+        let quiet = read_with(case, &chain, OUT, END, Duration::from_millis(200), &[])
+            .await
+            .unwrap();
+        assert!(quiet.records.is_empty());
+        assert_eq!(quiet.cursor, read.cursor);
+    }
+
+    pub(crate) async fn a_read_waits_no_longer_than_asked(case: &dyn Case) {
+        let chain = case.chain();
+        let started = tokio::time::Instant::now();
+        let read = read_with(
+            case,
+            &chain,
+            OUT,
+            BEGINNING,
+            Duration::from_millis(200),
+            &[],
+        )
+        .await
+        .unwrap();
+        assert!(read.records.is_empty());
+        assert_eq!(read.cursor, BEGINNING);
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(150), "{waited:?}");
+        assert!(waited < Duration::from_secs(3), "{waited:?}");
+    }
+
+    pub(crate) async fn dropping_a_waiting_read_releases_it(case: &dyn Case) {
+        let chain = case.chain();
+        let parked = read_with(case, &chain, OUT, BEGINNING, Duration::from_secs(30), &[]);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), parked)
+                .await
+                .is_err()
+        );
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        assert_eq!(
+            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
+            ["1"]
+        );
+    }
+
+    pub(crate) async fn beginning_starts_at_the_oldest_record_still_held(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let old = producer.append(&["1"]).await;
+        producer.append(&["2", "3"]).await;
+        case.drop_oldest(&chain, OUT, 2).await;
+        let read = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert_eq!(values(&read), ["2", "3"]);
+        // The dropped record's cursor still resumes, because nothing after it was dropped.
+        let old = cursor(case, &chain, OUT, &old.last_position);
+        assert_eq!(
+            values(&super::read(case, &chain, OUT, &old).await.unwrap()),
+            ["2", "3"]
+        );
+        // Once a record after it is gone too, the cursor is expired, which a reader can tell
+        // apart from a cursor that was never valid here.
+        case.drop_oldest(&chain, OUT, 1).await;
+        assert_eq!(
+            kind(super::read(case, &chain, OUT, &old).await),
+            StreamFailureKind::Expired
+        );
+    }
+
+    pub(crate) async fn a_reader_that_falls_behind_retention_is_told(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer.append(&["1", "2", "3"]).await;
+        let first = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        let after_one = first.records[0].cursor.clone();
+        case.drop_oldest(&chain, OUT, 1).await;
+        // The reader got record 1, and record 2 is gone, so it must hear so.
+        assert_eq!(
+            kind(read_with(case, &chain, OUT, &after_one, Duration::ZERO, &first.state).await),
+            StreamFailureKind::Expired
+        );
+    }
+
+    pub(crate) async fn a_retried_append_returns_the_original_positions(case: &dyn Case) {
+        let chain = case.chain();
+        let first = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1", "2"])
+            .await;
+        // A producer that lost the answer starts over with the same identity, as a restarted
+        // process does.
+        let retry = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1", "2"])
+            .await;
+        assert_eq!(retry, first);
+        assert_eq!(latest(case, &chain, OUT).await, first.last_position);
+        assert_eq!(
+            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
+            ["1", "2"]
+        );
+    }
+
+    pub(crate) async fn a_retry_with_other_ciphertext_still_deduplicates(case: &dyn Case) {
+        // A codec that encrypts with a fresh nonce makes a retry's bytes differ. The digest is
+        // over the plaintext hashes, so the store still knows the batch.
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let first = producer.send(&[encoded("1", b"nonce-a")]).await.unwrap();
+        let mut retry = Producer::new(case, &chain, OUT, "p", 1);
+        let again = retry.send(&[encoded("1", b"nonce-b")]).await.unwrap();
+        assert_eq!(again, first);
+        assert_eq!(
+            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
+            ["nonce-a"]
+        );
+    }
+
+    pub(crate) async fn a_divergent_retry_is_refused(case: &dyn Case) {
+        let chain = case.chain();
+        let first = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        let mut retry = Producer::new(case, &chain, OUT, "p", 1);
+        assert_eq!(
+            kind(retry.send(&[data("different")]).await),
+            StreamFailureKind::ProducerDivergent
+        );
+        assert_eq!(latest(case, &chain, OUT).await, first.last_position);
+    }
+
+    pub(crate) async fn a_sequence_below_the_newest_is_refused(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer.append(&["1"]).await;
+        let newest = producer.append(&["2"]).await;
+        // Even the same content is refused: only the newest batch is a retry.
+        let mut stale = Producer::new(case, &chain, OUT, "p", 1);
+        assert_eq!(
+            kind(stale.send(&[data("1")]).await),
+            StreamFailureKind::ProducerStale
+        );
+        assert_eq!(latest(case, &chain, OUT).await, newest.last_position);
+    }
+
+    pub(crate) async fn rule_9_1_a_batch_inside_the_held_batch_is_refused(case: &dyn Case) {
+        let chain = case.chain();
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1", "2", "3"])
+            .await;
+        // A second writer of the same attempt, whose sequence sits inside the held batch.
+        let mut inside = Producer::new(case, &chain, OUT, "p", 1);
+        inside.sequence = 2;
+        assert_eq!(
+            kind(inside.send(&[data("9")]).await),
+            StreamFailureKind::ProducerStale
+        );
+    }
+
+    pub(crate) async fn rule_64_1_a_gap_in_the_sequence_is_accepted(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer.append(&["1"]).await;
+        producer.sequence = 10;
+        producer.append(&["10"]).await;
+        assert_eq!(
+            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
+            ["1", "10"]
+        );
+    }
+
+    pub(crate) async fn producers_and_attempts_dedupe_apart(case: &dyn Case) {
+        let chain = case.chain();
+        Producer::new(case, &chain, OUT, "a", 1)
+            .append(&["1"])
+            .await;
+        Producer::new(case, &chain, OUT, "b", 1)
+            .append(&["1"])
+            .await;
+        Producer::new(case, &chain, OUT, "a", 2)
+            .append(&["1"])
+            .await;
+        let read = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        let data: Vec<_> = read
+            .records
+            .iter()
+            .filter_map(|record| match record.record.as_ref().unwrap() {
+                read_record::Record::Stored(s) => Some((s.producer_id.as_str(), s.attempt)),
+                read_record::Record::Superseded(_) => None,
+            })
+            .collect();
+        assert_eq!(data, [("a", 1), ("b", 1), ("a", 2)]);
+    }
+
+    pub(crate) async fn a_new_attempt_supersedes_the_old_one(case: &dyn Case) {
+        let chain = case.chain();
+        Producer::new(case, &chain, OUT, "model", 1)
+            .append(&["1"])
+            .await;
+        Producer::new(case, &chain, OUT, "model", 2)
+            .append(&["2"])
+            .await;
+        let read = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert_eq!(values(&read), ["1", "SUPERSEDED", "2"]);
+        let Some(read_record::Record::Superseded(superseded)) = &read.records[1].record else {
+            panic!("no supersession");
+        };
+        assert_eq!(
+            (
+                superseded.producer_id.as_str(),
+                superseded.previous_attempt,
+                superseded.attempt
+            ),
+            ("model", 1, 2)
+        );
+        // The supersession sits at the cursor of the old attempt's last record. A read that
+        // resumes there knows that attempt, so it reports the new one again.
+        assert_eq!(read.records[1].cursor, read.records[0].cursor);
+        let resumed = super::read(case, &chain, OUT, &read.records[1].cursor)
+            .await
+            .unwrap();
+        assert_eq!(values(&resumed), ["SUPERSEDED", "2"]);
+    }
+
+    pub(crate) async fn a_read_resumed_before_a_new_attempt_reports_it(case: &dyn Case) {
+        let chain = case.chain();
+        let mut first = Producer::new(case, &chain, OUT, "model", 1);
+        first.append(&["1"]).await;
+        let delivered = first.append(&["2"]).await;
+        // The reader stops here, then the producer's retry writes.
+        Producer::new(case, &chain, OUT, "model", 2)
+            .append(&["3"])
+            .await;
+        let after = cursor(case, &chain, OUT, &delivered.last_position);
+        let resumed = read(case, &chain, OUT, &after).await.unwrap();
+        assert_eq!(values(&resumed), ["SUPERSEDED", "3"]);
+    }
+
+    pub(crate) async fn a_record_that_does_not_parse_fails_with_its_cursor(case: &dyn Case) {
+        let chain = case.chain();
+        let producer = Producer::new(case, &chain, OUT, "p", 1);
+        let mut request = producer.request(&[data("bad")]);
+        request.records = vec![b"\xff not a record".to_vec()];
+        let bad = case.store().append(request).await.unwrap();
+        let mut next = Producer::new(case, &chain, OUT, "p", 1);
+        next.sequence = 2;
+        next.append(&["7"]).await;
+        let error = read(case, &chain, OUT, BEGINNING).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Record);
+        let bad = cursor(case, &chain, OUT, &bad.last_position);
+        assert_eq!(error.cursor.as_deref(), Some(bad.as_str()));
+        // Resuming past it is the caller's choice, and the next record reads.
+        assert_eq!(values(&read(case, &chain, OUT, &bad).await.unwrap()), ["7"]);
+    }
+
+    pub(crate) async fn finish_is_a_record_of_its_own(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer.append(&["1"]).await;
+        let finished = producer.send(&[finish()]).await.unwrap();
+        let read = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert_eq!(values(&read), ["1", "FINISH"]);
+        assert_eq!(
+            stored(&read.records[1]).kind,
+            StreamRecordKind::Finish as i32
+        );
+        assert_eq!(stored(&read.records[1]).producer_id, "p");
+        assert_eq!(
+            read.records[1].cursor,
+            cursor(case, &chain, OUT, &finished.last_position)
+        );
+    }
+
+    pub(crate) async fn topics_and_chains_are_apart(case: &dyn Case) {
+        let chain = case.chain();
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        Producer::new(case, &chain, OTHER, "p", 1)
+            .append(&["2"])
+            .await;
+        // A new chain on the same Workflow id gets streams of its own.
+        let next = ChainId {
+            first_run_id: format!("{}-next", chain.first_run_id),
+            ..chain.clone()
+        };
+        Producer::new(case, &next, OUT, "p", 1).append(&["3"]).await;
+        assert_eq!(
+            values(&read(case, &chain, OTHER, BEGINNING).await.unwrap()),
+            ["2"]
+        );
+        assert_eq!(
+            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
+            ["1"]
+        );
+        assert_eq!(
+            values(&read(case, &next, OUT, BEGINNING).await.unwrap()),
+            ["3"]
+        );
+    }
+
+    pub(crate) async fn a_cursor_from_another_stream_or_store_is_refused(case: &dyn Case) {
+        let one = case.chain();
+        let other = case.chain();
+        let landed = Producer::new(case, &one, OUT, "p", 1).append(&["1"]).await;
+        Producer::new(case, &other, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        Producer::new(case, &one, OTHER, "p", 1)
+            .append(&["1"])
+            .await;
+        // Another Workflow's stream, and another topic of the same one, both hold a record at
+        // that position. Neither may resume from it.
+        let cursor = cursor(case, &one, OUT, &landed.last_position);
+        for (chain, topic) in [(&other, OUT), (&one, OTHER)] {
+            let error = read(case, chain, topic, &cursor).await.unwrap_err();
+            assert_eq!(error.kind, StreamFailureKind::Cursor);
+            assert!(error.message.contains("another stream"), "{error}");
+        }
+        for token in ["elsewhere:0000abcd:1", "not a cursor"] {
+            assert_eq!(
+                kind(read(case, &one, OUT, token).await),
+                StreamFailureKind::Cursor
+            );
+        }
+    }
+
+    pub(crate) async fn a_closed_chain_refuses_new_batches_but_answers_a_repeat(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let landed = producer.append(&["1"]).await;
+        case.store().close_chain(&chain).await.unwrap();
+        let repeat = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        assert_eq!(repeat, landed);
+        assert_eq!(
+            kind(producer.send(&[data("2")]).await),
+            StreamFailureKind::Closed
+        );
+        assert_eq!(
+            kind(
+                Producer::new(case, &chain, OTHER, "q", 1)
+                    .send(&[data("1")])
+                    .await
+            ),
+            StreamFailureKind::Closed
+        );
+        let read = case
+            .store()
+            .read(StoreReadRequest {
+                chain: Some(chain.clone()),
+                topic: OUT.to_string(),
+                max_records: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(read.closed);
+        assert_eq!(read.records.len(), 1);
+    }
+
+    pub(crate) async fn a_refused_append_leaves_no_trace_of_its_topic(case: &dyn Case) {
+        // Every store must answer a resume on a topic that never held a record the same way.
+        let chain = case.chain();
+        let landed = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        case.store().close_chain(&chain).await.unwrap();
+        assert_eq!(
+            kind(
+                Producer::new(case, &chain, OTHER, "p", 1)
+                    .send(&[data("2")])
+                    .await
+            ),
+            StreamFailureKind::Closed
+        );
+        let after = cursor(case, &chain, OTHER, &landed.last_position);
+        assert_eq!(
+            kind(read(case, &chain, OTHER, &after).await),
+            StreamFailureKind::NotFound
+        );
+    }
+
+    pub(crate) async fn a_closed_topic_leaves_the_others_open(case: &dyn Case) {
+        let chain = case.chain();
+        case.store().close_topic(&chain, OUT).await.unwrap();
+        assert_eq!(
+            kind(
+                Producer::new(case, &chain, OUT, "p", 1)
+                    .send(&[data("1")])
+                    .await
+            ),
+            StreamFailureKind::Closed
+        );
+        Producer::new(case, &chain, OTHER, "p", 1)
+            .append(&["1"])
+            .await;
+    }
+
+    pub(crate) async fn deleting_an_owner_drops_every_chain_of_it(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        let next = ChainId {
+            first_run_id: format!("{}-next", chain.first_run_id),
+            ..chain.clone()
+        };
+        let bystander = case.chain();
+        let landed = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        Producer::new(case, &next, OUT, "p", 1).append(&["1"]).await;
+        Producer::new(case, &bystander, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        let request = DeleteOwnerRequest {
+            namespace: chain.namespace.clone(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: chain.workflow_id.clone(),
+        };
+        assert!(store.delete_owner(request.clone()).await.unwrap().deleted > 0);
+        assert_eq!(store.delete_owner(request).await.unwrap().deleted, 0);
+        assert_eq!(latest(case, &chain, OUT).await, "");
+        // Nothing is known about what followed the cursor any more.
+        let after = cursor(case, &chain, OUT, &landed.last_position);
+        assert_eq!(
+            kind(read(case, &chain, OUT, &after).await),
+            StreamFailureKind::NotFound
+        );
+        assert_eq!(
+            values(&read(case, &bystander, OUT, BEGINNING).await.unwrap()),
+            ["1"]
+        );
+    }
+}
+
+macro_rules! conformance {
+    ($case:expr; $($name:ident),* $(,)?) => {
+        $(
+            #[tokio::test]
+            async fn $name() {
+                let case = $case;
+                super::cases::$name(&case).await;
+            }
+        )*
+    };
+}
+
+mod memory {
+    conformance!(super::memory();
+        append_read_roundtrip,
+        a_batch_lands_in_order_and_names_its_last_record,
+        an_empty_append_is_refused,
+        latest_is_empty_on_an_empty_topic,
+        a_cursor_resumes_strictly_after_its_record,
+        latest_positions_a_reader_at_the_end,
+        end_reads_only_what_arrives_after_the_read_starts,
+        a_read_waits_no_longer_than_asked,
+        dropping_a_waiting_read_releases_it,
+        beginning_starts_at_the_oldest_record_still_held,
+        a_reader_that_falls_behind_retention_is_told,
+        a_retried_append_returns_the_original_positions,
+        a_retry_with_other_ciphertext_still_deduplicates,
+        a_divergent_retry_is_refused,
+        a_sequence_below_the_newest_is_refused,
+        rule_9_1_a_batch_inside_the_held_batch_is_refused,
+        rule_64_1_a_gap_in_the_sequence_is_accepted,
+        producers_and_attempts_dedupe_apart,
+        a_new_attempt_supersedes_the_old_one,
+        a_read_resumed_before_a_new_attempt_reports_it,
+        a_record_that_does_not_parse_fails_with_its_cursor,
+        finish_is_a_record_of_its_own,
+        topics_and_chains_are_apart,
+        a_cursor_from_another_stream_or_store_is_refused,
+        a_closed_chain_refuses_new_batches_but_answers_a_repeat,
+        a_closed_topic_leaves_the_others_open,
+        a_refused_append_leaves_no_trace_of_its_topic,
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
