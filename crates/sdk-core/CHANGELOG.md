@@ -80,9 +80,9 @@ relevant information.
   after every write, for readers that can't arm. Notifications for one stream fold into one call
   in flight, a failed last notification is tried twice more, and a notification never fails the
   write. `max_notifiers` caps how many streams the process keeps a notifier for (1000 when zero).
-* Experimental: `StreamStore` has `disarm` and `newest_or_arm`, and its read, append and promote
-  messages carry the arm. The Redis store keeps it in each topic's meta as `arm` and `arm_seq`,
-  which changes the append and promote script hashes.
+* Experimental: `StreamStore` has `disarm` and `newest_or_arm`, and its read and append messages
+  carry the arm. The Redis store keeps it in each topic's meta as `arm` and `arm_seq`, which
+  changes the append script hash.
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A Worker flushes at stop on its own, so only a process that holds just
   a client needs it.
