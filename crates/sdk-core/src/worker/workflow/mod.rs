@@ -7,6 +7,7 @@ mod history_update;
 mod machines;
 mod managed_run;
 mod run_cache;
+mod stream_output;
 mod wft_extraction;
 pub(crate) mod wft_poller;
 mod workflow_stream;

@@ -31,6 +31,7 @@ use crate::{
             machines::{
                 HistEventData, activity_state_machine::ActivityMachine,
                 child_workflow_state_machine::ChildWorkflowMachine,
+                external_stream_state_machine::ExternalStreamMachine,
                 modify_workflow_properties_state_machine::modify_workflow_properties,
                 nexus_operation_state_machine::NexusOperationMachine,
                 update_state_machine::UpdateMachine,
@@ -58,6 +59,7 @@ use temporalio_common::{
         VERSION_SEARCH_ATTR_KEY,
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
+            external_data::{ExternalStreamBoundary, ExternalStreamMarkerData},
             workflow_activation::{
                 self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
@@ -90,6 +92,10 @@ pub(crate) struct WorkflowMachines {
     protocol_msgs: Vec<IncomingProtocolMessage>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
+    /// The event before the current WorkflowTaskScheduled event, which is always its id minus
+    /// one, since History is applied in order. `None` only before the first task is scheduled
+    /// and after a speculative task is dropped, and output staging must fail then.
+    current_wft_history_floor_event_id: Option<i64>,
     /// The event id of the next workflow task started event that the machines need to process.
     /// Eventually, this number should reach the started id in the latest history update, but
     /// we must incrementally apply the history while communicating with lang.
@@ -280,6 +286,7 @@ impl WorkflowMachines {
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
             current_started_event_id: 0,
+            current_wft_history_floor_event_id: None,
             next_started_event_id: 0,
             last_processed_event: 0,
             workflow_start_time: None,
@@ -406,6 +413,10 @@ impl WorkflowMachines {
         self.current_started_event_id
     }
 
+    pub(crate) fn current_wft_history_floor_event_id(&self) -> Option<i64> {
+        self.current_wft_history_floor_event_id
+    }
+
     pub(crate) fn history_size_bytes(&self) -> u64 {
         self.history_size_bytes
     }
@@ -486,6 +497,29 @@ impl WorkflowMachines {
         }
     }
 
+    /// Writes one external stream marker for an output commit lang sent.
+    ///
+    /// Must be called before lang's own commands for the same completion are pushed, so the
+    /// marker precedes the other commands of that completion, a terminal command included.
+    /// Commands from earlier activations of the same Workflow Task are already queued and come
+    /// first.
+    pub(crate) fn emit_external_stream_marker(
+        &mut self,
+        data: ExternalStreamMarkerData,
+    ) -> Result<()> {
+        if data.terminal_boundary() == ExternalStreamBoundary::Unspecified {
+            return Err(fatal!(
+                "Refusing to write an external stream marker with no terminal boundary"
+            ));
+        }
+        self.add_cmd_to_wf_task(
+            ExternalStreamMachine::record_marker(data),
+            Default::default(),
+            CommandIdKind::CoreInternal,
+        );
+        Ok(())
+    }
+
     pub(crate) fn has_pending_jobs(&self) -> bool {
         !self.drive_me.peek_pending_jobs().is_empty()
     }
@@ -524,6 +558,7 @@ impl WorkflowMachines {
     pub(crate) fn reset_last_started_id(&mut self, id: i64) {
         debug!("Resetting back to event id {} due to speculative WFT", id);
         self.current_started_event_id = id;
+        self.current_wft_history_floor_event_id = None;
         // We must reset the last event we "processed" to be after the last WFT we really completed
         // + any command events (since the SDK "processed" those when it emitted the commands). This
         // is also equal to what we just processed in the speculative task, minus two, since we
@@ -674,6 +709,9 @@ impl WorkflowMachines {
                     self.last_processed_event,
                     eid
                 ));
+            }
+            if event.event_type() == EventType::WorkflowTaskScheduled {
+                self.current_wft_history_floor_event_id = Some(self.last_processed_event);
             }
             let next_event = history.peek();
 
@@ -1588,8 +1626,8 @@ impl WorkflowMachines {
                 }
                 WFCommandVariant::ExternalOutputStreamCommit(_) => {
                     return Err(fatal!(
-                        "WorkflowOutputStreamCommit reached the state machines; it must be \
-                         consumed when the completion is processed"
+                        "WorkflowOutputStreamCommit reached the state machines; it should have \
+                         been consumed when the completion was processed"
                     ));
                 }
                 WFCommandVariant::NoCommandsFromLang => (),

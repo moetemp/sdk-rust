@@ -9,6 +9,7 @@ mod cancel_workflow_state_machine;
 mod child_workflow_state_machine;
 mod complete_workflow_state_machine;
 mod continue_as_new_workflow_state_machine;
+mod external_stream_state_machine;
 mod fail_workflow_state_machine;
 mod local_activity_state_machine;
 mod modify_workflow_properties_state_machine;
@@ -36,6 +37,7 @@ use cancel_workflow_state_machine::CancelWorkflowMachine;
 use child_workflow_state_machine::ChildWorkflowMachine;
 use complete_workflow_state_machine::CompleteWorkflowMachine;
 use continue_as_new_workflow_state_machine::ContinueAsNewWorkflowMachine;
+use external_stream_state_machine::ExternalStreamMachine;
 use fail_workflow_state_machine::FailWorkflowMachine;
 use local_activity_state_machine::LocalActivityMachine;
 use modify_workflow_properties_state_machine::ModifyWorkflowPropertiesMachine;
@@ -72,6 +74,7 @@ enum Machines {
     ChildWorkflowMachine,
     CompleteWorkflowMachine,
     ContinueAsNewWorkflowMachine,
+    ExternalStreamMachine,
     FailWorkflowMachine,
     LocalActivityMachine,
     PatchMachine,

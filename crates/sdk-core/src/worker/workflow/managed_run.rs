@@ -16,6 +16,7 @@ use crate::{
             WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
+            stream_output::{MARKER_SCHEMA_VERSION, build_output_manifest, check_output_closes},
         },
     },
 };
@@ -32,11 +33,12 @@ use temporalio_common::protos::{
     TaskToken,
     coresdk::{
         common::ExternalStorageMetrics,
+        external_data::{ExternalStreamBoundary, ExternalStreamMarkerData},
         workflow_activation::{
             RemoveFromCache, WorkflowActivation, query_to_job, remove_from_cache::EvictionReason,
             workflow_activation_job,
         },
-        workflow_commands::{FailWorkflowExecution, QueryResult},
+        workflow_commands::{FailWorkflowExecution, QueryResult, WorkflowOutputStreamCommit},
         workflow_completion,
     },
     temporal::api::{
@@ -46,6 +48,7 @@ use temporalio_common::protos::{
 };
 use tokio::sync::oneshot;
 use tracing::Span;
+use uuid::Uuid;
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 pub(super) type RunUpdateAct = Option<ActivationOrAuto>;
@@ -774,10 +777,18 @@ impl ManagedRun {
             )));
         }
 
+        let mut lang_commands = completion.commands;
+        if let Err(source) = self.commit_external_output(&mut lang_commands) {
+            return Err(RunUpdateErr {
+                source,
+                complete_resp_chan: completion.resp_chan,
+            });
+        }
+
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
             // another activation and mark it if so
-            self.wfm.push_commands_and_iterate(completion.commands)?;
+            self.wfm.push_commands_and_iterate(lang_commands)?;
             if let Some(update) = update_from_new_page {
                 self.wfm.feed_history_from_new_page(update)?;
             }
@@ -870,6 +881,45 @@ impl ManagedRun {
                 complete_resp_chan: completion.resp_chan,
             }),
         }
+    }
+
+    /// Records the stream output lang committed, if any, as a marker ahead of its other commands.
+    ///
+    /// The marker is what makes the output visible. It's promoted only once the marker is in
+    /// History, so a Workflow Task that fails or times out publishes nothing.
+    fn commit_external_output(&mut self, commands: &mut Vec<WFCommand>) -> Result<()> {
+        let Some(commit) = take_output_stream_commit(commands)? else {
+            return Ok(());
+        };
+        check_output_closes(&commit.records, &commit.closes)?;
+        let manifest = build_output_manifest(
+            &commit.records,
+            self.wfm.machines.current_wft_history_floor_event_id(),
+            &self.wfm.machines.run_id,
+            Uuid::new_v4().simple().to_string(),
+            false,
+        )?;
+        // It covers this activation's commands only. With a Local Activity, an earlier activation
+        // of the same task may have produced commands, and nothing reads the field yet.
+        let terminal_boundary = if commands.iter().any(|c| c.variant.is_terminal()) {
+            ExternalStreamBoundary::WorkflowCompleted
+        } else if commands.iter().any(|c| {
+            !matches!(
+                c.variant,
+                WFCommandVariant::NoCommandsFromLang | WFCommandVariant::QueryResponse(_)
+            )
+        }) {
+            ExternalStreamBoundary::CommandsProduced
+        } else {
+            ExternalStreamBoundary::TaskCompleted
+        };
+        self.wfm
+            .machines
+            .emit_external_stream_marker(ExternalStreamMarkerData {
+                schema_version: MARKER_SCHEMA_VERSION,
+                terminal_boundary: terminal_boundary as i32,
+                output: Some(manifest),
+            })
     }
 
     fn _local_resolution(
@@ -1344,6 +1394,29 @@ impl ManagedRun {
     }
 }
 
+/// Removes lang's output commit from `commands`, if it sent one.
+fn take_output_stream_commit(
+    commands: &mut Vec<WFCommand>,
+) -> Result<Option<WorkflowOutputStreamCommit>> {
+    let mut commit = None;
+    let mut error = None;
+    commands.retain_mut(|command| {
+        let WFCommandVariant::ExternalOutputStreamCommit(taken) = &mut command.variant else {
+            return true;
+        };
+        if commit.replace(mem::take(taken)).is_some() {
+            error = Some(WFMachinesError::Fatal(
+                "Lang sent more than one WorkflowOutputStreamCommit in one completion".to_string(),
+            ));
+        }
+        false
+    });
+    match error {
+        Some(err) => Err(err),
+        None => Ok(commit),
+    }
+}
+
 // Construct a new command sequence with query responses removed, and any
 // terminal responses removed, except for the first terminal response, which is
 // placed at the end. Return new command sequence and query commands. Note that
@@ -1741,6 +1814,65 @@ mod tests {
         field::{Field, Visit},
         span,
     };
+
+    mod output_commit {
+        use super::super::take_output_stream_commit;
+        use crate::worker::workflow::{CommandAnnotations, WFCommand, WFCommandVariant};
+        use temporalio_common::protos::{
+            coresdk::workflow_commands::{OutputRecord, StartTimer, WorkflowOutputStreamCommit},
+            temporal::sdk::streams::v1::StreamRecordKind,
+        };
+
+        fn commit() -> WorkflowOutputStreamCommit {
+            WorkflowOutputStreamCommit {
+                records: vec![OutputRecord {
+                    topic: "a".to_string(),
+                    kind: StreamRecordKind::Finish as i32,
+                    ..Default::default()
+                }],
+                closes: vec![],
+            }
+        }
+
+        fn command(variant: WFCommandVariant) -> WFCommand {
+            WFCommand {
+                variant,
+                annotations: CommandAnnotations::default(),
+            }
+        }
+
+        #[test]
+        fn the_commit_is_taken_out_and_other_commands_keep_their_order() {
+            let mut commands = vec![
+                command(WFCommandVariant::AddTimer(StartTimer {
+                    seq: 1,
+                    ..Default::default()
+                })),
+                command(WFCommandVariant::ExternalOutputStreamCommit(commit())),
+                command(WFCommandVariant::AddTimer(StartTimer {
+                    seq: 2,
+                    ..Default::default()
+                })),
+            ];
+            let taken = take_output_stream_commit(&mut commands).unwrap().unwrap();
+            assert_eq!(taken, commit());
+            let seqs: Vec<_> = commands
+                .iter()
+                .map(|c| match &c.variant {
+                    WFCommandVariant::AddTimer(t) => t.seq,
+                    other => panic!("unexpected command left behind: {other}"),
+                })
+                .collect();
+            assert_eq!(seqs, vec![1, 2]);
+        }
+
+        #[test]
+        fn no_commit_leaves_the_commands_untouched() {
+            let mut commands = vec![command(WFCommandVariant::NoCommandsFromLang)];
+            assert!(take_output_stream_commit(&mut commands).unwrap().is_none());
+            assert_eq!(commands.len(), 1);
+        }
+    }
 
     use command_utils::*;
 
