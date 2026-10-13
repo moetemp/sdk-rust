@@ -228,7 +228,13 @@ pub async fn read_page(
 
 /// A stored record as a reader delivers it. Fails on bytes that are no record, and on a kind no
 /// writer stores, such as the `SUPERSEDED` that only readers synthesize.
+///
+/// Empty bytes are no record either. Every stored record names its topic, so it is never empty,
+/// and a store hands over an entry it holds without a record as empty bytes.
 fn parse(bytes: &[u8]) -> Result<StreamRecord, String> {
+    if bytes.is_empty() {
+        return Err("the entry holds no stream record".to_string());
+    }
     let mut record = StreamRecord::decode(bytes).map_err(|error| error.to_string())?;
     match StreamRecordKind::try_from(record.kind) {
         Ok(StreamRecordKind::Data | StreamRecordKind::Finish) => {}
@@ -660,6 +666,21 @@ mod tests {
         assert_eq!(error.kind, StreamFailureKind::Record);
         assert_eq!(error.cursor, Some(cursor(&bad)));
         assert!(error.message.contains("kind 3"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn rule_20_4_an_entry_without_a_record_fails_with_its_cursor() {
+        let log = Log::default();
+        log.write("p", 1, b"1");
+        let empty = log.push(Vec::new());
+        log.write("p", 1, b"3");
+        let first = read(&log, BEGINNING, &[]).await.unwrap();
+        assert_eq!(shape(&first), [(cursor("1"), DATA, 1, false)]);
+        let error = read(&log, &first.cursor, &first.state).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Record);
+        assert_eq!(error.cursor, Some(cursor(&empty)));
+        let after = read(&log, &cursor(&empty), &first.state).await.unwrap();
+        assert_eq!(shape(&after), [(cursor("3"), DATA, 1, false)]);
     }
 
     #[tokio::test]

@@ -197,6 +197,9 @@ impl StreamStore for MemoryStore {
         if request.records.is_empty() {
             return Err(StreamError::refused("an append needs at least one record"));
         }
+        if request.digest.is_empty() {
+            return Err(StreamError::refused("an append needs the batch's digest"));
+        }
         let mut chains = self.chains.lock().unwrap();
         let chain = chains
             .entry(chain_key(chain_of(request.chain.as_ref())?))

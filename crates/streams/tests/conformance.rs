@@ -61,8 +61,125 @@ impl Case for Memory {
     }
 }
 
-fn memory() -> Memory {
-    Memory(Arc::new(MemoryStore::new()))
+async fn memory() -> Option<Memory> {
+    Some(Memory(Arc::new(MemoryStore::new())))
+}
+
+#[cfg(feature = "redis")]
+mod on_redis {
+    use super::*;
+    use redis::{AsyncCommands, Value};
+    use temporalio_streams::{RedisStore, RedisStoreOptions};
+
+    /// A connection of the test's own, to do to the keys what retention does.
+    #[derive(Clone)]
+    pub(crate) enum Raw {
+        Single(redis::aio::MultiplexedConnection),
+        Cluster(redis::cluster_async::ClusterConnection),
+    }
+
+    impl Raw {
+        pub(crate) async fn connect(url: &str, cluster: bool) -> Self {
+            if cluster {
+                let client = redis::cluster::ClusterClient::new(vec![url]).unwrap();
+                return Raw::Cluster(client.get_async_connection().await.unwrap());
+            }
+            let client = redis::Client::open(url).unwrap();
+            Raw::Single(client.get_multiplexed_async_connection().await.unwrap())
+        }
+
+        pub(crate) async fn query<T: redis::FromRedisValue>(&mut self, cmd: &redis::Cmd) -> T {
+            match self {
+                Raw::Single(conn) => cmd.query_async(conn).await.unwrap(),
+                Raw::Cluster(conn) => cmd.query_async(conn).await.unwrap(),
+            }
+        }
+
+        pub(crate) async fn hset(&mut self, key: &str, field: &str, value: &str) {
+            let _: () = match self {
+                Raw::Single(conn) => conn.hset(key, field, value).await.unwrap(),
+                Raw::Cluster(conn) => conn.hset(key, field, value).await.unwrap(),
+            };
+        }
+    }
+
+    /// The key layout, written out again so the tests check the store's.
+    pub(crate) fn part(text: &str) -> String {
+        text.bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'.' | b'-' | b'~' => {
+                    (byte as char).to_string()
+                }
+                _ => format!("%{byte:02X}"),
+            })
+            .collect()
+    }
+
+    pub(crate) fn log_key(prefix: &str, chain: &ChainId, topic: &str) -> String {
+        format!(
+            "{}:{{{}:{}:{}}}:t:{}",
+            part(prefix),
+            part(&chain.namespace),
+            part(&chain.workflow_id),
+            part(&chain.first_run_id),
+            part(topic)
+        )
+    }
+
+    pub(crate) struct Redis {
+        pub(crate) store: Arc<RedisStore>,
+        pub(crate) raw: Raw,
+        pub(crate) prefix: String,
+    }
+
+    pub(crate) async fn redis(variable: &str, cluster: bool) -> Option<Redis> {
+        let Ok(url) = std::env::var(variable) else {
+            eprintln!("set {variable} to run the Redis store cases");
+            return None;
+        };
+        // A prefix per case keeps cases apart in one Redis.
+        let prefix = unique("conformance");
+        let mut options = RedisStoreOptions::new(url.clone());
+        options.cluster = cluster;
+        options.key_prefix = prefix.clone();
+        Some(Redis {
+            store: Arc::new(RedisStore::connect(options).await.unwrap()),
+            raw: Raw::connect(&url, cluster).await,
+            prefix,
+        })
+    }
+
+    #[async_trait::async_trait]
+    impl Case for Redis {
+        fn store(&self) -> Arc<dyn StreamStore> {
+            self.store.clone()
+        }
+
+        fn chain(&self) -> ChainId {
+            ChainId {
+                namespace: "default".to_string(),
+                workflow_id: unique("conformance"),
+                first_run_id: unique("run"),
+            }
+        }
+
+        async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize) {
+            // Trims as the append script does, watermark included.
+            let mut raw = self.raw.clone();
+            let log = log_key(&self.prefix, chain, topic);
+            let entries: Vec<(String, Value)> = raw
+                .query(redis::cmd("XRANGE").arg(&log).arg("-").arg("+"))
+                .await;
+            let Some(doomed) = entries.len().checked_sub(keep).filter(|&n| n > 0) else {
+                return;
+            };
+            let _: i64 = raw
+                .query(redis::cmd("XTRIM").arg(&log).arg("MAXLEN").arg(keep))
+                .await;
+            raw.hset(&format!("{log}:meta"), "trimmed", &entries[doomed - 1].0)
+                .await;
+        }
+    }
 }
 
 const OUT: &str = "out";
@@ -304,6 +421,17 @@ mod cases {
         let mut producer = Producer::new(case, &chain, OUT, "p", 1);
         assert_eq!(kind(producer.send(&[]).await), StreamFailureKind::Refused);
         assert_eq!(latest(case, &chain, OUT).await, "");
+    }
+
+    pub(crate) async fn an_append_without_a_digest_is_refused(case: &dyn Case) {
+        let chain = case.chain();
+        let producer = Producer::new(case, &chain, OUT, "p", 1);
+        let mut request = producer.request(&[data("1")]);
+        request.digest.clear();
+        assert_eq!(
+            kind(case.store().append(request).await),
+            StreamFailureKind::Refused
+        );
     }
 
     pub(crate) async fn latest_is_empty_on_an_empty_topic(case: &dyn Case) {
@@ -787,7 +915,7 @@ macro_rules! conformance {
         $(
             #[tokio::test]
             async fn $name() {
-                let case = $case;
+                let Some(case) = $case.await else { return };
                 super::cases::$name(&case).await;
             }
         )*
@@ -799,6 +927,7 @@ mod memory {
         append_read_roundtrip,
         a_batch_lands_in_order_and_names_its_last_record,
         an_empty_append_is_refused,
+        an_append_without_a_digest_is_refused,
         latest_is_empty_on_an_empty_topic,
         a_cursor_resumes_strictly_after_its_record,
         latest_positions_a_reader_at_the_end,
@@ -825,4 +954,48 @@ mod memory {
         a_refused_append_leaves_no_trace_of_its_topic,
         deleting_an_owner_drops_every_chain_of_it,
     );
+}
+
+/// Every case but the ones that need owner checks, reads that check retention, topic closes or
+/// owner deletes, which come with those features.
+#[cfg(feature = "redis")]
+macro_rules! redis_cases {
+    ($case:expr) => {
+        conformance!($case;
+            append_read_roundtrip,
+            a_batch_lands_in_order_and_names_its_last_record,
+            an_empty_append_is_refused,
+            an_append_without_a_digest_is_refused,
+            latest_is_empty_on_an_empty_topic,
+            a_cursor_resumes_strictly_after_its_record,
+            latest_positions_a_reader_at_the_end,
+            end_reads_only_what_arrives_after_the_read_starts,
+            a_read_waits_no_longer_than_asked,
+            dropping_a_waiting_read_releases_it,
+            a_retried_append_returns_the_original_positions,
+            a_retry_with_other_ciphertext_still_deduplicates,
+            a_divergent_retry_is_refused,
+            a_sequence_below_the_newest_is_refused,
+            rule_9_1_a_batch_inside_the_held_batch_is_refused,
+            rule_64_1_a_gap_in_the_sequence_is_accepted,
+            producers_and_attempts_dedupe_apart,
+            a_new_attempt_supersedes_the_old_one,
+            a_read_resumed_before_a_new_attempt_reports_it,
+            a_record_that_does_not_parse_fails_with_its_cursor,
+            finish_is_a_record_of_its_own,
+            topics_and_chains_are_apart,
+            a_cursor_from_another_stream_or_store_is_refused,
+            a_closed_chain_refuses_new_batches_but_answers_a_repeat,
+        );
+    };
+}
+
+#[cfg(feature = "redis")]
+mod standalone_redis {
+    redis_cases!(super::on_redis::redis("STREAMS_REDIS_URL", false));
+}
+
+#[cfg(feature = "redis")]
+mod cluster_redis {
+    redis_cases!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
 }

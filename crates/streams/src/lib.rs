@@ -13,8 +13,12 @@ mod error;
 mod memory;
 mod reader;
 mod record;
+#[cfg(feature = "redis")]
+mod redis;
 mod store;
 
+#[cfg(feature = "redis")]
+pub use self::redis::{RedisStore, RedisStoreOptions};
 pub use cursor::{BEGINNING, END, cursor_position, mint_cursor, stream_hash};
 pub use error::{StreamError, StreamResult};
 pub use memory::MemoryStore;
