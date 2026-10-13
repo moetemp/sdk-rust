@@ -34,13 +34,16 @@ pub struct ReadTarget {
 
 /// What a read carries from one call to the next. Lang passes it back as opaque bytes.
 #[derive(Clone, PartialEq, Message)]
-struct ReadState {
+pub(crate) struct ReadState {
     /// The newest attempt this read delivered, per producer id.
     #[prost(map = "string, int64", tag = "1")]
     attempts: HashMap<String, i64>,
     /// Set by the first call, so later calls don't look up the resume record again.
     #[prost(bool, tag = "2")]
     started: bool,
+    /// The first run of the chain the read follows, so later calls don't resolve it again.
+    #[prost(string, tag = "3")]
+    pub(crate) first_run_id: String,
     /// When this read last saw each producer in `attempts`, on the read's own clock, so the
     /// least recently seen one is forgotten first.
     #[prost(map = "string, uint64", tag = "9")]
@@ -65,7 +68,7 @@ enum Observed {
 }
 
 impl ReadState {
-    fn decode_from(state: &[u8]) -> StreamResult<Self> {
+    pub(crate) fn decode_from(state: &[u8]) -> StreamResult<Self> {
         Self::decode(state).map_err(|error| {
             StreamError::cursor(format!(
                 "the read state is not one an earlier call of this read returned: {error}"
@@ -138,6 +141,19 @@ pub async fn read_page(
     request: &ReadRequest,
 ) -> StreamResult<ReadResponse> {
     let mut state = ReadState::decode_from(&request.state)?;
+    let mut response = read_with(store, target, request, &mut state).await?;
+    response.state = state.encode_to_vec();
+    Ok(response)
+}
+
+/// [read_page] with the state already decoded, for a caller that keeps fields of its own in it.
+/// The answer's `state` is left empty.
+pub(crate) async fn read_with(
+    store: &dyn StreamStore,
+    target: &ReadTarget,
+    request: &ReadRequest,
+    state: &mut ReadState,
+) -> StreamResult<ReadResponse> {
     let from_end = request.after == END;
     let position = if from_end {
         store
@@ -221,7 +237,7 @@ pub async fn read_page(
     Ok(ReadResponse {
         records,
         cursor: previous,
-        state: state.encode_to_vec(),
+        state: Vec::new(),
         done: false,
     })
 }

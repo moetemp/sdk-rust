@@ -6,7 +6,9 @@
 //!
 //! **Appends.** One script writes a whole batch, so a reader never sees part of one. The topic's
 //! meta hash keeps one field per producer attempt: the newest batch's first sequence, its record
-//! count, its first and last entry ids, and lang's digest of it in hex.
+//! count, its first and last entry ids, and lang's digest of it in hex. The script refuses a
+//! new batch once the chain or the topic is closed, in the same step as the write, so no batch
+//! lands after a close returned. Only that topic check differs from the SDKs' script.
 //!
 //! **Retention.** Every script that writes a log trims it with `XTRIM MINID` to the retention and
 //! slides the expiry of the log and its meta, so a stream dies a retention after its last write
@@ -37,6 +39,7 @@ use tokio::time::Instant;
 const NAME: &str = "redis";
 const RECORD_FIELD: &str = "r";
 const TOMBSTONE_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const CLOSED_FIELD: &str = "closed";
 
 /// How to reach Redis and how long streams live there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +134,13 @@ impl RedisStore {
         let chain = chain
             .ok_or_else(|| StreamError::refused("a store call needs the chain it is about"))?;
         Ok(ChainKeys::new(&self.prefix, chain))
+    }
+
+    /// Reads the chain's close flag and the topic's, which share a slot on a cluster.
+    fn closed(pipeline: &mut redis::Pipeline, keys: &ChainKeys, topic: &str) {
+        pipeline
+            .hget(keys.chain(), CLOSED_FIELD)
+            .hget(keys.meta(topic), CLOSED_FIELD);
     }
 
     fn xread(
@@ -244,20 +254,21 @@ impl StreamStore for RedisStore {
         };
         let wait = wait_of(&request);
         let deadline = Instant::now() + wait;
-        let (reply, closed): (Value, Option<String>) = redis::pipe()
-            .add_command(Self::xread(
-                &keys,
-                &request.topic,
-                &after,
-                request.max_records,
-                None,
-            ))
-            .hget(keys.chain(), "closed")
+        let mut pipeline = redis::pipe();
+        pipeline.add_command(Self::xread(
+            &keys,
+            &request.topic,
+            &after,
+            request.max_records,
+            None,
+        ));
+        Self::closed(&mut pipeline, &keys, &request.topic);
+        let (reply, chain_closed, topic_closed): (Value, Option<String>, Option<String>) = pipeline
             .query_async(&mut self.shared.clone())
             .await
             .mapped(Call::Read)?;
         let mut found = records(reply)?;
-        let mut closed = closed.is_some();
+        let mut closed = chain_closed.is_some() || topic_closed.is_some();
         if found.is_empty() && !wait.is_zero() {
             let xread = Self::xread(
                 &keys,
@@ -274,13 +285,13 @@ impl StreamStore for RedisStore {
             if let Some(reply) = blocked {
                 found = records(reply)?;
                 // Asked after the wait, so a close that came during it is seen.
-                let flag: Option<String> = redis::cmd("HGET")
-                    .arg(keys.chain())
-                    .arg("closed")
+                let mut pipeline = redis::pipe();
+                Self::closed(&mut pipeline, &keys, &request.topic);
+                let (chain_closed, topic_closed): (Option<String>, Option<String>) = pipeline
                     .query_async(&mut self.shared.clone())
                     .await
                     .mapped(Call::Read)?;
-                closed = flag.is_some();
+                closed = chain_closed.is_some() || topic_closed.is_some();
             }
         }
         Ok(StoreReadResponse {
@@ -337,17 +348,23 @@ impl StreamStore for RedisStore {
         let keys = ChainKeys::new(&self.prefix, chain);
         redis::pipe()
             .atomic()
-            .hset(keys.chain(), "closed", "1")
+            .hset(keys.chain(), CLOSED_FIELD, "1")
             .pexpire(keys.chain(), (self.retention_ms + self.grace_ms) as i64)
             .query_async::<()>(&mut self.shared.clone())
             .await
             .mapped(Call::Write)
     }
 
-    async fn close_topic(&self, _chain: &ChainId, _topic: &str) -> StreamResult<()> {
-        Err(StreamError::unsupported(
-            "the Redis store closes whole chains, not single topics",
-        ))
+    async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()> {
+        let meta = ChainKeys::new(&self.prefix, chain).meta(topic);
+        // The meta is the topic's tombstone, so the mark lives as long as the topic is known.
+        redis::pipe()
+            .atomic()
+            .hset(&meta, CLOSED_FIELD, "1")
+            .pexpire(&meta, (self.retention_ms + self.grace_ms) as i64)
+            .query_async::<()>(&mut self.shared.clone())
+            .await
+            .mapped(Call::Write)
     }
 
     async fn delete_owner(

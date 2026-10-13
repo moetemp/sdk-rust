@@ -874,6 +874,31 @@ mod cases {
             .await;
     }
 
+    pub(crate) async fn a_closed_topic_answers_a_repeat_and_ends_reads(case: &dyn Case) {
+        let chain = case.chain();
+        let landed = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        case.store().close_topic(&chain, OUT).await.unwrap();
+        let repeat = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        assert_eq!(repeat, landed);
+        for topic in [OUT, OTHER] {
+            let read = case
+                .store()
+                .read(StoreReadRequest {
+                    chain: Some(chain.clone()),
+                    topic: topic.to_string(),
+                    max_records: 10,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            assert_eq!(read.closed, topic == OUT, "{topic}");
+        }
+    }
+
     pub(crate) async fn deleting_an_owner_drops_every_chain_of_it(case: &dyn Case) {
         let store = case.store();
         let chain = case.chain();
@@ -951,13 +976,14 @@ mod memory {
         a_cursor_from_another_stream_or_store_is_refused,
         a_closed_chain_refuses_new_batches_but_answers_a_repeat,
         a_closed_topic_leaves_the_others_open,
+        a_closed_topic_answers_a_repeat_and_ends_reads,
         a_refused_append_leaves_no_trace_of_its_topic,
         deleting_an_owner_drops_every_chain_of_it,
     );
 }
 
-/// Every case but the ones that need owner checks, reads that check retention, topic closes or
-/// owner deletes, which come with those features.
+/// Every case but the ones that need reads that check retention or owner deletes, which come
+/// with those features.
 #[cfg(feature = "redis")]
 macro_rules! redis_cases {
     ($case:expr) => {
@@ -986,6 +1012,8 @@ macro_rules! redis_cases {
             topics_and_chains_are_apart,
             a_cursor_from_another_stream_or_store_is_refused,
             a_closed_chain_refuses_new_batches_but_answers_a_repeat,
+            a_closed_topic_leaves_the_others_open,
+            a_closed_topic_answers_a_repeat_and_ends_reads,
         );
     };
 }
