@@ -26,6 +26,8 @@ mod pollers;
 mod protosext;
 pub mod replay;
 pub(crate) mod retry_logic;
+#[cfg(feature = "streams")]
+pub mod streams;
 pub mod telemetry;
 mod worker;
 

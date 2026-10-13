@@ -26,6 +26,37 @@ service StreamService {
   rpc DeleteOwner(DeleteOwnerRequest) returns (DeleteOwnerResponse);
 }
 
+// Which store holds a process's streams, and how to reach it. Lang builds one store from it and
+// sends its stream calls there.
+message StreamStoreConfig {
+  oneof store {
+    RedisStoreConfig redis = 1;
+    MemoryStoreConfig memory = 2;
+  }
+}
+
+// Streams in a Redis or Redis Cluster that Core connects to itself.
+message RedisStoreConfig {
+  // One `redis://` or `rediss://` URL, or the seed nodes of a cluster. Credentials and TLS come
+  // from the URL.
+  repeated string urls = 1;
+  bool cluster = 2;
+  // Prepended to every key, so streams can share a Redis with other data and an ACL can scope
+  // them. Empty uses `temporal-streams`.
+  string key_prefix = 3;
+  // How long a stream keeps a record. Unset keeps seven days.
+  google.protobuf.Duration retention = 4;
+  // How many reads may wait on one node at once, each on a connection of its own. Zero uses the
+  // default.
+  uint32 blocking_reads_per_node = 5;
+  // How long a short call waits for its reply. Unset uses the default.
+  google.protobuf.Duration response_timeout = 6;
+}
+
+// Streams in this process's memory, for tests and local development. Nothing survives the
+// process, and each connect makes a store of its own that shares no streams with another.
+message MemoryStoreConfig {}
+
 // What owns a stream. The owner decides when the stream closes.
 enum StreamOwnerKind {
   STREAM_OWNER_KIND_UNSPECIFIED = 0;

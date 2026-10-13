@@ -33,6 +33,12 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* Experimental: behind the new `streams` feature, `streams::connect_stream_service` builds one
+  stream store from a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in
+  process: append, read, latest, close and owner delete, as serialized `coresdk.streams`
+  requests.
+
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
   nondeterminism while retaining compatibility with histories recorded before these checks.

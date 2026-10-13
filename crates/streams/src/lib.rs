@@ -17,6 +17,7 @@ mod reader;
 mod record;
 #[cfg(feature = "redis")]
 mod redis;
+mod service;
 mod store;
 
 #[cfg(feature = "redis")]
@@ -30,6 +31,7 @@ pub use reader::{DEFAULT_MAX_RECORDS, MAX_TRACKED_PRODUCERS, ReadTarget, read_pa
 pub use record::{
     WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, stored_append_record,
 };
+pub use service::StreamService;
 pub use store::StreamStore;
 
 /// The protos stores and lang exchange.
