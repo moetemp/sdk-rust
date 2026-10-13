@@ -115,6 +115,16 @@ mod tests {
     }
 
     #[test]
+    fn an_invalid_argument_crosses_as_its_own_kind() {
+        let failure = StreamFailure::from(StreamError::invalid_argument("no producer id"));
+        assert_eq!(failure.kind, 12);
+        assert_eq!(
+            StreamError::from(failure).kind,
+            StreamFailureKind::InvalidArgument
+        );
+    }
+
+    #[test]
     fn a_kind_from_a_later_release_reads_as_a_storage_failure() {
         let failure = StreamFailure {
             kind: 99,
