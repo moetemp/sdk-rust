@@ -158,28 +158,34 @@ impl Streams {
         let (producer_id, attempt) = match &request.producer {
             Some(Producer::Named(named)) => {
                 if named.producer_id.is_empty() {
-                    return Err(StreamError::refused("a producer needs an id"));
+                    return Err(StreamError::invalid_argument("a producer needs an id"));
                 }
                 (named.producer_id.clone(), named.attempt)
             }
             Some(Producer::Activity(activity)) => {
                 (activity_producer_id(activity), i64::from(activity.attempt))
             }
-            None => return Err(StreamError::refused("an append needs its producer")),
+            None => {
+                return Err(StreamError::invalid_argument(
+                    "an append needs its producer",
+                ));
+            }
         };
         if attempt < 1 {
-            return Err(StreamError::refused(format!(
+            return Err(StreamError::invalid_argument(format!(
                 "a producer's attempt starts at one, not {attempt}"
             )));
         }
         if request.sequence < 1 {
-            return Err(StreamError::refused(format!(
+            return Err(StreamError::invalid_argument(format!(
                 "a producer's sequence starts at one, not {}",
                 request.sequence
             )));
         }
         if request.records.is_empty() {
-            return Err(StreamError::refused("an append needs at least one record"));
+            return Err(StreamError::invalid_argument(
+                "an append needs at least one record",
+            ));
         }
         check_append_digest(&request.digest)?;
         let chain = self
@@ -378,7 +384,8 @@ impl Streams {
 
 /// The address of a stream this release keeps, checked.
 fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
-    let stream = stream.ok_or_else(|| StreamError::refused("a stream call needs its stream"))?;
+    let stream =
+        stream.ok_or_else(|| StreamError::invalid_argument("a stream call needs its stream"))?;
     if stream.owner_kind != StreamOwnerKind::Workflow as i32 {
         return Err(StreamError::unsupported(format!(
             "this release keeps streams of Workflows only, not owner kind {}",
@@ -386,7 +393,7 @@ fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
         )));
     }
     if stream.namespace.is_empty() || stream.workflow_id.is_empty() {
-        return Err(StreamError::refused(
+        return Err(StreamError::invalid_argument(
             "a stream needs its namespace and its owner's Workflow id",
         ));
     }
@@ -396,7 +403,7 @@ fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
 
 /// Refuses a topic no store keys reliably, by the rules Core's Workflow path also applies.
 fn check_topic(topic: &str) -> StreamResult<()> {
-    temporalio_common::streams::check_topic(topic).map_err(StreamError::refused)
+    temporalio_common::streams::check_topic(topic).map_err(StreamError::invalid_argument)
 }
 
 fn owner_key(stream: &StreamAddress) -> OwnerKey {
@@ -679,7 +686,7 @@ mod tests {
     async fn requests_no_store_keeps_are_refused() {
         let setup = setup(StreamsOptions::default());
         let cases: Vec<(AppendRequest, StreamFailureKind)> = vec![
-            (append("", 1, "1"), StreamFailureKind::Refused),
+            (append("", 1, "1"), StreamFailureKind::InvalidArgument),
             (
                 AppendRequest {
                     producer: Some(Producer::Named(NamedProducer {
@@ -688,22 +695,22 @@ mod tests {
                     })),
                     ..append("p", 1, "1")
                 },
-                StreamFailureKind::Refused,
+                StreamFailureKind::InvalidArgument,
             ),
-            (append("p", 0, "1"), StreamFailureKind::Refused),
+            (append("p", 0, "1"), StreamFailureKind::InvalidArgument),
             (
                 AppendRequest {
                     records: Vec::new(),
                     ..append("p", 1, "1")
                 },
-                StreamFailureKind::Refused,
+                StreamFailureKind::InvalidArgument,
             ),
             (
                 AppendRequest {
                     producer: None,
                     ..append("p", 1, "1")
                 },
-                StreamFailureKind::Refused,
+                StreamFailureKind::InvalidArgument,
             ),
         ];
         for (request, expected) in cases {
@@ -720,7 +727,7 @@ mod tests {
             };
             assert_eq!(
                 kind(setup.streams.append(request).await),
-                StreamFailureKind::Refused,
+                StreamFailureKind::InvalidArgument,
                 "{topic:?}"
             );
         }
@@ -1035,7 +1042,7 @@ mod tests {
             request.digest = digest;
             assert_eq!(
                 kind(setup.streams.append(request).await),
-                StreamFailureKind::Refused
+                StreamFailureKind::InvalidArgument
             );
         }
         assert_eq!(setup.owners.describes(), 0);
