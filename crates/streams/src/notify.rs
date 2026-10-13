@@ -6,8 +6,7 @@
 use crate::{
     CloseOutcome, NewestOrArm, StreamResult, StreamStore, WORKFLOW_OWNER_KIND, mint_cursor,
     proto::{
-        ChainId, DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteOutcome,
-        PromoteResult, StageRef, StagedBatch, StoreAppendRequest, StoreAppendResponse,
+        ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse,
     },
     stream_hash,
@@ -730,9 +729,9 @@ impl NotifierClient for UnlessUnsupported {
 }
 
 /// A store that closes each stream's notifier after the store closes the stream, and with
-/// progress on, notifies it after an append lands and after a Workflow's staged output becomes
-/// visible, when the store reports that a reader armed the stream or can't tell. A landed
-/// notification clears the arm it answered.
+/// progress on, notifies it after an append lands, a Workflow's output included, when the store
+/// reports that a reader armed the stream or can't tell. A landed notification clears the arm it
+/// answered.
 ///
 /// Wraps the store a process hands to its stream calls and its Workers, so every write path
 /// notifies without knowing about notifiers. It forwards every trait method by name, since a
@@ -804,37 +803,6 @@ impl NotifyingStore {
             self.notifier
                 .notify_armed(chain, topic, cursor, counter, arm);
         }
-    }
-
-    /// Notifies the newest record of `chain`'s stream on `topic` without waiting for the read,
-    /// since a promotion sits on the Worker's report path and has no position of its own.
-    fn notify_latest(&self, chain: &ChainId, topic: &str, arm: Option<Arm>) {
-        let inner = self.inner.clone();
-        let (found_chain, found_topic) = (chain.clone(), topic.to_string());
-        self.notifier.notify_found(chain, topic, arm, async move {
-            let (chain, topic) = (found_chain, found_topic);
-            match inner
-                .latest(StoreLatestRequest {
-                    chain: Some(chain.clone()),
-                    topic: topic.clone(),
-                })
-                .await
-            {
-                Ok(latest) if !latest.position.is_empty() => {
-                    notification_at(inner.as_ref(), &chain, &topic, &latest.position)
-                }
-                Ok(_) => None,
-                Err(error) => {
-                    tracing::warn!(
-                        workflow_id = %chain.workflow_id,
-                        topic,
-                        %error,
-                        "Could not find the newest record to notify"
-                    );
-                    None
-                }
-            }
-        });
     }
 }
 
@@ -926,36 +894,6 @@ impl StreamStore for NotifyingStore {
         self.inner.dropped_after(chain, topic, mark).await
     }
 
-    async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {
-        self.inner.stage(batch).await
-    }
-
-    async fn promote(&self, stage: &StageRef) -> StreamResult<PromoteResult> {
-        let result = self.inner.promote(stage).await?;
-        if self.progress
-            && result.outcome() == PromoteOutcome::Promoted
-            && let Some(chain) = &stage.chain
-        {
-            for topic in &stage.topics {
-                match self.owed(result.arms.get(topic).copied()) {
-                    Some(arm) => self.notify_latest(chain, topic, arm),
-                    None => match self.notifier.refresh_due(chain, topic) {
-                        Some(Some((cursor, counter))) => {
-                            self.notifier.notify(chain, topic, cursor, counter)
-                        }
-                        Some(None) => self.notify_latest(chain, topic, None),
-                        None => {}
-                    },
-                }
-            }
-        }
-        Ok(result)
-    }
-
-    async fn abort(&self, stage: &StageRef) -> StreamResult<()> {
-        self.inner.abort(stage).await
-    }
-
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {
         // A reader that finds the owner ended can't know whether the Workflow's own closes
         // landed, and the server keeps the first close, so only the store closes here.
@@ -1028,10 +966,6 @@ impl StreamStore for NotifyingStore {
         Ok(())
     }
 
-    async fn pending_stages(&self, chain: &ChainId) -> StreamResult<Vec<PendingStage>> {
-        self.inner.pending_stages(chain).await
-    }
-
     async fn open_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
         self.inner.open_topics(chain).await
     }
@@ -1085,10 +1019,7 @@ impl StreamStore for NotifyingStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        MemoryStore,
-        proto::{StagedRecord, StoreAppendRequest},
-    };
+    use crate::{MemoryStore, proto::StoreAppendRequest};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
 
@@ -1453,23 +1384,11 @@ mod tests {
         async fn record_at(&self, c: &ChainId, t: &str, p: &str) -> StreamResult<Option<Vec<u8>>> {
             self.0.record_at(c, t, p).await
         }
-        async fn stage(&self, b: StagedBatch) -> StreamResult<()> {
-            self.0.stage(b).await
-        }
-        async fn promote(&self, s: &StageRef) -> StreamResult<PromoteResult> {
-            self.0.promote(s).await
-        }
-        async fn abort(&self, s: &StageRef) -> StreamResult<()> {
-            self.0.abort(s).await
-        }
         async fn close_chain(&self, c: &ChainId) -> StreamResult<()> {
             self.0.close_chain(c).await
         }
         async fn close_topic(&self, c: &ChainId, t: &str, r: Option<Payload>) -> StreamResult<()> {
             self.0.close_topic(c, t, r).await
-        }
-        async fn pending_stages(&self, c: &ChainId) -> StreamResult<Vec<PendingStage>> {
-            self.0.pending_stages(c).await
         }
         async fn delete_owner(&self, r: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
             self.0.delete_owner(r).await
@@ -1487,145 +1406,6 @@ mod tests {
             .unwrap();
         store.flush_notifications().await;
         assert!(recorder.sent().is_empty());
-    }
-
-    fn staged(chain: &ChainId, token: &str, topics: &[&str]) -> StagedBatch {
-        StagedBatch {
-            chain: Some(chain.clone()),
-            run_id: chain.first_run_id.clone(),
-            token: token.to_string(),
-            history_floor_event_id: 3,
-            records: topics
-                .iter()
-                .map(|topic| StagedRecord {
-                    topic: topic.to_string(),
-                    record: b"record".to_vec(),
-                })
-                .collect(),
-        }
-    }
-
-    fn stage_ref(chain: &ChainId, token: &str, topics: &[&str]) -> StageRef {
-        StageRef {
-            chain: Some(chain.clone()),
-            token: token.to_string(),
-            topics: topics.iter().map(|topic| topic.to_string()).collect(),
-        }
-    }
-
-    #[tokio::test]
-    async fn a_workflows_batch_notifies_each_of_its_topics_once_visible() {
-        let recorder = Arc::new(Recorder::default());
-        let (inner, store) = notifying_store(&recorder);
-        let run = chain("run-1");
-        arm(inner.as_ref(), &run, "a").await;
-        arm(inner.as_ref(), &run, "b").await;
-        store
-            .stage(staged(&run, "token", &["a", "b", "a"]))
-            .await
-            .unwrap();
-        store.flush_notifications().await;
-        assert!(recorder.sent().is_empty(), "a stage isn't visible yet");
-        store
-            .promote(&stage_ref(&run, "token", &["a", "b"]))
-            .await
-            .unwrap();
-        store.flush_notifications().await;
-        let sent = recorder.sent.lock().unwrap().clone();
-        let mut topics: Vec<(&str, i64)> =
-            sent.iter().map(|n| (n.topic.as_str(), n.counter)).collect();
-        topics.sort();
-        assert_eq!(
-            topics,
-            vec![("a", 2), ("b", 1)],
-            "each topic's newest record"
-        );
-
-        store
-            .promote(&stage_ref(&run, "token", &["a", "b"]))
-            .await
-            .unwrap();
-        store.stage(staged(&run, "aborted", &["a"])).await.unwrap();
-        store
-            .abort(&stage_ref(&run, "aborted", &["a"]))
-            .await
-            .unwrap();
-        store.flush_notifications().await;
-        assert_eq!(
-            recorder.sent().len(),
-            2,
-            "a repeated promotion and an abort make nothing visible"
-        );
-    }
-
-    /// A memory store whose `latest` waits for a permit.
-    struct HeldLatest(MemoryStore, Semaphore);
-
-    #[async_trait::async_trait]
-    impl StreamStore for HeldLatest {
-        fn name(&self) -> &str {
-            self.0.name()
-        }
-        async fn append(&self, r: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
-            self.0.append(r).await
-        }
-        async fn read(&self, r: StoreReadRequest) -> StreamResult<StoreReadResponse> {
-            self.0.read(r).await
-        }
-        async fn latest(&self, r: StoreLatestRequest) -> StreamResult<StoreLatestResponse> {
-            self.1.acquire().await.unwrap().forget();
-            self.0.latest(r).await
-        }
-        async fn record_at(&self, c: &ChainId, t: &str, p: &str) -> StreamResult<Option<Vec<u8>>> {
-            self.0.record_at(c, t, p).await
-        }
-        async fn stage(&self, b: StagedBatch) -> StreamResult<()> {
-            self.0.stage(b).await
-        }
-        async fn promote(&self, s: &StageRef) -> StreamResult<PromoteResult> {
-            self.0.promote(s).await
-        }
-        async fn abort(&self, s: &StageRef) -> StreamResult<()> {
-            self.0.abort(s).await
-        }
-        async fn close_chain(&self, c: &ChainId) -> StreamResult<()> {
-            self.0.close_chain(c).await
-        }
-        async fn close_topic(&self, c: &ChainId, t: &str, r: Option<Payload>) -> StreamResult<()> {
-            self.0.close_topic(c, t, r).await
-        }
-        async fn pending_stages(&self, c: &ChainId) -> StreamResult<Vec<PendingStage>> {
-            self.0.pending_stages(c).await
-        }
-        async fn delete_owner(&self, r: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
-            self.0.delete_owner(r).await
-        }
-    }
-
-    #[tokio::test]
-    async fn a_promotion_returns_before_it_reads_the_newest_positions() {
-        let recorder = Arc::new(Recorder::default());
-        let inner = Arc::new(HeldLatest(MemoryStore::new(), Semaphore::new(0)));
-        let store =
-            NotifyingStore::new(inner.clone(), Arc::new(Notifier::new(recorder.clone(), 10)));
-        let run = chain("run-1");
-        arm(&inner.0, &run, "a").await;
-        arm(&inner.0, &run, "b").await;
-        store
-            .stage(staged(&run, "token", &["a", "b"]))
-            .await
-            .unwrap();
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            store.promote(&stage_ref(&run, "token", &["a", "b"])),
-        )
-        .await
-        .expect("the promotion waited for the newest positions")
-        .unwrap();
-        assert!(recorder.sent().is_empty());
-        inner.1.add_permits(2);
-        store.flush_notifications().await;
-        assert_eq!(recorder.sent().len(), 2);
     }
 
     #[tokio::test]
@@ -2154,19 +1934,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promotions_notify_only_armed_topics() {
+    async fn a_workflows_appends_notify_only_armed_topics() {
         let recorder = Arc::new(Recorder::default());
         let (inner, store) = notifying_store(&recorder);
         let run = chain("run-1");
         arm(inner.as_ref(), &run, "a").await;
-        store
-            .stage(staged(&run, "token", &["a", "b"]))
-            .await
-            .unwrap();
-        store
-            .promote(&stage_ref(&run, "token", &["a", "b"]))
-            .await
-            .unwrap();
+        for topic in ["a", "b"] {
+            store
+                .append(StoreAppendRequest {
+                    producer_id: crate::workflow_producer_id("run-1"),
+                    ..append_request(&run, topic, 1)
+                })
+                .await
+                .unwrap();
+        }
         store.flush_notifications().await;
         let topics: Vec<String> = recorder
             .sent
@@ -2203,27 +1984,11 @@ mod tests {
         async fn record_at(&self, c: &ChainId, t: &str, p: &str) -> StreamResult<Option<Vec<u8>>> {
             self.0.record_at(c, t, p).await
         }
-        async fn stage(&self, b: StagedBatch) -> StreamResult<()> {
-            self.0.stage(b).await
-        }
-        async fn promote(&self, s: &StageRef) -> StreamResult<PromoteResult> {
-            let promoted = self.0.promote(s).await?;
-            Ok(PromoteResult {
-                arms: Default::default(),
-                ..promoted
-            })
-        }
-        async fn abort(&self, s: &StageRef) -> StreamResult<()> {
-            self.0.abort(s).await
-        }
         async fn close_chain(&self, c: &ChainId) -> StreamResult<()> {
             self.0.close_chain(c).await
         }
         async fn close_topic(&self, c: &ChainId, t: &str, r: Option<Payload>) -> StreamResult<()> {
             self.0.close_topic(c, t, r).await
-        }
-        async fn pending_stages(&self, c: &ChainId) -> StreamResult<Vec<PendingStage>> {
-            self.0.pending_stages(c).await
         }
         async fn delete_owner(&self, r: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
             self.0.delete_owner(r).await
@@ -2237,11 +2002,7 @@ mod tests {
         let store = NotifyingStore::new(Arc::new(CantTell(MemoryStore::new())), notifier);
         let run = chain("run-1");
         store.append(append_request(&run, "t", 1)).await.unwrap();
-        store.stage(staged(&run, "token", &["b"])).await.unwrap();
-        store
-            .promote(&stage_ref(&run, "token", &["b"]))
-            .await
-            .unwrap();
+        store.append(append_request(&run, "b", 1)).await.unwrap();
         store.flush_notifications().await;
         let mut topics: Vec<String> = recorder
             .sent

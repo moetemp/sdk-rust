@@ -425,9 +425,8 @@ mod tests {
     use super::*;
     use crate::{
         proto::{
-            DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteResult, StageRef,
-            StagedBatch, StoreAppendRequest, StoreAppendResponse, StoreLatestResponse,
-            StoreReadResponse, StoredRecord, StreamFailureKind,
+            DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
+            StoreLatestResponse, StoreReadResponse, StoredRecord, StreamFailureKind,
         },
         stream_hash,
     };
@@ -521,18 +520,6 @@ mod tests {
             Ok(self.entries.lock().unwrap().get(index - 1).cloned())
         }
 
-        async fn stage(&self, _: StagedBatch) -> StreamResult<()> {
-            unreachable!()
-        }
-
-        async fn promote(&self, _: &StageRef) -> StreamResult<PromoteResult> {
-            unreachable!()
-        }
-
-        async fn abort(&self, _: &StageRef) -> StreamResult<()> {
-            unreachable!()
-        }
-
         async fn close_chain(&self, _: &ChainId) -> StreamResult<()> {
             unreachable!()
         }
@@ -543,10 +530,6 @@ mod tests {
             _: &str,
             _: Option<crate::proto::Payload>,
         ) -> StreamResult<()> {
-            unreachable!()
-        }
-
-        async fn pending_stages(&self, _: &ChainId) -> StreamResult<Vec<PendingStage>> {
             unreachable!()
         }
 
