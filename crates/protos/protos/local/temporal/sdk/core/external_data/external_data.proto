@@ -58,20 +58,20 @@ enum ExternalStreamBoundary {
 message ExternalStreamMarkerData {
   uint32 schema_version = 1;
   ExternalStreamBoundary terminal_boundary = 5;
-  // The output staged for this Workflow Task.
+  // The output this Workflow Task published.
   ExternalOutputStreamManifest output = 6;
 }
 
 // Compact proof of the stream output one Workflow Task published, built by Core from the records
 // in the completion's `WorkflowOutputStreamCommit`.
 //
-// This message contains no record payloads. The stage token names the batch held in the stream
-// store, while the remaining fields let replay check the Workflow's logical output and let a cold
-// reader settle the held batch against History.
+// This message contains no record payloads. Core appends the records to the stream store when
+// lang completes the activation, and these fields let replay check the Workflow's logical output.
 message ExternalOutputStreamManifest {
+  reserved 3;
+  reserved "stage_token";
   uint32 schema_version = 1;
   uint32 fingerprint_version = 2;
-  string stage_token = 3;
   // The event immediately preceding this Workflow Task's WorkflowTaskScheduled event in the
   // ordered History view used to build its activation.
   int64 history_floor_event_id = 4;
@@ -79,8 +79,7 @@ message ExternalOutputStreamManifest {
   repeated ExternalOutputTopicManifest topics = 6;
   // One entry per activation segment, including segments which published no output.
   repeated ExternalOutputSegmentManifest segments = 7;
-  // The stream store that holds the batch. Reconciliation refuses to interpret the batch through
-  // a different store or store format.
+  // The stream store the records went to, and the layout it keeps them in.
   string provider_id = 8;
   uint32 provider_format_version = 9;
 }
