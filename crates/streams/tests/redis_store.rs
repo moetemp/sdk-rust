@@ -726,21 +726,7 @@ impl temporalio_streams::OwnerClient for OneOwner {
             run_id: "run-1".to_string(),
             first_run_id: "run-1".to_string(),
             status: *self.status.lock().unwrap(),
-            start_time: None,
         })
-    }
-
-    async fn history_after(
-        &self,
-        _namespace: &str,
-        _workflow_id: &str,
-        _run_id: &str,
-        _floor: i64,
-    ) -> Result<
-        Vec<temporalio_common::protos::temporal::api::history::v1::HistoryEvent>,
-        temporalio_streams::OwnerError,
-    > {
-        Ok(Vec::new())
     }
 }
 

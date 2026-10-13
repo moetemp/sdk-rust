@@ -19,7 +19,7 @@ use std::{
     time::Duration,
 };
 use temporalio_common::protos::temporal::api::{
-    common::v1::Payload, enums::v1::WorkflowExecutionStatus, history::v1::HistoryEvent,
+    common::v1::Payload, enums::v1::WorkflowExecutionStatus,
 };
 use temporalio_streams::{
     OwnerClient, OwnerDescription, OwnerError, ReadTarget, RedisStore, RedisStoreOptions,
@@ -278,18 +278,7 @@ impl OwnerClient for Running {
             run_id: FIRST_RUN.to_string(),
             first_run_id: FIRST_RUN.to_string(),
             status: WorkflowExecutionStatus::Running,
-            start_time: None,
         })
-    }
-
-    async fn history_after(
-        &self,
-        _namespace: &str,
-        _workflow_id: &str,
-        _run_id: &str,
-        _floor: i64,
-    ) -> Result<Vec<HistoryEvent>, OwnerError> {
-        Ok(Vec::new())
     }
 }
 
