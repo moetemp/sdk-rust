@@ -42,6 +42,7 @@ pub use store::StreamStore;
 pub mod proto {
     pub use temporalio_common::protos::{
         coresdk::streams::*,
+        temporal::api::common::v1::Payload,
         temporal::sdk::streams::v1::{StreamRecord, StreamRecordKind},
     };
 }

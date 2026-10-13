@@ -51,17 +51,20 @@ use temporalio_common::{
 use temporalio_streams::{
     StreamError, StreamResult, StreamStore,
     proto::{
-        ChainId, DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteResult, StageRef,
-        StagedBatch, StoreAppendRequest, StoreAppendResponse, StoreLatestRequest,
-        StoreLatestResponse, StoreReadRequest, StoreReadResponse,
+        ChainId, DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteOutcome,
+        PromoteResult, StageRef, StagedBatch, StoreAppendRequest, StoreAppendResponse,
+        StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse,
     },
 };
 use tokio::sync::Notify;
 
-/// A stream store that keeps what Core stages, and can be told to refuse it.
+/// A stream store that keeps what Core stages and logs each call, and can be told to refuse
+/// stages.
 #[derive(Default)]
 struct RecordingStore {
     staged: Mutex<Vec<StagedBatch>>,
+    /// Each stage, promote and abort, as `op token`, in call order.
+    log: Mutex<Vec<String>>,
     refuse: Option<StreamError>,
 }
 
@@ -75,6 +78,10 @@ impl RecordingStore {
 
     fn staged(&self) -> Vec<StagedBatch> {
         self.staged.lock().clone()
+    }
+
+    fn log(&self) -> Vec<String> {
+        self.log.lock().clone()
     }
 }
 
@@ -104,24 +111,39 @@ impl StreamStore for RecordingStore {
         if let Some(error) = &self.refuse {
             return Err(error.clone());
         }
+        self.log.lock().push(format!("stage {}", batch.token));
         self.staged.lock().push(batch);
         Ok(())
     }
 
-    async fn promote(&self, _: &StageRef) -> StreamResult<PromoteResult> {
-        Err(StreamError::unsupported("promote"))
+    async fn promote(&self, stage: &StageRef) -> StreamResult<PromoteResult> {
+        self.log.lock().push(format!("promote {}", stage.token));
+        Ok(PromoteResult {
+            outcome: PromoteOutcome::Promoted as i32,
+            records: 1,
+        })
     }
 
-    async fn abort(&self, _: &StageRef) -> StreamResult<()> {
-        Err(StreamError::unsupported("abort"))
+    async fn abort(&self, stage: &StageRef) -> StreamResult<()> {
+        self.log.lock().push(format!("abort {}", stage.token));
+        Ok(())
     }
 
     async fn close_chain(&self, _: &ChainId) -> StreamResult<()> {
         Err(StreamError::unsupported("close_chain"))
     }
 
-    async fn close_topic(&self, _: &ChainId, _: &str) -> StreamResult<()> {
-        Err(StreamError::unsupported("close_topic"))
+    async fn close_topic(
+        &self,
+        _: &ChainId,
+        topic: &str,
+        result: Option<Payload>,
+    ) -> StreamResult<()> {
+        let result = result.map(|r| String::from_utf8(r.data).unwrap());
+        self.log
+            .lock()
+            .push(format!("close {topic} {}", result.unwrap_or_default()));
+        Ok(())
     }
 
     async fn pending_stages(&self, _: &ChainId) -> StreamResult<Vec<PendingStage>> {
@@ -1802,6 +1824,247 @@ async fn replay_stages_nothing() {
 }
 
 #[tokio::test]
+async fn an_accepted_completion_promotes_its_stages_in_commit_order_after_it_is_sent() {
+    let (history, _) = two_commits_around_a_local_activity_history();
+    let store = Arc::new(RecordingStore::default());
+    let markers: RecordedMarkers = Default::default();
+    let worker = worker_staging_in(
+        history,
+        vec![1.into(), 2.into()],
+        store.clone(),
+        markers.clone(),
+        Default::default(),
+    );
+    let [first_commit, second_commit] = two_commits();
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(first_commit),
+                schedule_local_activity(1),
+            ],
+        ))
+        .await
+        .unwrap();
+    let resolved = run_local_activity(&worker).await;
+    assert!(only_resolves_local_activity(&resolved, 1));
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(second_commit),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    worker.complete_execution(&fired.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    let tokens = marker_tokens(&markers.lock());
+    assert_eq!(
+        store.log(),
+        vec![
+            format!("stage {}", tokens[0][0]),
+            format!("stage {}", tokens[0][1]),
+            format!("promote {}", tokens[0][0]),
+            format!("promote {}", tokens[0][1]),
+        ]
+    );
+}
+
+/// Runs one publishing task whose completion the server answers with `refusal`.
+async fn completion_answered_with(refusal: tonic::Status) -> Vec<String> {
+    let store = Arc::new(RecordingStore::default());
+    completion_on_store_answered_with(store.clone(), refusal).await;
+    store.log()
+}
+
+async fn completion_on_store_answered_with(store: Arc<RecordingStore>, refusal: tonic::Status) {
+    let (history, _) = output_then_timer_history(&["a"]);
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", history, [1], mock_worker_client());
+    let answer = Mutex::new(Some(refusal));
+    mock_cfg.completion_mock_fn = Some(Box::new(move |_| {
+        Err(answer.lock().take().expect("one completion"))
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.stream_store = Some(store.clone());
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id,
+            vec![
+                output_commit_command(records(&["a"])),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_completion_the_server_did_not_apply_aborts_its_stages() {
+    let log = completion_answered_with(tonic::Status::invalid_argument("UnhandledCommand")).await;
+    let [stage, abort] = log.try_into().unwrap();
+    assert!(stage.starts_with("stage "), "{stage}");
+    assert_eq!(abort, stage.replacen("stage", "abort", 1));
+}
+
+#[tokio::test]
+async fn a_completion_with_an_unknown_outcome_leaves_its_stages_undecided() {
+    let log = completion_answered_with(tonic::Status::unavailable("connection reset")).await;
+    assert_eq!(log.len(), 1, "{log:?}");
+    assert!(log[0].starts_with("stage "));
+}
+
+#[tokio::test]
+async fn a_stage_survives_a_not_found_answer_to_a_retried_completion() {
+    // The client retries a completion whose answer was lost, and the server answers the repeat of
+    // a completion it applied with `NotFound`. The marker is in History, so the stage must stay
+    // pending until a replay proves it.
+    let store = Arc::new(RecordingStore::default());
+    completion_on_store_answered_with(
+        store.clone(),
+        tonic::Status::not_found("Workflow task not found."),
+    )
+    .await;
+    let token = store.staged()[0].token.clone();
+
+    let mut applied = TestHistoryBuilder::default();
+    applied.add_by_type(EventType::WorkflowExecutionStarted);
+    let mut manifest = manifest_for(&records(&["a"]), applied.get_orig_run_id(), 1);
+    manifest.stage_token = token.clone();
+    applied.add_full_wf_task();
+    applied.add_external_stream_marker_data(output_marker(
+        ExternalStreamBoundary::CommandsProduced,
+        manifest,
+    ));
+    let timer_started = applied.add_by_type(EventType::TimerStarted);
+    applied.add_timer_fired(timer_started, "1".to_string());
+    applied.add_workflow_task_scheduled_and_started();
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        applied,
+        [ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    mock_cfg.completion_mock_fn = Some(Box::new(|_| {
+        Ok(RespondWorkflowTaskCompletedResponse::default())
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    let replaying_store = store.clone();
+    mock.worker_cfg(|w| {
+        w.stream_store = Some(replaying_store);
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+    let rebuilt = worker.poll_workflow_activation().await.unwrap();
+    let run_id = rebuilt.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(replayed(records(&["a"]))),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(has_fire_timer(&fired));
+    worker.complete_execution(&run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(
+        store.log(),
+        [format!("stage {token}"), format!("promote {token}")]
+    );
+}
+
+#[tokio::test]
+async fn replay_promotes_what_history_proves_and_the_next_completion_aborts_the_rest() {
+    // The first completion's answer is lost, so its stage is undecided and the run is evicted.
+    // History then shows a commit with another attempt's token, which replay promotes. The lost
+    // attempt's stage never committed, so the next accepted completion aborts it.
+    let (history, manifest) = output_then_timer_history(&["a"]);
+    let store = Arc::new(RecordingStore::default());
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        history,
+        [1.into(), ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    let answers = Mutex::new(vec![Err(tonic::Status::unavailable("connection reset"))]);
+    mock_cfg.completion_mock_fn = Some(Box::new(move |_| {
+        answers
+            .lock()
+            .pop()
+            .unwrap_or_else(|| Ok(RespondWorkflowTaskCompletedResponse::default()))
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.stream_store = Some(store.clone());
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(records(&["a"])),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker.handle_eviction().await;
+
+    let rebuilt = worker.poll_workflow_activation().await.unwrap();
+    assert!(rebuilt.is_replaying);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(replayed(records(&["a"]))),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(!fired.is_replaying);
+    worker.complete_execution(&run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    let log = store.log();
+    let lost = log[0]
+        .strip_prefix("stage ")
+        .expect("the lost attempt staged first");
+    assert_eq!(
+        log,
+        vec![
+            format!("stage {lost}"),
+            format!("promote {}", manifest.stage_token),
+            format!("abort {lost}"),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn a_failed_task_publishes_nothing() {
     // The first activation commits and waits on a local activity. The second fails, so the task
     // fails before any completion reports the commit, and nothing reaches the store.
@@ -1890,4 +2153,69 @@ async fn a_close_without_its_finish_fails_the_task() {
         .unwrap();
     worker.shutdown().await;
     worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_workflow_close_closes_its_topic_after_the_output_is_promoted() {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    let mut committed = records(&["a"]);
+    committed.push(OutputRecord {
+        topic: TOPIC.to_string(),
+        kind: StreamRecordKind::Finish as i32,
+        ..Default::default()
+    });
+    let mut manifest = manifest_for(&committed, history.get_orig_run_id(), 1);
+    manifest.topics[0].finished = true;
+    history.add_full_wf_task();
+    history.add_external_stream_marker_data(output_marker(
+        ExternalStreamBoundary::CommandsProduced,
+        manifest,
+    ));
+    let timer_started = history.add_by_type(EventType::TimerStarted);
+    history.add_timer_fired(timer_started, "1".to_string());
+    history.add_workflow_task_scheduled_and_started();
+    let store = Arc::new(RecordingStore::default());
+    let worker = worker_staging_in(
+        history,
+        vec![1.into(), 2.into()],
+        store.clone(),
+        Default::default(),
+        Default::default(),
+    );
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let commit = WorkflowOutputStreamCommit {
+        records: committed,
+        closes: vec![OutputClose {
+            topic: TOPIC.to_string(),
+            result: Some(Payload {
+                data: b"done".to_vec(),
+                ..Default::default()
+            }),
+        }],
+    };
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id.clone(),
+            vec![
+                workflow_command::Variant::WorkflowOutputStreamCommit(commit),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    worker.complete_execution(&fired.run_id).await;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while store.log().len() < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the topic close never came");
+    worker.drain_pollers_and_shutdown().await;
+    let log = store.log();
+    assert!(log[0].starts_with("stage "), "{log:?}");
+    assert!(log[1].starts_with("promote "), "{log:?}");
+    assert_eq!(log[2], format!("close {TOPIC} done"));
 }

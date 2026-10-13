@@ -520,7 +520,7 @@ impl Streams {
     pub async fn close(&self, request: CloseRequest) -> StreamResult<CloseResponse> {
         let stream = address(request.stream.as_ref())?;
         let chain = self.chain(stream).await?;
-        self.store.close_topic(&chain, &stream.topic).await?;
+        self.store.close_topic(&chain, &stream.topic, None).await?;
         Ok(CloseResponse {})
     }
 
@@ -1926,8 +1926,13 @@ mod tests {
         async fn close_chain(&self, c: &ChainId) -> StreamResult<()> {
             self.inner.close_chain(c).await
         }
-        async fn close_topic(&self, c: &ChainId, t: &str) -> StreamResult<()> {
-            self.inner.close_topic(c, t).await
+        async fn close_topic(
+            &self,
+            c: &ChainId,
+            t: &str,
+            result: Option<crate::proto::Payload>,
+        ) -> StreamResult<()> {
+            self.inner.close_topic(c, t, result).await
         }
         async fn pending_stages(
             &self,

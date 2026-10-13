@@ -87,7 +87,16 @@ pub trait StreamStore: Send + Sync {
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()>;
 
     /// Marks one topic of a chain closed, like [StreamStore::close_chain] for that topic alone.
-    async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()>;
+    ///
+    /// `result` is what the operations that handed the topic out complete with, when the owner
+    /// gave one. A store keeps no result itself, but a wrapper that notifies those operations
+    /// needs it.
+    async fn close_topic(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        result: Option<crate::proto::Payload>,
+    ) -> StreamResult<()>;
 
     /// The chain's stages that no one has promoted or aborted yet, for crash repair.
     async fn pending_stages(&self, chain: &ChainId) -> StreamResult<Vec<PendingStage>>;

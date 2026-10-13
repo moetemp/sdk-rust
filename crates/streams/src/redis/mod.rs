@@ -642,7 +642,12 @@ impl StreamStore for RedisStore {
             .mapped(Call::Write)
     }
 
-    async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()> {
+    async fn close_topic(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        _: Option<crate::proto::Payload>,
+    ) -> StreamResult<()> {
         let meta = ChainKeys::new(&self.prefix, chain).meta(topic);
         // The meta is the topic's tombstone, so the mark lives as long as the topic is known.
         redis::pipe()

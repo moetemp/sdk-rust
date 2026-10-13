@@ -47,6 +47,10 @@ relevant information.
   workflow's stream output goes to. Core stages each completion's records in it before the
   completion is sent, and fails the workflow task when the store refuses them or the Worker has
   none, so a task the server accepts always has its output staged.
+* Experimental: Core promotes a workflow task's staged stream output once the server accepts the
+  completion, and aborts it when the server says the task or its commands were not applied. When
+  the answer is lost, the next replay promotes what History shows committed and the next accepted
+  completion aborts the rest. Output another Worker staged and History proves is promoted once.
 * Experimental: behind `streams`, `streams::connect_stream_service` builds one stream store from
   a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in process: append, read,
   latest, close and owner delete, as serialized `coresdk.streams` requests.
