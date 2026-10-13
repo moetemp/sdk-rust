@@ -6,12 +6,10 @@ use temporalio_client::Connection;
 use temporalio_common::protos::temporal::api::{
     common::v1::{WorkflowExecution, callback},
     enums::v1::StreamOwnerKind,
-    history::v1::HistoryEvent,
     stream::v1::StreamReference,
     workflowservice::v1::{
         AttachStreamCallbackRequest, DescribeWorkflowExecutionRequest,
-        DescribeWorkflowExecutionResponse, DetachStreamCallbackRequest,
-        GetWorkflowExecutionHistoryReverseRequest, NotifyStreamRequest,
+        DescribeWorkflowExecutionResponse, DetachStreamCallbackRequest, NotifyStreamRequest,
     },
 };
 use temporalio_streams::{
@@ -198,60 +196,6 @@ impl OwnerClient for ConnectionOwnerClient {
             .map_err(owner_error)?;
         owner_description(response.into_inner())
     }
-
-    async fn history_after(
-        &self,
-        namespace: &str,
-        workflow_id: &str,
-        run_id: &str,
-        floor: i64,
-    ) -> Result<Vec<HistoryEvent>, OwnerError> {
-        let mut newest_first = vec![];
-        let mut page_token = vec![];
-        loop {
-            let page = self
-                .connection
-                .workflow_service()
-                .get_workflow_execution_history_reverse(
-                    GetWorkflowExecutionHistoryReverseRequest {
-                        namespace: namespace.to_string(),
-                        execution: Some(WorkflowExecution {
-                            workflow_id: workflow_id.to_string(),
-                            run_id: run_id.to_string(),
-                        }),
-                        next_page_token: page_token,
-                        ..Default::default()
-                    }
-                    .into_request(),
-                )
-                .await
-                .map_err(owner_error)?
-                .into_inner();
-            let reached_floor = take_events_after(
-                page.history.map(|h| h.events).unwrap_or_default(),
-                floor,
-                &mut newest_first,
-            );
-            page_token = page.next_page_token;
-            if reached_floor || page_token.is_empty() {
-                break;
-            }
-        }
-        newest_first.reverse();
-        Ok(newest_first)
-    }
-}
-
-/// Keeps the events of a newest-first page that come after `floor`, and says whether the page
-/// reached it, so no older page is needed.
-fn take_events_after(page: Vec<HistoryEvent>, floor: i64, kept: &mut Vec<HistoryEvent>) -> bool {
-    for event in page {
-        if event.event_id <= floor {
-            return true;
-        }
-        kept.push(event);
-    }
-    false
 }
 
 fn owner_error(status: tonic::Status) -> OwnerError {
@@ -281,7 +225,6 @@ fn owner_description(
     };
     Ok(OwnerDescription {
         status: info.status(),
-        start_time: info.start_time.and_then(|time| time.try_into().ok()),
         run_id,
         first_run_id,
     })
@@ -317,7 +260,6 @@ mod tests {
                 run_id: "run-2".to_string(),
                 first_run_id: "run-1".to_string(),
                 status: WorkflowExecutionStatus::ContinuedAsNew,
-                start_time: None,
             }
         );
     }
@@ -483,42 +425,6 @@ mod tests {
         ] {
             assert!(matches!(notify_error(status), NotifyError::Failed(_)));
         }
-    }
-
-    fn event(event_id: i64) -> HistoryEvent {
-        HistoryEvent {
-            event_id,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn a_newest_first_page_keeps_the_events_after_the_floor() {
-        let mut kept = vec![];
-        assert!(!take_events_after(vec![event(9), event(8)], 5, &mut kept));
-        assert!(take_events_after(
-            vec![event(7), event(6), event(5), event(4)],
-            5,
-            &mut kept
-        ));
-        assert_eq!(
-            kept.iter().map(|e| e.event_id).collect::<Vec<_>>(),
-            [9, 8, 7, 6]
-        );
-    }
-
-    #[test]
-    fn a_description_carries_the_run_start_time() {
-        let mut response = described("run-1", "run-1");
-        response
-            .workflow_execution_info
-            .as_mut()
-            .unwrap()
-            .start_time = Some(std::time::SystemTime::UNIX_EPOCH.into());
-        assert_eq!(
-            owner_description(response).unwrap().start_time,
-            Some(std::time::SystemTime::UNIX_EPOCH)
-        );
     }
 
     /// One HTTP request the test listener got: its `Nexus-Operation-State` and its body.
