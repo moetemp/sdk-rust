@@ -468,11 +468,16 @@ async fn until_reachable<T>(mut call: impl AsyncFnMut() -> StreamResult<T>) -> S
     call().await
 }
 
+/// Taken by a test that flushes the server's scripts, and by one that loses the reply to an
+/// append. Without a loaded script, that append is a `NOSCRIPT` answer that never runs.
+static SCRIPT_CACHE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 #[tokio::test]
 async fn a_lost_connection_is_an_unknown_outcome_and_the_retry_dedupes() {
     let Some(url) = url() else {
         return;
     };
+    let _serial = SCRIPT_CACHE.lock().await;
     let faults = Faults::start(&url).await;
     let mut setup = setup_at(&faults.url(), &url).await;
     let chain = chain();
@@ -1387,6 +1392,7 @@ async fn an_append_after_the_server_lost_its_scripts_still_lands_once() {
     let Some(mut setup) = setup().await else {
         return;
     };
+    let _serial = SCRIPT_CACHE.lock().await;
     let chain = chain();
     setup
         .store
