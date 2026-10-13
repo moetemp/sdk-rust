@@ -151,6 +151,12 @@ mockall::mock! {
         ) -> impl Future<Output = Result<GetWorkflowExecutionHistoryResponse>> + Send + 'b
             where 'a: 'b, Self: 'b;
 
+        fn describe_workflow_execution<'a, 'b>(
+            &self,
+            workflow_id: String,
+        ) -> impl Future<Output = Result<DescribeWorkflowExecutionResponse>> + Send + 'b
+            where 'a: 'b, Self: 'b;
+
         fn respond_legacy_query<'a, 'b>(
             &self,
             task_token: TaskToken,

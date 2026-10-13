@@ -6,8 +6,8 @@ use crate::{
     TaskToken,
     replay::{TestHistoryBuilder, canned_histories},
     test_help::{
-        MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers, build_mock_pollers, mock_worker,
-        schedule_local_activity_cmd, start_timer_cmd,
+        MockPollCfg, NAMESPACE, ResponseType, WorkerExt, WorkerTestHelpers, build_mock_pollers,
+        mock_worker, schedule_local_activity_cmd, start_timer_cmd,
     },
     worker::client::{WorkflowTaskCompletion, mocks::mock_worker_client},
 };
@@ -29,7 +29,8 @@ use temporalio_common::{
             },
             workflow_activation::{WorkflowActivation, workflow_activation_job},
             workflow_commands::{
-                ActivityCancellationType, CompleteWorkflowExecution, OutputClose, OutputRecord,
+                ActivityCancellationType, CompleteWorkflowExecution,
+                ContinueAsNewWorkflowExecution, FailWorkflowExecution, OutputClose, OutputRecord,
                 WorkflowOutputStreamCommit, workflow_command,
             },
             workflow_completion::WorkflowActivationCompletion,
@@ -38,9 +39,14 @@ use temporalio_common::{
             api::{
                 command::v1::{Command, command},
                 common::v1::Payload,
-                enums::v1::{CommandType, EventType, WorkflowTaskFailedCause},
+                enums::v1::{
+                    CommandType, EventType, WorkflowExecutionStatus, WorkflowTaskFailedCause,
+                },
                 failure::v1::Failure,
-                workflowservice::v1::RespondWorkflowTaskCompletedResponse,
+                workflow::v1::WorkflowExecutionInfo,
+                workflowservice::v1::{
+                    DescribeWorkflowExecutionResponse, RespondWorkflowTaskCompletedResponse,
+                },
             },
             sdk::streams::v1::{StreamRecord, StreamRecordKind},
         },
@@ -66,6 +72,20 @@ struct RecordingStore {
     /// Each stage, promote and abort, as `op token`, in call order.
     log: Mutex<Vec<String>>,
     refuse: Option<StreamError>,
+    closed: Mutex<Vec<ChainId>>,
+    /// How many chain closes to refuse before taking one.
+    close_failures: Mutex<usize>,
+    close_attempts: Mutex<usize>,
+    /// How long each topic close takes.
+    close_topic_delay: Mutex<Option<Duration>>,
+    /// Promotions, and topic and chain closes as they start and finish, in order.
+    closes: Mutex<Vec<String>>,
+    /// Can't close topics at all.
+    unsupported_topic_closes: Mutex<bool>,
+    /// Can't close chains at all.
+    unsupported_chain_closes: Mutex<bool>,
+    /// How many promotions to fail for now before taking one.
+    promote_failures: Mutex<usize>,
 }
 
 impl RecordingStore {
@@ -82,6 +102,22 @@ impl RecordingStore {
 
     fn log(&self) -> Vec<String> {
         self.log.lock().clone()
+    }
+
+    fn closed(&self) -> Vec<ChainId> {
+        self.closed.lock().clone()
+    }
+
+    /// Waits a bounded time for `count` chain closes, which Core makes in the background.
+    async fn wait_for_closes(&self, count: usize) -> Vec<ChainId> {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.closed.lock().len() < count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the chain close never came");
+        self.closed()
     }
 }
 
@@ -117,6 +153,15 @@ impl StreamStore for RecordingStore {
     }
 
     async fn promote(&self, stage: &StageRef) -> StreamResult<PromoteResult> {
+        {
+            let mut failures = self.promote_failures.lock();
+            if *failures > 0 {
+                *failures -= 1;
+                self.closes.lock().push("promote failed".to_string());
+                return Err(StreamError::storage("redis failed over"));
+            }
+        }
+        self.closes.lock().push("promote".to_string());
         self.log.lock().push(format!("promote {}", stage.token));
         Ok(PromoteResult {
             outcome: PromoteOutcome::Promoted as i32,
@@ -129,8 +174,19 @@ impl StreamStore for RecordingStore {
         Ok(())
     }
 
-    async fn close_chain(&self, _: &ChainId) -> StreamResult<()> {
-        Err(StreamError::unsupported("close_chain"))
+    async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {
+        self.closes.lock().push("close_chain".to_string());
+        *self.close_attempts.lock() += 1;
+        if *self.unsupported_chain_closes.lock() {
+            return Err(StreamError::unsupported("close_chain"));
+        }
+        let mut failures = self.close_failures.lock();
+        if *failures > 0 {
+            *failures -= 1;
+            return Err(StreamError::storage("redis is down"));
+        }
+        self.closed.lock().push(chain.clone());
+        Ok(())
     }
 
     async fn close_topic(
@@ -139,6 +195,20 @@ impl StreamStore for RecordingStore {
         topic: &str,
         result: Option<Payload>,
     ) -> StreamResult<()> {
+        self.closes
+            .lock()
+            .push(format!("close_topic {topic} started"));
+        let delay = *self.close_topic_delay.lock();
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
+        }
+        if *self.unsupported_topic_closes.lock() {
+            self.closes
+                .lock()
+                .push(format!("close_topic {topic} unsupported"));
+            return Err(StreamError::unsupported("close_topic"));
+        }
+        self.closes.lock().push(format!("close_topic {topic} done"));
         let result = result.map(|r| String::from_utf8(r.data).unwrap());
         self.log
             .lock()
@@ -2064,6 +2134,163 @@ async fn replay_promotes_what_history_proves_and_the_next_completion_aborts_the_
     );
 }
 
+type DescribeAnswer = Result<DescribeWorkflowExecutionResponse, tonic::Status>;
+
+/// Runs one task that publishes when `publishes`, then ends with `last`, on a worker whose client
+/// answers the chain check with what `latest` makes of the run's id.
+async fn final_task(
+    store: Arc<RecordingStore>,
+    publishes: bool,
+    last: workflow_command::Variant,
+    latest: Option<fn(&str) -> DescribeAnswer>,
+) -> (crate::Worker, String) {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    let run_id = history.get_orig_run_id().to_string();
+    history.add_full_wf_task();
+    if publishes {
+        history.add_external_stream_marker_data(output_marker(
+            ExternalStreamBoundary::WorkflowCompleted,
+            manifest_for(&records(&["a"]), &run_id, 1),
+        ));
+    }
+    history.add_workflow_execution_completed();
+    let mut mock_client = mock_worker_client();
+    if let Some(latest) = latest {
+        let latest = latest(&run_id);
+        mock_client
+            .expect_describe_workflow_execution()
+            .returning(move |_| latest.clone());
+    }
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", history, [1], mock_client);
+    // A Worker that runs out of tasks starts shutting down, which stops the close retries.
+    mock_cfg.make_poll_stream_interminable = true;
+    mock_cfg.completion_mock_fn = Some(Box::new(|_| {
+        Ok(RespondWorkflowTaskCompletedResponse::default())
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.stream_store = Some(store);
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let mut commands = vec![];
+    if publishes {
+        commands.push(output_commit_command(records(&["a"])));
+    }
+    commands.push(last);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id,
+            commands,
+        ))
+        .await
+        .unwrap();
+    (worker, run_id)
+}
+
+fn complete() -> workflow_command::Variant {
+    CompleteWorkflowExecution::default().into()
+}
+
+#[tokio::test]
+async fn a_final_task_closes_its_chain_after_the_completion_is_accepted() {
+    let store = Arc::new(RecordingStore::default());
+    let (worker, run_id) = final_task(store.clone(), true, complete(), None).await;
+    let closed = store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        closed,
+        vec![ChainId {
+            namespace: NAMESPACE.to_string(),
+            workflow_id: "fakeid".to_string(),
+            first_run_id: run_id,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn the_chain_close_is_retried_until_it_lands() {
+    let store = Arc::new(RecordingStore::default());
+    *store.close_failures.lock() = 2;
+    let (worker, _) = final_task(store.clone(), true, complete(), None).await;
+    store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(*store.close_attempts.lock(), 3);
+}
+
+#[rstest::rstest]
+#[case::retried_after_a_failure(FailWorkflowExecution::default().into())]
+#[case::cron_after_a_completion(complete())]
+#[tokio::test]
+async fn a_chain_whose_latest_run_still_runs_stays_open(#[case] last: workflow_command::Variant) {
+    // A retried or cron run follows in the same chain, so the chain's streams stay open.
+    fn successor_running(first_run_id: &str) -> DescribeAnswer {
+        Ok(DescribeWorkflowExecutionResponse {
+            workflow_execution_info: Some(WorkflowExecutionInfo {
+                first_run_id: first_run_id.to_string(),
+                status: WorkflowExecutionStatus::Running as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    }
+    let store = Arc::new(RecordingStore::default());
+    let (worker, _) = final_task(store.clone(), true, last, Some(successor_running)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert!(store.closed().is_empty());
+    assert_eq!(*store.close_attempts.lock(), 0);
+}
+
+#[tokio::test]
+async fn continue_as_new_does_not_close_the_chain() {
+    let store = Arc::new(RecordingStore::default());
+    let continued = ContinueAsNewWorkflowExecution {
+        workflow_type: "next".to_string(),
+        ..Default::default()
+    };
+    let (worker, _) = final_task(store.clone(), true, continued.into(), None).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert!(store.closed().is_empty());
+    assert_eq!(*store.close_attempts.lock(), 0);
+}
+
+#[tokio::test]
+async fn a_final_run_that_never_published_still_closes_the_chain() {
+    // An earlier run of the chain or the chain's Activities may have published.
+    let store = Arc::new(RecordingStore::default());
+    let (worker, run_id) = final_task(store.clone(), false, complete(), None).await;
+    let closed = store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(closed[0].first_run_id, run_id);
+}
+
+#[tokio::test]
+async fn a_chain_the_server_no_longer_knows_is_closed() {
+    fn gone(_: &str) -> DescribeAnswer {
+        Err(tonic::Status::not_found("workflow not found"))
+    }
+    let store = Arc::new(RecordingStore::default());
+    let (worker, _) = final_task(store.clone(), true, complete(), Some(gone)).await;
+    store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(*store.close_attempts.lock(), 1);
+}
+
+#[tokio::test]
+async fn a_chain_close_the_store_cannot_take_is_given_up() {
+    let store = Arc::new(RecordingStore::default());
+    *store.unsupported_chain_closes.lock() = true;
+    let (worker, _) = final_task(store.clone(), true, complete(), None).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(*store.close_attempts.lock(), 1);
+}
+
 #[tokio::test]
 async fn a_failed_task_publishes_nothing() {
     // The first activation commits and waits on a local activity. The second fails, so the task
@@ -2218,4 +2445,192 @@ async fn a_workflow_close_closes_its_topic_after_the_output_is_promoted() {
     assert!(log[0].starts_with("stage "), "{log:?}");
     assert!(log[1].starts_with("promote "), "{log:?}");
     assert_eq!(log[2], format!("close {TOPIC} done"));
+}
+
+/// Runs a final task that closes `TOPIC` and completes, on `store`.
+async fn final_task_closing_its_topic(store: Arc<RecordingStore>) -> crate::Worker {
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    let mut committed = records(&["a"]);
+    committed.push(OutputRecord {
+        topic: TOPIC.to_string(),
+        kind: StreamRecordKind::Finish as i32,
+        ..Default::default()
+    });
+    let mut manifest = manifest_for(&committed, history.get_orig_run_id(), 1);
+    manifest.topics[0].finished = true;
+    history.add_full_wf_task();
+    history.add_external_stream_marker_data(output_marker(
+        ExternalStreamBoundary::WorkflowCompleted,
+        manifest,
+    ));
+    history.add_workflow_execution_completed();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", history, [1], mock_worker_client());
+    mock_cfg.make_poll_stream_interminable = true;
+    mock_cfg.completion_mock_fn = Some(Box::new(|_| {
+        Ok(RespondWorkflowTaskCompletedResponse::default())
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.stream_store = Some(store);
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let commit = WorkflowOutputStreamCommit {
+        records: committed,
+        closes: vec![OutputClose {
+            topic: TOPIC.to_string(),
+            result: Some(Payload {
+                data: b"done".to_vec(),
+                ..Default::default()
+            }),
+        }],
+    };
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id,
+            vec![
+                workflow_command::Variant::WorkflowOutputStreamCommit(commit),
+                CompleteWorkflowExecution::default().into(),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker
+}
+
+#[tokio::test]
+async fn the_chain_closes_after_an_earlier_task_closes_its_topics() {
+    // The notifier keeps the first close it hears, so the chain close must not beat a topic close
+    // that an earlier task of the run left retrying.
+    let store = Arc::new(RecordingStore::default());
+    *store.close_topic_delay.lock() = Some(Duration::from_millis(200));
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    let mut committed = records(&["a"]);
+    committed.push(OutputRecord {
+        topic: TOPIC.to_string(),
+        kind: StreamRecordKind::Finish as i32,
+        ..Default::default()
+    });
+    let mut manifest = manifest_for(&committed, history.get_orig_run_id(), 1);
+    manifest.topics[0].finished = true;
+    history.add_full_wf_task();
+    history.add_external_stream_marker_data(output_marker(
+        ExternalStreamBoundary::CommandsProduced,
+        manifest,
+    ));
+    let timer_started = history.add_by_type(EventType::TimerStarted);
+    history.add_timer_fired(timer_started, "1".to_string());
+    history.add_full_wf_task();
+    history.add_workflow_execution_completed();
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history, [1, 2], mock_worker_client());
+    mock_cfg.make_poll_stream_interminable = true;
+    mock_cfg.completion_mock_fn = Some(Box::new(|_| {
+        Ok(RespondWorkflowTaskCompletedResponse::default())
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    let worker_store = store.clone();
+    mock.worker_cfg(|w| {
+        w.stream_store = Some(worker_store);
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    let commit = WorkflowOutputStreamCommit {
+        records: committed,
+        closes: vec![OutputClose {
+            topic: TOPIC.to_string(),
+            result: Some(Payload {
+                data: b"done".to_vec(),
+                ..Default::default()
+            }),
+        }],
+    };
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                workflow_command::Variant::WorkflowOutputStreamCommit(commit),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(has_fire_timer(&fired));
+    worker.complete_execution(&run_id).await;
+    store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        *store.closes.lock(),
+        [
+            "promote".to_string(),
+            format!("close_topic {TOPIC} started"),
+            format!("close_topic {TOPIC} done"),
+            "close_chain".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_chain_closes_after_the_final_task_closes_its_topics() {
+    // The notifier keeps the first close it hears, so a chain close that beat the topic close
+    // would end the topic's operations without the Workflow's result.
+    let store = Arc::new(RecordingStore::default());
+    *store.close_topic_delay.lock() = Some(Duration::from_millis(200));
+    let worker = final_task_closing_its_topic(store.clone()).await;
+    store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        *store.closes.lock(),
+        [
+            "promote".to_string(),
+            format!("close_topic {TOPIC} started"),
+            format!("close_topic {TOPIC} done"),
+            "close_chain".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_chain_closes_after_a_failed_final_promotion_lands_and_closes_its_topics() {
+    let store = Arc::new(RecordingStore::default());
+    *store.promote_failures.lock() = 1;
+    let worker = final_task_closing_its_topic(store.clone()).await;
+    store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        *store.closes.lock(),
+        [
+            "promote failed".to_string(),
+            "promote".to_string(),
+            format!("close_topic {TOPIC} started"),
+            format!("close_topic {TOPIC} done"),
+            "close_chain".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_chain_still_closes_after_a_topic_close_the_store_cannot_take() {
+    let store = Arc::new(RecordingStore::default());
+    *store.unsupported_topic_closes.lock() = true;
+    let worker = final_task_closing_its_topic(store.clone()).await;
+    store.wait_for_closes(1).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        *store.closes.lock(),
+        [
+            "promote".to_string(),
+            format!("close_topic {TOPIC} started"),
+            format!("close_topic {TOPIC} unsupported"),
+            "close_chain".to_string(),
+        ]
+    );
 }
