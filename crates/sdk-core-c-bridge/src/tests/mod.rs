@@ -463,3 +463,197 @@ fn assert_binary_header_value(
     let decoded = decode_result.ok().unwrap();
     assert_eq!(expected_value, decoded);
 }
+
+/// A server where every Workflow's latest run is `run-1`, the first of its chain, still running.
+unsafe extern "C" fn streams_callback_override(
+    req: *mut ClientGrpcOverrideRequest,
+    _user_data: *mut libc::c_void,
+) {
+    use temporalio_common::protos::temporal::api::{
+        common::v1::WorkflowExecution, enums::v1::WorkflowExecutionStatus,
+        workflow::v1::WorkflowExecutionInfo,
+        workflowservice::v1::DescribeWorkflowExecutionResponse,
+    };
+    let resp_raw = match temporal_core_client_grpc_override_request_rpc(req).to_str() {
+        "GetSystemInfo" => GetSystemInfoResponse::default().encode_to_vec(),
+        "DescribeWorkflowExecution" => DescribeWorkflowExecutionResponse {
+            workflow_execution_info: Some(WorkflowExecutionInfo {
+                execution: Some(WorkflowExecution {
+                    workflow_id: "wf".to_string(),
+                    run_id: "run-1".to_string(),
+                }),
+                first_run_id: "run-1".to_string(),
+                status: WorkflowExecutionStatus::Running as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .encode_to_vec(),
+        other => panic!("unexpected RPC {other}"),
+    };
+    let resp = ClientGrpcOverrideResponse {
+        status_code: 0,
+        headers: ByteArrayRefArray::empty(),
+        success_proto: resp_raw.as_slice().into(),
+        fail_message: ByteArrayRef::empty(),
+        fail_details: ByteArrayRef::empty(),
+    };
+    temporal_core_client_grpc_override_request_respond(req, resp);
+    let _ = resp_raw;
+}
+
+fn memory_store_config() -> Vec<u8> {
+    use temporalio_sdk_core::streams::proto::{
+        MemoryStoreConfig, StreamStoreConfig, stream_store_config,
+    };
+    StreamStoreConfig {
+        store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+    }
+    .encode_to_vec()
+}
+
+#[test]
+fn test_stream_store_appends_and_reads_through_the_c_bridge() {
+    use temporalio_common::protos::temporal::api::common::v1::Payload;
+    use temporalio_sdk_core::streams::proto::{
+        AppendRecord, AppendRequest, AppendResponse, NamedProducer, ReadRequest, ReadResponse,
+        StreamAddress, StreamOwnerKind, StreamRecordKind, append_request, read_record,
+    };
+    Context::with(|context| {
+        context.runtime_new().unwrap();
+        context
+            .client_connect_with_override(
+                Box::new(default_connection_options("127.0.0.1:4567")),
+                Some(streams_callback_override),
+                std::ptr::null_mut(),
+            )
+            .unwrap();
+        let store = context.stream_store_new(memory_store_config()).unwrap();
+        let address = StreamAddress {
+            namespace: "ns".to_string(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: "wf".to_string(),
+            run_id: String::new(),
+            topic: "out".to_string(),
+        };
+
+        let appended = context
+            .stream_store_call(
+                &store,
+                "Append",
+                AppendRequest {
+                    stream: Some(address.clone()),
+                    producer: Some(append_request::Producer::Named(NamedProducer {
+                        producer_id: "p".to_string(),
+                        attempt: 1,
+                    })),
+                    sequence: 1,
+                    digest: vec![1; 32],
+                    records: vec![AppendRecord {
+                        kind: StreamRecordKind::Data as i32,
+                        body: Some(Payload {
+                            data: b"encrypted".to_vec(),
+                            ..Default::default()
+                        }),
+                        content_hash: vec![7; 32],
+                    }],
+                }
+                .encode_to_vec(),
+            )
+            .unwrap()
+            .unwrap();
+        let appended = AppendResponse::decode(appended.as_slice()).unwrap();
+
+        let read = context
+            .stream_store_call(
+                &store,
+                "Read",
+                ReadRequest {
+                    stream: Some(address),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )
+            .unwrap()
+            .unwrap();
+        let read = ReadResponse::decode(read.as_slice()).unwrap();
+        assert_eq!(read.cursor, appended.last_cursor);
+        let [record] = read.records.as_slice() else {
+            panic!("expected one record, got {:?}", read.records);
+        };
+        let Some(read_record::Record::Stored(stored)) = &record.record else {
+            panic!("expected a stored record, got {record:?}");
+        };
+        assert_eq!(stored.body.as_ref().unwrap().data, b"encrypted");
+    });
+}
+
+#[test]
+fn test_a_cancelled_stream_read_says_it_only_stopped_reading() {
+    use temporalio_sdk_core::streams::proto::{
+        ReadRequest, StreamAddress, StreamFailure, StreamOwnerKind,
+    };
+    Context::with(|context| {
+        context.runtime_new().unwrap();
+        context
+            .client_connect_with_override(
+                Box::new(default_connection_options("127.0.0.1:4567")),
+                Some(streams_callback_override),
+                std::ptr::null_mut(),
+            )
+            .unwrap();
+        let store = context.stream_store_new(memory_store_config()).unwrap();
+        let token = crate::temporal_core_cancellation_token_new();
+        crate::temporal_core_cancellation_token_cancel(token);
+        let read = ReadRequest {
+            stream: Some(StreamAddress {
+                namespace: "ns".to_string(),
+                owner_kind: StreamOwnerKind::Workflow as i32,
+                workflow_id: "wf".to_string(),
+                run_id: String::new(),
+                topic: "out".to_string(),
+            }),
+            after: "$end".to_string(),
+            wait: Some(std::time::Duration::from_secs(30).try_into().unwrap()),
+            ..Default::default()
+        };
+        let failure = context
+            .stream_store_call_with_token(&store, "Read", read.encode_to_vec(), token)
+            .unwrap()
+            .unwrap_err();
+        crate::temporal_core_cancellation_token_free(token);
+        let failure = StreamFailure::decode(failure.as_slice()).unwrap();
+        assert_eq!(failure.message, "Cancelled before the read answered");
+    });
+}
+
+#[test]
+fn test_stream_store_failures_cross_the_c_bridge_as_stream_failures() {
+    use temporalio_sdk_core::streams::proto::{StreamFailure, StreamFailureKind};
+    Context::with(|context| {
+        context.runtime_new().unwrap();
+        context
+            .client_connect_with_override(
+                Box::new(default_connection_options("127.0.0.1:4567")),
+                Some(streams_callback_override),
+                std::ptr::null_mut(),
+            )
+            .unwrap();
+        let bad_config = context.stream_store_new(vec![0xff, 0xff]).unwrap_err();
+        assert!(
+            bad_config
+                .to_string()
+                .contains("Invalid stream store config"),
+            "{bad_config}"
+        );
+
+        let store = context.stream_store_new(memory_store_config()).unwrap();
+        let failure = context
+            .stream_store_call(&store, "Truncate", vec![])
+            .unwrap()
+            .unwrap_err();
+        let failure = StreamFailure::decode(failure.as_slice()).unwrap();
+        assert_eq!(failure.kind(), StreamFailureKind::Unsupported);
+        assert!(failure.message.contains("Truncate"));
+    });
+}

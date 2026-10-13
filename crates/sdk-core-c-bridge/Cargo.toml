@@ -47,7 +47,12 @@ features = ["experimental"]
 [dependencies.temporalio-sdk-core]
 path = "../sdk-core"
 version = "=0.10.0"
-features = ["ephemeral-server", "otel"]
+features = ["ephemeral-server", "otel", "streams"]
+
+[dependencies.temporalio-streams]
+path = "../streams"
+version = "0.1"
+features = ["redis"]
 
 [dependencies.temporalio-common]
 path = "../common"

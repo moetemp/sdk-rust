@@ -13,6 +13,7 @@ pub mod envconfig;
 pub mod metric;
 pub mod random;
 pub mod runtime;
+pub mod streams;
 pub mod testing;
 pub mod worker;
 

@@ -8,6 +8,10 @@ use crate::{
         Runtime, RuntimeInfoArray, RuntimeOptions, RuntimeOrFail, temporal_core_byte_array_free,
         temporal_core_runtime_free, temporal_core_runtime_new,
     },
+    streams::{
+        StreamStore, temporal_core_stream_store_call, temporal_core_stream_store_free,
+        temporal_core_stream_store_new,
+    },
     testing::{
         DevServerOptions, EphemeralServer, TestServerOptions, temporal_core_ephemeral_server_free,
         temporal_core_ephemeral_server_shutdown, temporal_core_ephemeral_server_start_dev_server,
@@ -449,6 +453,69 @@ impl Context {
         self.wait_for_operation_result().map(|r| *r)
     }
 
+    /// Builds a stream store from the serialized `config` on this context's client.
+    pub fn stream_store_new(self: &Arc<Self>, config: Vec<u8>) -> anyhow::Result<StreamStorePtr> {
+        let (runtime, client) = {
+            let mut guard = self.wait_for_available()?;
+            let client = guard.client;
+            if client.is_null() {
+                return Err(anyhow!("Client is null"));
+            }
+            guard.operation_state = ContextOperationState::InProgress;
+            (guard.runtime, client)
+        };
+        let config_ref: ByteArrayRef = config.as_slice().into();
+        let user_data = Box::into_raw(Box::new(CallbackUserData {
+            data: runtime,
+            context: Arc::downgrade(self),
+            _allocations: Box::new(config),
+        })) as *mut libc::c_void;
+        temporal_core_stream_store_new(client, config_ref, user_data, stream_store_new_callback);
+        self.wait_for_operation_result().map(|r| *r)
+    }
+
+    /// Makes one stream call, answering with the response or the serialized failure.
+    pub fn stream_store_call(
+        self: &Arc<Self>,
+        store: &StreamStorePtr,
+        rpc: &str,
+        request: Vec<u8>,
+    ) -> anyhow::Result<Result<Vec<u8>, Vec<u8>>> {
+        self.stream_store_call_with_token(store, rpc, request, std::ptr::null())
+    }
+
+    /// Makes a stream call that `cancellation_token`, when not null, can cancel.
+    pub fn stream_store_call_with_token(
+        self: &Arc<Self>,
+        store: &StreamStorePtr,
+        rpc: &str,
+        request: Vec<u8>,
+        cancellation_token: *const crate::CancellationToken,
+    ) -> anyhow::Result<Result<Vec<u8>, Vec<u8>>> {
+        let runtime = {
+            let mut guard = self.wait_for_available()?;
+            guard.operation_state = ContextOperationState::InProgress;
+            guard.runtime
+        };
+        let rpc = rpc.to_string();
+        let rpc_ref: ByteArrayRef = rpc.as_str().into();
+        let request_ref: ByteArrayRef = request.as_slice().into();
+        let user_data = Box::into_raw(Box::new(CallbackUserData {
+            data: runtime,
+            context: Arc::downgrade(self),
+            _allocations: Box::new((rpc, request)),
+        })) as *mut libc::c_void;
+        temporal_core_stream_store_call(
+            store.0,
+            rpc_ref,
+            request_ref,
+            cancellation_token,
+            user_data,
+            stream_store_call_callback,
+        );
+        self.wait_for_operation_result().map(|r| *r)
+    }
+
     fn wait_while(
         &self,
         condition: impl FnMut(&mut InnerContext) -> bool,
@@ -708,5 +775,72 @@ impl From<&HashMap<String, Vec<u8>>> for GrpcMetadataHolder {
             data: refs.iter().map(ByteArrayRef::from).collect(),
             _allocations: refs,
         }
+    }
+}
+
+/// A stream store the test owns, freed when dropped.
+#[derive(Debug)]
+pub struct StreamStorePtr(*mut StreamStore);
+
+unsafe impl Send for StreamStorePtr {}
+
+impl Drop for StreamStorePtr {
+    fn drop(&mut self) {
+        temporal_core_stream_store_free(self.0);
+    }
+}
+
+extern "C" fn stream_store_new_callback(
+    user_data: *mut libc::c_void,
+    mut store: *mut StreamStore,
+    mut fail: *const ByteArray,
+) {
+    let user_data = unsafe { Box::from_raw(user_data as *mut CallbackUserData<(), Context>) };
+    if let Some(context) = user_data.context.upgrade() {
+        let _ = context.complete_operation_catch_unwind(|guard| {
+            if let Some(fail) = byte_array_to_string(guard.runtime, std::mem::take(&mut fail)) {
+                ContextOperationState::CallbackError(anyhow!("Stream store failed: {fail}"))
+            } else {
+                let store = StreamStorePtr(std::mem::take(&mut store));
+                ContextOperationState::CallbackOk(Some(Box::new(store) as _))
+            }
+        });
+    }
+    if !fail.is_null() {
+        temporal_core_byte_array_free(std::ptr::null_mut(), fail);
+    }
+    if !store.is_null() {
+        temporal_core_stream_store_free(store);
+    }
+}
+
+extern "C" fn stream_store_call_callback(
+    user_data: *mut libc::c_void,
+    mut success: *const ByteArray,
+    mut failure: *const ByteArray,
+) {
+    let user_data = unsafe { Box::from_raw(user_data as *mut CallbackUserData<(), Context>) };
+    if let Some(context) = user_data.context.upgrade() {
+        let _ = context.complete_operation_catch_unwind(|guard| {
+            let success = byte_array_to_vec(guard.runtime, std::mem::take(&mut success));
+            let failure = byte_array_to_vec(guard.runtime, std::mem::take(&mut failure));
+            let result: Result<Vec<u8>, Vec<u8>> = match (success, failure) {
+                (Some(success), None) => Ok(success),
+                (None, Some(failure)) => Err(failure),
+                other => {
+                    return ContextOperationState::CallbackError(anyhow!(
+                        "A stream call must answer with exactly one of success and failure, got \
+                         {other:?}"
+                    ));
+                }
+            };
+            ContextOperationState::CallbackOk(Some(Box::new(result) as _))
+        });
+    }
+    if !success.is_null() {
+        temporal_core_byte_array_free(std::ptr::null_mut(), success);
+    }
+    if !failure.is_null() {
+        temporal_core_byte_array_free(std::ptr::null_mut(), failure);
     }
 }

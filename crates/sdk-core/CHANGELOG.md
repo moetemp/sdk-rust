@@ -38,6 +38,8 @@ relevant information.
   stream store from a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in
   process: append, read, latest, close and owner delete, as serialized `coresdk.streams`
   requests.
+* Experimental: the C bridge has `temporal_core_stream_store_new`, `_call` and `_free` for the
+  stream service, built with the Redis store.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

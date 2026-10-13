@@ -108,6 +108,11 @@ typedef struct TemporalCoreRuntime TemporalCoreRuntime;
 
 typedef struct TemporalCoreSlotReserveCompletionCtx TemporalCoreSlotReserveCompletionCtx;
 
+/**
+ * One process's stream store, serving the stream calls lang makes.
+ */
+typedef struct TemporalCoreStreamStore TemporalCoreStreamStore;
+
 typedef struct TemporalCoreWorker TemporalCoreWorker;
 
 typedef struct TemporalCoreWorkerReplayPusher TemporalCoreWorkerReplayPusher;
@@ -546,6 +551,22 @@ typedef struct TemporalCoreRuntimeOptions {
    */
   bool disable_environment_info;
 } TemporalCoreRuntimeOptions;
+
+/**
+ * If success or fail are not null, they must be manually freed when done.
+ */
+typedef void (*TemporalCoreStreamStoreNewCallback)(void *user_data,
+                                                   struct TemporalCoreStreamStore *success,
+                                                   const struct TemporalCoreByteArray *fail);
+
+/**
+ * If success or failure are not null, they must be manually freed when done. Exactly one is
+ * set. Success is the serialized response, and failure a serialized
+ * `coresdk.streams.StreamFailure`.
+ */
+typedef void (*TemporalCoreStreamStoreCallCallback)(void *user_data,
+                                                    const struct TemporalCoreByteArray *success,
+                                                    const struct TemporalCoreByteArray *failure);
 
 typedef struct TemporalCoreTestServerOptions {
   /**
@@ -1072,6 +1093,30 @@ struct TemporalCoreByteArrayRef temporal_core_forwarded_log_message(const struct
 uint64_t temporal_core_forwarded_log_timestamp_millis(const struct TemporalCoreForwardedLog *log);
 
 struct TemporalCoreByteArrayRef temporal_core_forwarded_log_fields_json(const struct TemporalCoreForwardedLog *log);
+
+/**
+ * Connects to the store `config` names, a serialized `coresdk.streams.StreamStoreConfig`. The
+ * store asks `client`'s server about streams' owners. Client must live as long as the store, and
+ * config and user data must live through the callback.
+ */
+void temporal_core_stream_store_new(struct TemporalCoreConnection *client,
+                                    struct TemporalCoreByteArrayRef config,
+                                    void *user_data,
+                                    TemporalCoreStreamStoreNewCallback callback);
+
+void temporal_core_stream_store_free(struct TemporalCoreStreamStore *store);
+
+/**
+ * Makes one stream call. `rpc` names a `coresdk.streams.StreamService` method and `request` is
+ * its serialized request. Cancelling the token drops the call, which a read uses to stop
+ * waiting. Store, request and user data must live through the callback.
+ */
+void temporal_core_stream_store_call(struct TemporalCoreStreamStore *store,
+                                     struct TemporalCoreByteArrayRef rpc,
+                                     struct TemporalCoreByteArrayRef request,
+                                     const struct TemporalCoreCancellationToken *cancellation_token,
+                                     void *user_data,
+                                     TemporalCoreStreamStoreCallCallback callback);
 
 /**
  * Runtime must live as long as server. Options and user data must live through
