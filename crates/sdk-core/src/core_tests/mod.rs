@@ -1,5 +1,6 @@
 mod activity_tasks;
 mod event_groups;
+mod external_streams;
 mod queries;
 mod replay_flag;
 mod updates;
