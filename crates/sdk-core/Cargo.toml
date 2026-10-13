@@ -49,6 +49,8 @@ antithesis_assertions = ["dep:antithesis_sdk"]
 dynamic-tls = ["temporalio-client/dynamic-tls"]
 # Used by the integration-test runner to make Cloud exclusions native libtest ignores.
 cloud-test-mode = []
+# The stream store integration: lang reaches the store in process.
+streams = ["dep:temporalio-streams"]
 
 [dependencies]
 anyhow = "1.0"
@@ -131,6 +133,11 @@ zip = { version = "8.4", optional = true, default-features = false, features = [
 ] }
 
 # 1st party local deps
+[dependencies.temporalio-streams]
+path = "../streams"
+version = "0.1"
+optional = true
+
 [dependencies.temporalio-common]
 path = "../common"
 version = "~1.1.0"

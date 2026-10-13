@@ -1,0 +1,63 @@
+use crate::{
+    StreamResult,
+    proto::{
+        ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
+        StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse,
+    },
+};
+
+/// A store that holds streams, keyed by their owner's run chain.
+///
+/// A store moves serialized `temporal.sdk.streams.v1.StreamRecord`s with encoded bodies and deals
+/// in its own positions. Owner checks, cursors and supersession sit above it, so every
+/// store behaves the same where the contract says so, and a new store only implements this.
+///
+/// Every call is safe to repeat. A call that fails while the store may have acted reports
+/// [crate::StreamError::outcome_unknown] for an append and a storage failure otherwise.
+#[async_trait::async_trait]
+pub trait StreamStore: Send + Sync {
+    /// The short name minted into this store's cursors, such as `redis` or `memory`. A cursor
+    /// from another store is refused.
+    fn name(&self) -> &str;
+
+    /// Appends one batch for one producer attempt, whole and in order.
+    ///
+    /// The store keeps the attempt's newest batch: its first sequence, its record count, its
+    /// positions and its digest. A repeat of that batch with the same digest answers with its
+    /// positions and writes nothing. The same first sequence with another digest fails as
+    /// producer divergent, and a first sequence below the end of the newest batch as producer
+    /// stale. A closed chain or topic refuses a new batch as closed, but still answers a repeat.
+    async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse>;
+
+    /// Reads the records of a topic after a position, waiting up to the request's `wait` for one
+    /// when none is there.
+    ///
+    /// Fails as expired when the position names a record retention dropped, or when retention
+    /// dropped records the read had not delivered yet. Fails as not found when nothing is known
+    /// about the topic and the position is not empty.
+    async fn read(&self, request: StoreReadRequest) -> StreamResult<StoreReadResponse>;
+
+    /// The position of the newest record of a topic, or empty when it holds none.
+    async fn latest(&self, request: StoreLatestRequest) -> StreamResult<StoreLatestResponse>;
+
+    /// Marks a chain closed, so its topics refuse new batches from producers.
+    async fn close_chain(&self, chain: &ChainId) -> StreamResult<()>;
+
+    /// Marks one topic of a chain closed, like [StreamStore::close_chain] for that topic alone.
+    async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()>;
+
+    /// Deletes every stream of one owner, across all its chains.
+    async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StreamStore;
+    use std::sync::Arc;
+
+    #[test]
+    fn a_store_can_be_shared_as_a_trait_object() {
+        // Core holds the configured store behind one pointer for every Worker and client call.
+        fn _shared(_: Arc<dyn StreamStore>) {}
+    }
+}

@@ -15,6 +15,7 @@ pub mod fsm_trait;
 pub mod payload_limits;
 pub mod payload_visitor;
 pub mod protos;
+pub mod streams;
 pub mod telemetry;
 pub mod worker;
 pub use temporalio_common_wasm::{
