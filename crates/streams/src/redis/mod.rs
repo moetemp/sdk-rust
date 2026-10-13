@@ -1,21 +1,4 @@
-//! The store on the application's Redis.
-//!
-//! Records live in Redis and never pass through Temporal. The key layout, the stored values and
-//! the Lua scripts are the ones the SDKs used before the store moved into Core, so a stream one
-//! wrote stays readable and writable by the other.
-//!
-//! **Appends.** One script writes a whole batch, so a reader never sees part of one. The topic's
-//! meta hash keeps one field per producer attempt: the newest batch's first sequence, its record
-//! count, its first and last entry ids, and lang's digest of it in hex. The script refuses a
-//! new batch once the chain or the topic is closed, in the same step as the write, so no batch
-//! lands after a close returned. Only that topic check differs from the SDKs' script.
-//!
-//! **Retention.** Every script that writes a log trims it with `XTRIM MINID` to the retention and
-//! slides the expiry of the log and its meta, so a stream dies a retention after its last write
-//! and nobody cleans up when the Workflow closes. The meta outlives its log by a 30-day grace, as
-//! the tombstone that tells a log that expired from one that never existed.
-//!
-//! Redis 7.0 or later is required.
+#![doc = include_str!("../../docs/redis.md")]
 
 mod conn;
 mod errors;
@@ -114,6 +97,7 @@ impl RedisStore {
         let shared = Shared::connect(&options.urls, options.cluster, options.response_timeout)
             .await
             .mapped(Call::Read)?;
+        check_server(&shared).await?;
         let blocking = BlockingPool::new(
             seed,
             options.blocking_reads_per_node,
@@ -165,6 +149,100 @@ impl RedisStore {
         xread.arg("STREAMS").arg(keys.log(topic)).arg(after);
         xread
     }
+}
+
+/// Refuses a server older than Redis 7.0, and warns about one that may evict stream keys.
+async fn check_server(shared: &Shared) -> StreamResult<()> {
+    let mut info = redis::cmd("INFO");
+    info.arg("server");
+    for (node, reply) in shared.on_each_primary(info).await.mapped(Call::Read)? {
+        let text: String = redis::from_redis_value(reply).map_err(|error| {
+            StreamError::storage(format!("Redis answered INFO with no text: {error}"))
+        })?;
+        check_version(&node, &text)?;
+    }
+    let mut policy = redis::cmd("CONFIG");
+    policy.arg("GET").arg("maxmemory-policy");
+    match shared.on_each_primary(policy).await {
+        Ok(replies) => {
+            let policies: Vec<_> = replies
+                .into_iter()
+                .map(|(node, reply)| (node, eviction_policy(reply)))
+                .collect();
+            if let Some(warning) = eviction_warning(&policies) {
+                tracing::warn!("{warning}");
+            }
+        }
+        // Managed services often refuse CONFIG. The policy is theirs to document then.
+        Err(error) => tracing::debug!("Could not read maxmemory-policy: {error}"),
+    }
+    Ok(())
+}
+
+fn check_version(node: &str, info: &str) -> StreamResult<()> {
+    let version = info
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("redis_version:"))
+        .unwrap_or("0");
+    let major: u32 = version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse().ok())
+        .unwrap_or(0);
+    if major < 7 {
+        let at = if node.is_empty() {
+            String::new()
+        } else {
+            format!(" at {node}")
+        };
+        return Err(StreamError::unsupported(format!(
+            "the Redis store needs Redis 7.0 or later, but the server{at} reports redis_version \
+             {version}"
+        )));
+    }
+    Ok(())
+}
+
+fn eviction_policy(reply: Value) -> Option<String> {
+    let pairs: Vec<(String, String)> = match reply {
+        Value::Map(pairs) => pairs
+            .into_iter()
+            .filter_map(|(name, value)| {
+                Some((
+                    redis::from_redis_value(name).ok()?,
+                    redis::from_redis_value(value).ok()?,
+                ))
+            })
+            .collect(),
+        other => {
+            let flat: Vec<String> = redis::from_redis_value(other).ok()?;
+            flat.chunks(2)
+                .filter_map(|pair| Some((pair.first()?.clone(), pair.get(1)?.clone())))
+                .collect()
+        }
+    };
+    pairs
+        .into_iter()
+        .find(|(name, _)| name == "maxmemory-policy")
+        .map(|(_, value)| value)
+}
+
+fn eviction_warning(policies: &[(String, Option<String>)]) -> Option<String> {
+    let (node, policy) = policies.iter().find_map(|(node, policy)| {
+        policy
+            .as_deref()
+            .filter(|policy| !policy.is_empty() && *policy != "noeviction")
+            .map(|policy| (node, policy))
+    })?;
+    let at = if node.is_empty() {
+        String::new()
+    } else {
+        format!(" at {node}")
+    };
+    Some(format!(
+        "Redis{at} has maxmemory-policy {policy:?}. Under memory pressure Redis may evict whole \
+         stream keys, losing records and their dedupe state. Use \"noeviction\" for streams."
+    ))
 }
 
 /// A Redis stream id as its two numbers, so ids compare in log order.
@@ -501,6 +579,7 @@ impl StreamStore for RedisStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::StreamFailureKind;
 
     #[test]
     fn stream_ids_compare_in_log_order() {
@@ -510,6 +589,50 @@ mod tests {
         for bad in ["", "x-1", "1-x", "-1"] {
             assert!(entry(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_server_older_than_redis_7_is_refused() {
+        for (info, ok) in [
+            ("# Server\r\nredis_version:7.0.0\r\n", true),
+            ("redis_version:8.10.1\r\nredis_mode:standalone", true),
+            ("redis_version:6.2.14\r\n", false),
+            ("no version here", false),
+        ] {
+            let checked = check_version("", info);
+            assert_eq!(checked.is_ok(), ok, "{info:?}");
+            if let Err(error) = checked {
+                assert_eq!(error.kind, StreamFailureKind::Unsupported);
+                assert!(error.message.contains("Redis 7.0"), "{error}");
+            }
+        }
+        let error = check_version("10.0.0.2:7102", "redis_version:6.0.0").unwrap_err();
+        assert!(error.message.contains("10.0.0.2:7102"), "{error}");
+    }
+
+    #[test]
+    fn only_a_policy_that_may_evict_is_warned_about() {
+        let primary = |policy: Option<&str>| (String::new(), policy.map(str::to_string));
+        assert_eq!(eviction_warning(&[primary(Some("noeviction"))]), None);
+        // A server that refused CONFIG, or answered nothing, says nothing either way.
+        assert_eq!(eviction_warning(&[primary(None)]), None);
+        let warning = eviction_warning(&[
+            primary(Some("noeviction")),
+            ("10.0.0.3:7103".to_string(), Some("allkeys-lru".to_string())),
+        ])
+        .unwrap();
+        assert!(warning.contains("allkeys-lru"), "{warning}");
+        assert!(warning.contains("10.0.0.3:7103"), "{warning}");
+    }
+
+    #[test]
+    fn the_policy_reads_from_either_reply_shape() {
+        let bulk = |text: &str| Value::BulkString(text.as_bytes().to_vec());
+        let array = Value::Array(vec![bulk("maxmemory-policy"), bulk("allkeys-lru")]);
+        assert_eq!(eviction_policy(array).as_deref(), Some("allkeys-lru"));
+        let map = Value::Map(vec![(bulk("maxmemory-policy"), bulk("noeviction"))]);
+        assert_eq!(eviction_policy(map).as_deref(), Some("noeviction"));
+        assert_eq!(eviction_policy(Value::Nil), None);
     }
 
     #[test]

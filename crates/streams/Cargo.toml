@@ -40,6 +40,7 @@ default-features = false
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 tokio = { version = "1.47", features = [
     "io-util",
     "macros",

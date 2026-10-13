@@ -1051,3 +1051,176 @@ async fn rule_20_4_a_malformed_entry_fails_with_its_cursor() {
     .unwrap();
     assert_eq!(after.records.len(), 1);
 }
+
+/// Tests that change the server's eviction policy run one at a time.
+static POLICY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// What the store logs while `connect` runs.
+async fn logs_of_connect(options: RedisStoreOptions) -> String {
+    #[derive(Clone, Default)]
+    struct Logs(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Logs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let logs = Logs::default();
+    let writer = logs.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(move || writer.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    RedisStore::connect(options).await.unwrap();
+    String::from_utf8(logs.0.lock().unwrap().clone()).unwrap()
+}
+
+async fn set_policy(url: &str, policy: &str) {
+    let mut admin = redis::Client::open(url)
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("CONFIG")
+        .arg("SET")
+        .arg("maxmemory-policy")
+        .arg(policy)
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_noeviction_server_is_not_warned_about() {
+    let Some(url) = url() else {
+        return;
+    };
+    let _serial = POLICY.lock().await;
+    set_policy(&url, "noeviction").await;
+    let logs = logs_of_connect(RedisStoreOptions::new(url)).await;
+    assert!(!logs.contains("maxmemory-policy"), "{logs}");
+}
+
+#[tokio::test]
+async fn an_evicting_server_is_warned_about() {
+    let Some(url) = url() else {
+        return;
+    };
+    let _serial = POLICY.lock().await;
+    set_policy(&url, "allkeys-lru").await;
+    let logs = logs_of_connect(RedisStoreOptions::new(url.clone())).await;
+    set_policy(&url, "noeviction").await;
+    assert!(logs.contains("allkeys-lru"), "{logs}");
+    assert_eq!(logs.matches("maxmemory-policy").count(), 1, "{logs}");
+}
+
+#[tokio::test]
+async fn a_server_that_refuses_config_is_not_warned_about() {
+    let Some(url) = url() else {
+        return;
+    };
+    let _serial = POLICY.lock().await;
+    set_policy(&url, "allkeys-lru").await;
+    // Managed services often refuse CONFIG, so the store goes on without the check.
+    let name = unique("no-config");
+    let mut admin = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let _: () = redis::cmd("ACL")
+        .arg("SETUSER")
+        .arg(&name)
+        .arg("on")
+        .arg(">pw")
+        .arg("allkeys")
+        .arg("+@all")
+        .arg("-config")
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    let address = url.trim_start_matches("redis://");
+    let logs = logs_of_connect(RedisStoreOptions::new(format!(
+        "redis://{name}:pw@{address}"
+    )))
+    .await;
+    let _: () = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&name)
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    set_policy(&url, "noeviction").await;
+    assert!(!logs.contains("maxmemory-policy"), "{logs}");
+}
+
+#[tokio::test]
+async fn an_evicting_primary_of_a_cluster_is_warned_about() {
+    let Ok(url) = std::env::var("STREAMS_REDIS_CLUSTER_URL") else {
+        eprintln!("set STREAMS_REDIS_CLUSTER_URL to run the Redis cluster tests");
+        return;
+    };
+    let _serial = POLICY.lock().await;
+    // One primary of three, so a check of only the seed would miss it.
+    let mut nodes = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let shards: String = redis::cmd("CLUSTER")
+        .arg("NODES")
+        .query_async(&mut nodes)
+        .await
+        .unwrap();
+    let seed = url
+        .trim_start_matches("redis://")
+        .split('/')
+        .next()
+        .unwrap();
+    let other = shards
+        .lines()
+        .filter(|line| line.contains("master"))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|address| address.split('@').next().unwrap().to_string())
+        .find(|address| !seed.ends_with(address.rsplit(':').next().unwrap()))
+        .unwrap();
+    let other_url = format!("redis://{other}/0");
+    set_policy(&other_url, "allkeys-lru").await;
+    let mut options = RedisStoreOptions::new(url);
+    options.cluster = true;
+    let logs = logs_of_connect(options).await;
+    set_policy(&other_url, "noeviction").await;
+    assert!(logs.contains("allkeys-lru"), "{logs}");
+    assert!(logs.contains(other.rsplit(':').next().unwrap()), "{logs}");
+}
+
+#[tokio::test]
+async fn the_documented_acl_is_the_python_sdks() {
+    // One rule set for every SDK, so an application's ACL keeps working across the move.
+    let Ok(checkout) = std::env::var("STREAMS_BROOK_PY") else {
+        eprintln!("set STREAMS_BROOK_PY to compare the documented ACL with the Python SDK's");
+        return;
+    };
+    let rules = |page: &str| -> Vec<String> {
+        page.lines()
+            .find_map(|line| line.strip_prefix("ACL SETUSER "))
+            .unwrap()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()
+    };
+    let python = std::fs::read_to_string(
+        std::path::Path::new(&checkout).join("temporalio/contrib/streams/docs/redis-guarantees.md"),
+    )
+    .unwrap();
+    // A cluster client asks the topology with `CLUSTER SLOTS`, which the Python SDK's page left
+    // out. It is the one rule Core adds.
+    let mut expected = rules(&python);
+    expected.push("+cluster|slots".to_string());
+    assert_eq!(rules(include_str!("../docs/redis.md")), expected);
+}

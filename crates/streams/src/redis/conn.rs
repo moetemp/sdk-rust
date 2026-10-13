@@ -12,6 +12,7 @@ use redis::{
     aio::{ConnectionLike, ConnectionManager, ConnectionManagerConfig, MultiplexedConnection},
     cluster::ClusterClient,
     cluster_async::ClusterConnection,
+    cluster_routing::{MultipleNodeRoutingInfo, RoutingInfo},
 };
 use std::{
     collections::HashMap,
@@ -75,6 +76,35 @@ impl Shared {
         Ok(Shared::Single(
             client.get_connection_manager_with_config(config).await?,
         ))
+    }
+
+    /// Runs `cmd` on the server, or on every primary of a cluster, and answers each reply with
+    /// the node that sent it. Each primary holds its own share of the keys and its own settings.
+    pub(crate) async fn on_each_primary(&self, cmd: Cmd) -> RedisResult<Vec<(String, Value)>> {
+        match self.clone() {
+            Shared::Single(mut conn) => {
+                Ok(vec![(String::new(), cmd.query_async(&mut conn).await?)])
+            }
+            Shared::Cluster(mut conn) => {
+                let routing = RoutingInfo::MultiNode((MultipleNodeRoutingInfo::AllMasters, None));
+                match conn.route_command(cmd, routing).await? {
+                    Value::Map(replies) => Ok(replies
+                        .into_iter()
+                        .map(|(node, reply)| {
+                            let node = match node {
+                                Value::BulkString(bytes) => {
+                                    String::from_utf8_lossy(&bytes).into_owned()
+                                }
+                                Value::SimpleString(text) => text,
+                                other => format!("{other:?}"),
+                            };
+                            (node, reply)
+                        })
+                        .collect()),
+                    other => Ok(vec![(String::new(), other)]),
+                }
+            }
+        }
     }
 }
 
