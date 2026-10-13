@@ -18,6 +18,7 @@ mod reader;
 mod record;
 #[cfg(feature = "redis")]
 mod redis;
+mod repair;
 mod service;
 mod store;
 
@@ -33,6 +34,7 @@ pub use record::{
     WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, stored_append_record,
     stored_output_record,
 };
+pub use repair::{Decision, decide_token};
 pub use service::StreamService;
 pub use store::StreamStore;
 
