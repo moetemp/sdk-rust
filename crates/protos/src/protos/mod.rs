@@ -3185,7 +3185,6 @@ mod sdk_helpers {
                     output: Some(ExternalOutputStreamManifest {
                         schema_version: 1,
                         fingerprint_version: 2,
-                        stage_token: "token".to_string(),
                         history_floor_event_id: 3,
                         run_id: "run".to_string(),
                         topics: vec![ExternalOutputTopicManifest {

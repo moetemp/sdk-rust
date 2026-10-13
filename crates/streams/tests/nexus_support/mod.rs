@@ -12,7 +12,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 use temporalio_common::protos::temporal::api::{
-    common::v1::Payload, enums::v1::WorkflowExecutionStatus, history::v1::HistoryEvent,
+    common::v1::Payload, enums::v1::WorkflowExecutionStatus,
 };
 use temporalio_streams::{
     MemoryStore, OwnerClient, OwnerDescription, OwnerError, StreamStore, Streams, StreamsOptions,
@@ -44,18 +44,7 @@ impl OwnerClient for Running {
             run_id: if run_id.is_empty() { "run-1" } else { run_id }.to_string(),
             first_run_id: "run-1".to_string(),
             status: WorkflowExecutionStatus::Running,
-            start_time: None,
         })
-    }
-
-    async fn history_after(
-        &self,
-        _: &str,
-        _: &str,
-        _: &str,
-        _: i64,
-    ) -> Result<Vec<HistoryEvent>, OwnerError> {
-        Ok(Vec::new())
     }
 }
 

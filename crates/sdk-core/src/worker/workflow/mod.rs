@@ -148,7 +148,7 @@ pub(crate) struct Workflows {
     default_versioning_behavior: Option<VersioningBehavior>,
     namespace_capabilities: Arc<NamespaceCapabilities>,
     shutdown_token: CancellationToken,
-    /// Stages, promotes and aborts Workflow stream output, when the Worker has a stream store.
+    /// Appends Workflow stream output and closes its topics, when the Worker has a stream store.
     #[cfg(feature = "streams")]
     output_store: Option<Arc<stream_output::OutputStore>>,
 }
@@ -400,17 +400,6 @@ impl Workflows {
                     },
                 metrics: run_metrics,
             } => {
-                let stream_output::ReportedOutput {
-                    output,
-                    proven,
-                    close,
-                } = stream_output.map(|o| *o).unwrap_or_default();
-                #[cfg(feature = "streams")]
-                if let Some(store) = &self.output_store {
-                    store.promote_proven(run_id, &proven).await;
-                }
-                #[cfg(not(feature = "streams"))]
-                let _ = proven;
                 let reserved_act_permits =
                     self.reserve_activity_slots_for_outgoing_commands(commands.as_mut_slice());
                 debug!(commands=%commands.display(), query_responses=%query_responses.display(),
@@ -457,42 +446,15 @@ impl Workflows {
                 completion.sticky_attributes = sticky_attrs;
 
                 let mut reset_last_started_to = None;
-                #[cfg(feature = "streams")]
                 let mut output_outcome = stream_output::CompletionOutcome::Refused;
                 self.handle_wft_reporting_errs(run_id, || async {
-                    // Staged before the completion, so a task the server accepts always has its
-                    // output in the store, ready to promote.
-                    if let Err(failure) = self.stage_output(&output).await {
-                        let message = failure
-                            .failure
-                            .as_ref()
-                            .map(|f| f.message.clone())
-                            .unwrap_or_default();
-                        self.handle_activation_failed(
-                            run_id,
-                            completion_time,
-                            FailedActivationWFTReport::new(
-                                task_token,
-                                attempt,
-                                WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
-                                failure,
-                                WftFailureKind::Task,
-                                &run_metrics,
-                            ),
-                        )
-                        .await;
-                        return Err(tonic::Status::unavailable(message));
-                    }
                     match self
                         .client
                         .complete_workflow_task(completion, self.shutdown_token.clone())
                         .await
                     {
                         Ok(response) => {
-                            #[cfg(feature = "streams")]
-                            {
-                                output_outcome = stream_output::CompletionOutcome::Accepted;
-                            }
+                            output_outcome = stream_output::CompletionOutcome::Accepted;
                             if let Some(record) = maybe_record_terminal_metric.take() {
                                 record(&run_metrics);
                             }
@@ -508,10 +470,7 @@ impl Workflows {
                             );
                         }
                         Err(e) => {
-                            #[cfg(feature = "streams")]
-                            {
-                                output_outcome = completion_outcome(&e);
-                            }
+                            output_outcome = completion_outcome(&e);
                             let cause_and_failure =
                                 if e.metadata().contains_key(REQUEST_TOO_LARGE_KEY) {
                                     // Completion exceeds the namespace's recombined size limit, so the
@@ -558,21 +517,20 @@ impl Workflows {
                 })
                 .await;
                 #[cfg(feature = "streams")]
-                if let Some(store) = &self.output_store {
-                    store.settle(run_id, output, output_outcome).await;
-                    if let Some(chain) = close
-                        && output_outcome == stream_output::CompletionOutcome::Accepted
-                    {
+                if let (Some(store), Some(output)) = (&self.output_store, stream_output) {
+                    let chain = output.chain.clone();
+                    let ends_chain = output.ends_chain;
+                    store.settle_closes(run_id, *output, output_outcome);
+                    if ends_chain && output_outcome == stream_output::CompletionOutcome::Accepted {
                         store.close_after_final_task(
                             self.client.clone(),
                             chain,
                             run_id.to_string(),
-                            self.shutdown_token.clone(),
                         );
                     }
                 }
                 #[cfg(not(feature = "streams"))]
-                let _ = close;
+                let _ = (stream_output, output_outcome);
                 WFTReportStatus::Reported {
                     reset_last_started_to,
                     completion_time,
@@ -593,21 +551,53 @@ impl Workflows {
         }
     }
 
-    /// Stages a completion's stream output in the Worker's store, in commit order.
-    async fn stage_output(&self, output: &[stream_output::OutputBatch]) -> Result<(), Failure> {
-        if output.is_empty() {
-            return Ok(());
-        }
+    /// Appends the stream output `result` carries, if any, before anything else happens with the
+    /// completion.
+    ///
+    /// The run has one outstanding activation until [Self::post_activation], so its appends never
+    /// overlap and land in commit order. When the append fails, the Workflow Task fails instead of
+    /// whatever the completion would have done, and the run is evicted, since its machines hold
+    /// the output's marker.
+    async fn append_output(
+        &self,
+        run_id: &str,
+        mut result: ActivationCompleteResult,
+    ) -> ActivationCompleteResult {
+        let Some(output) = result.output.take() else {
+            return result;
+        };
+        let Err(failure) = self.append_to_store(&output.batch).await else {
+            return result;
+        };
+        self.request_eviction(
+            run_id,
+            "The Workflow Task's stream output could not be appended",
+            EvictionReason::Fatal,
+        );
+        result.outcome =
+            ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport::new(
+                output.task_token,
+                output.attempt,
+                WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                failure,
+                WftFailureKind::Task,
+                &output.metrics,
+            )));
+        result
+    }
+
+    async fn append_to_store(&self, batch: &stream_output::OutputBatch) -> Result<(), Failure> {
         #[cfg(feature = "streams")]
         if let Some(store) = &self.output_store {
-            return store.stage(output).await.map_err(|e| {
+            return store.append(batch).await.map_err(|e| {
                 make_stream_output_failure(&format!(
-                    "Could not stage the Workflow Task's stream output ({e})"
+                    "Could not append the Workflow Task's stream output ({e})"
                 ))
             });
         }
+        let _ = batch;
         Err(make_stream_output_failure(
-            "This Worker has no stream store to stage the Workflow Task's stream output in",
+            "This Worker has no stream store to append the Workflow Task's stream output to",
         ))
     }
 
@@ -732,6 +722,7 @@ impl Workflows {
             );
             return Ok(());
         };
+        let completion_outcome = self.append_output(&run_id, completion_outcome).await;
         let replaying = completion_outcome.replaying;
 
         let mut wft_from_complete = None;
@@ -1271,7 +1262,7 @@ pub(crate) enum ActivationAction {
         sdk_metadata: WorkflowTaskCompletedMetadata,
         versioning_behavior: VersioningBehavior,
         attempt: u32,
-        /// Stream output to stage, and output replay proved, when the run has any.
+        /// The topics the task closed, to close in the store by the server's answer.
         stream_output: Option<Box<stream_output::ReportedOutput>>,
     },
     /// We should respond to a legacy query request
@@ -1402,6 +1393,25 @@ struct GetStateInfoMsg {
 struct ActivationCompleteResult {
     replaying: bool,
     outcome: ActivationCompleteOutcome,
+    /// The stream output this activation committed, to append before anything else is done.
+    output: Option<Box<ActivationOutput>>,
+}
+
+/// One activation's stream output, and what failing its Workflow Task takes.
+struct ActivationOutput {
+    batch: stream_output::OutputBatch,
+    task_token: TaskToken,
+    attempt: u32,
+    metrics: MetricsContext,
+}
+impl Debug for ActivationOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivationOutput")
+            .field("batch", &self.batch)
+            .field("task_token", &self.task_token)
+            .field("attempt", &self.attempt)
+            .finish()
+    }
 }
 
 /// What needs to be done after calling [Workflows::activation_completed]
@@ -2077,7 +2087,6 @@ fn make_request_too_large_failure() -> Failure {
 ///
 /// `NotFound` proves nothing. The client retries a completion whose answer was lost, and the
 /// server answers the repeat of a completion it applied with `NotFound`.
-#[cfg(feature = "streams")]
 fn completion_outcome(error: &tonic::Status) -> stream_output::CompletionOutcome {
     let not_applied = (error.code() == tonic::Code::InvalidArgument
         && error.message() == "UnhandledCommand")
@@ -2099,7 +2108,7 @@ fn make_stream_output_failure(message: &str) -> Failure {
                 message: message.to_string(),
                 failure_info: Some(FailureInfo::ApplicationFailureInfo(
                     ApplicationFailureInfo {
-                        r#type: "StreamOutputNotStaged".to_string(),
+                        r#type: "StreamOutputNotAppended".to_string(),
                         non_retryable: false,
                         ..Default::default()
                     },
