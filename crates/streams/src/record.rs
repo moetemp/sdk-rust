@@ -28,7 +28,7 @@ pub fn activity_producer_id(activity: &ActivityProducer) -> String {
 /// another way would turn a retry into a divergent write.
 pub fn check_append_digest(digest: &[u8]) -> StreamResult<()> {
     if digest.len() != HASH_LENGTH {
-        return Err(StreamError::refused(format!(
+        return Err(StreamError::invalid_argument(format!(
             "an append needs the {HASH_LENGTH}-byte digest lang takes over the batch before the \
              codec, not {} bytes",
             digest.len()
@@ -39,8 +39,9 @@ pub fn check_append_digest(digest: &[u8]) -> StreamResult<()> {
 
 /// The record a store keeps for one appended record of a producer.
 ///
-/// Fails as refused when the record is one no writer stores: a kind other than DATA or FINISH, a
-/// DATA record without a body or a 32-byte content hash, or a FINISH record with a body.
+/// Fails as an invalid argument when the record is one no writer stores: a kind other than DATA
+/// or FINISH, a DATA record without a body or a 32-byte content hash, or a FINISH record with a
+/// body.
 pub fn stored_append_record(
     topic: &str,
     producer_id: &str,
@@ -85,7 +86,9 @@ fn stored_record(
     content_hash: &[u8],
 ) -> StreamResult<StreamRecord> {
     if topic.is_empty() {
-        return Err(StreamError::refused("a stream record needs a topic"));
+        return Err(StreamError::invalid_argument(
+            "a stream record needs a topic",
+        ));
     }
     let mut stored = StreamRecord {
         topic: topic.to_string(),
@@ -95,10 +98,10 @@ fn stored_record(
     match StreamRecordKind::try_from(kind) {
         Ok(StreamRecordKind::Data) => {
             let Some(body) = body else {
-                return Err(StreamError::refused("a DATA record needs a body"));
+                return Err(StreamError::invalid_argument("a DATA record needs a body"));
             };
             if content_hash.len() != HASH_LENGTH {
-                return Err(StreamError::refused(format!(
+                return Err(StreamError::invalid_argument(format!(
                     "a DATA record needs the {HASH_LENGTH}-byte SHA-256 of its plaintext body, \
                      not {} bytes",
                     content_hash.len()
@@ -112,11 +115,13 @@ fn stored_record(
         }
         Ok(StreamRecordKind::Finish) => {
             if body.is_some() || !content_hash.is_empty() {
-                return Err(StreamError::refused("a FINISH record carries no body"));
+                return Err(StreamError::invalid_argument(
+                    "a FINISH record carries no body",
+                ));
             }
         }
         _ => {
-            return Err(StreamError::refused(format!(
+            return Err(StreamError::invalid_argument(format!(
                 "a writer stores DATA or FINISH records, not kind {kind}"
             )));
         }
@@ -220,7 +225,7 @@ mod tests {
             (unspecified, "not kind 0"),
         ] {
             let error = stored_append_record("out", "p", 1, 1, &record).unwrap_err();
-            assert_eq!(error.kind, StreamFailureKind::Refused);
+            assert_eq!(error.kind, StreamFailureKind::InvalidArgument);
             assert!(error.message.contains(expected), "{expected}: {error}");
         }
         let error = stored_append_record("", "p", 1, 1, &data(1)).unwrap_err();
@@ -232,7 +237,7 @@ mod tests {
         assert_eq!(check_append_digest(&[9; HASH_LENGTH]), Ok(()));
         for digest in [vec![], vec![9; 16]] {
             let error = check_append_digest(&digest).unwrap_err();
-            assert_eq!(error.kind, StreamFailureKind::Refused);
+            assert_eq!(error.kind, StreamFailureKind::InvalidArgument);
             assert!(error.message.contains("32-byte digest"), "{error}");
         }
     }
