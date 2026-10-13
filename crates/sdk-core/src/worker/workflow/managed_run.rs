@@ -17,7 +17,7 @@ use crate::{
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
             stream_output::{
-                MARKER_SCHEMA_VERSION, build_output_manifest, check_output_closes,
+                MARKER_SCHEMA_VERSION, OutputBatch, build_output_manifest, check_output_closes,
                 check_replayed_output_manifest,
             },
         },
@@ -102,6 +102,9 @@ pub(super) struct ManagedRun {
     /// duplicating field values. Remove this once https://github.com/tokio-rs/tracing/issues/2334
     /// is fixed.
     recorded_span_ids: HashSet<tracing::Id>,
+    /// Stream output this run committed and has not reported with a completion yet, in commit
+    /// order.
+    pending_output: Vec<OutputBatch>,
     metrics: MetricsContext,
     /// We store the paginator used for our own run's history fetching
     paginator: Option<HistoryPaginator>,
@@ -127,6 +130,7 @@ impl ManagedRun {
             task_buffer: Default::default(),
             trying_to_evict: None,
             recorded_span_ids: Default::default(),
+            pending_output: vec![],
             metrics,
             paginator: None,
             completion_waiting_on_page_fetch: None,
@@ -906,13 +910,35 @@ impl ManagedRun {
             let recorded = self.wfm.machines.take_replayed_output_manifest();
             return check_replayed_output_manifest(replayed, recorded);
         }
-        let manifest = build_output_manifest(
+        let Some(store_name) = self.stream_store_name() else {
+            return Err(WFMachinesError::Fatal(
+                "Refusing a stream output commit, since this Worker has no stream store"
+                    .to_string(),
+            ));
+        };
+        let mut manifest = build_output_manifest(
             &commit.records,
             self.wfm.machines.current_wft_history_floor_event_id(),
             &self.wfm.machines.run_id,
             Uuid::new_v4().simple().to_string(),
             false,
         )?;
+        manifest.provider_id = store_name;
+        if self.wfm.machines.first_execution_run_id.is_empty() {
+            return Err(WFMachinesError::Fatal(
+                "Refusing a stream output commit, since the run's start event names no first run \
+                 to key its streams by"
+                    .to_string(),
+            ));
+        }
+        let batch = OutputBatch {
+            token: manifest.stage_token.clone(),
+            history_floor_event_id: manifest.history_floor_event_id,
+            workflow_id: self.wfm.machines.workflow_id.clone(),
+            run_id: self.wfm.machines.run_id.clone(),
+            first_run_id: self.wfm.machines.first_execution_run_id.clone(),
+            records: commit.records,
+        };
         // It covers this activation's commands only. With a Local Activity, an earlier activation
         // of the same task may have produced commands, and nothing reads the field yet.
         let terminal_boundary = if commands.iter().any(|c| c.variant.is_terminal()) {
@@ -933,7 +959,26 @@ impl ManagedRun {
                 schema_version: MARKER_SCHEMA_VERSION,
                 terminal_boundary: terminal_boundary as i32,
                 output: Some(manifest),
-            })
+            })?;
+        self.pending_output.push(batch);
+        Ok(())
+    }
+
+    /// The name of the Worker's stream store, or `None` when it has none.
+    fn stream_store_name(&self) -> Option<String> {
+        #[cfg(feature = "streams")]
+        {
+            self.wfm
+                .machines
+                .worker_config()
+                .stream_store
+                .as_ref()
+                .map(|store| store.name().to_string())
+        }
+        #[cfg(not(feature = "streams"))]
+        {
+            None
+        }
     }
 
     fn _local_resolution(
@@ -1320,6 +1365,7 @@ impl ManagedRun {
                     sdk_metadata: machines_wft_response.metadata_for_complete(),
                     versioning_behavior: data.versioning_behavior,
                     attempt,
+                    output: mem::take(&mut self.pending_output),
                 },
                 metrics: self.metrics.clone(),
             })

@@ -696,8 +696,11 @@ fn default_attribs(et: EventType) -> Result<Attributes> {
 
 /// Returns default workflow execution started attributes for testing.
 pub fn default_wes_attribs() -> WorkflowExecutionStartedEventAttributes {
+    let run_id = Uuid::new_v4().to_string();
     WorkflowExecutionStartedEventAttributes {
-        original_execution_run_id: Uuid::new_v4().to_string(),
+        // The first run of a chain, as the server records it.
+        first_execution_run_id: run_id.clone(),
+        original_execution_run_id: run_id,
         workflow_type: Some(WorkflowType {
             name: DEFAULT_WORKFLOW_TYPE.to_owned(),
         }),
