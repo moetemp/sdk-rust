@@ -80,7 +80,8 @@ message ExternalOutputStreamManifest {
   // One entry per activation segment, including segments which published no output.
   repeated ExternalOutputSegmentManifest segments = 7;
   // The stream store that holds the batch. Reconciliation refuses to interpret the batch through
-  // a different store or store format.
+  // a different store or store format. Replay compares neither, since a store can be renamed,
+  // swapped for a Replayer or change its stage layout without changing the output.
   string provider_id = 8;
   uint32 provider_format_version = 9;
 }
