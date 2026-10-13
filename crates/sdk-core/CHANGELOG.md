@@ -47,9 +47,6 @@ relevant information.
   workflow's stream output goes to. Core stages each completion's records in it before the
   completion is sent, and fails the workflow task when the store refuses them or the Worker has
   none, so a task the server accepts always has its output staged.
-  is accepted. A workflow that wrote this marker can only move forward. A Worker on an older
-  Core, or one whose lang doesn't commit the records again on replay, fails that workflow's next
-  task, so don't roll such a fleet back.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
