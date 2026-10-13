@@ -44,6 +44,21 @@ pub(crate) struct ReadState {
     /// The first run of the chain the read follows, so later calls don't resolve it again.
     #[prost(string, tag = "3")]
     pub(crate) first_run_id: String,
+    /// Set once the read learned its owner ended, so it only drains what is left.
+    #[prost(bool, tag = "4")]
+    pub(crate) owner_ended: bool,
+    /// How long the read waits between owner checks while nothing arrives.
+    #[prost(uint64, tag = "5")]
+    pub(crate) check_interval_ms: u64,
+    /// When the next owner check is due, in milliseconds since the Unix epoch.
+    #[prost(uint64, tag = "6")]
+    pub(crate) next_check_ms: u64,
+    /// The topic's newest position ever when a read that has delivered nothing started. Such a
+    /// read has no position, so a record retention dropped after this mark was lost to it.
+    #[prost(string, tag = "7")]
+    watermark: String,
+    #[prost(bool, tag = "8")]
+    watermark_known: bool,
     /// When this read last saw each producer in `attempts`, on the read's own clock, so the
     /// least recently seen one is forgotten first.
     #[prost(map = "string, uint64", tag = "9")]
@@ -141,19 +156,19 @@ pub async fn read_page(
     request: &ReadRequest,
 ) -> StreamResult<ReadResponse> {
     let mut state = ReadState::decode_from(&request.state)?;
-    let mut response = read_with(store, target, request, &mut state).await?;
+    let (mut response, _) = read_with(store, target, request, &mut state).await?;
     response.state = state.encode_to_vec();
     Ok(response)
 }
 
 /// [read_page] with the state already decoded, for a caller that keeps fields of its own in it.
-/// The answer's `state` is left empty.
+/// The answer's `state` is left empty. Also answers whether the store marked the stream closed.
 pub(crate) async fn read_with(
     store: &dyn StreamStore,
     target: &ReadTarget,
     request: &ReadRequest,
     state: &mut ReadState,
-) -> StreamResult<ReadResponse> {
+) -> StreamResult<(ReadResponse, bool)> {
     let from_end = request.after == END;
     let position = if from_end {
         store
@@ -183,6 +198,21 @@ pub(crate) async fn read_with(
         }
     }
     state.started = true;
+    if position.is_empty() {
+        if !state.watermark_known {
+            state.watermark = store.newest_ever(&target.chain, &target.topic).await?;
+            state.watermark_known = true;
+        } else if let Some(dropped) = store
+            .dropped_after(&target.chain, &target.topic, &state.watermark)
+            .await?
+        {
+            return Err(StreamError::expired(format!(
+                "records on topic {:?} were dropped by retention while this read was behind \
+                 them, before it delivered any; the newest dropped one is {dropped}",
+                target.topic
+            )));
+        }
+    }
 
     let page = store
         .read(StoreReadRequest {
@@ -196,6 +226,7 @@ pub(crate) async fn read_with(
             },
         })
         .await?;
+    let closed = page.closed;
     let mut records = Vec::with_capacity(page.records.len());
     let mut previous = start;
     for stored in page.records {
@@ -234,12 +265,15 @@ pub(crate) async fn read_with(
         });
         previous = cursor;
     }
-    Ok(ReadResponse {
-        records,
-        cursor: previous,
-        state: Vec::new(),
-        done: false,
-    })
+    Ok((
+        ReadResponse {
+            records,
+            cursor: previous,
+            state: Vec::new(),
+            done: false,
+        },
+        closed,
+    ))
 }
 
 /// A stored record as a reader delivers it. Fails on bytes that are no record, and on a kind no

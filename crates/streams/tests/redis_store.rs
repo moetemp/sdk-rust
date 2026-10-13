@@ -841,3 +841,213 @@ async fn rule_10_1_an_append_that_races_a_topic_close_is_refused_once_the_close_
     let length: usize = raw.xlen(log_key(&prefix, &chain, "events")).await.unwrap();
     assert_eq!(length, 1);
 }
+
+fn read_after(chain: &ChainId, position: &str, max_records: u32) -> StoreReadRequest {
+    StoreReadRequest {
+        chain: Some(chain.clone()),
+        topic: "events".to_string(),
+        after_position: position.to_string(),
+        max_records,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn an_expired_log_leaves_a_tombstone_that_tells_expired_from_empty() {
+    let Some(mut setup) = retained_for(Duration::from_millis(300)).await else {
+        return;
+    };
+    let chain = chain();
+    let first = setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let last = setup
+        .store
+        .append(append(&chain, "p", 2, 1, b"\x02"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let log = log_key(&setup.prefix, &chain, "events");
+    let exists: bool = setup.raw.exists(&log).await.unwrap();
+    assert!(!exists);
+    let error = setup
+        .store
+        .read(read_after(&chain, &first.last_position, 10))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Expired);
+    assert!(error.message.contains("expired"), "{error}");
+    // Nothing came after the last record, so the stream is empty after it.
+    let empty = setup
+        .store
+        .read(read_after(&chain, &last.last_position, 10))
+        .await
+        .unwrap();
+    assert!(empty.records.is_empty());
+    let _: () = setup.raw.del(format!("{log}:meta")).await.unwrap();
+    let error = setup
+        .store
+        .read(read_after(&chain, &last.last_position, 10))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::NotFound);
+    assert!(error.message.contains("no tombstone"), "{error}");
+    // A read from the beginning of a missing log just finds no records.
+    let empty = setup.store.read(read_after(&chain, "", 10)).await.unwrap();
+    assert!(empty.records.is_empty());
+}
+
+#[tokio::test]
+async fn retention_expires_a_cursor_only_past_the_newest_trimmed_record() {
+    let Some(setup) = retained_for(Duration::from_millis(300)).await else {
+        return;
+    };
+    let chain = chain();
+    let first = setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let second = setup
+        .store
+        .append(append(&chain, "p", 2, 1, b"\x02"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let third = setup
+        .store
+        .append(append(&chain, "p", 3, 1, b"\x03"))
+        .await
+        .unwrap();
+    let error = setup
+        .store
+        .read(read_after(&chain, &first.last_position, 10))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Expired);
+    assert!(error.message.contains("dropped by retention"), "{error}");
+    // Nothing after the newest trimmed record was lost, so it still resumes.
+    let resumed = setup
+        .store
+        .read(read_after(&chain, &second.last_position, 10))
+        .await
+        .unwrap();
+    let positions: Vec<_> = resumed.records.iter().map(|r| &r.position).collect();
+    assert_eq!(positions, [&third.last_position]);
+}
+
+#[tokio::test]
+async fn a_read_that_falls_behind_retention_fails_instead_of_skipping() {
+    let Some(setup) = retained_for(Duration::from_millis(300)).await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 2, b"\x01"))
+        .await
+        .unwrap();
+    // One record per read, so the trim lands between two reads of one batch.
+    let first = setup.store.read(read_after(&chain, "", 1)).await.unwrap();
+    assert_eq!(first.records.len(), 1);
+    tokio::time::sleep(Duration::from_millis(350)).await;
+    // This append trims both earlier records, and the second was never delivered.
+    let third = setup
+        .store
+        .append(append(&chain, "p", 3, 1, b"\x02"))
+        .await
+        .unwrap();
+    let error = setup
+        .store
+        .read(read_after(&chain, &first.records[0].position, 1))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Expired);
+    assert!(
+        error.message.contains("while this read was behind"),
+        "{error}"
+    );
+    // A read that starts after the trim begins at the oldest record left.
+    let fresh = setup.store.read(read_after(&chain, "", 1)).await.unwrap();
+    assert_eq!(fresh.records[0].position, third.last_position);
+}
+
+#[tokio::test]
+async fn rule_22_1_a_lost_connection_on_the_read_checks_is_a_storage_failure() {
+    let Some(url) = url() else {
+        return;
+    };
+    let faults = Faults::start(&url).await;
+    let setup = setup_at(&faults.url(), &url).await;
+    let chain = chain();
+    let landed = setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    faults.next(LOSE_REQUEST);
+    let error = setup
+        .store
+        .read(read_after(&chain, &landed.last_position, 10))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Storage, "{error}");
+}
+
+#[tokio::test]
+async fn rule_20_4_a_malformed_entry_fails_with_its_cursor() {
+    use temporalio_streams::{ReadTarget, mint_cursor, proto::ReadRequest, read_page, stream_hash};
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let log = log_key(&setup.prefix, &chain, "events");
+    let entry: String = setup.raw.xadd(&log, "*", &[("not-r", "x")]).await.unwrap();
+    setup
+        .store
+        .append(append(&chain, "p", 2, 1, b"\x02"))
+        .await
+        .unwrap();
+    let target = ReadTarget {
+        chain: chain.clone(),
+        topic: "events".to_string(),
+        stream_hash: stream_hash(&chain.namespace, "workflow", &chain.workflow_id, "events"),
+    };
+    let first = read_page(&setup.store, &target, &ReadRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(first.records.len(), 1);
+    let error = read_page(
+        &setup.store,
+        &target,
+        &ReadRequest {
+            after: first.cursor.clone(),
+            state: first.state.clone(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Record);
+    let bad = mint_cursor("redis", &target.stream_hash, &entry);
+    assert_eq!(error.cursor.as_deref(), Some(bad.as_str()));
+    let after = read_page(
+        &setup.store,
+        &target,
+        &ReadRequest {
+            after: bad,
+            state: first.state,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(after.records.len(), 1);
+}

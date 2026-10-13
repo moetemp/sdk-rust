@@ -50,6 +50,25 @@ pub trait StreamStore: Send + Sync {
         position: &str,
     ) -> StreamResult<Option<Vec<u8>>>;
 
+    /// The position of the newest record a topic ever took, even one retention dropped since,
+    /// or empty when it took none. A read that has delivered nothing keeps it as its mark, since
+    /// it has no position the store could check.
+    async fn newest_ever(&self, _chain: &ChainId, _topic: &str) -> StreamResult<String> {
+        Ok(String::new())
+    }
+
+    /// The position of the newest record retention dropped from a topic, when that record came
+    /// after `mark`, the topic's [StreamStore::newest_ever] when a read started. Such a record
+    /// was lost to the read. A store that never drops records keeps the default.
+    async fn dropped_after(
+        &self,
+        _chain: &ChainId,
+        _topic: &str,
+        _mark: &str,
+    ) -> StreamResult<Option<String>> {
+        Ok(None)
+    }
+
     /// Marks a chain closed, so its topics refuse new batches from producers.
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()>;
 

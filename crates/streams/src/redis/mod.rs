@@ -136,11 +136,18 @@ impl RedisStore {
         Ok(ChainKeys::new(&self.prefix, chain))
     }
 
-    /// Reads the chain's close flag and the topic's, which share a slot on a cluster.
-    fn closed(pipeline: &mut redis::Pipeline, keys: &ChainKeys, topic: &str) {
-        pipeline
-            .hget(keys.chain(), CLOSED_FIELD)
-            .hget(keys.meta(topic), CLOSED_FIELD);
+    /// What a read needs to know besides the records, in one script so a cluster answers it
+    /// from the slot the chain's keys share.
+    fn checks(keys: &ChainKeys, topic: &str) -> Cmd {
+        let mut eval = redis::cmd("EVAL");
+        eval.arg(TOPIC_STATE)
+            .arg(4)
+            .arg(keys.log(topic))
+            .arg(keys.meta(topic))
+            .arg(keys.chain())
+            .arg(keys.meta(topic))
+            .arg(CLOSED_FIELD);
+        eval
     }
 
     fn xread(
@@ -191,6 +198,100 @@ fn records(reply: Value) -> StreamResult<Vec<StoredRecord>> {
             position: id.id,
         })
         .collect())
+}
+
+/// Reads whether the log is there, what its meta says and both close flags. Lua turns a missing
+/// value into `false`, which keeps the reply's places where a `nil` would cut the list short.
+const TOPIC_STATE: &str = "\
+return {redis.call('EXISTS', KEYS[1]), redis.call('EXISTS', KEYS[2]), \
+redis.call('HGET', KEYS[2], 'trimmed'), redis.call('HGET', KEYS[2], 'last'), \
+redis.call('HGET', KEYS[3], ARGV[1]), redis.call('HGET', KEYS[4], ARGV[1])}";
+
+/// What the store knows about a topic besides its records.
+#[derive(Debug, Default)]
+struct TopicState {
+    log_exists: bool,
+    meta_exists: bool,
+    /// The newest id retention trimmed from the log.
+    trimmed: Option<String>,
+    /// The newest id the log ever took. It outlives the log in the meta.
+    last: Option<String>,
+    chain_closed: bool,
+    topic_closed: bool,
+}
+
+impl redis::FromRedisValue for TopicState {
+    fn from_redis_value(value: Value) -> Result<Self, redis::ParsingError> {
+        let text = |value: &Value| match value {
+            Value::BulkString(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+            _ => None,
+        };
+        let number = |value: &Value| matches!(value, Value::Int(n) if *n > 0);
+        let Value::Array(values) = value else {
+            return Err(format!("a topic state is a list, not {value:?}").into());
+        };
+        let [log, meta, trimmed, last, chain_closed, topic_closed] = values.as_slice() else {
+            return Err(format!("a topic state has six values, not {}", values.len()).into());
+        };
+        Ok(Self {
+            log_exists: number(log),
+            meta_exists: number(meta),
+            trimmed: text(trimmed),
+            last: text(last),
+            chain_closed: text(chain_closed).is_some(),
+            topic_closed: text(topic_closed).is_some(),
+        })
+    }
+}
+
+impl TopicState {
+    /// Why a read after `position` can't go on, if the store lost records after it.
+    ///
+    /// With the log there, records after the position are lost when retention trimmed past it
+    /// and the read did not get them first. With the log gone but its meta left, they are lost
+    /// when the log took records after the position. With neither, nothing is known. A read
+    /// from the beginning loses nothing, since anything trimmed was behind its start.
+    fn lost(
+        &self,
+        topic: &str,
+        position: Option<(&str, (u64, u64))>,
+        found: &[StoredRecord],
+    ) -> StreamResult<Option<StreamError>> {
+        let Some((position, at)) = position else {
+            return Ok(None);
+        };
+        if !self.log_exists && found.is_empty() {
+            if !self.meta_exists {
+                return Ok(Some(StreamError::not_found(format!(
+                    "topic {topic:?} keeps no log and no tombstone, so nothing is known about \
+                     what followed {position}"
+                ))));
+            }
+            if let Some(last) = &self.last
+                && entry(last)? > at
+            {
+                return Ok(Some(StreamError::expired(format!(
+                    "the log of topic {topic:?} expired with records after {position}"
+                ))));
+            }
+            return Ok(None);
+        }
+        let Some(trimmed) = &self.trimmed else {
+            return Ok(None);
+        };
+        let watermark = entry(trimmed)?;
+        let first = found
+            .first()
+            .map(|record| entry(&record.position))
+            .transpose()?;
+        if watermark > at && first.is_none_or(|first| watermark < first) {
+            return Ok(Some(StreamError::expired(format!(
+                "records after {position} on topic {topic:?} were dropped by retention while \
+                 this read was behind them; the newest dropped one is {trimmed}"
+            ))));
+        }
+        Ok(None)
+    }
 }
 
 fn wait_of(request: &StoreReadRequest) -> Duration {
@@ -245,58 +346,45 @@ impl StreamStore for RedisStore {
 
     async fn read(&self, request: StoreReadRequest) -> StreamResult<StoreReadResponse> {
         let keys = self.keys(request.chain.as_ref())?;
-        let after = match request.after_position.as_str() {
-            "" => "0-0".to_string(),
-            position => {
-                entry(position)?;
-                position.to_string()
-            }
+        let topic = request.topic.as_str();
+        let position = match request.after_position.as_str() {
+            "" => None,
+            position => Some((position, entry(position)?)),
         };
+        let after = position.map_or("0-0", |(position, _)| position);
         let wait = wait_of(&request);
         let deadline = Instant::now() + wait;
         let mut pipeline = redis::pipe();
-        pipeline.add_command(Self::xread(
-            &keys,
-            &request.topic,
-            &after,
-            request.max_records,
-            None,
-        ));
-        Self::closed(&mut pipeline, &keys, &request.topic);
-        let (reply, chain_closed, topic_closed): (Value, Option<String>, Option<String>) = pipeline
+        pipeline.add_command(Self::xread(&keys, topic, after, request.max_records, None));
+        let checks = Self::checks(&keys, topic);
+        pipeline.add_command(checks.clone());
+        let (reply, mut state): (Value, TopicState) = pipeline
             .query_async(&mut self.shared.clone())
             .await
             .mapped(Call::Read)?;
         let mut found = records(reply)?;
-        let mut closed = chain_closed.is_some() || topic_closed.is_some();
-        if found.is_empty() && !wait.is_zero() {
-            let xread = Self::xread(
-                &keys,
-                &request.topic,
-                &after,
-                request.max_records,
-                Some(wait),
-            );
+        if found.is_empty() && !wait.is_zero() && state.lost(topic, position, &found)?.is_none() {
+            let xread = Self::xread(&keys, topic, after, request.max_records, Some(wait));
             let blocked = self
                 .blocking
-                .query(&keys.log(&request.topic), &xread, deadline)
+                .query(&keys.log(topic), &xread, deadline)
                 .await
                 .mapped(Call::Read)?;
             if let Some(reply) = blocked {
                 found = records(reply)?;
-                // Asked after the wait, so a close that came during it is seen.
-                let mut pipeline = redis::pipe();
-                Self::closed(&mut pipeline, &keys, &request.topic);
-                let (chain_closed, topic_closed): (Option<String>, Option<String>) = pipeline
+                // Read again after the wait, so a trim or a close that raced it is seen.
+                state = checks
                     .query_async(&mut self.shared.clone())
                     .await
                     .mapped(Call::Read)?;
-                closed = chain_closed.is_some() || topic_closed.is_some();
             }
+        }
+        if let Some(error) = state.lost(topic, position, &found)? {
+            return Err(error);
         }
         Ok(StoreReadResponse {
             records: found,
-            closed,
+            closed: state.chain_closed || state.topic_closed,
         })
     }
 
@@ -342,6 +430,39 @@ impl StreamStore for RedisStore {
                 Some(Value::BulkString(bytes)) => bytes.clone(),
                 _ => Vec::new(),
             }))
+    }
+
+    async fn newest_ever(&self, chain: &ChainId, topic: &str) -> StreamResult<String> {
+        let last: Option<String> = redis::cmd("HGET")
+            .arg(ChainKeys::new(&self.prefix, chain).meta(topic))
+            .arg("last")
+            .query_async(&mut self.shared.clone())
+            .await
+            .mapped(Call::Read)?;
+        Ok(last.unwrap_or_default())
+    }
+
+    async fn dropped_after(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        mark: &str,
+    ) -> StreamResult<Option<String>> {
+        let trimmed: Option<String> = redis::cmd("HGET")
+            .arg(ChainKeys::new(&self.prefix, chain).meta(topic))
+            .arg("trimmed")
+            .query_async(&mut self.shared.clone())
+            .await
+            .mapped(Call::Read)?;
+        let Some(trimmed) = trimmed else {
+            return Ok(None);
+        };
+        // A log that expired comes back with `trimmed` set to its old `last`, which is the mark
+        // itself, so a revive counts as no loss.
+        if !mark.is_empty() && entry(&trimmed)? <= entry(mark)? {
+            return Ok(None);
+        }
+        Ok(Some(trimmed))
     }
 
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {

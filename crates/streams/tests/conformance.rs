@@ -28,6 +28,10 @@ trait Case: Send + Sync {
 
     /// Drops all but the newest `keep` records of a topic, as retention does.
     async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize);
+
+    /// Lets a quiet topic's records expire whole, as a log does after a retention with no
+    /// write. What the store knows about the topic stays.
+    async fn expire_log(&self, chain: &ChainId, topic: &str);
 }
 
 static CHAINS: AtomicUsize = AtomicUsize::new(0);
@@ -58,6 +62,10 @@ impl Case for Memory {
 
     async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize) {
         self.0.truncate(chain, topic, keep);
+    }
+
+    async fn expire_log(&self, chain: &ChainId, topic: &str) {
+        self.0.truncate(chain, topic, 0);
     }
 }
 
@@ -177,6 +185,14 @@ mod on_redis {
                 .query(redis::cmd("XTRIM").arg(&log).arg("MAXLEN").arg(keep))
                 .await;
             raw.hset(&format!("{log}:meta"), "trimmed", &entries[doomed - 1].0)
+                .await;
+        }
+
+        async fn expire_log(&self, chain: &ChainId, topic: &str) {
+            // The log key expires and its meta stays, as the tombstone.
+            let mut raw = self.raw.clone();
+            let _: i64 = raw
+                .query(redis::cmd("DEL").arg(log_key(&self.prefix, chain, topic)))
                 .await;
         }
     }
@@ -557,6 +573,87 @@ mod cases {
             kind(read_with(case, &chain, OUT, &after_one, Duration::ZERO, &first.state).await),
             StreamFailureKind::Expired
         );
+    }
+
+    pub(crate) async fn an_empty_read_from_the_beginning_learns_of_a_trim(case: &dyn Case) {
+        // The read has delivered nothing, so it has no position, but records written after it
+        // started and dropped before its next call are still lost to it.
+        let chain = case.chain();
+        let first = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert!(first.records.is_empty());
+        assert_eq!(first.cursor, BEGINNING);
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1", "2"])
+            .await;
+        case.drop_oldest(&chain, OUT, 1).await;
+        assert_eq!(
+            kind(
+                read_with(
+                    case,
+                    &chain,
+                    OUT,
+                    &first.cursor,
+                    Duration::ZERO,
+                    &first.state
+                )
+                .await
+            ),
+            StreamFailureKind::Expired
+        );
+        // A new read starts at the oldest record left, as a read from the beginning does.
+        assert_eq!(
+            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
+            ["2"]
+        );
+    }
+
+    pub(crate) async fn rule_11_2_an_empty_read_goes_on_when_a_quiet_log_comes_back(
+        case: &dyn Case,
+    ) {
+        // A log that expired comes back with its next write, and nothing the read could have
+        // seen was lost.
+        let chain = case.chain();
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        case.expire_log(&chain, OUT).await;
+        let first = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert!(first.records.is_empty());
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer.sequence = 2;
+        producer.append(&["2"]).await;
+        let next = read_with(
+            case,
+            &chain,
+            OUT,
+            &first.cursor,
+            Duration::ZERO,
+            &first.state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values(&next), ["2"]);
+    }
+
+    pub(crate) async fn an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on(
+        case: &dyn Case,
+    ) {
+        let chain = case.chain();
+        let first = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        let next = read_with(
+            case,
+            &chain,
+            OUT,
+            &first.cursor,
+            Duration::ZERO,
+            &first.state,
+        )
+        .await
+        .unwrap();
+        assert_eq!(values(&next), ["1"]);
     }
 
     pub(crate) async fn a_retried_append_returns_the_original_positions(case: &dyn Case) {
@@ -961,6 +1058,9 @@ mod memory {
         dropping_a_waiting_read_releases_it,
         beginning_starts_at_the_oldest_record_still_held,
         a_reader_that_falls_behind_retention_is_told,
+        an_empty_read_from_the_beginning_learns_of_a_trim,
+        an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on,
+        rule_11_2_an_empty_read_goes_on_when_a_quiet_log_comes_back,
         a_retried_append_returns_the_original_positions,
         a_retry_with_other_ciphertext_still_deduplicates,
         a_divergent_retry_is_refused,
@@ -982,8 +1082,7 @@ mod memory {
     );
 }
 
-/// Every case but the ones that need reads that check retention or owner deletes, which come
-/// with those features.
+/// Every case but owner deletes, which come with that feature.
 #[cfg(feature = "redis")]
 macro_rules! redis_cases {
     ($case:expr) => {
@@ -998,6 +1097,12 @@ macro_rules! redis_cases {
             end_reads_only_what_arrives_after_the_read_starts,
             a_read_waits_no_longer_than_asked,
             dropping_a_waiting_read_releases_it,
+            beginning_starts_at_the_oldest_record_still_held,
+            a_reader_that_falls_behind_retention_is_told,
+            an_empty_read_from_the_beginning_learns_of_a_trim,
+            an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on,
+            rule_11_2_an_empty_read_goes_on_when_a_quiet_log_comes_back,
+            a_refused_append_leaves_no_trace_of_its_topic,
             a_retried_append_returns_the_original_positions,
             a_retry_with_other_ciphertext_still_deduplicates,
             a_divergent_retry_is_refused,

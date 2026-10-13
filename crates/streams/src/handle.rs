@@ -21,6 +21,7 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
+use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
 use tokio::time::Instant;
 
 /// The longest a producer writes without asking whether its owner's chain ended.
@@ -34,6 +35,10 @@ pub struct StreamsOptions {
     pub owner_recheck: Duration,
     /// How many producer attempts and chains to remember the last owner check of.
     pub remembered: usize,
+    /// How long an idle read waits before it first asks whether its owner ended.
+    pub owner_check_min: Duration,
+    /// The longest an idle read waits between two such questions.
+    pub owner_check_max: Duration,
 }
 
 impl Default for StreamsOptions {
@@ -41,6 +46,8 @@ impl Default for StreamsOptions {
         Self {
             owner_recheck: OWNER_RECHECK,
             remembered: 10_000,
+            owner_check_min: Duration::from_millis(500),
+            owner_check_max: Duration::from_secs(5),
         }
     }
 }
@@ -230,7 +237,15 @@ impl Streams {
         })
     }
 
-    /// Reads one page of a stream. The first call resolves the chain, and the state carries it.
+    /// Reads one page of a stream, waiting up to the request's `wait` for a record.
+    ///
+    /// The first call resolves the chain, and the state carries it. While nothing arrives, the
+    /// read asks whether its owner ended, first after [StreamsOptions::owner_check_min] and
+    /// then twice as long each time, up to [StreamsOptions::owner_check_max]. A record starts
+    /// the interval over. So many readers parked on a quiet stream don't load the server. Once
+    /// the owner ended, or the store marked the stream closed, the read delivers what is left
+    /// and answers `done`. A read pinned to a run ends when that run closes, even if the chain
+    /// continued as new.
     pub async fn read(&self, request: ReadRequest) -> StreamResult<ReadResponse> {
         let stream = address(request.stream.as_ref())?;
         let mut state = ReadState::decode_from(&request.state)?;
@@ -242,9 +257,90 @@ impl Streams {
             topic: stream.topic.clone(),
             stream_hash: self.hash(stream),
         };
-        let mut response = read_with(&*self.store, &target, &request, &mut state).await?;
-        response.state = state.encode_to_vec();
-        Ok(response)
+        let wait = request
+            .wait
+            .and_then(|wait| Duration::try_from(wait).ok())
+            .unwrap_or_default();
+        let deadline = Instant::now() + wait;
+        let minimum = self.options.owner_check_min;
+        let mut page_request = request.clone();
+        let response = loop {
+            let now = unix_ms();
+            if state.check_interval_ms == 0 {
+                state.check_interval_ms = millis(minimum);
+                state.next_check_ms = now + state.check_interval_ms;
+            }
+            let until_check = Duration::from_millis(state.next_check_ms.saturating_sub(now));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait = if state.owner_ended {
+                Duration::ZERO
+            } else {
+                remaining.min(until_check)
+            };
+            page_request.wait = wait.try_into().ok();
+            let (mut page, closed) =
+                read_with(&*self.store, &target, &page_request, &mut state).await?;
+            page_request.after = page.cursor.clone();
+            if !page.records.is_empty() {
+                state.check_interval_ms = millis(minimum);
+                state.next_check_ms = unix_ms() + state.check_interval_ms;
+                break page;
+            }
+            if closed && !state.owner_ended {
+                // One more pass after learning of the close, as after learning the owner ended.
+                state.owner_ended = true;
+                continue;
+            }
+            if state.owner_ended {
+                page.done = true;
+                break page;
+            }
+            if unix_ms() >= state.next_check_ms {
+                state.owner_ended = self.owner_ended(stream, &target.chain).await?;
+                state.check_interval_ms = (state.check_interval_ms * 2)
+                    .clamp(millis(minimum), millis(self.options.owner_check_max));
+                state.next_check_ms = unix_ms() + state.check_interval_ms;
+                // One more pass after learning the owner ended, so a record that landed
+                // between the read and the describe is delivered.
+                if state.owner_ended {
+                    continue;
+                }
+            }
+            if Instant::now() >= deadline {
+                break page;
+            }
+        };
+        Ok(ReadResponse {
+            state: state.encode_to_vec(),
+            ..response
+        })
+    }
+
+    /// Whether the owner a read follows ended. Following the chain, a run that continued as
+    /// new is not the end, and a new chain on the Workflow id is.
+    async fn owner_ended(&self, stream: &StreamAddress, chain: &ChainId) -> StreamResult<bool> {
+        let key = owner_key(stream);
+        match self.describe(&key, &key.run_id).await {
+            Err(OwnerError::NotFound(_)) => {
+                // The chain came from this Workflow, so History has since dropped it, and
+                // nothing more will be written for it.
+                if key.run_id.is_empty() {
+                    self.store.close_chain(chain).await?;
+                }
+                Ok(true)
+            }
+            Err(error) => Err(describe_failed(&error)),
+            Ok(described) if !key.run_id.is_empty() => {
+                Ok(described.status != WorkflowExecutionStatus::Running)
+            }
+            Ok(latest) if !latest.chain_ended() && latest.first_run_id == chain.first_run_id => {
+                Ok(false)
+            }
+            Ok(_) => {
+                self.store.close_chain(chain).await?;
+                Ok(true)
+            }
+        }
     }
 
     /// The cursor of a stream's newest record, empty when it holds none.
@@ -404,6 +500,18 @@ fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
 /// Refuses a topic no store keys reliably, by the rules Core's Workflow path also applies.
 fn check_topic(topic: &str) -> StreamResult<()> {
     temporalio_common::streams::check_topic(topic).map_err(StreamError::invalid_argument)
+}
+
+fn unix_ms() -> u64 {
+    millis(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default(),
+    )
+}
+
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn owner_key(stream: &StreamAddress) -> OwnerKey {
@@ -987,6 +1095,238 @@ mod tests {
         let mut other = append("p", 1, "1");
         other.stream.as_mut().unwrap().topic = "other".to_string();
         setup.streams.append(other).await.unwrap();
+    }
+
+    fn quick() -> StreamsOptions {
+        StreamsOptions {
+            owner_check_min: Duration::from_millis(20),
+            owner_check_max: Duration::from_millis(80),
+            ..StreamsOptions::default()
+        }
+    }
+
+    fn read_after(after: &str, state: &[u8], wait: Duration) -> ReadRequest {
+        ReadRequest {
+            stream: Some(stream("out")),
+            after: after.to_string(),
+            state: state.to_vec(),
+            wait: Some(wait.try_into().unwrap()),
+            ..Default::default()
+        }
+    }
+
+    /// Reads until the read says it is done, or fails after `limit` calls.
+    async fn read_to_end(streams: &Streams, wait: Duration) -> (usize, ReadResponse) {
+        let mut delivered = 0;
+        let mut last = read_after("", &[], wait);
+        for _ in 0..50 {
+            let page = streams.read(last.clone()).await.unwrap();
+            delivered += page.records.len();
+            if page.done {
+                return (delivered, page);
+            }
+            last = read_after(&page.cursor, &page.state, wait);
+        }
+        panic!("the read never ended");
+    }
+
+    #[tokio::test]
+    async fn a_read_ends_when_its_owner_chain_ends_and_marks_it_closed() {
+        let setup = setup(quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup.owners.end("wf", WorkflowExecutionStatus::Completed);
+        let (delivered, end) = read_to_end(&setup.streams, Duration::from_secs(5)).await;
+        assert_eq!(delivered, 1);
+        assert!(end.records.is_empty());
+        // The read saw the chain end, and says so to later producers.
+        assert!(chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test]
+    async fn a_read_follows_a_chain_that_continued_as_new() {
+        let setup = setup(quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup
+            .owners
+            .end("wf", WorkflowExecutionStatus::ContinuedAsNew);
+        setup.owners.run("wf", "run-2", "run-1");
+        let page = setup
+            .streams
+            .read(read_after("", &[], Duration::from_millis(200)))
+            .await
+            .unwrap();
+        let idle = setup
+            .streams
+            .read(read_after(
+                &page.cursor,
+                &page.state,
+                Duration::from_millis(200),
+            ))
+            .await
+            .unwrap();
+        assert!(!idle.done);
+        assert!(!chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test]
+    async fn a_read_pinned_to_a_run_ends_when_that_run_continues() {
+        let setup = setup(quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup
+            .owners
+            .runs
+            .lock()
+            .unwrap()
+            .get_mut("run-1")
+            .unwrap()
+            .status = WorkflowExecutionStatus::ContinuedAsNew;
+        setup.owners.run("wf", "run-2", "run-1");
+        let mut request = read_after("", &[], Duration::from_secs(5));
+        request.stream.as_mut().unwrap().run_id = "run-1".to_string();
+        let mut done = false;
+        for _ in 0..10 {
+            let page = setup.streams.read(request.clone()).await.unwrap();
+            if page.done {
+                done = true;
+                break;
+            }
+            request.after = page.cursor;
+            request.state = page.state;
+        }
+        assert!(done);
+        // It stopped with the first run, though the chain still runs.
+        assert!(!chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test]
+    async fn a_read_ends_when_a_new_chain_reuses_the_workflow_id() {
+        let setup = setup(quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        let first = setup
+            .streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        // The id's latest run is running, but it belongs to another chain.
+        setup.owners.run("wf", "run-9", "run-9");
+        let mut request = read_after(&first.cursor, &first.state, Duration::from_secs(5));
+        let mut done = false;
+        for _ in 0..10 {
+            let page = setup.streams.read(request.clone()).await.unwrap();
+            assert!(page.records.is_empty());
+            if page.done {
+                done = true;
+                break;
+            }
+            request = read_after(&page.cursor, &page.state, Duration::from_secs(5));
+        }
+        assert!(done);
+        assert!(chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test]
+    async fn rule_20_3_a_read_ends_when_history_no_longer_holds_its_owner() {
+        let setup = setup(quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        let first = setup
+            .streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        setup
+            .owners
+            .fail("wf", OwnerError::NotFound("workflow not found".to_string()));
+        let page = setup
+            .streams
+            .read(read_after(
+                &first.cursor,
+                &first.state,
+                Duration::from_secs(5),
+            ))
+            .await
+            .unwrap();
+        assert!(page.done);
+        assert!(chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test]
+    async fn rule_17_2_an_owner_check_during_a_read_that_fails_is_a_storage_failure() {
+        let setup = setup(quick());
+        let first = setup
+            .streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        setup
+            .owners
+            .fail("wf", OwnerError::Failed("unavailable".to_string()));
+        let error = setup
+            .streams
+            .read(read_after(
+                &first.cursor,
+                &first.state,
+                Duration::from_secs(5),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Storage);
+        assert!(error.message.contains("unavailable"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_idle_read_backs_off_its_owner_checks() {
+        let setup = setup(quick());
+        let first = setup
+            .streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        let before = setup.owners.describes();
+        let idle = setup
+            .streams
+            .read(read_after(
+                &first.cursor,
+                &first.state,
+                Duration::from_secs(1),
+            ))
+            .await
+            .unwrap();
+        // Fixed checks every 20 ms would be about 50, and doubling to 80 ms is about 15.
+        let checks = setup.owners.describes() - before;
+        assert!((8..=20).contains(&checks), "{checks} checks");
+        let state = ReadState::decode_from(&idle.state).unwrap();
+        assert_eq!(state.check_interval_ms, 80);
+        // A record starts the interval over.
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        let page = setup
+            .streams
+            .read(read_after(
+                &idle.cursor,
+                &idle.state,
+                Duration::from_secs(1),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        let state = ReadState::decode_from(&page.state).unwrap();
+        assert_eq!(state.check_interval_ms, 20);
+    }
+
+    #[tokio::test]
+    async fn a_closed_stream_ends_its_reads_without_asking_temporal() {
+        let setup = setup(quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup
+            .streams
+            .close(CloseRequest {
+                stream: Some(stream("out")),
+            })
+            .await
+            .unwrap();
+        let before = setup.owners.describes();
+        let (delivered, _) = read_to_end(&setup.streams, Duration::from_secs(5)).await;
+        assert_eq!(delivered, 1);
+        assert_eq!(setup.owners.describes(), before);
     }
 
     /// The digest the Python SDK's Redis provider took over `[{"n": 1}, {"n": 2}]` from producer
