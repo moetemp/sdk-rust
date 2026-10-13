@@ -56,9 +56,6 @@ relevant information.
   and producers are refused. It checks the chain's latest run first and leaves the streams open
   for a retry or cron successor. A failed close is retried with backoff until it lands or the
   Worker stops.
-  is accepted. A workflow that wrote this marker can only move forward. A Worker on an older
-  Core, or one whose lang doesn't commit the records again on replay, fails that workflow's next
-  task, so don't roll such a fleet back.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
