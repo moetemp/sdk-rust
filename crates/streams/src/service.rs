@@ -20,8 +20,8 @@ const MAX_READ_WAIT: Duration = Duration::from_secs(60);
 
 /// One process's stream store and the calls lang makes on it.
 ///
-/// Lang builds one from a [StreamStoreConfig] and sends its stream calls to
-/// [StreamService::call] as serialized `coresdk.streams` requests.
+/// Lang builds one from a [StreamStoreConfig], hands [StreamService::store] to its Workers, and
+/// sends its stream calls to [StreamService::call] as serialized `coresdk.streams` requests.
 pub struct StreamService {
     store: Arc<dyn StreamStore>,
     streams: Streams,
@@ -67,6 +67,11 @@ impl StreamService {
     ) -> Self {
         let streams = Streams::new(store.clone(), owner, options);
         Self { store, streams }
+    }
+
+    /// The store, for the Workers that stage and promote Workflow output in it.
+    pub fn store(&self) -> Arc<dyn StreamStore> {
+        self.store.clone()
     }
 
     /// Serves one call: `rpc` is a `StreamService` method name and `request` its serialized

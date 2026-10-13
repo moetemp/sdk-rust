@@ -27,7 +27,7 @@ service StreamService {
 }
 
 // Which store holds a process's streams, and how to reach it. Lang builds one store from it and
-// sends its stream calls there.
+// hands it to its Workers and its stream calls.
 message StreamStoreConfig {
   oneof store {
     RedisStoreConfig redis = 1;
