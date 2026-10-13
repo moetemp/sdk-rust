@@ -69,6 +69,8 @@ struct RecordingStore {
     inner: MemoryStore,
     appends: Mutex<Vec<StoreAppendRequest>>,
     calls: Mutex<Vec<&'static str>>,
+    /// Each topic close, with its result's data.
+    closes: Mutex<Vec<(String, Vec<u8>)>>,
     /// Failures the next appends answer with, one each, before the store takes them.
     failures: Mutex<std::collections::VecDeque<StreamError>>,
     /// The failure every append answers with.
@@ -96,6 +98,24 @@ impl RecordingStore {
 
     fn calls(&self) -> Vec<&'static str> {
         self.calls.lock().clone()
+    }
+
+    fn closes(&self) -> Vec<(String, Vec<u8>)> {
+        self.closes.lock().clone()
+    }
+
+    /// Waits for `count` topic closes, which run in the background.
+    async fn wait_for_closes(&self, count: usize) -> Vec<(String, Vec<u8>)> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if self.closes.lock().len() >= count {
+                    return self.closes();
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the topic closes landed in time")
     }
 
     /// Each append as `(topic, producer, attempt, sequence, record count)`.
@@ -184,9 +204,18 @@ impl StreamStore for RecordingStore {
         self.inner.close_chain(chain).await
     }
 
-    async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()> {
+    async fn close_topic(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        result: Option<Payload>,
+    ) -> StreamResult<()> {
         self.calls.lock().push("close_topic");
-        self.inner.close_topic(chain, topic).await
+        self.closes.lock().push((
+            topic.to_string(),
+            result.clone().map(|r| r.data).unwrap_or_default(),
+        ));
+        self.inner.close_topic(chain, topic, result).await
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
@@ -268,7 +297,9 @@ fn manifest_for(
                 content_hash: &r.content_hash,
             }))
             .to_vec(),
-            finished: false,
+            finished: records
+                .iter()
+                .any(|r| r.kind == StreamRecordKind::Finish as i32),
         }],
         segments: vec![ExternalOutputSegmentManifest {
             record_counts_by_topic: vec![records.len() as u32],
@@ -2184,4 +2215,198 @@ async fn a_close_without_its_finish_fails_the_task() {
         .unwrap();
     worker.shutdown().await;
     worker.finalize_shutdown().await;
+}
+
+/// What a Workflow that publishes `values` and closes the topic with `result` commits.
+fn closing_commit(values: &[&str], result: &[u8]) -> WorkflowOutputStreamCommit {
+    let mut records = records(values);
+    records.push(OutputRecord {
+        topic: TOPIC.to_string(),
+        kind: StreamRecordKind::Finish as i32,
+        ..Default::default()
+    });
+    WorkflowOutputStreamCommit {
+        records,
+        closes: vec![OutputClose {
+            topic: TOPIC.to_string(),
+            result: Some(Payload {
+                data: result.to_vec(),
+                ..Default::default()
+            }),
+        }],
+    }
+}
+
+/// Start, a task that commits `commit` and starts a timer, the timer firing, and the next task.
+fn closing_then_timer_history(commit: &WorkflowOutputStreamCommit) -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    let manifest = manifest_for(&commit.records, t.get_orig_run_id(), 1);
+    t.add_full_wf_task();
+    t.add_external_stream_marker_data(output_marker(
+        ExternalStreamBoundary::CommandsProduced,
+        manifest,
+    ));
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+/// A worker on `store` whose completions the server answers with `answers`, in order, then with
+/// success. Records how many topic closes `store` held when each completion was sent.
+fn worker_answering(
+    history: TestHistoryBuilder,
+    batches: Vec<ResponseType>,
+    store: Arc<RecordingStore>,
+    answers: Vec<tonic::Status>,
+    closes_at_completion: Arc<Mutex<Vec<usize>>>,
+) -> crate::Worker {
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history, batches, mock_worker_client());
+    let seen_store = store.clone();
+    let mut answers = std::collections::VecDeque::from(answers);
+    mock_cfg.completion_mock_fn = Some(Box::new(move |_| {
+        closes_at_completion.lock().push(seen_store.closes().len());
+        match answers.pop_front() {
+            Some(error) => Err(error),
+            None => Ok(RespondWorkflowTaskCompletedResponse::default()),
+        }
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.stream_store = Some(store);
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    mock_worker(mock)
+}
+
+#[tokio::test]
+async fn an_accepted_task_closes_its_topic_after_the_completion_is_sent() {
+    let commit = closing_commit(&["a"], b"the answer");
+    let store = Arc::new(RecordingStore::default());
+    let closes_at_completion: Arc<Mutex<Vec<usize>>> = Default::default();
+    let worker = worker_answering(
+        closing_then_timer_history(&commit),
+        vec![1.into(), 2.into()],
+        store.clone(),
+        vec![],
+        closes_at_completion.clone(),
+    );
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id,
+            vec![
+                workflow_command::Variant::WorkflowOutputStreamCommit(commit),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        store.wait_for_closes(1).await,
+        [(TOPIC.to_string(), b"the answer".to_vec())]
+    );
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    worker.complete_execution(&fired.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        closes_at_completion.lock()[0],
+        0,
+        "the topic stays open until the server accepts the task"
+    );
+    assert_eq!(
+        store.calls()[..2],
+        ["append", "close_topic"],
+        "the FINISH record is appended at activation completion, the close after acceptance"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_task_leaves_its_topic_open_for_the_rerun() {
+    let commit = closing_commit(&["a"], b"the answer");
+    let store = Arc::new(RecordingStore::default());
+    let worker = worker_answering(
+        closing_then_timer_history(&commit),
+        vec![1.into()],
+        store.clone(),
+        vec![tonic::Status::invalid_argument("UnhandledCommand")],
+        Default::default(),
+    );
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id,
+            vec![
+                workflow_command::Variant::WorkflowOutputStreamCommit(commit),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(store.calls(), ["append"]);
+}
+
+#[tokio::test]
+async fn a_lost_answer_closes_the_topic_once_replay_finds_the_commit() {
+    let commit = closing_commit(&["a"], b"the answer");
+    let store = Arc::new(RecordingStore::default());
+    // The answer to the first completion is lost, so Core evicts the run. The next task's
+    // History holds the commit's marker, so the server had applied it.
+    let worker = worker_answering(
+        closing_then_timer_history(&commit),
+        vec![1.into(), ResponseType::AllHistory],
+        store.clone(),
+        vec![tonic::Status::unavailable("connection reset")],
+        Default::default(),
+    );
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id.clone(),
+            vec![
+                workflow_command::Variant::WorkflowOutputStreamCommit(commit.clone()),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let eviction = worker.poll_workflow_activation().await.unwrap();
+    assert!(eviction.eviction_reason().is_some());
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    assert!(store.closes().is_empty());
+
+    let rebuilt = worker.poll_workflow_activation().await.unwrap();
+    assert!(rebuilt.is_replaying);
+    let mut again = commit;
+    again.records = replayed(again.records);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            rebuilt.run_id,
+            vec![
+                workflow_command::Variant::WorkflowOutputStreamCommit(again),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    worker.complete_execution(&fired.run_id).await;
+    assert_eq!(
+        store.wait_for_closes(1).await,
+        [(TOPIC.to_string(), b"the answer".to_vec())]
+    );
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        store.calls(),
+        ["append", "close_topic"],
+        "replay appends nothing"
+    );
 }

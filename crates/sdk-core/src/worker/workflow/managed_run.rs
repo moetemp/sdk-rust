@@ -17,8 +17,9 @@ use crate::{
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
             stream_output::{
-                MARKER_SCHEMA_VERSION, OutputBatch, build_output_manifest, check_output_closes,
-                check_replayed_output_manifest, count_replayed_output, output_by_topic,
+                MARKER_SCHEMA_VERSION, OutputBatch, ReportedOutput, RunChain,
+                build_output_manifest, check_output_closes, check_replayed_output_manifest,
+                count_replayed_output, output_by_topic,
             },
         },
     },
@@ -41,7 +42,9 @@ use temporalio_common::protos::{
             RemoveFromCache, WorkflowActivation, query_to_job, remove_from_cache::EvictionReason,
             workflow_activation_job,
         },
-        workflow_commands::{FailWorkflowExecution, QueryResult, WorkflowOutputStreamCommit},
+        workflow_commands::{
+            FailWorkflowExecution, OutputClose, QueryResult, WorkflowOutputStreamCommit,
+        },
         workflow_completion,
     },
     temporal::api::{
@@ -104,6 +107,11 @@ pub(super) struct ManagedRun {
     /// How many stream records this run committed to each topic, live or in replay, which is
     /// where its next commit's sequences start.
     committed_by_topic: HashMap<String, i64>,
+    /// The topics this run's Workflow Task closed and has not reported with a completion yet, in
+    /// commit order.
+    pending_closes: Vec<OutputClose>,
+    /// The closes of commits replay found in History and has not reported yet, in commit order.
+    proven_closes: Vec<OutputClose>,
     metrics: MetricsContext,
     /// We store the paginator used for our own run's history fetching
     paginator: Option<HistoryPaginator>,
@@ -130,6 +138,8 @@ impl ManagedRun {
             trying_to_evict: None,
             recorded_span_ids: Default::default(),
             committed_by_topic: Default::default(),
+            pending_closes: vec![],
+            proven_closes: vec![],
             metrics,
             paginator: None,
             completion_waiting_on_page_fetch: None,
@@ -930,6 +940,7 @@ impl ManagedRun {
             count_replayed_output(&replayed, &mut self.committed_by_topic);
             let recorded = self.wfm.machines.take_replayed_output_manifest();
             check_replayed_output_manifest(replayed, recorded)?;
+            self.proven_closes.extend(commit.closes);
             return Ok(None);
         }
         let Some(store_name) = self.stream_store_name() else {
@@ -980,6 +991,7 @@ impl ManagedRun {
                 terminal_boundary: terminal_boundary as i32,
                 output: Some(manifest),
             })?;
+        self.pending_closes.extend(commit.closes);
         Ok(Some(batch))
     }
 
@@ -1327,6 +1339,10 @@ impl ManagedRun {
         data: CompletionDataForWFT,
         due_to_heartbeat_timeout: bool,
     ) -> FulfillableActivationComplete {
+        let chain = RunChain {
+            workflow_id: self.wfm.machines.workflow_id.clone(),
+            first_run_id: self.wfm.machines.first_execution_run_id.clone(),
+        };
         let outstanding_las = self.wfm.machines.outstanding_local_activity_count() > 0;
         let can_report_eviction =
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
@@ -1384,6 +1400,11 @@ impl ManagedRun {
                     sdk_metadata: machines_wft_response.metadata_for_complete(),
                     versioning_behavior: data.versioning_behavior,
                     attempt,
+                    stream_output: ReportedOutput::take(
+                        chain,
+                        &mut self.pending_closes,
+                        &mut self.proven_closes,
+                    ),
                 },
                 metrics: self.metrics.clone(),
             })

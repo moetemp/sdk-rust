@@ -43,18 +43,15 @@ relevant information.
   marker can only move forward. A Worker on an older Core, or one whose lang doesn't commit the
   records again on replay, fails that workflow's next task, so don't roll such a fleet back.
 * Experimental: behind the new `streams` feature, `WorkerConfig::stream_store` takes the store a
-  workflow's stream output goes to. Core stages each completion's records in it before the
-  completion is sent, and fails the workflow task when the store refuses them or the Worker has
-  none, so a task the server accepts always has its output staged.
-* Experimental: Core promotes a workflow task's staged stream output once the server accepts the
-  completion, and aborts it when the server says the task or its commands were not applied. When
-  the answer is lost, the next replay promotes what History shows committed and the next accepted
-  completion aborts the rest. Output another Worker staged and History proves is promoted once.
   workflow's stream output goes to. Core appends each activation's records to it when the
   activation completes, before the workflow task completes, as the run's producer `@<run id>`.
   The producer attempt rises only after a workflow task failed or timed out, so readers see one
   supersession when a task runs again. Core fails the workflow task when the store refuses the
   records or the Worker has none.
+* Experimental: Core closes the stream topics a workflow task closed once the server accepts the
+  completion, in commit order, with each close's result. A task the server refuses closes
+  nothing, so its rerun can still publish. When the answer is lost, Core closes only what the
+  next replay finds in History.
 * Experimental: behind `streams`, `streams::connect_stream_service` builds one stream store from
   a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in process: append, read,
   latest, close and owner delete, as serialized `coresdk.streams` requests.

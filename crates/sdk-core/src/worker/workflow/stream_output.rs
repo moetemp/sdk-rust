@@ -99,6 +99,56 @@ pub(super) fn count_replayed_output(
     }
 }
 
+/// The run chain a run's streams are keyed by.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RunChain {
+    pub(crate) workflow_id: String,
+    pub(crate) first_run_id: String,
+}
+
+/// The topic closes a completion carries to the report path.
+#[derive(Debug)]
+// Only a Worker with a stream store closes topics.
+#[cfg_attr(not(feature = "streams"), allow(dead_code))]
+pub(crate) struct ReportedOutput {
+    pub(crate) chain: RunChain,
+    /// The task's own closes, in commit order, to close once the server accepts the task.
+    pub(crate) closes: Vec<OutputClose>,
+    /// The closes of commits replay found in History, in commit order. Only those whose
+    /// completion this Worker sent without learning the answer still need closing.
+    pub(crate) proven: Vec<OutputClose>,
+}
+
+impl ReportedOutput {
+    /// What to report with the next completion, leaving both lists empty, or `None` when there is
+    /// nothing.
+    pub(crate) fn take(
+        chain: RunChain,
+        closes: &mut Vec<OutputClose>,
+        proven: &mut Vec<OutputClose>,
+    ) -> Option<Box<Self>> {
+        if closes.is_empty() && proven.is_empty() {
+            return None;
+        }
+        Some(Box::new(Self {
+            chain,
+            closes: std::mem::take(closes),
+            proven: std::mem::take(proven),
+        }))
+    }
+}
+
+/// What the server answered to a completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompletionOutcome {
+    /// The commands were applied, so each output marker is in History.
+    Accepted,
+    /// The commands were not applied, so the task runs again.
+    Refused,
+    /// The completion may or may not have been applied.
+    Unknown,
+}
+
 /// How often an append that may not have landed is sent again before the task fails.
 #[cfg(feature = "streams")]
 const APPEND_TRIES: u32 = 4;
@@ -108,11 +158,79 @@ const APPEND_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis
 #[cfg(all(feature = "streams", test))]
 const APPEND_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(1);
 
-/// The Worker's side of a Workflow's stream output: appends what each activation committed.
+#[cfg(feature = "streams")]
+const MAX_UNDECIDED_RUNS: usize = 1000;
+#[cfg(all(feature = "streams", not(test)))]
+const RETRY_FIRST: std::time::Duration = std::time::Duration::from_secs(1);
+// Keeps the retry tests fast.
+#[cfg(all(feature = "streams", test))]
+const RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(10);
+#[cfg(feature = "streams")]
+const RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The Worker's side of a Workflow's stream output: appends what each activation committed, and
+/// closes the topics a task closed once the server accepts it.
 #[cfg(feature = "streams")]
 pub(crate) struct OutputStore {
     store: std::sync::Arc<dyn temporalio_streams::StreamStore>,
     namespace: String,
+    /// Closes whose completion's answer was lost, by run. The run is evicted then, so the replay
+    /// before its next completion shows which of them History holds. Bounded, since a run that
+    /// moves to another Worker never comes back here.
+    undecided: parking_lot::Mutex<lru::LruCache<String, Vec<OutputClose>>>,
+    /// Background topic closes, by run.
+    runs: std::sync::Arc<parking_lot::Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>>>,
+    /// Stops the close retries when the Worker stops.
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+/// Whether the store can never take the call. Every other failure is retried, since the close
+/// lives only in this Worker until the store takes it. `REFUSED` is retried too, since it is an
+/// ACL or configuration fault that an operator can fix.
+#[cfg(feature = "streams")]
+fn refused_for_good(error: &temporalio_streams::StreamError) -> bool {
+    error.kind == temporalio_streams::proto::StreamFailureKind::Unsupported
+}
+
+/// Closes `closes` on `chain` one after another, each retried with backoff until it lands or
+/// `shutdown` fires. A store that can't close topics is logged and given up on.
+#[cfg(feature = "streams")]
+async fn close_in_order(
+    store: &dyn temporalio_streams::StreamStore,
+    chain: &temporalio_streams::proto::ChainId,
+    closes: &[OutputClose],
+    shutdown: &tokio_util::sync::CancellationToken,
+) {
+    for close in closes {
+        let mut delay = RETRY_FIRST;
+        loop {
+            let error = match store
+                .close_topic(chain, &close.topic, close.result.clone())
+                .await
+            {
+                Ok(()) => break,
+                Err(error) => error,
+            };
+            if refused_for_good(&error) {
+                warn!(
+                    topic = %close.topic,
+                    %error,
+                    "The store refused to close a stream topic a Workflow closed"
+                );
+                break;
+            }
+            warn!(
+                topic = %close.topic,
+                %error,
+                "Could not close a stream topic a Workflow closed; trying again in {delay:?}"
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = shutdown.cancelled() => return,
+            }
+            delay = (delay * 2).min(RETRY_CAP);
+        }
+    }
 }
 
 #[cfg(feature = "streams")]
@@ -120,8 +238,84 @@ impl OutputStore {
     pub(crate) fn new(
         store: std::sync::Arc<dyn temporalio_streams::StreamStore>,
         namespace: String,
+        shutdown: tokio_util::sync::CancellationToken,
     ) -> Self {
-        Self { store, namespace }
+        Self {
+            store,
+            namespace,
+            undecided: parking_lot::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_UNDECIDED_RUNS).expect("not zero"),
+            )),
+            runs: Default::default(),
+            shutdown,
+        }
+    }
+
+    /// Closes the topics a completion closed, by the server's answer to it, in commit order and
+    /// in the background.
+    ///
+    /// The FINISH records are already appended. The close waits for the answer, because a task
+    /// the server refuses runs again and appends to the topic under a new attempt, which a closed
+    /// topic would refuse. Replay calls nothing, except for closes this Worker kept because the
+    /// answer to their completion was lost and replay found their commit.
+    pub(crate) fn settle_closes(
+        &self,
+        run_id: &str,
+        output: ReportedOutput,
+        outcome: CompletionOutcome,
+    ) {
+        let mut closes = vec![];
+        {
+            let mut undecided = self.undecided.lock();
+            if let Some(kept) = undecided.get_mut(run_id) {
+                for proven in &output.proven {
+                    if let Some(index) = kept.iter().position(|k| k.topic == proven.topic) {
+                        closes.push(kept.remove(index));
+                    }
+                }
+            }
+            match outcome {
+                CompletionOutcome::Accepted => {
+                    // Replay before this completion found every kept close History holds.
+                    undecided.pop(run_id);
+                    closes.extend(output.closes);
+                }
+                CompletionOutcome::Refused => {}
+                CompletionOutcome::Unknown => {
+                    if !output.closes.is_empty() {
+                        match undecided.get_mut(run_id) {
+                            Some(kept) => kept.extend(output.closes),
+                            None => {
+                                undecided.put(run_id.to_string(), output.closes);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if closes.is_empty() {
+            return;
+        }
+        let store = self.store.clone();
+        let chain = self.chain(&output.chain);
+        let shutdown = self.shutdown.clone();
+        let task = tokio::spawn(async move {
+            close_in_order(&*store, &chain, &closes, &shutdown).await;
+        });
+        let mut runs = self.runs.lock();
+        runs.retain(|_, tasks| {
+            tasks.retain(|task| !task.is_finished());
+            !tasks.is_empty()
+        });
+        runs.entry(run_id.to_string()).or_default().push(task);
+    }
+
+    fn chain(&self, chain: &RunChain) -> temporalio_streams::proto::ChainId {
+        temporalio_streams::proto::ChainId {
+            namespace: self.namespace.clone(),
+            workflow_id: chain.workflow_id.clone(),
+            first_run_id: chain.first_run_id.clone(),
+        }
     }
 
     /// Appends `batch` as its run's producer, one topic after another.
@@ -629,5 +823,116 @@ mod tests {
             message.contains("over the 64 KiB marker budget"),
             "{message}"
         );
+    }
+
+    #[cfg(feature = "streams")]
+    mod closes {
+        use super::super::*;
+        use std::sync::Arc;
+        use temporalio_common::protos::temporal::api::common::v1::Payload;
+        use temporalio_streams::{
+            MemoryStore, StreamStore,
+            proto::{ChainId, StoreReadRequest},
+        };
+
+        const RUN: &str = "run-1";
+
+        fn close(topic: &str) -> OutputClose {
+            OutputClose {
+                topic: topic.to_string(),
+                result: Some(Payload::default()),
+            }
+        }
+
+        fn chain() -> RunChain {
+            RunChain {
+                workflow_id: "wf".to_string(),
+                first_run_id: RUN.to_string(),
+            }
+        }
+
+        fn reported(closes: &[&str], proven: &[&str]) -> ReportedOutput {
+            ReportedOutput {
+                chain: chain(),
+                closes: closes.iter().map(|t| close(t)).collect(),
+                proven: proven.iter().map(|t| close(t)).collect(),
+            }
+        }
+
+        fn store() -> (Arc<MemoryStore>, OutputStore) {
+            let memory = Arc::new(MemoryStore::new());
+            let output = OutputStore::new(memory.clone(), "ns".to_string(), Default::default());
+            (memory, output)
+        }
+
+        /// Which of `topics` the store holds closed once the background closes are done.
+        async fn closed(
+            output: &OutputStore,
+            memory: &MemoryStore,
+            topics: &[&str],
+        ) -> Vec<String> {
+            let tasks: Vec<_> = output.runs.lock().drain().flat_map(|(_, t)| t).collect();
+            for task in tasks {
+                task.await.unwrap();
+            }
+            let mut closed = vec![];
+            for topic in topics {
+                let read = memory
+                    .read(StoreReadRequest {
+                        chain: Some(ChainId {
+                            namespace: "ns".to_string(),
+                            workflow_id: "wf".to_string(),
+                            first_run_id: RUN.to_string(),
+                        }),
+                        topic: topic.to_string(),
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                if read.closed {
+                    closed.push(topic.to_string());
+                }
+            }
+            closed
+        }
+
+        #[tokio::test]
+        async fn an_accepted_completion_closes_its_topics() {
+            let (memory, store) = store();
+            store.settle_closes(RUN, closing(&["a", "b"]), CompletionOutcome::Accepted);
+            assert_eq!(closed(&store, &memory, &["a", "b"]).await, ["a", "b"]);
+        }
+
+        fn closing(closes: &[&str]) -> ReportedOutput {
+            reported(closes, &[])
+        }
+
+        #[tokio::test]
+        async fn a_refused_completion_closes_nothing() {
+            let (memory, store) = store();
+            store.settle_closes(RUN, closing(&["a"]), CompletionOutcome::Refused);
+            assert!(closed(&store, &memory, &["a"]).await.is_empty());
+        }
+
+        #[tokio::test]
+        async fn a_lost_answer_closes_what_replay_finds() {
+            let (memory, store) = store();
+            store.settle_closes(RUN, closing(&["a", "b"]), CompletionOutcome::Unknown);
+            assert!(closed(&store, &memory, &["a", "b"]).await.is_empty());
+            // Replay found the commit that closed `a` only, so the one that closed `b` never
+            // reached History.
+            store.settle_closes(RUN, reported(&[], &["a"]), CompletionOutcome::Accepted);
+            assert_eq!(closed(&store, &memory, &["a", "b"]).await, ["a"]);
+            // Nothing is kept once a completion is accepted.
+            store.settle_closes(RUN, reported(&[], &["b"]), CompletionOutcome::Accepted);
+            assert_eq!(closed(&store, &memory, &["a", "b"]).await, ["a"]);
+        }
+
+        #[tokio::test]
+        async fn replay_on_a_worker_that_kept_nothing_closes_nothing() {
+            let (memory, store) = store();
+            store.settle_closes(RUN, reported(&[], &["a"]), CompletionOutcome::Accepted);
+            assert!(closed(&store, &memory, &["a"]).await.is_empty());
+        }
     }
 }

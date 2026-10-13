@@ -148,7 +148,7 @@ pub(crate) struct Workflows {
     default_versioning_behavior: Option<VersioningBehavior>,
     namespace_capabilities: Arc<NamespaceCapabilities>,
     shutdown_token: CancellationToken,
-    /// Appends Workflow stream output, when the Worker has a stream store.
+    /// Appends Workflow stream output and closes its topics, when the Worker has a stream store.
     #[cfg(feature = "streams")]
     output_store: Option<stream_output::OutputStore>,
 }
@@ -202,7 +202,11 @@ impl Workflows {
         let shutdown_token = basics.shutdown_token.clone();
         #[cfg(feature = "streams")]
         let output_store = basics.worker_config.stream_store.clone().map(|store| {
-            stream_output::OutputStore::new(store, basics.worker_config.namespace.clone())
+            stream_output::OutputStore::new(
+                store,
+                basics.worker_config.namespace.clone(),
+                basics.shutdown_token.clone(),
+            )
         });
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
@@ -392,6 +396,7 @@ impl Workflows {
                         sdk_metadata,
                         mut versioning_behavior,
                         attempt,
+                        stream_output,
                     },
                 metrics: run_metrics,
             } => {
@@ -441,6 +446,7 @@ impl Workflows {
                 completion.sticky_attributes = sticky_attrs;
 
                 let mut reset_last_started_to = None;
+                let mut output_outcome = stream_output::CompletionOutcome::Refused;
                 self.handle_wft_reporting_errs(run_id, || async {
                     match self
                         .client
@@ -448,6 +454,7 @@ impl Workflows {
                         .await
                     {
                         Ok(response) => {
+                            output_outcome = stream_output::CompletionOutcome::Accepted;
                             if let Some(record) = maybe_record_terminal_metric.take() {
                                 record(&run_metrics);
                             }
@@ -463,6 +470,7 @@ impl Workflows {
                             );
                         }
                         Err(e) => {
+                            output_outcome = completion_outcome(&e);
                             let cause_and_failure =
                                 if e.metadata().contains_key(REQUEST_TOO_LARGE_KEY) {
                                     // Completion exceeds the namespace's recombined size limit, so the
@@ -508,6 +516,12 @@ impl Workflows {
                     Ok(())
                 })
                 .await;
+                #[cfg(feature = "streams")]
+                if let (Some(store), Some(output)) = (&self.output_store, stream_output) {
+                    store.settle_closes(run_id, *output, output_outcome);
+                }
+                #[cfg(not(feature = "streams"))]
+                let _ = (stream_output, output_outcome);
                 WFTReportStatus::Reported {
                     reset_last_started_to,
                     completion_time,
@@ -1239,6 +1253,8 @@ pub(crate) enum ActivationAction {
         sdk_metadata: WorkflowTaskCompletedMetadata,
         versioning_behavior: VersioningBehavior,
         attempt: u32,
+        /// The topics the task closed, to close in the store by the server's answer.
+        stream_output: Option<Box<stream_output::ReportedOutput>>,
     },
     /// We should respond to a legacy query request
     RespondLegacyQuery { result: Box<QueryResult> },
@@ -2055,6 +2071,24 @@ fn make_request_too_large_failure() -> Failure {
             },
         ),
         force_cause: WorkflowTaskFailedCause::RequestTooLarge as i32,
+    }
+}
+
+/// Whether the server applied a completion that failed with `error`, as far as it says.
+///
+/// `NotFound` proves nothing. The client retries a completion whose answer was lost, and the
+/// server answers the repeat of a completion it applied with `NotFound`.
+fn completion_outcome(error: &tonic::Status) -> stream_output::CompletionOutcome {
+    let not_applied = (error.code() == tonic::Code::InvalidArgument
+        && error.message() == "UnhandledCommand")
+        // The worker failed these itself, before sending.
+        || error.metadata().contains_key(REQUEST_TOO_LARGE_KEY)
+        || error.metadata().contains_key(MESSAGE_TOO_LARGE_KEY)
+        || payload_limit_violation_from(error).is_some();
+    if not_applied {
+        stream_output::CompletionOutcome::Refused
+    } else {
+        stream_output::CompletionOutcome::Unknown
     }
 }
 
