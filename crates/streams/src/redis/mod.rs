@@ -8,8 +8,7 @@ mod scripts;
 use crate::{
     StreamError, StreamResult, StreamStore,
     proto::{
-        ChainId, DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteOutcome,
-        PromoteResult, StageRef, StagedBatch, StoreAppendRequest, StoreAppendResponse,
+        ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredRecord,
         StreamOwnerKind,
     },
@@ -24,7 +23,6 @@ use tokio::time::Instant;
 const NAME: &str = "redis";
 const RECORD_FIELD: &str = "r";
 const TOMBSTONE_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-const STAGE_SEPARATOR: char = '\x1f';
 const CLOSED_FIELD: &str = "closed";
 const DELETE_BATCH: usize = 500;
 
@@ -547,90 +545,6 @@ impl StreamStore for RedisStore {
         Ok(Some(trimmed))
     }
 
-    async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {
-        let keys = self.keys(batch.chain.as_ref())?;
-        let mut topics: Vec<&str> = Vec::new();
-        for record in &batch.records {
-            if !topics.contains(&record.topic.as_str()) {
-                topics.push(&record.topic);
-            }
-        }
-        let floor = batch.history_floor_event_id.to_string();
-        let description = [batch.run_id.as_str(), floor.as_str()]
-            .into_iter()
-            .chain(topics)
-            .collect::<Vec<_>>()
-            .join(&STAGE_SEPARATOR.to_string());
-        let mut eval = redis::cmd("EVAL");
-        eval.arg(scripts::STAGE)
-            .arg(2)
-            .arg(keys.stage(&batch.token))
-            .arg(keys.pending())
-            // Until promoted, a stage holds committed output, and crash repair can come after the
-            // retention.
-            .arg(self.retention_ms + self.grace_ms)
-            .arg(&batch.token)
-            .arg(description);
-        for record in &batch.records {
-            eval.arg(&record.topic).arg(record.record.as_slice());
-        }
-        // The script appends to the stage, so a repeat after a lost answer would hold the records
-        // twice. Clearing the stage in the same transaction makes a repeat replace it. `EVAL`
-        // and not `EVALSHA`, since a transaction can't load a script the server lost.
-        redis::pipe()
-            .atomic()
-            .del(keys.stage(&batch.token))
-            .ignore()
-            .add_command(eval)
-            .ignore()
-            .query_async::<()>(&mut self.shared.clone())
-            .await
-            .mapped(Call::Write)
-    }
-
-    async fn promote(&self, stage: &StageRef) -> StreamResult<PromoteResult> {
-        let keys = self.keys(stage.chain.as_ref())?;
-        let mut script = scripts::PROMOTE_SCRIPT.prepare_invoke();
-        script.key(keys.stage(&stage.token)).key(keys.pending());
-        for topic in &stage.topics {
-            script.key(keys.log(topic)).key(keys.meta(topic));
-        }
-        script
-            .arg(self.retention_ms)
-            .arg(self.grace_ms)
-            .arg(&stage.token);
-        for topic in &stage.topics {
-            script.arg(topic);
-        }
-        let added: i64 = script
-            .invoke_async(&mut self.shared.clone())
-            .await
-            .map_err(|error| match error.code() {
-                Some("STREAMS_TOPIC") => StreamError::refused(error.detail().unwrap_or_default()),
-                _ => errors::stream_error(&error, Call::Write),
-            })?;
-        let (outcome, records) = match added {
-            -1 => (PromoteOutcome::Lost, 0),
-            0 => (PromoteOutcome::Settled, 0),
-            added => (PromoteOutcome::Promoted, added as u32),
-        };
-        Ok(PromoteResult {
-            outcome: outcome as i32,
-            records,
-        })
-    }
-
-    async fn abort(&self, stage: &StageRef) -> StreamResult<()> {
-        let keys = self.keys(stage.chain.as_ref())?;
-        redis::pipe()
-            .atomic()
-            .del(keys.stage(&stage.token))
-            .hdel(keys.pending(), &stage.token)
-            .query_async::<()>(&mut self.shared.clone())
-            .await
-            .mapped(Call::Write)
-    }
-
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {
         let keys = ChainKeys::new(&self.prefix, chain);
         redis::pipe()
@@ -652,34 +566,6 @@ impl StreamStore for RedisStore {
             .query_async::<()>(&mut self.shared.clone())
             .await
             .mapped(Call::Write)
-    }
-
-    async fn pending_stages(&self, chain: &ChainId) -> StreamResult<Vec<PendingStage>> {
-        let keys = ChainKeys::new(&self.prefix, chain);
-        let pending: HashMap<String, String> = redis::cmd("HGETALL")
-            .arg(keys.pending())
-            .query_async(&mut self.shared.clone())
-            .await
-            .mapped(Call::Read)?;
-        pending
-            .into_iter()
-            .map(|(token, description)| {
-                let mut parts = description.split(STAGE_SEPARATOR);
-                let run_id = parts.next().unwrap_or_default().to_string();
-                let floor = parts.next().and_then(|floor| floor.parse().ok());
-                let Some(history_floor_event_id) = floor else {
-                    return Err(StreamError::storage(format!(
-                        "pending stage {token:?} has no History floor: {description:?}"
-                    )));
-                };
-                Ok(PendingStage {
-                    token,
-                    run_id,
-                    history_floor_event_id,
-                    topics: parts.map(str::to_string).collect(),
-                })
-            })
-            .collect()
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {

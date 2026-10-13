@@ -265,9 +265,6 @@ impl Streams {
         let deadline = Instant::now() + wait;
         let minimum = self.options.owner_check_min;
         let mut page_request = request.clone();
-        // Set once the read found a stage of the chain still pending after the end, so it waits
-        // for the promotion rather than reading as fast as it can.
-        let mut awaiting_stage = false;
         let response = loop {
             let now = unix_ms();
             if state.check_interval_ms == 0 {
@@ -276,10 +273,10 @@ impl Streams {
             }
             let until_check = Duration::from_millis(state.next_check_ms.saturating_sub(now));
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let wait = match (state.owner_ended, awaiting_stage) {
-                (false, _) => remaining.min(until_check),
-                (true, false) => Duration::ZERO,
-                (true, true) => remaining.min(minimum),
+            let wait = if state.owner_ended {
+                Duration::ZERO
+            } else {
+                remaining.min(until_check)
             };
             page_request.wait = wait.try_into().ok();
             let (mut page, closed) =
@@ -296,17 +293,8 @@ impl Streams {
                 continue;
             }
             if state.owner_ended {
-                // A close doesn't prove the chain's output is visible, since a promotion still
-                // lands after it. The read ends once nothing of the chain is pending.
-                if self.store.pending_stages(&target.chain).await?.is_empty() {
-                    page.done = true;
-                    break page;
-                }
-                awaiting_stage = true;
-                if Instant::now() >= deadline {
-                    break page;
-                }
-                continue;
+                page.done = true;
+                break page;
             }
             if unix_ms() >= state.next_check_ms {
                 state.owner_ended = self.owner_ended(stream, &target.chain).await?;
