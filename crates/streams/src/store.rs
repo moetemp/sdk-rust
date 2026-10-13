@@ -1,16 +1,15 @@
 use crate::{
     StreamResult,
     proto::{
-        ChainId, DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteResult, StageRef,
-        StagedBatch, StoreAppendRequest, StoreAppendResponse, StoreLatestRequest,
-        StoreLatestResponse, StoreReadRequest, StoreReadResponse,
+        ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
+        StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse,
     },
 };
 
 /// A store that holds streams, keyed by their owner's run chain.
 ///
 /// A store moves serialized `temporal.sdk.streams.v1.StreamRecord`s with encoded bodies and deals
-/// in its own positions. Owner checks, cursors, supersession and repair sit above it, so every
+/// in its own positions. Owner checks, cursors and supersession sit above it, so every
 /// store behaves the same where the contract says so, and a new store only implements this.
 ///
 /// Every call is safe to repeat. A call that fails while the store may have acted reports
@@ -70,20 +69,7 @@ pub trait StreamStore: Send + Sync {
         Ok(None)
     }
 
-    /// Holds a Workflow Task's records, invisible to readers, until [StreamStore::promote] or
-    /// [StreamStore::abort] names its token. A stage outlives the retention, since crash repair
-    /// can come after it.
-    async fn stage(&self, batch: StagedBatch) -> StreamResult<()>;
-
-    /// Moves a stage's records into their topics in one step, so readers see all or none of
-    /// them. Idempotent, and the records become visible once.
-    async fn promote(&self, stage: &StageRef) -> StreamResult<PromoteResult>;
-
-    /// Drops a stage whose Workflow Task never committed. Idempotent.
-    async fn abort(&self, stage: &StageRef) -> StreamResult<()>;
-
-    /// Marks a chain closed, so its topics refuse new batches from producers. Promotions still
-    /// land, since a Workflow's committed output is never refused.
+    /// Marks a chain closed, so its topics refuse new batches from producers.
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()>;
 
     /// Marks one topic of a chain closed, like [StreamStore::close_chain] for that topic alone.
@@ -98,10 +84,7 @@ pub trait StreamStore: Send + Sync {
         result: Option<crate::proto::Payload>,
     ) -> StreamResult<()>;
 
-    /// The chain's stages that no one has promoted or aborted yet, for crash repair.
-    async fn pending_stages(&self, chain: &ChainId) -> StreamResult<Vec<PendingStage>>;
-
-    /// Deletes every stream and stage of one owner, across all its chains.
+    /// Deletes every stream of one owner, across all its chains.
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse>;
 }
 
