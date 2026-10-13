@@ -19,8 +19,8 @@ use std::{
 use temporalio_streams::{
     RedisStore, RedisStoreOptions, StreamResult, StreamStore,
     proto::{
-        ChainId, PromoteOutcome, StageRef, StagedBatch, StagedRecord, StoreAppendRequest,
-        StoreAppendResponse, StoreLatestRequest, StoreReadRequest, StreamFailureKind, StreamRecord,
+        ChainId, StoreAppendRequest, StoreAppendResponse, StoreLatestRequest, StoreReadRequest,
+        StreamFailureKind, StreamRecord,
     },
 };
 use tokio::{
@@ -305,44 +305,6 @@ async fn ids_with_separators_and_braces_keep_their_own_keys() {
 }
 
 #[tokio::test]
-async fn a_promotion_of_a_stage_whose_records_are_gone_is_lost() {
-    let Some(mut setup) = setup().await else {
-        return;
-    };
-    let chain = chain();
-    setup
-        .store
-        .stage(StagedBatch {
-            chain: Some(chain.clone()),
-            run_id: "run-1".to_string(),
-            token: "t1".to_string(),
-            history_floor_event_id: 3,
-            records: vec![StagedRecord {
-                topic: "events".to_string(),
-                record: record("events", "", 0),
-            }],
-        })
-        .await
-        .unwrap();
-    // Retention dropped the stage's records while it was still pending.
-    let _: () = setup
-        .raw
-        .del(format!("{}:stage:t1", base(&setup.prefix, &chain)))
-        .await
-        .unwrap();
-    let reference = StageRef {
-        chain: Some(chain.clone()),
-        token: "t1".to_string(),
-        topics: vec!["events".to_string()],
-    };
-    let lost = setup.store.promote(&reference).await.unwrap();
-    assert_eq!(lost.outcome, PromoteOutcome::Lost as i32);
-    assert!(setup.store.pending_stages(&chain).await.unwrap().is_empty());
-    let again = setup.store.promote(&reference).await.unwrap();
-    assert_eq!(again.outcome, PromoteOutcome::Settled as i32);
-}
-
-#[tokio::test]
 async fn a_reply_that_refuses_a_write_arrives_as_refused() {
     let Some(mut setup) = setup().await else {
         return;
@@ -353,20 +315,6 @@ async fn a_reply_that_refuses_a_write_arrives_as_refused() {
     let error = setup
         .store
         .append(append(&chain, "p", 1, 1, b"\x01"))
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind, StreamFailureKind::Refused);
-    assert!(error.message.contains("WRONGTYPE"), "{error}");
-
-    let stage = format!("{}:stage:t1", base(&setup.prefix, &chain));
-    let _: () = setup.raw.set(&stage, "not a list").await.unwrap();
-    let error = setup
-        .store
-        .promote(&StageRef {
-            chain: Some(chain.clone()),
-            token: "t1".to_string(),
-            topics: vec!["events".to_string()],
-        })
         .await
         .unwrap_err();
     assert_eq!(error.kind, StreamFailureKind::Refused);
@@ -606,41 +554,6 @@ async fn store_errors_on_reads_arrive_as_storage_failures() {
     assert_eq!(error.kind, StreamFailureKind::Storage, "{error}");
 }
 
-#[tokio::test]
-async fn a_lost_connection_while_staging_is_an_unknown_outcome() {
-    let Some(url) = url() else {
-        return;
-    };
-    let faults = Faults::start(&url).await;
-    let setup = setup_at(&faults.url(), &url).await;
-    let chain = chain();
-    let batch = StagedBatch {
-        chain: Some(chain.clone()),
-        run_id: "run-1".to_string(),
-        token: "t1".to_string(),
-        history_floor_event_id: 3,
-        records: vec![StagedRecord {
-            topic: "events".to_string(),
-            record: record("events", "", 0),
-        }],
-    };
-    // A real call first, so the script is loaded.
-    setup.store.stage(batch.clone()).await.unwrap();
-    faults.next(LOSE_REPLY);
-    let error = setup.store.stage(batch.clone()).await.unwrap_err();
-    assert_eq!(error.kind, StreamFailureKind::OutcomeUnknown, "{error}");
-    // The repeat replaces the stage the lost call wrote, so its records are there once.
-    until_reachable(async || setup.store.stage(batch.clone()).await)
-        .await
-        .unwrap();
-    let mut raw = setup.raw.clone();
-    let items: usize = raw
-        .llen(format!("{}:stage:t1", base(&setup.prefix, &chain)))
-        .await
-        .unwrap();
-    assert_eq!(items, 2);
-}
-
 async fn retained_for(retention: Duration) -> Option<Setup> {
     let url = url()?;
     Some(
@@ -649,29 +562,6 @@ async fn retained_for(retention: Duration) -> Option<Setup> {
         })
         .await,
     )
-}
-
-fn stage_of(chain: &ChainId, token: &str, count: usize) -> StagedBatch {
-    StagedBatch {
-        chain: Some(chain.clone()),
-        run_id: "run-1".to_string(),
-        token: token.to_string(),
-        history_floor_event_id: 3,
-        records: (0..count)
-            .map(|index| StagedRecord {
-                topic: "events".to_string(),
-                record: record("events", "", index as i64),
-            })
-            .collect(),
-    }
-}
-
-fn stage_ref(chain: &ChainId, token: &str) -> StageRef {
-    StageRef {
-        chain: Some(chain.clone()),
-        token: token.to_string(),
-        topics: vec!["events".to_string()],
-    }
 }
 
 const GRACE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -745,95 +635,6 @@ async fn rule_18_1_a_session_older_than_the_retention_leaves_the_meta() {
     let meta = format!("{}:meta", log_key(&setup.prefix, &chain, "events"));
     let held = held(&mut setup.raw, &meta).await;
     assert_eq!(held.keys().collect::<Vec<_>>(), ["hw:3:new:1"]);
-}
-
-#[tokio::test]
-async fn rule_18_2_a_stage_lives_for_the_retention_and_the_grace() {
-    // A stage only has to live until someone promotes it, and crash repair can come late.
-    let Some(mut setup) = retained_for(Duration::from_secs(30)).await else {
-        return;
-    };
-    let chain = chain();
-    setup.store.stage(stage_of(&chain, "t1", 2)).await.unwrap();
-    let stage = format!("{}:stage:t1", base(&setup.prefix, &chain));
-    let ttl: i64 = setup.raw.pttl(&stage).await.unwrap();
-    assert!(30_000 < ttl && ttl <= 30_000 + GRACE_MS, "{ttl}");
-    setup.store.promote(&stage_ref(&chain, "t1")).await.unwrap();
-    let exists: bool = setup.raw.exists(&stage).await.unwrap();
-    assert!(!exists);
-    let log = log_key(&setup.prefix, &chain, "events");
-    let length: usize = setup.raw.xlen(&log).await.unwrap();
-    assert_eq!(length, 2);
-    // Promoted records live by the log's retention, like appended ones.
-    let ttl: i64 = setup.raw.pttl(&log).await.unwrap();
-    assert!(0 < ttl && ttl <= 30_000, "{ttl}");
-    let fields: HashMap<String, String> = setup.raw.hgetall(format!("{log}:meta")).await.unwrap();
-    assert_eq!(fields["added"], "2");
-    setup.store.promote(&stage_ref(&chain, "t1")).await.unwrap();
-    let length: usize = setup.raw.xlen(&log).await.unwrap();
-    assert_eq!(length, 2);
-}
-
-#[tokio::test]
-async fn rule_18_2_the_pending_stages_outlive_every_stage_they_name() {
-    let Some(url) = url() else {
-        return;
-    };
-    // Two Workers of one chain, configured with different retentions.
-    let prefix = unique("pending");
-    let mut long = setup_with(&url, &url, &prefix, |options| {
-        options.retention = Duration::from_secs(30)
-    })
-    .await;
-    let short = setup_with(&url, &url, &prefix, |options| {
-        options.retention = Duration::from_millis(300)
-    })
-    .await;
-    let chain = chain();
-    long.store.stage(stage_of(&chain, "long", 1)).await.unwrap();
-    short
-        .store
-        .stage(stage_of(&chain, "short", 1))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(600)).await;
-    let exists: bool = long
-        .raw
-        .exists(format!("{}:stage:long", base(&prefix, &chain)))
-        .await
-        .unwrap();
-    assert!(exists);
-    let pending = long.store.pending_stages(&chain).await.unwrap();
-    assert!(
-        pending.iter().any(|stage| stage.token == "long"),
-        "{pending:?}"
-    );
-}
-
-#[tokio::test]
-async fn rule_18_2_a_large_stage_lands_whole() {
-    // The stage script pushes in chunks, since Lua's unpack has a limit far below this.
-    let Some(mut setup) = setup().await else {
-        return;
-    };
-    let chain = chain();
-    setup
-        .store
-        .stage(stage_of(&chain, "big", 10_000))
-        .await
-        .unwrap();
-    let promoted = setup
-        .store
-        .promote(&stage_ref(&chain, "big"))
-        .await
-        .unwrap();
-    assert_eq!(promoted.records, 10_000);
-    let length: usize = setup
-        .raw
-        .xlen(log_key(&setup.prefix, &chain, "events"))
-        .await
-        .unwrap();
-    assert_eq!(length, 10_000);
 }
 
 fn waiting_read(chain: &ChainId, wait: Duration) -> StoreReadRequest {
@@ -925,21 +726,7 @@ impl temporalio_streams::OwnerClient for OneOwner {
             run_id: "run-1".to_string(),
             first_run_id: "run-1".to_string(),
             status: *self.status.lock().unwrap(),
-            start_time: None,
         })
-    }
-
-    async fn history_after(
-        &self,
-        _namespace: &str,
-        _workflow_id: &str,
-        _run_id: &str,
-        _floor: i64,
-    ) -> Result<
-        Vec<temporalio_common::protos::temporal::api::history::v1::HistoryEvent>,
-        temporalio_streams::OwnerError,
-    > {
-        Ok(Vec::new())
     }
 }
 
@@ -1465,14 +1252,13 @@ async fn an_admin_deletes_one_workflows_stream_keys() {
         ..chain.clone()
     };
     let bystander = self::chain();
-    // A log, its meta, a stage, the pending list and a close flag on one chain, and a log on the
-    // next chain of the same Workflow id.
+    // A log, its meta and a close flag on one chain, and a log on the next chain of the same
+    // Workflow id.
     setup
         .store
         .append(append(&chain, "p", 1, 1, b"\x01"))
         .await
         .unwrap();
-    setup.store.stage(stage_of(&chain, "t1", 1)).await.unwrap();
     setup.store.close_chain(&chain).await.unwrap();
     setup
         .store
@@ -1490,13 +1276,13 @@ async fn an_admin_deletes_one_workflows_stream_keys() {
         .query_async(&mut setup.raw)
         .await
         .unwrap();
-    assert_eq!(before.len(), 7, "{before:?}");
+    assert_eq!(before.len(), 5, "{before:?}");
     let deleted = setup
         .store
         .delete_owner(delete_request(&chain.workflow_id))
         .await
         .unwrap();
-    assert_eq!(deleted.deleted, 7);
+    assert_eq!(deleted.deleted, 5);
     let after: Vec<String> = redis::cmd("KEYS")
         .arg(&pattern)
         .query_async(&mut setup.raw)
@@ -1696,38 +1482,19 @@ async fn notification_counters_come_from_redis_entry_ids_and_grow_with_the_strea
         positions.push(landed.last_position);
         store.flush_notifications().await;
     }
-    store
-        .stage(StagedBatch {
-            chain: Some(chain.clone()),
-            run_id: "run-1".to_string(),
-            token: "token".to_string(),
-            history_floor_event_id: 3,
-            records: vec![StagedRecord {
-                topic: "events".to_string(),
-                record: record("events", "workflow", 1),
-            }],
-        })
+    // A Workflow's output is an append as its run's producer, so it notifies the same way.
+    let landed = store
+        .append(append(
+            &chain,
+            &temporalio_streams::workflow_producer_id("run-1"),
+            1,
+            1,
+            &[9],
+        ))
         .await
         .unwrap();
-    let promoted = store
-        .promote(&StageRef {
-            chain: Some(chain.clone()),
-            token: "token".to_string(),
-            topics: vec!["events".to_string()],
-        })
-        .await
-        .unwrap();
-    assert_eq!(promoted.outcome(), PromoteOutcome::Promoted);
+    positions.push(landed.last_position);
     store.flush_notifications().await;
-    let latest = store
-        .latest(StoreLatestRequest {
-            chain: Some(chain.clone()),
-            topic: "events".to_string(),
-        })
-        .await
-        .unwrap()
-        .position;
-    positions.push(latest);
 
     let counters: Vec<i64> = recorder
         .0

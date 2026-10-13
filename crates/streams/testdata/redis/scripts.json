@@ -83,28 +83,5 @@
       "last": "1791686712743-2",
       "note": "a retry of a landed batch still returns its position"
     }
-  ],
-  "promote": [
-    {
-      "label": "promote naming too few topics",
-      "outcome": "error",
-      "error_prefix": "STREAMS_TOPIC",
-      "writes": 0,
-      "pending_kept": true
-    },
-    {
-      "label": "promote",
-      "returned": 3,
-      "xlen_a": 2,
-      "xlen_b": 1
-    },
-    {
-      "label": "promote again",
-      "returned": 0
-    },
-    {
-      "label": "promote of a pending stage whose list is gone",
-      "returned": -1
-    }
   ]
 }
