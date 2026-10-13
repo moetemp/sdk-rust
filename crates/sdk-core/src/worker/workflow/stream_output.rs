@@ -33,6 +33,78 @@ const MAX_COMMIT_BYTES: u64 = 16 * 1024 * 1024;
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 
+/// One publishing completion's records, held until its Workflow Task's completion is reported.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct OutputBatch {
+    /// The stage token the completion's marker names.
+    pub(crate) token: String,
+    pub(crate) history_floor_event_id: i64,
+    pub(crate) workflow_id: String,
+    pub(crate) run_id: String,
+    pub(crate) first_run_id: String,
+    pub(crate) records: Vec<OutputRecord>,
+}
+
+/// Stages a Workflow's output in the Worker's stream store.
+#[cfg(feature = "streams")]
+pub(crate) struct OutputStager {
+    store: std::sync::Arc<dyn temporalio_streams::StreamStore>,
+    namespace: String,
+}
+
+#[cfg(feature = "streams")]
+impl OutputStager {
+    pub(crate) fn new(
+        store: std::sync::Arc<dyn temporalio_streams::StreamStore>,
+        namespace: String,
+    ) -> Self {
+        Self { store, namespace }
+    }
+
+    /// Stages `batches` in commit order, each whole. Nothing is visible until promoted, so a
+    /// completion the server refuses publishes nothing.
+    pub(crate) async fn stage(
+        &self,
+        batches: &[OutputBatch],
+    ) -> std::result::Result<(), temporalio_streams::StreamError> {
+        use prost::Message;
+        use temporalio_streams::proto::{ChainId, StagedBatch, StagedRecord};
+        for batch in batches {
+            let records = batch
+                .records
+                .iter()
+                .map(|record| {
+                    temporalio_streams::stored_output_record(
+                        &record.topic,
+                        record.kind,
+                        record.body.clone(),
+                        &record.content_hash,
+                        &batch.run_id,
+                    )
+                    .map(|stored| StagedRecord {
+                        topic: record.topic.clone(),
+                        record: stored.encode_to_vec(),
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            self.store
+                .stage(StagedBatch {
+                    chain: Some(ChainId {
+                        namespace: self.namespace.clone(),
+                        workflow_id: batch.workflow_id.clone(),
+                        first_run_id: batch.first_run_id.clone(),
+                    }),
+                    run_id: batch.run_id.clone(),
+                    token: batch.token.clone(),
+                    history_floor_event_id: batch.history_floor_event_id,
+                    records,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+}
+
 /// Builds the manifest for the records one completion committed.
 ///
 /// `replaying` allows records without bodies, since lang sends no body when nothing is stored

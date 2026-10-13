@@ -11,7 +11,9 @@ use crate::{
     },
     worker::client::{WorkflowTaskCompletion, mocks::mock_worker_client},
 };
+use mockall::TimesRange;
 use parking_lot::Mutex;
+use prost::Message;
 use std::{sync::Arc, time::Duration};
 use temporalio_common::{
     protos::{
@@ -40,18 +42,103 @@ use temporalio_common::{
                 failure::v1::Failure,
                 workflowservice::v1::RespondWorkflowTaskCompletedResponse,
             },
-            sdk::streams::v1::StreamRecordKind,
+            sdk::streams::v1::{StreamRecord, StreamRecordKind},
         },
     },
-    streams::{FingerprintRecord, fingerprint},
+    streams::{CONTENT_HASH_KEY, FingerprintRecord, RUN_ID_KEY, content_hash_text, fingerprint},
     worker::WorkerTaskTypes,
 };
+use temporalio_streams::{
+    StreamError, StreamResult, StreamStore,
+    proto::{
+        ChainId, DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteResult, StageRef,
+        StagedBatch, StoreAppendRequest, StoreAppendResponse, StoreLatestRequest,
+        StoreLatestResponse, StoreReadRequest, StoreReadResponse,
+    },
+};
 use tokio::sync::Notify;
+
+/// A stream store that keeps what Core stages, and can be told to refuse it.
+#[derive(Default)]
+struct RecordingStore {
+    staged: Mutex<Vec<StagedBatch>>,
+    refuse: Option<StreamError>,
+}
+
+impl RecordingStore {
+    fn refusing(error: StreamError) -> Self {
+        Self {
+            refuse: Some(error),
+            ..Default::default()
+        }
+    }
+
+    fn staged(&self) -> Vec<StagedBatch> {
+        self.staged.lock().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl StreamStore for RecordingStore {
+    fn name(&self) -> &str {
+        STORE
+    }
+
+    async fn append(&self, _: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
+        Err(StreamError::unsupported("append"))
+    }
+
+    async fn read(&self, _: StoreReadRequest) -> StreamResult<StoreReadResponse> {
+        Err(StreamError::unsupported("read"))
+    }
+
+    async fn latest(&self, _: StoreLatestRequest) -> StreamResult<StoreLatestResponse> {
+        Err(StreamError::unsupported("latest"))
+    }
+
+    async fn record_at(&self, _: &ChainId, _: &str, _: &str) -> StreamResult<Option<Vec<u8>>> {
+        Err(StreamError::unsupported("record_at"))
+    }
+
+    async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {
+        if let Some(error) = &self.refuse {
+            return Err(error.clone());
+        }
+        self.staged.lock().push(batch);
+        Ok(())
+    }
+
+    async fn promote(&self, _: &StageRef) -> StreamResult<PromoteResult> {
+        Err(StreamError::unsupported("promote"))
+    }
+
+    async fn abort(&self, _: &StageRef) -> StreamResult<()> {
+        Err(StreamError::unsupported("abort"))
+    }
+
+    async fn close_chain(&self, _: &ChainId) -> StreamResult<()> {
+        Err(StreamError::unsupported("close_chain"))
+    }
+
+    async fn close_topic(&self, _: &ChainId, _: &str) -> StreamResult<()> {
+        Err(StreamError::unsupported("close_topic"))
+    }
+
+    async fn pending_stages(&self, _: &ChainId) -> StreamResult<Vec<PendingStage>> {
+        Err(StreamError::unsupported("pending_stages"))
+    }
+
+    async fn delete_owner(&self, _: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
+        Err(StreamError::unsupported("delete_owner"))
+    }
+}
 
 /// Every completion's external stream markers, in the order the completions were reported.
 type RecordedMarkers = Arc<Mutex<Vec<Vec<ExternalStreamMarkerData>>>>;
 
 const TOPIC: &str = "results";
+/// The name the test store records under, which Core writes into each manifest.
+const STORE: &str = "recording";
 
 fn stream_marker_data(wft: &WorkflowTaskCompletion) -> Vec<ExternalStreamMarkerData> {
     wft.commands
@@ -125,7 +212,7 @@ fn manifest_for(
         segments: vec![ExternalOutputSegmentManifest {
             record_counts_by_topic: vec![records.len() as u32],
         }],
-        provider_id: String::new(),
+        provider_id: STORE.to_string(),
         provider_format_version: 1,
     }
 }
@@ -220,6 +307,7 @@ fn worker_recording(
     }));
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
+        w.stream_store = Some(Arc::new(RecordingStore::default()));
         w.task_types = WorkerTaskTypes::workflow_only();
         w.max_cached_workflows = 1;
     });
@@ -237,6 +325,7 @@ fn worker_failing_with(history: TestHistoryBuilder, expected: &'static str) -> c
     });
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
+        w.stream_store = Some(Arc::new(RecordingStore::default()));
         w.task_types = WorkerTaskTypes::workflow_only();
         w.max_cached_workflows = 1;
     });
@@ -552,6 +641,7 @@ async fn a_marker_in_history_with_a_different_manifest_is_nondeterministic() {
     });
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
+        w.stream_store = Some(Arc::new(RecordingStore::default()));
         w.task_types = WorkerTaskTypes::workflow_only();
         w.max_cached_workflows = 1;
     });
@@ -689,6 +779,7 @@ async fn replay_with_commit(
     }
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
+        w.stream_store = Some(Arc::new(RecordingStore::default()));
         w.task_types = WorkerTaskTypes::workflow_only();
         w.max_cached_workflows = 1;
     });
@@ -787,6 +878,7 @@ async fn a_replayed_commit_where_history_recorded_none_is_nondeterministic() {
     });
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
+        w.stream_store = Some(Arc::new(RecordingStore::default()));
         w.task_types = WorkerTaskTypes::workflow_only();
         w.max_cached_workflows = 1;
     });
@@ -847,6 +939,7 @@ fn worker_expecting_nondeterminism(
     mock_cfg.expect_fail_wft_matcher = nondeterminism_matcher(message, failed.clone());
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
+        w.stream_store = Some(Arc::new(RecordingStore::default()));
         w.task_types = WorkerTaskTypes::workflow_only();
         w.max_cached_workflows = 1;
     });
@@ -950,6 +1043,7 @@ fn local_activity_worker(
     }
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
+        w.stream_store = Some(Arc::new(RecordingStore::default()));
         w.task_types = WorkerTaskTypes {
             enable_local_activities: true,
             ..WorkerTaskTypes::workflow_only()
@@ -1424,6 +1518,7 @@ async fn an_external_stream_marker_that_does_not_decode_fails_the_task() {
     });
     let mut mock = build_mock_pollers(mock_cfg);
     mock.worker_cfg(|w| {
+        w.stream_store = Some(Arc::new(RecordingStore::default()));
         w.task_types = WorkerTaskTypes::workflow_only();
         w.max_cached_workflows = 1;
     });
@@ -1431,6 +1526,343 @@ async fn an_external_stream_marker_that_does_not_decode_fails_the_task() {
     let _ = worker.poll_workflow_activation().await;
     failed_within_deadline(&failed).await;
     worker.drain_pollers_and_shutdown().await;
+}
+
+/// A worker on `store` that records the markers each completion carried, and what `store` held
+/// when each completion was sent.
+fn worker_staging_in(
+    history: TestHistoryBuilder,
+    batches: Vec<ResponseType>,
+    store: Arc<RecordingStore>,
+    markers: RecordedMarkers,
+    staged_at_completion: Arc<Mutex<Vec<Vec<String>>>>,
+) -> crate::Worker {
+    let mut mock_cfg =
+        MockPollCfg::from_resp_batches("fakeid", history, batches, mock_worker_client());
+    let seen_store = store.clone();
+    mock_cfg.completion_mock_fn = Some(Box::new(move |wft| {
+        markers.lock().push(stream_marker_data(wft));
+        staged_at_completion
+            .lock()
+            .push(seen_store.staged().into_iter().map(|b| b.token).collect());
+        Ok(RespondWorkflowTaskCompletedResponse::default())
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.stream_store = Some(store);
+        w.task_types = WorkerTaskTypes {
+            enable_local_activities: true,
+            ..WorkerTaskTypes::workflow_only()
+        };
+        w.max_cached_workflows = 1;
+    });
+    mock_worker(mock)
+}
+
+fn marker_tokens(markers: &[Vec<ExternalStreamMarkerData>]) -> Vec<Vec<String>> {
+    markers
+        .iter()
+        .map(|task| {
+            task.iter()
+                .map(|m| m.output.as_ref().unwrap().stage_token.clone())
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_commit_is_staged_before_its_completion_is_sent() {
+    let (history, manifest) = output_then_timer_history(&["ab", "c"]);
+    let run_id = manifest.run_id.clone();
+    let store = Arc::new(RecordingStore::default());
+    let markers: RecordedMarkers = Default::default();
+    let staged_at_completion: Arc<Mutex<Vec<Vec<String>>>> = Default::default();
+    let worker = worker_staging_in(
+        history,
+        vec![1.into(), 2.into()],
+        store.clone(),
+        markers.clone(),
+        staged_at_completion.clone(),
+    );
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id.clone(),
+            vec![
+                output_commit_command(records(&["ab", "c"])),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    worker.complete_execution(&fired.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    let tokens = marker_tokens(&markers.lock());
+    assert_eq!(
+        staged_at_completion.lock()[0],
+        tokens[0],
+        "the completion's output is in the store before the completion goes out"
+    );
+    let [staged] = store.staged().try_into().unwrap();
+    assert_eq!(staged.token, tokens[0][0]);
+    assert_eq!(staged.run_id, run_id);
+    assert_eq!(staged.history_floor_event_id, 1);
+    let chain = staged.chain.unwrap();
+    assert_eq!(
+        (chain.workflow_id.as_str(), chain.first_run_id.as_str()),
+        ("fakeid", run_id.as_str())
+    );
+    let committed = records(&["ab", "c"]);
+    for (staged, committed) in staged.records.iter().zip(&committed) {
+        assert_eq!(staged.topic, TOPIC);
+        let stored = StreamRecord::decode(staged.record.as_slice()).unwrap();
+        assert_eq!(
+            stored.body, committed.body,
+            "the body stays as lang's codec left it"
+        );
+        assert_eq!(stored.kind, StreamRecordKind::Data as i32);
+        assert_eq!(stored.metadata[RUN_ID_KEY].data, run_id.as_bytes());
+        assert_eq!(
+            stored.metadata[CONTENT_HASH_KEY].data,
+            content_hash_text(&committed.content_hash).into_bytes()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_store_that_refuses_the_stage_fails_the_task_and_sends_no_completion() {
+    let store = Arc::new(RecordingStore::refusing(StreamError::storage(
+        "redis is down",
+    )));
+    let failed = Arc::new(Notify::new());
+    let notify = failed.clone();
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        canned_histories::single_timer("1"),
+        [1],
+        mock_worker_client(),
+    );
+    mock_cfg.num_expected_fails = 1;
+    mock_cfg.num_expected_completions = Some(TimesRange::from(0));
+    mock_cfg.expect_fail_wft_matcher = Box::new(move |_, cause, failure| {
+        let matches = *cause == WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
+            && failure.as_ref().is_some_and(|f| {
+                f.message.contains("Could not stage") && f.message.contains("redis is down")
+            });
+        if matches {
+            notify.notify_one();
+        }
+        matches
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.stream_store = Some(store);
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id,
+            vec![
+                output_commit_command(records(&["a"])),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    failed_within_deadline(&failed).await;
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_live_commit_on_a_worker_without_a_store_fails_the_task() {
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        canned_histories::single_timer("1"),
+        [1],
+        mock_worker_client(),
+    );
+    mock_cfg.num_expected_fails = 1;
+    mock_cfg.expect_fail_wft_matcher = Box::new(|_, _, failure| {
+        failure
+            .as_ref()
+            .is_some_and(|f| f.message.contains("has no stream store"))
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    mock.worker_cfg(|w| {
+        w.task_types = WorkerTaskTypes::workflow_only();
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id,
+            vec![output_commit_command(records(&["a"]))],
+        ))
+        .await
+        .unwrap();
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+}
+
+#[tokio::test]
+async fn commits_around_a_local_activity_are_staged_in_commit_order() {
+    let (history, _) = two_commits_around_a_local_activity_history();
+    let store = Arc::new(RecordingStore::default());
+    let markers: RecordedMarkers = Default::default();
+    let staged_at_completion: Arc<Mutex<Vec<Vec<String>>>> = Default::default();
+    let worker = worker_staging_in(
+        history,
+        vec![1.into(), 2.into()],
+        store.clone(),
+        markers.clone(),
+        staged_at_completion.clone(),
+    );
+    let [first_commit, second_commit] = two_commits();
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(first_commit),
+                schedule_local_activity(1),
+            ],
+        ))
+        .await
+        .unwrap();
+    let resolved = run_local_activity(&worker).await;
+    assert!(only_resolves_local_activity(&resolved, 1));
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            run_id.clone(),
+            vec![
+                output_commit_command(second_commit),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    worker.complete_execution(&fired.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    let tokens = marker_tokens(&markers.lock());
+    assert_eq!(tokens[0].len(), 2);
+    assert_eq!(
+        store
+            .staged()
+            .into_iter()
+            .map(|b| (b.token, b.records[0].topic.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            (tokens[0][0].clone(), TOPIC.to_string()),
+            (tokens[0][1].clone(), "progress".to_string()),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn replay_stages_nothing() {
+    let (history, _) = output_then_timer_history(&["a"]);
+    let store = Arc::new(RecordingStore::default());
+    let worker = worker_staging_in(
+        history,
+        vec![2.into()],
+        store.clone(),
+        Default::default(),
+        Default::default(),
+    );
+    let first = worker.poll_workflow_activation().await.unwrap();
+    assert!(first.is_replaying);
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id.clone(),
+            vec![
+                output_commit_command(replayed(records(&["a"]))),
+                start_timer_cmd(1, Duration::from_secs(10)),
+            ],
+        ))
+        .await
+        .unwrap();
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    worker.complete_execution(&fired.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert!(store.staged().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_task_publishes_nothing() {
+    // The first activation commits and waits on a local activity. The second fails, so the task
+    // fails before any completion reports the commit, and nothing reaches the store.
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_workflow_task_scheduled_and_started();
+    let store = Arc::new(RecordingStore::default());
+    let failed = Arc::new(Notify::new());
+    let notify = failed.clone();
+    let mut mock_cfg = MockPollCfg::from_resp_batches("fakeid", history, [1], mock_worker_client());
+    mock_cfg.num_expected_fails = 1;
+    mock_cfg.num_expected_completions = Some(TimesRange::from(0));
+    mock_cfg.expect_fail_wft_matcher = Box::new(move |_, _, failure| {
+        let matches = failure
+            .as_ref()
+            .is_some_and(|f| f.message.contains("the workflow broke"));
+        if matches {
+            notify.notify_one();
+        }
+        matches
+    });
+    let mut mock = build_mock_pollers(mock_cfg);
+    let worker_store = store.clone();
+    mock.worker_cfg(|w| {
+        w.stream_store = Some(worker_store);
+        w.task_types = WorkerTaskTypes {
+            enable_local_activities: true,
+            ..WorkerTaskTypes::workflow_only()
+        };
+        w.max_cached_workflows = 1;
+    });
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            first.run_id.clone(),
+            vec![
+                output_commit_command(records(&["a"])),
+                schedule_local_activity(1),
+            ],
+        ))
+        .await
+        .unwrap();
+    let resolved = run_local_activity(&worker).await;
+    assert!(only_resolves_local_activity(&resolved, 1));
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::fail(
+            first.run_id,
+            Failure {
+                message: "the workflow broke".to_string(),
+                ..Default::default()
+            },
+            None,
+        ))
+        .await
+        .unwrap();
+    failed_within_deadline(&failed).await;
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+    assert!(store.staged().is_empty());
 }
 
 #[tokio::test]

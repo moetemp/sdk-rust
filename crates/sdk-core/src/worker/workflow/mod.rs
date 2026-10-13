@@ -7,7 +7,7 @@ mod history_update;
 mod machines;
 mod managed_run;
 mod run_cache;
-mod stream_output;
+pub(crate) mod stream_output;
 mod wft_extraction;
 pub(crate) mod wft_poller;
 mod workflow_stream;
@@ -148,6 +148,9 @@ pub(crate) struct Workflows {
     default_versioning_behavior: Option<VersioningBehavior>,
     namespace_capabilities: Arc<NamespaceCapabilities>,
     shutdown_token: CancellationToken,
+    /// Stages Workflow stream output, when the Worker has a stream store.
+    #[cfg(feature = "streams")]
+    output_stager: Option<stream_output::OutputStager>,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -197,6 +200,10 @@ impl Workflows {
         let default_versioning_behavior = basics.default_versioning_behavior;
         let namespace_capabilities = basics.namespace_capabilities.clone();
         let shutdown_token = basics.shutdown_token.clone();
+        #[cfg(feature = "streams")]
+        let output_stager = basics.worker_config.stream_store.clone().map(|store| {
+            stream_output::OutputStager::new(store, basics.worker_config.namespace.clone())
+        });
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
             basics.worker_config.fetching_concurrency,
@@ -294,6 +301,8 @@ impl Workflows {
             default_versioning_behavior,
             namespace_capabilities,
             shutdown_token,
+            #[cfg(feature = "streams")]
+            output_stager,
         }
     }
 
@@ -383,6 +392,7 @@ impl Workflows {
                         sdk_metadata,
                         mut versioning_behavior,
                         attempt,
+                        output,
                     },
                 metrics: run_metrics,
             } => {
@@ -433,6 +443,29 @@ impl Workflows {
 
                 let mut reset_last_started_to = None;
                 self.handle_wft_reporting_errs(run_id, || async {
+                    // Staged before the completion, so a task the server accepts always has its
+                    // output in the store, ready to promote.
+                    if let Err(failure) = self.stage_output(&output).await {
+                        let message = failure
+                            .failure
+                            .as_ref()
+                            .map(|f| f.message.clone())
+                            .unwrap_or_default();
+                        self.handle_activation_failed(
+                            run_id,
+                            completion_time,
+                            FailedActivationWFTReport::new(
+                                task_token,
+                                attempt,
+                                WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                                failure,
+                                WftFailureKind::Task,
+                                &run_metrics,
+                            ),
+                        )
+                        .await;
+                        return Err(tonic::Status::unavailable(message));
+                    }
                     match self
                         .client
                         .complete_workflow_task(completion, self.shutdown_token.clone())
@@ -517,6 +550,24 @@ impl Workflows {
                 }
             }
         }
+    }
+
+    /// Stages a completion's stream output in the Worker's store, in commit order.
+    async fn stage_output(&self, output: &[stream_output::OutputBatch]) -> Result<(), Failure> {
+        if output.is_empty() {
+            return Ok(());
+        }
+        #[cfg(feature = "streams")]
+        if let Some(stager) = &self.output_stager {
+            return stager.stage(output).await.map_err(|e| {
+                make_stream_output_failure(&format!(
+                    "Could not stage the Workflow Task's stream output ({e})"
+                ))
+            });
+        }
+        Err(make_stream_output_failure(
+            "This Worker has no stream store to stage the Workflow Task's stream output in",
+        ))
     }
 
     /// The single point through which every workflow task failure passes on its way to the
@@ -1179,6 +1230,8 @@ pub(crate) enum ActivationAction {
         sdk_metadata: WorkflowTaskCompletedMetadata,
         versioning_behavior: VersioningBehavior,
         attempt: u32,
+        /// Stream output to stage before the completion is sent, in commit order.
+        output: Vec<stream_output::OutputBatch>,
     },
     /// We should respond to a legacy query request
     RespondLegacyQuery { result: Box<QueryResult> },
@@ -1976,6 +2029,25 @@ fn make_request_too_large_failure() -> Failure {
             },
         ),
         force_cause: WorkflowTaskFailedCause::RequestTooLarge as i32,
+    }
+}
+
+fn make_stream_output_failure(message: &str) -> Failure {
+    Failure {
+        failure: Some(
+            temporalio_common::protos::temporal::api::failure::v1::Failure {
+                message: message.to_string(),
+                failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                    ApplicationFailureInfo {
+                        r#type: "StreamOutputNotStaged".to_string(),
+                        non_retryable: false,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
+        ),
+        force_cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure as i32,
     }
 }
 

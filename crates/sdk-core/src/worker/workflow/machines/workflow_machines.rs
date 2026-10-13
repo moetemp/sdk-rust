@@ -128,6 +128,9 @@ pub(crate) struct WorkflowMachines {
     pub(crate) workflow_type: String,
     /// Identifies the current run
     pub(crate) run_id: String,
+    /// The first run of the run chain this run belongs to, as the start event names it. Empty
+    /// until the start event is applied.
+    pub(crate) first_execution_run_id: String,
     /// Is set to true once we've seen the final event in workflow history, to avoid accidentally
     /// re-applying the final workflow task.
     pub(crate) have_seen_terminal_event: bool,
@@ -295,6 +298,7 @@ impl WorkflowMachines {
             last_history_from_server: basics.history,
             protocol_msgs: vec![],
             workflow_id: basics.workflow_id,
+            first_execution_run_id: String::new(),
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
             drive_me: driven_wf,
@@ -429,6 +433,11 @@ impl WorkflowMachines {
 
     pub(crate) fn get_last_wft_started_id(&self) -> i64 {
         self.current_started_event_id
+    }
+
+    #[cfg(feature = "streams")]
+    pub(crate) fn worker_config(&self) -> &WorkerConfig {
+        &self.worker_config
     }
 
     pub(crate) fn current_wft_history_floor_event_id(&self) -> Option<i64> {
@@ -1153,6 +1162,7 @@ impl WorkflowMachines {
                         // workflow time set.
                         self.set_current_time(as_systime);
                     }
+                    self.first_execution_run_id = attrs.first_execution_run_id.clone();
                     // Notify the lang sdk that it's time to kick off a workflow
                     self.drive_me.start(
                         self.workflow_id.clone(),
