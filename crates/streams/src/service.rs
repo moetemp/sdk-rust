@@ -231,7 +231,7 @@ fn capped(mut request: ReadRequest) -> ReadRequest {
 
 fn decode<T: Message + Default>(rpc: &str, request: &[u8]) -> Result<T, StreamFailure> {
     T::decode(request).map_err(|error| {
-        StreamError::refused(format!("the {rpc} request did not decode ({error})")).into()
+        StreamError::invalid_argument(format!("the {rpc} request did not decode ({error})")).into()
     })
 }
 
@@ -498,7 +498,7 @@ mod tests {
         assert_eq!(unknown.kind(), StreamFailureKind::Unsupported);
         assert!(unknown.message.contains("Truncate"));
         let garbled = service.call("Append", &[0xff, 0xff]).await.unwrap_err();
-        assert_eq!(garbled.kind(), StreamFailureKind::Refused);
+        assert_eq!(garbled.kind(), StreamFailureKind::InvalidArgument);
         assert!(garbled.message.contains("did not decode"));
     }
 
@@ -524,7 +524,7 @@ mod tests {
             .call("DeleteOwner", &no_id.encode_to_vec())
             .await
             .unwrap_err();
-        assert_eq!(failure.kind(), StreamFailureKind::Refused);
+        assert_eq!(failure.kind(), StreamFailureKind::InvalidArgument);
     }
 
     #[tokio::test]
@@ -1108,7 +1108,7 @@ mod tests {
             .unwrap();
         let step = NexusStep::decode(answer.as_slice()).unwrap();
         assert!(matches!(step.step, Some(nexus_step::Step::Failure(_))));
-        let refused = service.call("NexusRead", b"\xff").await.unwrap_err();
-        assert_eq!(refused.kind, StreamFailureKind::Refused as i32);
+        let invalid = service.call("NexusRead", b"\xff").await.unwrap_err();
+        assert_eq!(invalid.kind, StreamFailureKind::InvalidArgument as i32);
     }
 }
