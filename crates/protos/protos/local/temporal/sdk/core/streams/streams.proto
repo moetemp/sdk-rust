@@ -111,6 +111,7 @@ message ReadRequest {
   // How long to wait for a record when none is there. Zero answers at once. Core waits at most
   // 60 seconds, the stream service contract's long-poll maximum.
   google.protobuf.Duration wait = 3;
+  // How many stored records one answer holds at most. A synthesized supersession comes on top.
   // Zero lets Core choose. Core answers with at most 1,000 records.
   uint32 max_records = 4;
   // The `state` of the previous answer of the same read. Empty on its first call.

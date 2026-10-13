@@ -21,11 +21,15 @@ async-trait = "0.1"
 prost = { workspace = true }
 sha2 = "0.10"
 thiserror = { workspace = true }
+tracing = "0.1"
 
 [dependencies.temporalio-common]
 path = "../common"
 version = "~1.1.0"
 default-features = false
+
+[dev-dependencies]
+tokio = { version = "1.47", features = ["macros", "rt"] }
 
 [lints]
 workspace = true
