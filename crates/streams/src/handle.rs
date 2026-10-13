@@ -538,7 +538,7 @@ impl Streams {
             )));
         }
         if request.namespace.is_empty() || request.workflow_id.is_empty() {
-            return Err(StreamError::refused(
+            return Err(StreamError::invalid_argument(
                 "a delete needs the namespace and the owner's Workflow id",
             ));
         }
@@ -1799,9 +1799,9 @@ mod tests {
                 > 0
         );
         assert_eq!(setup.owners.describes(), before);
-        for (field, refused) in [
-            ("namespace", StreamFailureKind::Refused),
-            ("workflow_id", StreamFailureKind::Refused),
+        for (field, expected) in [
+            ("namespace", StreamFailureKind::InvalidArgument),
+            ("workflow_id", StreamFailureKind::InvalidArgument),
             ("owner_kind", StreamFailureKind::Unsupported),
         ] {
             let mut bad = request.clone();
@@ -1812,7 +1812,7 @@ mod tests {
             }
             assert_eq!(
                 kind(setup.streams.delete_owner(bad).await),
-                refused,
+                expected,
                 "{field}"
             );
         }
