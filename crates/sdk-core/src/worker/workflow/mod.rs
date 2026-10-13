@@ -150,7 +150,7 @@ pub(crate) struct Workflows {
     shutdown_token: CancellationToken,
     /// Appends Workflow stream output and closes its topics, when the Worker has a stream store.
     #[cfg(feature = "streams")]
-    output_store: Option<stream_output::OutputStore>,
+    output_store: Option<Arc<stream_output::OutputStore>>,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -202,11 +202,11 @@ impl Workflows {
         let shutdown_token = basics.shutdown_token.clone();
         #[cfg(feature = "streams")]
         let output_store = basics.worker_config.stream_store.clone().map(|store| {
-            stream_output::OutputStore::new(
+            Arc::new(stream_output::OutputStore::new(
                 store,
                 basics.worker_config.namespace.clone(),
                 basics.shutdown_token.clone(),
-            )
+            ))
         });
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
@@ -518,7 +518,16 @@ impl Workflows {
                 .await;
                 #[cfg(feature = "streams")]
                 if let (Some(store), Some(output)) = (&self.output_store, stream_output) {
+                    let chain = output.chain.clone();
+                    let ends_chain = output.ends_chain;
                     store.settle_closes(run_id, *output, output_outcome);
+                    if ends_chain && output_outcome == stream_output::CompletionOutcome::Accepted {
+                        store.close_after_final_task(
+                            self.client.clone(),
+                            chain,
+                            run_id.to_string(),
+                        );
+                    }
                 }
                 #[cfg(not(feature = "streams"))]
                 let _ = (stream_output, output_outcome);

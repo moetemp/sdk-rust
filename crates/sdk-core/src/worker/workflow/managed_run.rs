@@ -48,7 +48,7 @@ use temporalio_common::protos::{
         workflow_completion,
     },
     temporal::api::{
-        enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
+        enums::v1::{CommandType, VersioningBehavior, WorkflowTaskFailedCause},
         failure::v1::Failure,
     },
 };
@@ -1343,6 +1343,7 @@ impl ManagedRun {
             workflow_id: self.wfm.machines.workflow_id.clone(),
             first_run_id: self.wfm.machines.first_execution_run_id.clone(),
         };
+        let has_stream_store = self.stream_store_name().is_some();
         let outstanding_las = self.wfm.machines.outstanding_local_activity_count() > 0;
         let can_report_eviction =
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
@@ -1390,6 +1391,17 @@ impl ManagedRun {
             };
 
             let attempt = self.wft.as_ref().map(|t| t.info.attempt).unwrap_or(1);
+            // Continue-as-new keeps the chain going, so only these end it. Any run of the chain,
+            // or its Activities, may have published, so every chain end closes.
+            let ends_chain = has_stream_store
+                && commands.iter().any(|c| {
+                    matches!(
+                        c.command_type(),
+                        CommandType::CompleteWorkflowExecution
+                            | CommandType::FailWorkflowExecution
+                            | CommandType::CancelWorkflowExecution
+                    )
+                });
             ActivationCompleteOutcome::ReportWFTSuccess(ServerCommandsWithWorkflowInfo {
                 task_token: data.task_token,
                 action: ActivationAction::WftComplete {
@@ -1404,6 +1416,7 @@ impl ManagedRun {
                         chain,
                         &mut self.pending_closes,
                         &mut self.proven_closes,
+                        ends_chain,
                     ),
                 },
                 metrics: self.metrics.clone(),

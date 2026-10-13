@@ -117,6 +117,8 @@ pub(crate) struct ReportedOutput {
     /// The closes of commits replay found in History, in commit order. Only those whose
     /// completion this Worker sent without learning the answer still need closing.
     pub(crate) proven: Vec<OutputClose>,
+    /// Whether the completion ends the chain, so its streams close once it is accepted.
+    pub(crate) ends_chain: bool,
 }
 
 impl ReportedOutput {
@@ -126,14 +128,16 @@ impl ReportedOutput {
         chain: RunChain,
         closes: &mut Vec<OutputClose>,
         proven: &mut Vec<OutputClose>,
+        ends_chain: bool,
     ) -> Option<Box<Self>> {
-        if closes.is_empty() && proven.is_empty() {
+        if closes.is_empty() && proven.is_empty() && !ends_chain {
             return None;
         }
         Some(Box::new(Self {
             chain,
             closes: std::mem::take(closes),
             proven: std::mem::take(proven),
+            ends_chain,
         }))
     }
 }
@@ -308,6 +312,94 @@ impl OutputStore {
             !tasks.is_empty()
         });
         runs.entry(run_id.to_string()).or_default().push(task);
+    }
+
+    /// Closes `chain`'s streams in the background, retrying with backoff until it succeeds or the
+    /// Worker stops.
+    ///
+    /// The chain's latest run decides. A retried or cron run ends with a successor in the same
+    /// chain, which keeps the streams open, so the successor's own final task closes them.
+    ///
+    /// It waits first for `run_id`'s topic closes that have not finished. A notifier keeps the
+    /// first close it hears, so the chain's close must not beat the result a topic closes with. A
+    /// topic close that was given up on still lets the chain close. Every append of the final task
+    /// landed before its completion was sent, so before this close.
+    pub(crate) fn close_after_final_task(
+        self: &std::sync::Arc<Self>,
+        client: std::sync::Arc<dyn crate::worker::client::WorkerClient>,
+        chain: RunChain,
+        run_id: String,
+    ) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            this.run_closes_done(&run_id).await;
+            if this.shutdown.is_cancelled() {
+                return;
+            }
+            let mut delay = RETRY_FIRST;
+            loop {
+                match this.close_if_ended(client.as_ref(), &chain).await {
+                    Ok(()) => return,
+                    Err(error) if refused_for_good(&error) => {
+                        warn!(
+                            workflow_id = %chain.workflow_id,
+                            %error,
+                            "The store can't close a finished run chain's streams"
+                        );
+                        return;
+                    }
+                    Err(error) => warn!(
+                        workflow_id = %chain.workflow_id,
+                        %error,
+                        "Could not close a finished run chain's streams; trying again in {delay:?}"
+                    ),
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = this.shutdown.cancelled() => return,
+                }
+                delay = (delay * 2).min(RETRY_CAP);
+            }
+        });
+    }
+
+    /// Waits for `run_id`'s topic closes, those that start meanwhile too.
+    async fn run_closes_done(&self, run_id: &str) {
+        loop {
+            let Some(tasks) = self.runs.lock().remove(run_id) else {
+                return;
+            };
+            for task in tasks {
+                let _ = task.await;
+            }
+        }
+    }
+
+    async fn close_if_ended(
+        &self,
+        client: &dyn crate::worker::client::WorkerClient,
+        chain: &RunChain,
+    ) -> std::result::Result<(), temporalio_streams::StreamError> {
+        use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
+        let latest = match client
+            .describe_workflow_execution(chain.workflow_id.clone())
+            .await
+        {
+            Ok(description) => description.workflow_execution_info,
+            // Retention removed the Workflow, so its chain has ended.
+            Err(status) if status.code() == tonic::Code::NotFound => None,
+            Err(status) => return Err(temporalio_streams::StreamError::storage(status.message())),
+        };
+        if let Some(latest) = latest
+            && latest.first_run_id == chain.first_run_id
+            && matches!(
+                latest.status(),
+                WorkflowExecutionStatus::Running | WorkflowExecutionStatus::ContinuedAsNew
+            )
+        {
+            return Ok(());
+        }
+        self.store.close_chain(&self.chain(chain)).await
     }
 
     fn chain(&self, chain: &RunChain) -> temporalio_streams::proto::ChainId {
@@ -856,6 +948,7 @@ mod tests {
                 chain: chain(),
                 closes: closes.iter().map(|t| close(t)).collect(),
                 proven: proven.iter().map(|t| close(t)).collect(),
+                ends_chain: false,
             }
         }
 
