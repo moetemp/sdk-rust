@@ -18,8 +18,8 @@ use std::convert::TryFrom;
 use temporalio_common::protos::{
     constants::EXTERNAL_STREAM_MARKER_NAME,
     coresdk::external_data::{
-        ExternalOutputStreamManifest, ExternalStreamMarkerData,
-        build_external_stream_marker_details, extract_external_stream_marker_data,
+        ExternalStreamMarkerData, build_external_stream_marker_details,
+        extract_external_stream_marker_data,
     },
     temporal::api::{
         command::v1::{Command as ProtoCommand, RecordMarkerCommandAttributes, command},
@@ -152,13 +152,12 @@ impl ResolvedFromMarkerLookAheadWaitingMarkerEvent {
 ///
 /// Markers carry no sequence number and are paired with machines in History order, so comparing
 /// the manifest is what turns a reordered or foreign marker into a nondeterminism error rather
-/// than a silently different published batch. The stage token is left out. Core mints it fresh
-/// for each attempt, so it says nothing about what the Workflow published.
+/// than a silently different published batch.
 fn verify_marker_matches(
     state: &mut SharedState,
     data: &ExternalStreamMarkerData,
 ) -> ExternalStreamMachineTransition<MarkerCommandRecorded> {
-    if without_stage_token(&data.output) != without_stage_token(&state.data.output) {
+    if data.output != state.data.output {
         return TransitionResult::Err(WFMachinesError::Nondeterminism(
             "External stream marker in history carries a different external output manifest than \
              the machine expecting it"
@@ -166,15 +165,6 @@ fn verify_marker_matches(
         ));
     }
     TransitionResult::default()
-}
-
-fn without_stage_token(
-    output: &Option<ExternalOutputStreamManifest>,
-) -> Option<ExternalOutputStreamManifest> {
-    output.clone().map(|mut manifest| {
-        manifest.stage_token.clear();
-        manifest
-    })
 }
 
 impl ExternalStreamMachine {
@@ -324,14 +314,14 @@ impl WFMachinesAdapter for ExternalStreamMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temporalio_common::protos::coresdk::external_data::ExternalOutputStreamManifest;
 
-    fn marker(stage_token: &str, history_floor_event_id: i64) -> ExternalStreamMarkerData {
+    fn marker(history_floor_event_id: i64) -> ExternalStreamMarkerData {
         ExternalStreamMarkerData {
             schema_version: 1,
             output: Some(ExternalOutputStreamManifest {
                 schema_version: 1,
                 fingerprint_version: 2,
-                stage_token: stage_token.to_string(),
                 history_floor_event_id,
                 run_id: "run-id".to_string(),
                 provider_id: "provider".to_string(),
@@ -344,11 +334,11 @@ mod tests {
 
     #[test]
     fn a_different_output_manifest_is_nondeterministic() {
-        let expected = marker("token", 1);
+        let expected = marker(1);
         let mut state = SharedState {
             data: expected.clone(),
         };
-        let actual = marker("token", 2);
+        let actual = marker(2);
 
         assert!(matches!(
             verify_marker_matches(&mut state, &actual),
@@ -358,16 +348,12 @@ mod tests {
     }
 
     #[test]
-    fn the_same_output_manifest_matches_whatever_its_stage_token() {
-        let mut state = SharedState {
-            data: marker("token", 1),
-        };
+    fn the_same_output_manifest_matches() {
+        let mut state = SharedState { data: marker(1) };
 
-        for recorded in [marker("token", 1), marker("other attempt's token", 1)] {
-            assert!(matches!(
-                verify_marker_matches(&mut state, &recorded),
-                TransitionResult::Ok { .. }
-            ));
-        }
+        assert!(matches!(
+            verify_marker_matches(&mut state, &marker(1)),
+            TransitionResult::Ok { .. }
+        ));
     }
 }

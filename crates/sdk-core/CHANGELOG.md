@@ -43,6 +43,9 @@ relevant information.
   store name aside), or the task fails as nondeterministic. A workflow that wrote this marker
   can only move forward. A Worker on an older Core, or one whose lang doesn't commit the records
   again on replay, fails that workflow's next task, so don't roll such a fleet back.
+  of the completion's other commands, so replay can check the output. A workflow that wrote this marker can only move forward. A Worker on an older
+  Core, or one whose lang doesn't commit the records again on replay, fails that workflow's next
+  task, so don't roll such a fleet back.
 * Experimental: behind the new `streams` feature, `streams::connect_stream_service` builds one
   stream store from a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in
   process: append, read, latest, close and owner delete, as serialized `coresdk.streams`
