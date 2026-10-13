@@ -300,7 +300,7 @@ pub struct WorkerConfig {
     #[builder(default = false)]
     pub disable_payload_error_limit: bool,
 
-    /// The store a Workflow's stream output is staged in and promoted to. A Workflow that commits
+    /// The store a Workflow's stream output is appended to. A Workflow that commits
     /// stream output on a Worker without one fails its Workflow Task. Replay needs no store.
     /// NOTE: Experimental
     #[cfg(feature = "streams")]

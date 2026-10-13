@@ -3,7 +3,7 @@
 
 use super::external_streams::{
     RecordedMarkers, manifest_for, output_commit_command, output_marker, records, replayed,
-    without_tokens, worker_recording,
+    worker_recording,
 };
 use crate::{
     replay::TestHistoryBuilder,
@@ -834,10 +834,8 @@ async fn a_progress_task_that_commits_output_replays_in_the_activations_it_ran_l
         run_progress_task_that_commits_output(vec![5.into()], true).await;
 
     assert_eq!(live, replayed);
-    let mut manifest = manifest;
-    manifest.stage_token.clear();
     assert_eq!(
-        without_tokens(&live_markers.lock()),
+        live_markers.lock().clone(),
         vec![
             vec![],
             vec![],
