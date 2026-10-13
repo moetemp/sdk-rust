@@ -18,7 +18,7 @@ pub const METADATA_ENCODING: &[u8] = b"binary/plain";
 pub const MAX_TOPIC_BYTES: usize = 256;
 
 /// Refuses a topic no store keys reliably, with the reason. A control character could be a
-/// separator a store uses, such as the one between a stage's topics.
+/// separator a store uses.
 pub fn check_topic(topic: &str) -> Result<(), String> {
     if topic.is_empty() {
         return Err("a stream needs a topic".to_string());
