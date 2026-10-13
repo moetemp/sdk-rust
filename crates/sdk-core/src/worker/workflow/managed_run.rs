@@ -7,8 +7,8 @@ use crate::{
         LEGACY_QUERY_ID, LocalActRequest, WorkflowErrorType,
         workflow::{
             ActivationAction, ActivationCompleteOutcome, ActivationCompleteResult,
-            ActivationOrAuto, BufferedTasks, DrivenWorkflow, EvictionRequestResult,
-            FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
+            ActivationOrAuto, ActivationOutput, BufferedTasks, DrivenWorkflow,
+            EvictionRequestResult, FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
             LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
             OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
             ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
@@ -17,15 +17,16 @@ use crate::{
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
             stream_output::{
-                ChainToClose, MARKER_SCHEMA_VERSION, OutputBatch, ProvenStage, ReportedOutput,
+                MARKER_SCHEMA_VERSION, OutputBatch, ReportedOutput, RunChain,
                 build_output_manifest, check_output_closes, check_replayed_output_manifest,
+                count_replayed_output, output_by_topic,
             },
         },
     },
 };
 use futures_util::future::AbortHandle;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     mem,
     ops::{Add, Sub},
     rc::Rc,
@@ -41,7 +42,9 @@ use temporalio_common::protos::{
             RemoveFromCache, WorkflowActivation, query_to_job, remove_from_cache::EvictionReason,
             workflow_activation_job,
         },
-        workflow_commands::{FailWorkflowExecution, QueryResult, WorkflowOutputStreamCommit},
+        workflow_commands::{
+            FailWorkflowExecution, OutputClose, QueryResult, WorkflowOutputStreamCommit,
+        },
         workflow_completion,
     },
     temporal::api::{
@@ -51,7 +54,6 @@ use temporalio_common::protos::{
 };
 use tokio::sync::oneshot;
 use tracing::Span;
-use uuid::Uuid;
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 pub(super) type RunUpdateAct = Option<ActivationOrAuto>;
@@ -102,11 +104,14 @@ pub(super) struct ManagedRun {
     /// duplicating field values. Remove this once https://github.com/tokio-rs/tracing/issues/2334
     /// is fixed.
     recorded_span_ids: HashSet<tracing::Id>,
-    /// Stream output this run committed and has not reported with a completion yet, in commit
-    /// order.
-    pending_output: Vec<OutputBatch>,
-    /// Stages that replay found committed in History and has not reported yet, in commit order.
-    proven_output: Vec<ProvenStage>,
+    /// How many stream records this run committed to each topic, live or in replay, which is
+    /// where its next commit's sequences start.
+    committed_by_topic: HashMap<String, i64>,
+    /// The topics this run's Workflow Task closed and has not reported with a completion yet, in
+    /// commit order.
+    pending_closes: Vec<OutputClose>,
+    /// The closes of commits replay found in History and has not reported yet, in commit order.
+    proven_closes: Vec<OutputClose>,
     metrics: MetricsContext,
     /// We store the paginator used for our own run's history fetching
     paginator: Option<HistoryPaginator>,
@@ -132,8 +137,9 @@ impl ManagedRun {
             task_buffer: Default::default(),
             trying_to_evict: None,
             recorded_span_ids: Default::default(),
-            pending_output: vec![],
-            proven_output: vec![],
+            committed_by_topic: Default::default(),
+            pending_closes: vec![],
+            proven_closes: vec![],
             metrics,
             paginator: None,
             completion_waiting_on_page_fetch: None,
@@ -788,12 +794,22 @@ impl ManagedRun {
         }
 
         let mut lang_commands = completion.commands;
-        if let Err(source) = self.commit_external_output(&mut lang_commands) {
-            return Err(RunUpdateErr {
-                source,
-                complete_resp_chan: completion.resp_chan,
-            });
-        }
+        let output = match self.commit_external_output(&mut lang_commands) {
+            Ok(output) => output.map(|batch| {
+                Box::new(ActivationOutput {
+                    batch,
+                    task_token: data.task_token.clone(),
+                    attempt: self.wft.as_ref().map(|t| t.info.attempt).unwrap_or(1),
+                    metrics: self.metrics.clone(),
+                })
+            }),
+            Err(source) => {
+                return Err(RunUpdateErr {
+                    source,
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+        };
 
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
@@ -828,7 +844,7 @@ impl ManagedRun {
             }
         })();
 
-        match outcome {
+        let completed = match outcome {
             Ok(None) => {
                 if let Some(waiting) = self.waiting_on_la.take() {
                     waiting.hb_timeout_handle.abort();
@@ -881,6 +897,7 @@ impl ManagedRun {
                         result: ActivationCompleteResult {
                             outcome: ActivationCompleteOutcome::DoNothing,
                             replaying: self.wfm.machines.replaying,
+                            output: None,
                         },
                         resp_chan: completion.resp_chan,
                     }))
@@ -890,16 +907,27 @@ impl ManagedRun {
                 source: e,
                 complete_resp_chan: completion.resp_chan,
             }),
-        }
+        };
+        // Only a completion the run took has output to append.
+        completed.map(|done| {
+            done.map(|mut done| {
+                done.result.output = output;
+                done
+            })
+        })
     }
 
     /// Records the stream output lang committed, if any, as a marker ahead of its other commands.
     ///
-    /// The marker is what makes the output visible. It's promoted only once the marker is in
-    /// History, so a Workflow Task that fails or times out publishes nothing.
-    fn commit_external_output(&mut self, commands: &mut Vec<WFCommand>) -> Result<()> {
+    /// The marker is what replay checks the Workflow's output against.
+    ///
+    /// Returns the records to append, when the commit is live.
+    fn commit_external_output(
+        &mut self,
+        commands: &mut Vec<WFCommand>,
+    ) -> Result<Option<OutputBatch>> {
         let Some(commit) = take_output_stream_commit(commands)? else {
-            return Ok(());
+            return Ok(None);
         };
         check_output_closes(&commit.records, &commit.closes)?;
         if self.wfm.machines.replaying {
@@ -907,22 +935,13 @@ impl ManagedRun {
                 &commit.records,
                 self.wfm.machines.current_wft_history_floor_event_id(),
                 &self.wfm.machines.run_id,
-                String::new(),
                 true,
             )?;
+            count_replayed_output(&replayed, &mut self.committed_by_topic);
             let recorded = self.wfm.machines.take_replayed_output_manifest();
-            let proven = recorded.as_ref().map(|recorded| ProvenStage {
-                token: recorded.stage_token.clone(),
-                workflow_id: self.wfm.machines.workflow_id.clone(),
-                first_run_id: self.wfm.machines.first_execution_run_id.clone(),
-                topics: recorded.topics.iter().map(|t| t.topic.clone()).collect(),
-                closes: commit.closes.clone(),
-            });
             check_replayed_output_manifest(replayed, recorded)?;
-            // History proves the commit, but the Worker that staged it may have stopped before
-            // promoting it.
-            self.proven_output.extend(proven);
-            return Ok(());
+            self.proven_closes.extend(commit.closes);
+            return Ok(None);
         }
         let Some(store_name) = self.stream_store_name() else {
             return Err(WFMachinesError::Fatal(
@@ -934,7 +953,6 @@ impl ManagedRun {
             &commit.records,
             self.wfm.machines.current_wft_history_floor_event_id(),
             &self.wfm.machines.run_id,
-            Uuid::new_v4().simple().to_string(),
             false,
         )?;
         manifest.provider_id = store_name;
@@ -946,13 +964,11 @@ impl ManagedRun {
             ));
         }
         let batch = OutputBatch {
-            token: manifest.stage_token.clone(),
-            history_floor_event_id: manifest.history_floor_event_id,
             workflow_id: self.wfm.machines.workflow_id.clone(),
             run_id: self.wfm.machines.run_id.clone(),
             first_run_id: self.wfm.machines.first_execution_run_id.clone(),
-            records: commit.records,
-            closes: commit.closes,
+            attempt: self.wfm.machines.stream_producer_attempt(),
+            topics: output_by_topic(commit.records, &manifest, &mut self.committed_by_topic),
         };
         // It covers this activation's commands only. With a Local Activity, an earlier activation
         // of the same task may have produced commands, and nothing reads the field yet.
@@ -975,8 +991,8 @@ impl ManagedRun {
                 terminal_boundary: terminal_boundary as i32,
                 output: Some(manifest),
             })?;
-        self.pending_output.push(batch);
-        Ok(())
+        self.pending_closes.extend(commit.closes);
+        Ok(Some(batch))
     }
 
     /// The name of the Worker's stream store, or `None` when it has none.
@@ -1323,7 +1339,7 @@ impl ManagedRun {
         data: CompletionDataForWFT,
         due_to_heartbeat_timeout: bool,
     ) -> FulfillableActivationComplete {
-        let chain = ChainToClose {
+        let chain = RunChain {
             workflow_id: self.wfm.machines.workflow_id.clone(),
             first_run_id: self.wfm.machines.first_execution_run_id.clone(),
         };
@@ -1375,18 +1391,17 @@ impl ManagedRun {
             };
 
             let attempt = self.wft.as_ref().map(|t| t.info.attempt).unwrap_or(1);
-            // Continue-as-new keeps the chain going, so only these end it.
-            let ends_chain = commands.iter().any(|c| {
-                matches!(
-                    c.command_type(),
-                    CommandType::CompleteWorkflowExecution
-                        | CommandType::FailWorkflowExecution
-                        | CommandType::CancelWorkflowExecution
-                )
-            });
-            // Any run of the chain, or its Activities, may have published, so every chain end
-            // closes.
-            let close = (ends_chain && has_stream_store).then_some(chain);
+            // Continue-as-new keeps the chain going, so only these end it. Any run of the chain,
+            // or its Activities, may have published, so every chain end closes.
+            let ends_chain = has_stream_store
+                && commands.iter().any(|c| {
+                    matches!(
+                        c.command_type(),
+                        CommandType::CompleteWorkflowExecution
+                            | CommandType::FailWorkflowExecution
+                            | CommandType::CancelWorkflowExecution
+                    )
+                });
             ActivationCompleteOutcome::ReportWFTSuccess(ServerCommandsWithWorkflowInfo {
                 task_token: data.task_token,
                 action: ActivationAction::WftComplete {
@@ -1398,9 +1413,10 @@ impl ManagedRun {
                     versioning_behavior: data.versioning_behavior,
                     attempt,
                     stream_output: ReportedOutput::take(
-                        &mut self.pending_output,
-                        &mut self.proven_output,
-                        close,
+                        chain,
+                        &mut self.pending_closes,
+                        &mut self.proven_closes,
+                        ends_chain,
                     ),
                 },
                 metrics: self.metrics.clone(),
@@ -1413,7 +1429,11 @@ impl ManagedRun {
             self.wfm.wft_completion_reported();
         }
         FulfillableActivationComplete {
-            result: ActivationCompleteResult { outcome, replaying },
+            result: ActivationCompleteResult {
+                outcome,
+                replaying,
+                output: None,
+            },
             resp_chan,
         }
     }
@@ -1447,6 +1467,7 @@ impl ManagedRun {
                 .send(ActivationCompleteResult {
                     outcome,
                     replaying: self.wfm.machines.replaying,
+                    output: None,
                 })
                 .is_err()
         {
@@ -2994,7 +3015,6 @@ mod tests {
             ExternalOutputStreamManifest {
                 schema_version: 1,
                 fingerprint_version: 1,
-                stage_token: format!("{topic}-token"),
                 history_floor_event_id: 1,
                 run_id: "run".to_owned(),
                 topics: vec![ExternalOutputTopicManifest {

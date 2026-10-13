@@ -185,7 +185,7 @@ mod tests {
         },
     };
     use temporalio_common::protos::temporal::api::{
-        common::v1::Payload, enums::v1::WorkflowExecutionStatus, history::v1::HistoryEvent,
+        common::v1::Payload, enums::v1::WorkflowExecutionStatus,
     };
 
     /// Every Workflow's latest run is `run-1`, the first of its chain, and still running.
@@ -203,18 +203,7 @@ mod tests {
                 run_id: "run-1".to_string(),
                 first_run_id: "run-1".to_string(),
                 status: WorkflowExecutionStatus::Running,
-                start_time: None,
             })
-        }
-
-        async fn history_after(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: i64,
-        ) -> Result<Vec<HistoryEvent>, OwnerError> {
-            Ok(vec![])
         }
     }
 
