@@ -50,6 +50,15 @@ relevant information.
 * Experimental: behind `streams`, `streams::connect_stream_service` builds one stream store from
   a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in process: append, read,
   latest, close and owner delete, as serialized `coresdk.streams` requests.
+  of the completion's other commands. While replaying, lang commits the same records again
+  without bodies, and Core checks the manifest it builds from them against the recorded one (the
+  run id and store name aside), or the task fails as nondeterministic. A workflow that wrote this
+  marker can only move forward. A Worker on an older Core, or one whose lang doesn't commit the
+  records again on replay, fails that workflow's next task, so don't roll such a fleet back.
+* Experimental: behind the new `streams` feature, `streams::connect_stream_service` builds one
+  stream store from a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in
+  process: append, read, latest, close and owner delete, as serialized `coresdk.streams`
+  requests.
 * Experimental: the C bridge has `temporal_core_stream_store_new`, `_call` and `_free` for the
   stream service, built with the Redis store.
 

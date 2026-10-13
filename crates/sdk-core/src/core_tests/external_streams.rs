@@ -194,7 +194,6 @@ fn manifest_for(
     ExternalOutputStreamManifest {
         schema_version: 1,
         fingerprint_version: 2,
-        stage_token: "recorded-stage-token".to_string(),
         history_floor_event_id,
         run_id: run_id.to_string(),
         topics: vec![ExternalOutputTopicManifest {
@@ -233,33 +232,6 @@ fn output_marker(
         terminal_boundary: terminal as i32,
         output: Some(manifest),
     }
-}
-
-/// The written markers with their stage tokens checked and cleared, since Core mints them.
-fn without_tokens(written: &[Vec<ExternalStreamMarkerData>]) -> Vec<Vec<ExternalStreamMarkerData>> {
-    written
-        .iter()
-        .map(|markers| {
-            markers
-                .iter()
-                .cloned()
-                .map(|mut marker| {
-                    let output = marker.output.as_mut().expect("an output marker");
-                    assert_eq!(output.stage_token.len(), 32, "{}", output.stage_token);
-                    assert!(output.stage_token.chars().all(|c| c.is_ascii_hexdigit()));
-                    output.stage_token.clear();
-                    marker
-                })
-                .collect()
-        })
-        .collect()
-}
-
-fn without_token(mut marker: ExternalStreamMarkerData) -> ExternalStreamMarkerData {
-    if let Some(output) = marker.output.as_mut() {
-        output.stage_token.clear();
-    }
-    marker
 }
 
 /// Start, a task that commits `values` and starts a timer, the timer firing, and the next task.
@@ -377,7 +349,7 @@ async fn the_marker_names_the_exact_history_floor_before_its_scheduled_event() {
         .unwrap();
     worker.drain_pollers_and_shutdown().await;
 
-    let written = without_tokens(&markers.lock());
+    let written = markers.lock().clone();
     assert_eq!(
         floor, 6,
         "TimerFired precedes the second WorkflowTaskScheduled"
@@ -386,10 +358,10 @@ async fn the_marker_names_the_exact_history_floor_before_its_scheduled_event() {
         written,
         vec![
             vec![],
-            vec![without_token(output_marker(
+            vec![output_marker(
                 ExternalStreamBoundary::WorkflowCompleted,
                 manifest
-            ))]
+            )]
         ]
     );
 }
@@ -463,77 +435,15 @@ async fn a_commit_on_an_accepted_task_writes_one_marker() {
     worker.drain_pollers_and_shutdown().await;
 
     assert_eq!(
-        without_tokens(&markers.lock()),
+        markers.lock().clone(),
         vec![
-            vec![without_token(output_marker(
+            vec![output_marker(
                 ExternalStreamBoundary::CommandsProduced,
                 manifest
-            ))],
+            )],
             vec![]
         ]
     );
-}
-
-#[tokio::test]
-async fn each_commit_gets_a_stage_token_of_its_own() {
-    let mut history = TestHistoryBuilder::default();
-    history.add_by_type(EventType::WorkflowExecutionStarted);
-    let run_id = history.get_orig_run_id().to_string();
-    history.add_full_wf_task();
-    history.add_external_stream_marker_data(output_marker(
-        ExternalStreamBoundary::CommandsProduced,
-        manifest_for(&records(&["a"]), &run_id, 1),
-    ));
-    let timer_started = history.add_by_type(EventType::TimerStarted);
-    history.add_timer_fired(timer_started, "1".to_string());
-    let floor = history.current_event_id();
-    history.add_full_wf_task();
-    history.add_external_stream_marker_data(output_marker(
-        ExternalStreamBoundary::WorkflowCompleted,
-        manifest_for(&records(&["a"]), &run_id, floor),
-    ));
-    history.add_workflow_execution_completed();
-
-    let markers: RecordedMarkers = Default::default();
-    let worker = worker_recording(
-        history,
-        vec![1.into(), 2.into()],
-        markers.clone(),
-        Default::default(),
-    );
-    let first = worker.poll_workflow_activation().await.unwrap();
-    worker
-        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-            first.run_id.clone(),
-            vec![
-                output_commit_command(records(&["a"])),
-                start_timer_cmd(1, Duration::from_secs(10)),
-            ],
-        ))
-        .await
-        .unwrap();
-    let fired = worker.poll_workflow_activation().await.unwrap();
-    worker
-        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
-            fired.run_id,
-            vec![
-                output_commit_command(records(&["a"])),
-                CompleteWorkflowExecution::default().into(),
-            ],
-        ))
-        .await
-        .unwrap();
-    worker.drain_pollers_and_shutdown().await;
-
-    let written = markers.lock();
-    let tokens: Vec<_> = written
-        .iter()
-        .flatten()
-        .map(|m| m.output.as_ref().unwrap().stage_token.clone())
-        .collect();
-    assert_eq!(tokens.len(), 2);
-    assert_ne!(tokens[0], tokens[1]);
-    assert!(tokens.iter().all(|t| t.len() == 32));
 }
 
 #[tokio::test]
@@ -567,11 +477,11 @@ async fn a_commit_with_nothing_else_completes_the_task_with_its_marker() {
     worker.drain_pollers_and_shutdown().await;
 
     assert_eq!(
-        without_tokens(&markers.lock()),
-        vec![vec![without_token(output_marker(
+        markers.lock().clone(),
+        vec![vec![output_marker(
             ExternalStreamBoundary::TaskCompleted,
             manifest
-        ))]]
+        )]]
     );
     assert_eq!(*command_types.lock(), vec![vec![CommandType::RecordMarker]]);
 }
@@ -611,11 +521,11 @@ async fn a_terminal_command_writes_the_output_marker_ordered_before_it() {
     worker.drain_pollers_and_shutdown().await;
 
     assert_eq!(
-        without_tokens(&markers.lock()),
-        vec![vec![without_token(output_marker(
+        markers.lock().clone(),
+        vec![vec![output_marker(
             ExternalStreamBoundary::WorkflowCompleted,
             manifest
-        ))]]
+        )]]
     );
     assert_eq!(
         *command_types.lock(),
@@ -747,12 +657,12 @@ async fn the_output_marker_survives_a_cache_eviction() {
     worker.drain_pollers_and_shutdown().await;
 
     assert_eq!(
-        without_tokens(&markers.lock()),
+        markers.lock().clone(),
         vec![
-            vec![without_token(output_marker(
+            vec![output_marker(
                 ExternalStreamBoundary::CommandsProduced,
                 manifest
-            ))],
+            )],
             vec![],
         ],
         "only the live task writes the marker; the replayed one does not"
@@ -1207,14 +1117,14 @@ async fn commits_around_a_local_activity_write_one_marker_each_in_order() {
     );
     // Both activations belong to the same Workflow Task, so both commits name its floor.
     assert_eq!(
-        without_tokens(&[stream_markers_in(first_task)]),
+        vec![stream_markers_in(first_task)],
         vec![
             [first_commit, second_commit]
                 .iter()
-                .map(|records| without_token(output_marker(
+                .map(|records| output_marker(
                     ExternalStreamBoundary::CommandsProduced,
                     manifest_for(records, &run_id, 1)
-                )))
+                ))
                 .collect::<Vec<_>>()
         ]
     );
@@ -1371,16 +1281,16 @@ async fn commits_around_a_local_activity_replay_then_go_live_in_the_next_task() 
     let completions = completions.lock();
     assert_eq!(completions.len(), 1, "only the live task completes");
     assert_eq!(
-        without_tokens(&[stream_markers_in(&completions[0])]),
+        vec![stream_markers_in(&completions[0])],
         vec![vec![
-            without_token(output_marker(
+            output_marker(
                 ExternalStreamBoundary::CommandsProduced,
                 manifest_for(&first_commit, &run_id, live_floor)
-            )),
-            without_token(output_marker(
+            ),
+            output_marker(
                 ExternalStreamBoundary::WorkflowCompleted,
                 manifest_for(&second_commit, &run_id, live_floor)
-            )),
+            ),
         ]]
     );
     assert_eq!(

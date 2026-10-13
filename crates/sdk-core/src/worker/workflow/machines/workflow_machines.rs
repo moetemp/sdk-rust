@@ -110,7 +110,7 @@ pub(crate) struct WorkflowMachines {
     current_started_event_id: i64,
     /// The event before the current WorkflowTaskScheduled event, which is always its id minus
     /// one, since History is applied in order. `None` only before the first task is scheduled
-    /// and after a speculative task is dropped, and output staging must fail then.
+    /// and after a speculative task is dropped, and a live output commit must fail then.
     current_wft_history_floor_event_id: Option<i64>,
     /// The event id of the next workflow task started event that the machines need to process.
     /// Eventually, this number should reach the started id in the latest history update, but
