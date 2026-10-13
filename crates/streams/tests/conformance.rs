@@ -243,13 +243,17 @@ mod on_redis {
             .collect()
     }
 
-    pub(crate) async fn redis_as_documented_user(variable: &str, cluster: bool) -> Option<Redis> {
+    pub(crate) async fn redis_as_documented_user(
+        variable: &str,
+        cluster: bool,
+        extra: &[&str],
+    ) -> Option<Redis> {
         let Ok(url) = std::env::var(variable) else {
             eprintln!("set {variable} to run the Redis store cases");
             return None;
         };
         let prefix = unique("conformance-acl");
-        let user = DocumentedUser::create(&url, &prefix, "default", &[]).await;
+        let user = DocumentedUser::create(&url, &prefix, "default", extra).await;
         let mut options = RedisStoreOptions::new(user.url.clone());
         options.key_prefix = prefix.clone();
         options.cluster = cluster;
@@ -1204,7 +1208,7 @@ mod memory {
     );
 }
 
-/// Every case but owner deletes, which come with that feature.
+/// Every case but owner deletes, which need a rule of their own under the documented ACL.
 #[cfg(feature = "redis")]
 macro_rules! redis_cases {
     ($case:expr) => {
@@ -1248,19 +1252,31 @@ macro_rules! redis_cases {
 #[cfg(feature = "redis")]
 mod standalone_redis {
     redis_cases!(super::on_redis::redis("STREAMS_REDIS_URL", false));
+    conformance!(super::on_redis::redis("STREAMS_REDIS_URL", false);
+        deleting_an_owner_drops_every_chain_of_it,
+    );
 }
 
 #[cfg(feature = "redis")]
 mod cluster_redis {
     redis_cases!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
+    // A Workflow id's chains hash to different slots, so the delete reaches every primary.
+    conformance!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true);
+        deleting_an_owner_drops_every_chain_of_it,
+    );
 }
 
 #[cfg(feature = "redis")]
 mod documented_acl_redis {
     redis_cases!(super::on_redis::redis_as_documented_user(
         "STREAMS_REDIS_URL",
-        false
+        false,
+        &[]
     ));
+    // The page names the one rule a delete needs beyond the others.
+    conformance!(super::on_redis::redis_as_documented_user("STREAMS_REDIS_URL", false, &["+scan"]);
+        deleting_an_owner_drops_every_chain_of_it,
+    );
 }
 
 #[cfg(feature = "redis")]
@@ -1268,6 +1284,14 @@ mod documented_acl_cluster_redis {
     // A cluster client asks the topology first, so the documented rules must allow it.
     redis_cases!(super::on_redis::redis_as_documented_user(
         "STREAMS_REDIS_CLUSTER_URL",
-        true
+        true,
+        &[]
     ));
+    conformance!(super::on_redis::redis_as_documented_user(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true,
+        &["+scan"]
+    );
+        deleting_an_owner_drops_every_chain_of_it,
+    );
 }

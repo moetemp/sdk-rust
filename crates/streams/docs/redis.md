@@ -17,6 +17,10 @@ slides the expiry of the log and its meta, so a stream dies a retention after it
 and nobody cleans up when the Workflow closes. The meta outlives its log by a 30-day grace, as
 the tombstone that tells a log that expired from one that never existed.
 
+**Deletes.** Deleting an owner's streams scans every primary for the Workflow id's keys. `SCAN`
+makes no promise about keys that move to another node while it runs, so a delete during a
+cluster reshard can miss some. Run it again once the reshard is done.
+
 **Server.** Redis 7.0 or later is required, and the store refuses an older server when it
 connects. At the same moment it reads `maxmemory-policy` on every primary and logs a warning
 for anything but `noeviction`, since an evicting Redis drops whole stream keys under memory

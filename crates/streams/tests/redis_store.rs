@@ -1224,3 +1224,218 @@ async fn the_documented_acl_is_the_python_sdks() {
     expected.push("+cluster|slots".to_string());
     assert_eq!(rules(include_str!("../docs/redis.md")), expected);
 }
+
+fn delete_request(workflow_id: &str) -> temporalio_streams::proto::DeleteOwnerRequest {
+    temporalio_streams::proto::DeleteOwnerRequest {
+        namespace: "ns".to_string(),
+        owner_kind: temporalio_streams::proto::StreamOwnerKind::Workflow as i32,
+        workflow_id: workflow_id.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn an_admin_deletes_one_workflows_stream_keys() {
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    let next = ChainId {
+        first_run_id: "run-2".to_string(),
+        ..chain.clone()
+    };
+    let bystander = self::chain();
+    // A log, its meta and a close flag on one chain, and a log on the next chain of the same
+    // Workflow id.
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    setup.store.close_chain(&chain).await.unwrap();
+    setup
+        .store
+        .append(append(&next, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    setup
+        .store
+        .append(append(&bystander, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let pattern = format!("{}:{{ns:{}:*", setup.prefix, part(&chain.workflow_id));
+    let before: Vec<String> = redis::cmd("KEYS")
+        .arg(&pattern)
+        .query_async(&mut setup.raw)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 5, "{before:?}");
+    let deleted = setup
+        .store
+        .delete_owner(delete_request(&chain.workflow_id))
+        .await
+        .unwrap();
+    assert_eq!(deleted.deleted, 5);
+    let after: Vec<String> = redis::cmd("KEYS")
+        .arg(&pattern)
+        .query_async(&mut setup.raw)
+        .await
+        .unwrap();
+    assert!(after.is_empty(), "{after:?}");
+    let left: usize = setup
+        .raw
+        .xlen(log_key(&setup.prefix, &bystander, "events"))
+        .await
+        .unwrap();
+    assert_eq!(left, 1);
+    let again = setup
+        .store
+        .delete_owner(delete_request(&chain.workflow_id))
+        .await
+        .unwrap();
+    assert_eq!(again.deleted, 0);
+}
+
+#[tokio::test]
+async fn a_store_error_on_delete_arrives_as_a_stream_error() {
+    let Some(url) = url() else {
+        return;
+    };
+    let faults = Faults::start(&url).await;
+    let setup = setup_at(&faults.url(), &url).await;
+    let chain = chain();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    faults.next(LOSE_REQUEST);
+    // Some keys may already be gone when a later step fails.
+    let error = setup
+        .store
+        .delete_owner(delete_request(&chain.workflow_id))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::OutcomeUnknown, "{error}");
+}
+
+#[tokio::test]
+async fn a_delete_without_scan_is_refused_under_the_documented_acl() {
+    let Some(url) = url() else {
+        return;
+    };
+    let prefix = unique("acl-delete");
+    let rules = |page: &str| -> Vec<String> {
+        page.lines()
+            .find_map(|line| line.strip_prefix("ACL SETUSER "))
+            .unwrap()
+            .split_whitespace()
+            .skip(1)
+            .map(str::to_string)
+            .collect()
+    };
+    let name = unique("streams-acl");
+    let mut admin = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let mut setuser = redis::cmd("ACL");
+    setuser.arg("SETUSER").arg(&name);
+    for rule in rules(include_str!("../docs/redis.md")) {
+        match rule.as_str() {
+            "~temporal-streams:{my-ns:*" => setuser.arg(format!("~{}:{{ns:*", part(&prefix))),
+            ">secret" => setuser.arg(">pw"),
+            rule => setuser.arg(rule),
+        };
+    }
+    let _: () = setuser.query_async(&mut admin).await.unwrap();
+    let address = url.trim_start_matches("redis://");
+    let mut options = RedisStoreOptions::new(format!("redis://{name}:pw@{address}"));
+    options.key_prefix = prefix;
+    let store = RedisStore::connect(options).await.unwrap();
+    let error = store.delete_owner(delete_request("wf")).await.unwrap_err();
+    let _: () = redis::cmd("ACL")
+        .arg("DELUSER")
+        .arg(&name)
+        .query_async(&mut admin)
+        .await
+        .unwrap();
+    assert_eq!(error.kind, StreamFailureKind::Refused, "{error}");
+    assert!(error.message.contains("NOPERM"), "{error}");
+}
+
+#[tokio::test]
+async fn a_delete_reaches_every_primary_of_a_cluster() {
+    let Ok(url) = std::env::var("STREAMS_REDIS_CLUSTER_URL") else {
+        eprintln!("set STREAMS_REDIS_CLUSTER_URL to run the Redis cluster tests");
+        return;
+    };
+    let prefix = unique("cluster-delete");
+    let mut options = RedisStoreOptions::new(url.clone());
+    options.cluster = true;
+    options.key_prefix = prefix.clone();
+    let store = RedisStore::connect(options).await.unwrap();
+    let workflow_id = unique("wf");
+    for run in 0..30 {
+        let chain = ChainId {
+            namespace: "ns".to_string(),
+            workflow_id: workflow_id.clone(),
+            first_run_id: format!("run-{run}"),
+        };
+        store
+            .append(append(&chain, "p", 1, 1, b"\x01"))
+            .await
+            .unwrap();
+    }
+    let mut seed = redis::Client::open(url.as_str())
+        .unwrap()
+        .get_multiplexed_async_connection()
+        .await
+        .unwrap();
+    let nodes: String = redis::cmd("CLUSTER")
+        .arg("NODES")
+        .query_async(&mut seed)
+        .await
+        .unwrap();
+    let primaries: Vec<String> = nodes
+        .lines()
+        .filter(|line| line.contains("master"))
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .map(|address| address.split('@').next().unwrap().to_string())
+        .collect();
+    let pattern = format!("{}:{{ns:{}:*", part(&prefix), part(&workflow_id));
+    let mut held = Vec::new();
+    for primary in &primaries {
+        let mut node = redis::Client::open(format!("redis://{primary}/0"))
+            .unwrap()
+            .get_multiplexed_async_connection()
+            .await
+            .unwrap();
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(&pattern)
+            .query_async(&mut node)
+            .await
+            .unwrap();
+        held.push((node, keys.len()));
+    }
+    assert!(
+        held.iter().all(|(_, count)| *count > 0),
+        "the chains should land on every primary"
+    );
+    let deleted = store
+        .delete_owner(delete_request(&workflow_id))
+        .await
+        .unwrap();
+    assert_eq!(
+        deleted.deleted as usize,
+        held.iter().map(|(_, count)| count).sum::<usize>()
+    );
+    for (mut node, _) in held {
+        let keys: Vec<String> = redis::cmd("KEYS")
+            .arg(&pattern)
+            .query_async(&mut node)
+            .await
+            .unwrap();
+        assert!(keys.is_empty(), "{keys:?}");
+    }
+}

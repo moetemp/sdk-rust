@@ -68,6 +68,16 @@ pub(crate) fn session_field(producer_id: &str, attempt: i64) -> String {
     format!("hw:{}:{producer_id}:{attempt}", producer_id.len())
 }
 
+/// The pattern that matches every key of one Workflow id, across all its chains.
+pub(crate) fn owner_pattern(prefix: &str, namespace: &str, workflow_id: &str) -> String {
+    format!(
+        "{}:{{{}:{}:*",
+        part(prefix),
+        part(namespace),
+        part(workflow_id)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -109,5 +119,26 @@ mod tests {
                 text(case, "field")
             );
         }
+    }
+
+    #[test]
+    fn an_owner_pattern_covers_every_chain_of_one_workflow_only() {
+        let chain = ChainId {
+            namespace: "ns".to_string(),
+            workflow_id: "wf".to_string(),
+            first_run_id: "run-1".to_string(),
+        };
+        let pattern = owner_pattern("p", "ns", "wf");
+        assert_eq!(pattern, "p:{ns:wf:*");
+        let matches = |key: &str| key.starts_with(pattern.trim_end_matches('*'));
+        assert!(matches(&ChainKeys::new("p", &chain).chain()));
+        // The `:` after the id keeps `wf` from matching the chains of `wf2`.
+        let other = ChainId {
+            workflow_id: "wf2".to_string(),
+            ..chain
+        };
+        assert!(!matches(&ChainKeys::new("p", &other).chain()));
+        // Each part is encoded as the keys encode it, so a glob character matches only itself.
+        assert_eq!(owner_pattern("p", "ns", "a*b"), "p:{ns:a%2Ab:*");
     }
 }
