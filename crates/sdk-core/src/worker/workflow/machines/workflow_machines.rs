@@ -1586,6 +1586,12 @@ impl WorkflowMachines {
                         annotations
                     );
                 }
+                WFCommandVariant::ExternalOutputStreamCommit(_) => {
+                    return Err(fatal!(
+                        "WorkflowOutputStreamCommit reached the state machines; it must be \
+                         consumed when the completion is processed"
+                    ));
+                }
                 WFCommandVariant::NoCommandsFromLang => (),
             }
         }

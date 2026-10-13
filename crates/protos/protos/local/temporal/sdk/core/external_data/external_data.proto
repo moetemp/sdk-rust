@@ -40,3 +40,72 @@ message PatchedMarkerData {
   // Whether or not the patch is marked deprecated.
   bool deprecated = 2;
 }
+
+// How the Workflow Task that wrote an external stream marker ended. Values 1 to 5, 9 and 10 are
+// left free for boundaries that only stream input and output retention can produce.
+enum ExternalStreamBoundary {
+  EXTERNAL_STREAM_BOUNDARY_UNSPECIFIED = 0;
+  // The completion carried server-bound commands (timer, activity, child workflow, signal).
+  EXTERNAL_STREAM_BOUNDARY_COMMANDS_PRODUCED = 6;
+  // The completion carried a terminal command: complete, fail, cancel, or continue-as-new.
+  EXTERNAL_STREAM_BOUNDARY_WORKFLOW_COMPLETED = 7;
+  // The completion carried nothing else for the server.
+  EXTERNAL_STREAM_BOUNDARY_TASK_COMPLETED = 8;
+}
+
+// What Core writes into a `core_external_stream` marker. Fields 2 to 4 are left free for the
+// stream input state that will share this marker, so replay has one schedule for both.
+message ExternalStreamMarkerData {
+  uint32 schema_version = 1;
+  ExternalStreamBoundary terminal_boundary = 5;
+  // The output staged for this Workflow Task.
+  ExternalOutputStreamManifest output = 6;
+}
+
+// Compact proof of the stream output one Workflow Task published, built by Core from the records
+// in the completion's `WorkflowOutputStreamCommit`.
+//
+// This message contains no record payloads. The stage token names the batch held in the stream
+// store, while the remaining fields let replay check the Workflow's logical output and let a cold
+// reader settle the held batch against History.
+message ExternalOutputStreamManifest {
+  uint32 schema_version = 1;
+  uint32 fingerprint_version = 2;
+  string stage_token = 3;
+  // The event immediately preceding this Workflow Task's WorkflowTaskScheduled event in the
+  // ordered History view used to build its activation.
+  int64 history_floor_event_id = 4;
+  string run_id = 5;
+  repeated ExternalOutputTopicManifest topics = 6;
+  // One entry per activation segment, including segments which published no output.
+  repeated ExternalOutputSegmentManifest segments = 7;
+  // The stream store that holds the batch. Reconciliation refuses to interpret the batch through
+  // a different store or store format.
+  string provider_id = 8;
+  uint32 provider_format_version = 9;
+}
+
+// Logical, pre-codec identity of one topic sub-batch.
+//
+// Core computes these over the topic's records in publish order, from each body's plaintext hash
+// and size, so replay computes them again from records that carry no body. Nothing a reset
+// changes, such as the run that published a record, takes part.
+message ExternalOutputTopicManifest {
+  string topic = 1;
+  uint32 record_count = 2;
+  // The sum of the records' body sizes as the payload converter made them.
+  uint64 logical_byte_count = 3;
+  // For fingerprint_version 2, the SHA-256 over each record as its length in 8 bytes big-endian,
+  // then the record itself as its topic's length in 8 bytes big-endian, the topic's UTF-8 bytes,
+  // its kind in 4 bytes big-endian, its content hash's length in 8 bytes big-endian and the
+  // content hash.
+  bytes logical_fingerprint = 4;
+  // True when the batch holds a FINISH record for this topic.
+  bool finished = 5;
+}
+
+// Record counts for one activation segment. Entries correspond positionally to `topics` in the
+// enclosing ExternalOutputStreamManifest, so empty segments do not repeat topic names.
+message ExternalOutputSegmentManifest {
+  repeated uint32 record_counts_by_topic = 1;
+}

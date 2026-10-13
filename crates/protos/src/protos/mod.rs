@@ -1003,6 +1003,46 @@ pub mod coresdk {
     }
     pub mod external_data {
         tonic::include_proto!("coresdk.external_data");
+        pub use self::stream_marker_helpers::*;
+        mod stream_marker_helpers {
+            use super::ExternalStreamMarkerData;
+            use crate::protos::temporal::api::common::v1::{Payload, Payloads};
+            use prost::Message;
+            use std::collections::HashMap;
+
+            const DETAILS_KEY: &str = "external_stream";
+
+            /// Packs the marker envelope into a `RecordMarker` details map.
+            ///
+            /// Encoded as proto binary rather than JSON so the marker stays compact and its
+            /// fields keep their wire numbers when the envelope grows.
+            pub fn build_external_stream_marker_details(
+                data: &ExternalStreamMarkerData,
+            ) -> HashMap<String, Payloads> {
+                let payload = Payload {
+                    metadata: HashMap::from([(
+                        "encoding".to_string(),
+                        b"binary/protobuf".to_vec(),
+                    )]),
+                    data: data.encode_to_vec(),
+                    ..Default::default()
+                };
+                HashMap::from([(
+                    DETAILS_KEY.to_string(),
+                    Payloads {
+                        payloads: vec![payload],
+                    },
+                )])
+            }
+
+            /// Reads the envelope back out, or `None` if this is not one of ours.
+            pub fn extract_external_stream_marker_data(
+                details: &HashMap<String, Payloads>,
+            ) -> Option<ExternalStreamMarkerData> {
+                let payload = details.get(DETAILS_KEY)?.payloads.first()?;
+                ExternalStreamMarkerData::decode(payload.data.as_slice()).ok()
+            }
+        }
         mod sdk_helpers {
             use prost_types::{Duration, Timestamp};
             use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -1617,6 +1657,17 @@ pub mod coresdk {
             impl Display for RequestCancelNexusOperation {
                 fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
                     write!(f, "RequestCancelNexusOperation({})", self.seq)
+                }
+            }
+
+            impl Display for WorkflowOutputStreamCommit {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "WorkflowOutputStreamCommit({} record(s), {} close(s))",
+                        self.records.len(),
+                        self.closes.len()
+                    )
                 }
             }
 
@@ -3110,6 +3161,115 @@ mod sdk_helpers {
                     StreamRecordKind::try_from(3),
                     Err(prost::UnknownEnumValue(3))
                 );
+            }
+        }
+
+        mod external_stream_marker {
+            use crate::protos::{
+                coresdk::external_data::{
+                    ExternalOutputSegmentManifest, ExternalOutputStreamManifest,
+                    ExternalOutputTopicManifest, ExternalStreamBoundary, ExternalStreamMarkerData,
+                    build_external_stream_marker_details, extract_external_stream_marker_data,
+                },
+                temporal::api::common::v1::{Payload, Payloads},
+            };
+            use std::collections::HashMap;
+
+            fn marker() -> ExternalStreamMarkerData {
+                ExternalStreamMarkerData {
+                    schema_version: 1,
+                    terminal_boundary: ExternalStreamBoundary::CommandsProduced as i32,
+                    output: Some(ExternalOutputStreamManifest {
+                        schema_version: 1,
+                        fingerprint_version: 2,
+                        stage_token: "token".to_string(),
+                        history_floor_event_id: 3,
+                        run_id: "run".to_string(),
+                        topics: vec![ExternalOutputTopicManifest {
+                            topic: "t".to_string(),
+                            record_count: 1,
+                            logical_byte_count: 4,
+                            logical_fingerprint: vec![7; 32],
+                            finished: true,
+                        }],
+                        segments: vec![ExternalOutputSegmentManifest {
+                            record_counts_by_topic: vec![1],
+                        }],
+                        provider_id: "provider".to_string(),
+                        provider_format_version: 1,
+                    }),
+                }
+            }
+
+            #[test]
+            fn marker_details_round_trip_as_binary_protobuf() {
+                let details = build_external_stream_marker_details(&marker());
+                let payload = &details["external_stream"].payloads[0];
+                assert_eq!(payload.metadata["encoding"], b"binary/protobuf");
+                assert_eq!(
+                    extract_external_stream_marker_data(&details),
+                    Some(marker())
+                );
+            }
+
+            #[test]
+            fn other_marker_details_are_not_read_as_ours() {
+                assert_eq!(extract_external_stream_marker_data(&HashMap::new()), None);
+                let foreign =
+                    HashMap::from([("external_stream".to_string(), Payloads { payloads: vec![] })]);
+                assert_eq!(extract_external_stream_marker_data(&foreign), None);
+                let garbage = HashMap::from([(
+                    "external_stream".to_string(),
+                    Payloads {
+                        payloads: vec![Payload {
+                            data: vec![0xff, 0xff, 0xff],
+                            ..Default::default()
+                        }],
+                    },
+                )]);
+                assert_eq!(extract_external_stream_marker_data(&garbage), None);
+            }
+
+            #[test]
+            fn the_commit_command_converts_and_displays() {
+                use crate::protos::{
+                    coresdk::workflow_commands::{
+                        OutputClose, OutputRecord, WorkflowCommand, WorkflowOutputStreamCommit,
+                        workflow_command,
+                    },
+                    temporal::sdk::streams::v1::StreamRecordKind,
+                };
+                let variant = workflow_command::Variant::WorkflowOutputStreamCommit(
+                    WorkflowOutputStreamCommit {
+                        records: vec![
+                            OutputRecord {
+                                topic: "t".to_string(),
+                                kind: StreamRecordKind::Data as i32,
+                                body: Some(Payload::default()),
+                                content_hash: vec![7; 32],
+                                logical_size: 4,
+                            },
+                            OutputRecord {
+                                topic: "t".to_string(),
+                                kind: StreamRecordKind::Finish as i32,
+                                ..Default::default()
+                            },
+                        ],
+                        closes: vec![OutputClose {
+                            topic: "t".to_string(),
+                            result: Some(Payload::default()),
+                        }],
+                    },
+                );
+                assert_eq!(
+                    variant.to_string(),
+                    "WorkflowOutputStreamCommit(2 record(s), 1 close(s))"
+                );
+                let command: WorkflowCommand = variant.into();
+                assert!(matches!(
+                    command.variant,
+                    Some(workflow_command::Variant::WorkflowOutputStreamCommit(_))
+                ));
             }
         }
 
