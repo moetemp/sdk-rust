@@ -60,9 +60,6 @@ relevant information.
   a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in process: append, read,
   latest, close and owner delete, as serialized `coresdk.streams` requests. Its store goes to each
   Worker's `stream_store`, so a Workflow's output and outside producers share it.
-  is accepted. A workflow that wrote this marker can only move forward. A Worker on an older
-  Core, or one whose lang doesn't commit the records again on replay, fails that workflow's next
-  task, so don't roll such a fleet back.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
