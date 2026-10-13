@@ -62,9 +62,6 @@ relevant information.
   Worker's `stream_store`, so a Workflow's output and outside producers share it.
 * Experimental: the C bridge has `temporal_core_stream_store_new`, `_call` and `_free` for the
   stream service, built with the Redis store, and a `stream_store` field on its worker options.
-  is accepted. A workflow that wrote this marker can only move forward. A Worker on an older
-  Core, or one whose lang doesn't commit the records again on replay, fails that workflow's next
-  task, so don't roll such a fleet back.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
