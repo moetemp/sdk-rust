@@ -387,6 +387,11 @@ pub trait WorkerClient: Sync + Send {
         task_token: TaskToken,
         query_result: LegacyQueryResult,
     ) -> Result<RespondQueryTaskCompletedResponse>;
+    /// Describe the latest run of a workflow
+    async fn describe_workflow_execution(
+        &self,
+        workflow_id: String,
+    ) -> Result<DescribeWorkflowExecutionResponse>;
     /// Describe the namespace
     async fn describe_namespace(&self) -> Result<DescribeNamespaceResponse>;
     /// Shutdown the worker
@@ -989,6 +994,27 @@ impl WorkerClient for WorkerClientBag {
                     failure,
                     cause: cause.into(),
                     poller_group_id: Default::default(),
+                }
+                .into_request(),
+            )
+            .await?
+            .into_inner())
+    }
+
+    async fn describe_workflow_execution(
+        &self,
+        workflow_id: String,
+    ) -> Result<DescribeWorkflowExecutionResponse> {
+        Ok(self
+            .client
+            .clone()
+            .describe_workflow_execution(
+                DescribeWorkflowExecutionRequest {
+                    namespace: self.namespace.clone(),
+                    execution: Some(WorkflowExecution {
+                        workflow_id,
+                        run_id: String::new(),
+                    }),
                 }
                 .into_request(),
             )

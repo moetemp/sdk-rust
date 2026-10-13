@@ -51,6 +51,11 @@ relevant information.
   completion, and aborts it when the server says the task or its commands were not applied. When
   the answer is lost, the next replay promotes what History shows committed and the next accepted
   completion aborts the rest. Output another Worker staged and History proves is promoted once.
+* Experimental: after a publishing workflow's final task (complete, fail or cancel, not
+  continue-as-new) is accepted, Core closes its run chain's streams in the store, so readers end
+  and producers are refused. It checks the chain's latest run first and leaves the streams open
+  for a retry or cron successor. A failed close is retried with backoff until it lands or the
+  Worker stops.
 * Experimental: behind `streams`, `streams::connect_stream_service` builds one stream store from
   a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in process: append, read,
   latest, close and owner delete, as serialized `coresdk.streams` requests.
