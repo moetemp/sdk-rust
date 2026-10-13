@@ -8,8 +8,6 @@
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:t:<topic>        the log
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:t:<topic>:meta   its meta
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:chain            the close flag
-//! <prefix>:{<namespace>:<workflow id>:<first run id>}:stages           pending stages
-//! <prefix>:{<namespace>:<workflow id>:<first run id>}:stage:<token>    one stage
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:topics           the topic set
 //! ```
 //!
@@ -62,17 +60,9 @@ impl ChainKeys {
         format!("{}:chain", self.base)
     }
 
-    pub(crate) fn pending(&self) -> String {
-        format!("{}:stages", self.base)
-    }
-
     /// The set of the chain's topic names, so a chain end can list them without a scan.
     pub(crate) fn topics(&self) -> String {
         format!("{}:topics", self.base)
-    }
-
-    pub(crate) fn stage(&self, token: &str) -> String {
-        format!("{}:stage:{}", self.base, part(token))
     }
 }
 
@@ -122,8 +112,6 @@ mod tests {
             assert_eq!(keys.log(topic), text(case, "log"));
             assert_eq!(keys.meta(topic), text(case, "meta"));
             assert_eq!(keys.chain(), text(case, "chain"));
-            assert_eq!(keys.stage("abc"), text(case, "stage_token_abc"));
-            assert_eq!(keys.pending(), text(case, "pending"));
         }
     }
 

@@ -17,22 +17,19 @@ lands after a close returned. That topic check and the arm report differ from th
 with nothing. The topic's meta holds two more fields. `arm_seq` counts the arms the topic ever
 took, and `arm` holds the newest one's generation while a reader waits. One script finds the
 log empty after the read's position and sets `arm` to the next `arm_seq`, or answers the newer
-record. The append and promote scripts answer each topic's `arm` with their positions, so a
-producer notifies only while a reader waits. Once its notification landed, the producer
+record. The append script answers the topic's `arm` with its positions, so a producer
+notifies only while a reader waits. Once its notification landed, the producer
 deletes `arm` only when it still holds the generation that notification carried, so a reader
 that armed again keeps its arm. An arm on a topic with no meta creates the meta with the
 tombstone's expiry, and an arm on a meta leaves its expiry as the last write set it. The
-script hashes differ from the SDKs' for append and promote, so a server's script cache entry
-for an SDK's provider no longer serves Core. The stored format only gains the two fields, and
+append script's hash differs from the SDKs', so a server's script cache entry for an SDK's
+provider no longer serves Core. The stored format only gains the two fields, and
 an SDK's provider ignores them.
 
 **Retention.** Every script that writes a log trims it with `XTRIM MINID` to the retention and
 slides the expiry of the log and its meta, so a stream dies a retention after its last write
 and nobody cleans up when the Workflow closes. The meta outlives its log by a 30-day grace, as
 the tombstone that tells a log that expired from one that never existed.
-
-**Stages.** A Workflow's own output is staged next to its logs and moved into them by one
-script, so readers see a Workflow Task's records together or not at all.
 
 **Deletes.** Deleting an owner's streams scans every primary for the Workflow id's keys. `SCAN`
 makes no promise about keys that move to another node while it runs, so a delete during a
