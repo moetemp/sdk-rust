@@ -1,11 +1,17 @@
 //! The external stream marker machine.
 //!
 //! Modeled on [`super::local_activity_state_machine`], and for the same reason: a marker written
-//! live must be *matched* by the `MarkerRecorded` event the server writes back.
+//! live must be *matched* by the `MarkerRecorded` event on replay, and on replay the marker must
+//! be found by lookahead so the commit lang sends again is checked in the activation that produced
+//! it.
+//!
+//! The two paths are created by different callers and never by the same one: the live marker comes
+//! from a completion that committed staged output, and the replay marker comes from the lookahead
+//! in [`super::WorkflowMachines`].
 
 use super::{
-    EventInfo, HistEventData, NewMachineWithCommand, OnEventWrapper, TransitionResult,
-    WFMachinesAdapter, WFMachinesError, fsm, workflow_machines::MachineResponse,
+    EventInfo, HistEventData, NewMachineWithCommand, OnEventWrapper, StateMachine,
+    TransitionResult, WFMachinesAdapter, WFMachinesError, fsm, workflow_machines::MachineResponse,
 };
 use crate::worker::workflow::nondeterminism;
 use std::convert::TryFrom;
@@ -33,6 +39,16 @@ fsm! {
     MarkerCommandCreated --(CommandRecordMarker, on_command_record_marker) --> ResultNotified;
     ResultNotified --(MarkerRecorded(ExternalStreamMarkerData), shared on_marker_recorded)
       --> MarkerCommandRecorded;
+
+    // Replay path: the marker is found by lookahead before the activation it belongs to, and is
+    // settled when its `MarkerRecorded` event is reached.
+    Replaying --(Emit, shared on_replay_emit) --> WaitingResolveFromMarkerLookAhead;
+    WaitingResolveFromMarkerLookAhead --(HandleKnownResult(ExternalStreamMarkerData),
+                                         shared on_handle_known_result)
+      --> ResolvedFromMarkerLookAheadWaitingMarkerEvent;
+    ResolvedFromMarkerLookAheadWaitingMarkerEvent
+      --(MarkerRecorded(ExternalStreamMarkerData), shared on_marker_recorded)
+      --> MarkerCommandRecorded;
 }
 
 #[derive(Debug, Clone)]
@@ -48,16 +64,27 @@ pub(super) struct SharedState {
 pub(super) enum ExternalStreamCommand {
     /// Write the marker to History.
     RecordMarker,
+    /// The marker already exists in History; nothing to write.
+    AlreadyRecorded,
 }
 
 #[derive(Default, Clone)]
 pub(super) struct Created {}
 
 #[derive(Default, Clone)]
+pub(super) struct Replaying {}
+
+#[derive(Default, Clone)]
 pub(super) struct MarkerCommandCreated {}
 
 #[derive(Default, Clone)]
 pub(super) struct ResultNotified {}
+
+#[derive(Default, Clone)]
+pub(super) struct WaitingResolveFromMarkerLookAhead {}
+
+#[derive(Default, Clone)]
+pub(super) struct ResolvedFromMarkerLookAheadWaitingMarkerEvent {}
 
 #[derive(Default, Clone)]
 pub(super) struct MarkerCommandRecorded {}
@@ -71,6 +98,17 @@ impl Created {
     }
 }
 
+impl Replaying {
+    pub(super) fn on_replay_emit(
+        self,
+        _state: &mut SharedState,
+    ) -> ExternalStreamMachineTransition<WaitingResolveFromMarkerLookAhead> {
+        // Nothing is written on replay: the marker is already in History, and writing it again
+        // would produce a command mismatch against the very event it was derived from.
+        TransitionResult::commands(vec![ExternalStreamCommand::AlreadyRecorded])
+    }
+}
+
 impl MarkerCommandCreated {
     pub(super) fn on_command_record_marker(
         self,
@@ -79,7 +117,28 @@ impl MarkerCommandCreated {
     }
 }
 
+impl WaitingResolveFromMarkerLookAhead {
+    pub(super) fn on_handle_known_result(
+        self,
+        state: &mut SharedState,
+        data: ExternalStreamMarkerData,
+    ) -> ExternalStreamMachineTransition<ResolvedFromMarkerLookAheadWaitingMarkerEvent> {
+        state.data = data;
+        TransitionResult::default()
+    }
+}
+
 impl ResultNotified {
+    pub(super) fn on_marker_recorded(
+        self,
+        state: &mut SharedState,
+        data: ExternalStreamMarkerData,
+    ) -> ExternalStreamMachineTransition<MarkerCommandRecorded> {
+        verify_marker_matches(state, &data)
+    }
+}
+
+impl ResolvedFromMarkerLookAheadWaitingMarkerEvent {
     pub(super) fn on_marker_recorded(
         self,
         state: &mut SharedState,
@@ -135,6 +194,46 @@ impl ExternalStreamMachine {
             machine: machine.into(),
         }
     }
+
+    /// A machine for a marker the replay lookahead found ahead of the activation it belongs to.
+    ///
+    /// Nothing is written: the marker is already in History, and issuing a command for it would
+    /// produce a mismatch against the very event it was read from. The machine exists only so that
+    /// event, when history reaches it, has something to be matched by. That is what turns a
+    /// marker Core did not expect into a nondeterminism error rather than a silent skip.
+    pub(super) fn resolved_from_marker_lookahead(data: ExternalStreamMarkerData) -> Self {
+        let mut machine = ExternalStreamMachine {
+            state: Some(ExternalStreamMachineState::Replaying(Replaying {})),
+            shared_state: SharedState { data: data.clone() },
+        };
+        OnEventWrapper::on_event_mut(&mut machine, ExternalStreamMachineEvents::Emit)
+            .expect("Emit is always valid from the initial state");
+        OnEventWrapper::on_event_mut(
+            &mut machine,
+            ExternalStreamMachineEvents::HandleKnownResult(data),
+        )
+        .expect("A looked-ahead marker always resolves the machine created for it");
+        machine
+    }
+
+    /// Whether the `MarkerRecorded` event for this machine bypasses normal command matching.
+    ///
+    /// It does exactly when the machine came from lookahead, because no command was ever issued
+    /// for it and there is therefore nothing in the outgoing queue to match. A machine that wrote
+    /// its own marker is in `ResultNotified` and must go through the queue like any other command,
+    /// or the command it issued would never be consumed.
+    pub(super) fn marker_should_get_special_handling(&self) -> Result<bool, WFMachinesError> {
+        match self.state() {
+            ExternalStreamMachineState::ResultNotified(_) => Ok(false),
+            ExternalStreamMachineState::ResolvedFromMarkerLookAheadWaitingMarkerEvent(_) => {
+                Ok(true)
+            }
+            _ => Err(WFMachinesError::Fatal(format!(
+                "Attempted to check for external stream marker handling in invalid state {}",
+                self.state()
+            ))),
+        }
+    }
 }
 
 fn marker_command(data: &ExternalStreamMarkerData) -> command::Attributes {
@@ -176,6 +275,16 @@ impl TryFrom<HistEventData> for ExternalStreamMachineEvents {
     }
 }
 
+/// Whether `e` is a `MarkerRecorded` event with our marker name, whatever its details hold.
+pub(super) fn is_stream_marker(e: &HistoryEvent) -> bool {
+    e.event_type() == EventType::MarkerRecorded
+        && matches!(
+            &e.attributes,
+            Some(history_event::Attributes::MarkerRecordedEventAttributes(attrs))
+                if attrs.marker_name == EXTERNAL_STREAM_MARKER_NAME
+        )
+}
+
 /// The envelope inside a `MarkerRecorded` event, if it is one of ours.
 pub(super) fn extract_stream_marker(e: &HistoryEvent) -> Option<ExternalStreamMarkerData> {
     if e.event_type() != EventType::MarkerRecorded {
@@ -207,6 +316,7 @@ impl WFMachinesAdapter for ExternalStreamMachine {
                     ..marker_command(&self.shared_state.data).into()
                 })]
             }
+            ExternalStreamCommand::AlreadyRecorded => vec![],
         })
     }
 }

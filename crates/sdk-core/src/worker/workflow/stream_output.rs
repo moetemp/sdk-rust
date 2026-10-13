@@ -129,6 +129,40 @@ pub(super) fn build_output_manifest(
     Ok(manifest)
 }
 
+/// Compares the manifest Core built from the records lang committed while replaying with the one
+/// History recorded.
+///
+/// The stage token is left out because nothing is staged on replay, so there is no token. The
+/// run id is left out because a reset forks the base run's History, so the new run replays
+/// markers that name the base run. Everything else derives from the Workflow's own output.
+pub(super) fn check_replayed_output_manifest(
+    mut replayed: ExternalOutputStreamManifest,
+    recorded: Option<ExternalOutputStreamManifest>,
+) -> Result<()> {
+    let Some(mut recorded) = recorded else {
+        return Err(WFMachinesError::Nondeterminism(
+            "Lang committed external output while replaying a Workflow Task that recorded none"
+                .to_string(),
+        ));
+    };
+    // Only the logical output must replay the same. A reset run replays markers that name its
+    // base run, a stage token is new on every attempt, and a provider can be renamed, swapped for
+    // a Replayer or change its stage layout without changing what the Workflow published.
+    for manifest in [&mut replayed, &mut recorded] {
+        manifest.stage_token.clear();
+        manifest.run_id.clear();
+        manifest.provider_id.clear();
+        manifest.provider_format_version = 0;
+    }
+    if replayed != recorded {
+        return Err(WFMachinesError::Nondeterminism(format!(
+            "External output committed while replaying differs from the manifest recorded in \
+             History: committed {replayed:?}, recorded {recorded:?}"
+        )));
+    }
+    Ok(())
+}
+
 /// Refuses closes the marker could not prove. Each close names a topic once, carries its result,
 /// and has its topic's FINISH record among the committed records.
 pub(super) fn check_output_closes(records: &[OutputRecord], closes: &[OutputClose]) -> Result<()> {
@@ -332,6 +366,57 @@ mod tests {
             assert!(message.contains(expected), "{expected}: {message}");
         }
         assert!(rejection(&[]).contains("no records"));
+    }
+
+    fn manifest() -> ExternalOutputStreamManifest {
+        build(&[data("a", 1, 3), finish("b")]).unwrap()
+    }
+
+    #[test]
+    fn a_replayed_commit_matches_the_recorded_manifest_whatever_its_token() {
+        let mut replayed = manifest();
+        replayed.stage_token.clear();
+        check_replayed_output_manifest(replayed, Some(manifest())).unwrap();
+    }
+
+    #[test]
+    fn a_replayed_commit_matches_a_manifest_recorded_by_another_run() {
+        let mut recorded = manifest();
+        recorded.run_id = "reset-base-run".to_string();
+        check_replayed_output_manifest(manifest(), Some(recorded)).unwrap();
+    }
+
+    #[test]
+    fn a_replayed_commit_matches_a_manifest_recorded_under_another_store_name() {
+        let mut recorded = manifest();
+        recorded.provider_id = "renamed-store".to_string();
+        check_replayed_output_manifest(manifest(), Some(recorded)).unwrap();
+    }
+
+    #[test]
+    fn a_replayed_commit_matches_a_manifest_recorded_under_another_store_format() {
+        // A later Core may lay out stages differently. That is the store's concern, not output
+        // the Workflow published.
+        let mut recorded = manifest();
+        recorded.provider_format_version = 2;
+        check_replayed_output_manifest(manifest(), Some(recorded)).unwrap();
+    }
+
+    #[test]
+    fn a_replayed_commit_that_differs_from_history_is_nondeterministic() {
+        let replayed = build(&[data("a", 2, 3), finish("b")]).unwrap();
+        assert!(matches!(
+            check_replayed_output_manifest(replayed, Some(manifest())),
+            Err(WFMachinesError::Nondeterminism(message)) if message.contains("differs")
+        ));
+    }
+
+    #[test]
+    fn a_replayed_commit_with_nothing_recorded_is_nondeterministic() {
+        assert!(matches!(
+            check_replayed_output_manifest(manifest(), None),
+            Err(WFMachinesError::Nondeterminism(message)) if message.contains("recorded none")
+        ));
     }
 
     #[test]
