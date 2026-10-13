@@ -409,7 +409,12 @@ impl StreamStore for MemoryStore {
         Ok(())
     }
 
-    async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()> {
+    async fn close_topic(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        _: Option<crate::proto::Payload>,
+    ) -> StreamResult<()> {
         self.chains
             .lock()
             .unwrap()

@@ -1006,7 +1006,11 @@ async fn a_topic_closed_before_its_first_write_still_expires() {
         return;
     };
     let chain = chain();
-    setup.store.close_topic(&chain, "events").await.unwrap();
+    setup
+        .store
+        .close_topic(&chain, "events", None)
+        .await
+        .unwrap();
     let meta = format!("{}:meta", log_key(&setup.prefix, &chain, "events"));
     let closed: Option<String> = setup.raw.hget(&meta, "closed").await.unwrap();
     assert_eq!(closed.as_deref(), Some("1"));
@@ -1047,7 +1051,11 @@ async fn rule_10_1_an_append_that_races_a_topic_close_is_refused_once_the_close_
         })
     };
     tokio::time::sleep(Duration::from_millis(100)).await;
-    closer.store.close_topic(&chain, "events").await.unwrap();
+    closer
+        .store
+        .close_topic(&chain, "events", None)
+        .await
+        .unwrap();
     let error = racing.await.unwrap().unwrap_err();
     assert_eq!(error.kind, StreamFailureKind::Closed, "{error}");
     let mut raw = closer.raw.clone();

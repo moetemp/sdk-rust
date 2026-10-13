@@ -17,8 +17,8 @@ use crate::{
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
             stream_output::{
-                MARKER_SCHEMA_VERSION, OutputBatch, build_output_manifest, check_output_closes,
-                check_replayed_output_manifest,
+                MARKER_SCHEMA_VERSION, OutputBatch, ProvenStage, ReportedOutput,
+                build_output_manifest, check_output_closes, check_replayed_output_manifest,
             },
         },
     },
@@ -105,6 +105,8 @@ pub(super) struct ManagedRun {
     /// Stream output this run committed and has not reported with a completion yet, in commit
     /// order.
     pending_output: Vec<OutputBatch>,
+    /// Stages that replay found committed in History and has not reported yet, in commit order.
+    proven_output: Vec<ProvenStage>,
     metrics: MetricsContext,
     /// We store the paginator used for our own run's history fetching
     paginator: Option<HistoryPaginator>,
@@ -131,6 +133,7 @@ impl ManagedRun {
             trying_to_evict: None,
             recorded_span_ids: Default::default(),
             pending_output: vec![],
+            proven_output: vec![],
             metrics,
             paginator: None,
             completion_waiting_on_page_fetch: None,
@@ -908,7 +911,18 @@ impl ManagedRun {
                 true,
             )?;
             let recorded = self.wfm.machines.take_replayed_output_manifest();
-            return check_replayed_output_manifest(replayed, recorded);
+            let proven = recorded.as_ref().map(|recorded| ProvenStage {
+                token: recorded.stage_token.clone(),
+                workflow_id: self.wfm.machines.workflow_id.clone(),
+                first_run_id: self.wfm.machines.first_execution_run_id.clone(),
+                topics: recorded.topics.iter().map(|t| t.topic.clone()).collect(),
+                closes: commit.closes.clone(),
+            });
+            check_replayed_output_manifest(replayed, recorded)?;
+            // History proves the commit, but the Worker that staged it may have stopped before
+            // promoting it.
+            self.proven_output.extend(proven);
+            return Ok(());
         }
         let Some(store_name) = self.stream_store_name() else {
             return Err(WFMachinesError::Fatal(
@@ -938,6 +952,7 @@ impl ManagedRun {
             run_id: self.wfm.machines.run_id.clone(),
             first_run_id: self.wfm.machines.first_execution_run_id.clone(),
             records: commit.records,
+            closes: commit.closes,
         };
         // It covers this activation's commands only. With a Local Activity, an earlier activation
         // of the same task may have produced commands, and nothing reads the field yet.
@@ -1365,7 +1380,10 @@ impl ManagedRun {
                     sdk_metadata: machines_wft_response.metadata_for_complete(),
                     versioning_behavior: data.versioning_behavior,
                     attempt,
-                    output: mem::take(&mut self.pending_output),
+                    stream_output: ReportedOutput::take(
+                        &mut self.pending_output,
+                        &mut self.proven_output,
+                    ),
                 },
                 metrics: self.metrics.clone(),
             })

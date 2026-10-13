@@ -423,7 +423,12 @@ mod tests {
             unreachable!()
         }
 
-        async fn close_topic(&self, _: &ChainId, _: &str) -> StreamResult<()> {
+        async fn close_topic(
+            &self,
+            _: &ChainId,
+            _: &str,
+            _: Option<crate::proto::Payload>,
+        ) -> StreamResult<()> {
             unreachable!()
         }
 
