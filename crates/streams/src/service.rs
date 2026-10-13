@@ -131,7 +131,7 @@ impl StreamService {
         self
     }
 
-    /// The store, for the Workers that stage and promote Workflow output in it.
+    /// The store, for the Workers that append Workflow output to it.
     pub fn store(&self) -> Arc<dyn StreamStore> {
         self.store.clone()
     }
@@ -287,7 +287,7 @@ mod tests {
         },
     };
     use temporalio_common::protos::temporal::api::{
-        common::v1::Payload, enums::v1::WorkflowExecutionStatus, history::v1::HistoryEvent,
+        common::v1::Payload, enums::v1::WorkflowExecutionStatus,
     };
 
     /// Every Workflow's latest run is `run-1`, the first of its chain, and still running.
@@ -305,18 +305,7 @@ mod tests {
                 run_id: "run-1".to_string(),
                 first_run_id: "run-1".to_string(),
                 status: WorkflowExecutionStatus::Running,
-                start_time: None,
             })
-        }
-
-        async fn history_after(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: i64,
-        ) -> Result<Vec<HistoryEvent>, OwnerError> {
-            Ok(vec![])
         }
     }
 
@@ -728,18 +717,7 @@ mod tests {
                 } else {
                     WorkflowExecutionStatus::Running
                 },
-                start_time: None,
             })
-        }
-
-        async fn history_after(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: i64,
-        ) -> Result<Vec<HistoryEvent>, OwnerError> {
-            Ok(vec![])
         }
     }
 
@@ -904,18 +882,6 @@ mod tests {
         ) -> StreamResult<Option<Vec<u8>>> {
             self.0.record_at(c, t, p).await
         }
-        async fn stage(&self, b: crate::proto::StagedBatch) -> StreamResult<()> {
-            self.0.stage(b).await
-        }
-        async fn promote(
-            &self,
-            s: &crate::proto::StageRef,
-        ) -> StreamResult<crate::proto::PromoteResult> {
-            self.0.promote(s).await
-        }
-        async fn abort(&self, s: &crate::proto::StageRef) -> StreamResult<()> {
-            self.0.abort(s).await
-        }
         async fn close_chain(&self, c: &crate::proto::ChainId) -> StreamResult<()> {
             self.0.close_chain(c).await
         }
@@ -926,12 +892,6 @@ mod tests {
             r: Option<Payload>,
         ) -> StreamResult<()> {
             self.0.close_topic(c, t, r).await
-        }
-        async fn pending_stages(
-            &self,
-            c: &crate::proto::ChainId,
-        ) -> StreamResult<Vec<crate::proto::PendingStage>> {
-            self.0.pending_stages(c).await
         }
         async fn delete_owner(
             &self,

@@ -9,36 +9,24 @@ use crate::{
     owner::{OwnerClient, OwnerDescription, OwnerError},
     proto::{
         AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse, DeleteOwnerRequest,
-        DeleteOwnerResponse, LatestRequest, LatestResponse, PromoteOutcome, ReadRequest,
-        ReadResponse, StageRef, StoreAppendRequest, StoreLatestRequest, StreamAddress,
-        StreamOwnerKind, append_request::Producer,
+        DeleteOwnerResponse, LatestRequest, LatestResponse, ReadRequest, ReadResponse,
+        StoreAppendRequest, StoreLatestRequest, StreamAddress, StreamOwnerKind,
+        append_request::Producer,
     },
     reader::{Attempts, ReadState, read_with},
-    repair::{Decision, decide_token},
     stored_append_record, stream_hash,
 };
 use prost::Message;
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
 use tokio::time::Instant;
 
 /// The longest a producer writes without asking whether its owner's chain ended.
 pub const OWNER_RECHECK: Duration = Duration::from_secs(60);
-
-/// Whether a repair takes a stage History couldn't decide lately as still undecided.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Recent {
-    Trust,
-    /// The owner ended or the stream closed, so History may hold the answer now.
-    Ask,
-}
-
-/// How long a stage History couldn't decide is taken as still undecided without asking again.
-const UNDECIDED_FOR: Duration = Duration::from_secs(5);
 
 /// How the stream layer behaves.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -151,9 +139,6 @@ pub struct Streams {
     chains: Remembered<OwnerKey>,
     /// The chains carried read states named that a describe showed are the Workflow's own.
     carried_chains: Remembered<OwnerKey>,
-    /// Stages History couldn't decide lately, by token. Each new read would otherwise walk the
-    /// staging run's History back to the floor again.
-    undecided: Remembered<String>,
 }
 
 impl std::fmt::Debug for Streams {
@@ -176,7 +161,6 @@ impl Streams {
             store,
             owner,
             producers: Remembered::new(options.remembered),
-            undecided: Remembered::new(options.remembered),
             carried_chains: Remembered::new(options.remembered),
             chains: Remembered::new(options.remembered),
             options,
@@ -290,8 +274,7 @@ impl Streams {
     pub(crate) async fn read_carried(&self, request: ReadRequest) -> StreamResult<CarriedRead> {
         let stream = address(request.stream.as_ref())?;
         let mut state = ReadState::decode_from(&request.state)?;
-        let starting = state.first_run_id.is_empty();
-        if starting {
+        if state.first_run_id.is_empty() {
             state.first_run_id = self.chain(stream).await?.first_run_id;
             // Resolved here, so it is the Workflow's own, and the state it rides in back needs
             // no check.
@@ -310,9 +293,6 @@ impl Streams {
             topic: stream.topic.clone(),
             stream_hash: self.hash(stream),
         };
-        if starting {
-            self.repair(&target.chain, Recent::Trust).await;
-        }
         let wait = request
             .wait
             .and_then(|wait| Duration::try_from(wait).ok())
@@ -320,9 +300,6 @@ impl Streams {
         let deadline = Instant::now() + wait;
         let minimum = self.options.owner_check_min;
         let mut page_request = request.clone();
-        // Set once the read found a stage of the chain still pending after the end, so it waits
-        // for the promotion rather than reading as fast as it can.
-        let mut awaiting_stage = false;
         let mut before;
         let response = loop {
             let now = unix_ms();
@@ -332,10 +309,10 @@ impl Streams {
             }
             let until_check = Duration::from_millis(state.next_check_ms.saturating_sub(now));
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let wait = match (state.owner_ended, awaiting_stage) {
-                (false, _) => remaining.min(until_check),
-                (true, false) => Duration::ZERO,
-                (true, true) => remaining.min(minimum),
+            let wait = if state.owner_ended {
+                Duration::ZERO
+            } else {
+                remaining.min(until_check)
             };
             page_request.wait = wait.try_into().ok();
             // Only the pass that waits out the read's own wait arms, so a shorter pass before an
@@ -352,28 +329,14 @@ impl Streams {
                 break page;
             }
             if closed && !state.owner_ended {
-                // One more pass after learning of the close, as after learning the owner ended,
-                // with output a Worker committed but never promoted.
+                // One more pass after learning of the close, as after learning the owner ended.
                 state.owner_ended = true;
-                self.repair(&target.chain, Recent::Ask).await;
                 continue;
             }
             if state.owner_ended {
-                // A close doesn't prove the chain's output is visible, since a promotion still
-                // lands after it. The read ends once nothing of the chain is pending.
-                if awaiting_stage {
-                    self.repair(&target.chain, Recent::Trust).await;
-                }
-                if self.store.pending_stages(&target.chain).await?.is_empty() {
-                    page.done = true;
-                    page.armed = false;
-                    break page;
-                }
-                awaiting_stage = true;
-                if Instant::now() >= deadline {
-                    break page;
-                }
-                continue;
+                page.done = true;
+                page.armed = false;
+                break page;
             }
             if unix_ms() >= state.next_check_ms {
                 state.owner_ended = self.owner_ended(stream, &target.chain).await?;
@@ -381,10 +344,8 @@ impl Streams {
                     .clamp(millis(minimum), millis(self.options.owner_check_max));
                 state.next_check_ms = unix_ms() + state.check_interval_ms;
                 // One more pass after learning the owner ended, so a record that landed
-                // between the read and the describe is delivered, and so is output a Worker
-                // committed but never promoted.
+                // between the read and the describe is delivered.
                 if state.owner_ended {
-                    self.repair(&target.chain, Recent::Ask).await;
                     continue;
                 }
             }
@@ -434,119 +395,6 @@ impl Streams {
         }
         self.carried_chains
             .put(key, first_run_id, self.options.owner_recheck);
-        Ok(())
-    }
-
-    /// Settles the stages a Worker left behind on `chain`, as History decides them. Best effort:
-    /// a stage History has not decided stays for the next reader, and a failure only logs.
-    async fn repair(&self, chain: &ChainId, recent: Recent) {
-        if let Err(error) = self.try_repair(chain, recent).await {
-            tracing::warn!(
-                workflow_id = %chain.workflow_id,
-                "Could not settle the pending stream stages of the Workflow: {error}"
-            );
-        }
-    }
-
-    async fn try_repair(&self, chain: &ChainId, recent: Recent) -> StreamResult<()> {
-        let mut pending = self.store.pending_stages(chain).await?;
-        let mut started: HashMap<String, Option<SystemTime>> = HashMap::new();
-        for stage in &pending {
-            if started.contains_key(&stage.run_id) {
-                continue;
-            }
-            let start = match self
-                .owner
-                .describe(&chain.namespace, &chain.workflow_id, &stage.run_id)
-                .await
-            {
-                Ok(described) => Some(described.start_time.unwrap_or(SystemTime::UNIX_EPOCH)),
-                Err(OwnerError::NotFound(_)) => None,
-                Err(error) => return Err(describe_failed(&error)),
-            };
-            started.insert(stage.run_id.clone(), start);
-        }
-        // Promotions append, so they go in commit order: by run, then by floor within the run.
-        pending.sort_by(|a, b| {
-            (started[&a.run_id], &a.run_id, a.history_floor_event_id).cmp(&(
-                started[&b.run_id],
-                &b.run_id,
-                b.history_floor_event_id,
-            ))
-        });
-        for stage in pending {
-            if started[&stage.run_id].is_none() {
-                // Retention may have removed the run, or a replica behind a failover may not have
-                // it yet. Aborting could drop committed output, so the stage waits for its expiry
-                // and holds back nothing.
-                tracing::debug!(
-                    token = %stage.token,
-                    run_id = %stage.run_id,
-                    "Leaving a stream stage whose run is not in History"
-                );
-                continue;
-            }
-            if recent == Recent::Trust
-                && self
-                    .undecided
-                    .get(&stage.token)
-                    .is_some_and(|checked| checked.at.elapsed() < UNDECIDED_FOR)
-            {
-                return Ok(());
-            }
-            let events = match self
-                .owner
-                .history_after(
-                    &chain.namespace,
-                    &chain.workflow_id,
-                    &stage.run_id,
-                    stage.history_floor_event_id,
-                )
-                .await
-            {
-                Ok(events) => events,
-                Err(OwnerError::NotFound(_)) => continue,
-                Err(error) => return Err(describe_failed(&error)),
-            };
-            let reference = StageRef {
-                chain: Some(chain.clone()),
-                token: stage.token.clone(),
-                topics: stage.topics,
-            };
-            // A reader never holds an attempt in flight, so the same-floor rule always holds.
-            let settled =
-                match decide_token(&events, &stage.token, stage.history_floor_event_id, true) {
-                    Decision::Promote => self.store.promote(&reference).await.map(|promoted| {
-                        if promoted.outcome == PromoteOutcome::Lost as i32 {
-                            tracing::warn!(
-                                token = %stage.token,
-                                workflow_id = %chain.workflow_id,
-                                "Stream output the Workflow committed was dropped by retention \
-                                 before it was promoted"
-                            );
-                        }
-                    }),
-                    Decision::Abort => self.store.abort(&reference).await,
-                    // A stage History has not decided holds back the ones after it.
-                    Decision::Unknown => {
-                        self.undecided.put(stage.token.clone(), "", UNDECIDED_FOR);
-                        return Ok(());
-                    }
-                };
-            match settled {
-                Ok(()) => {}
-                // A stage the store refuses for good would hold back every later stage on every
-                // read, so it is left to its expiry and the repair goes on.
-                Err(error) if error.kind == crate::proto::StreamFailureKind::Refused => {
-                    tracing::warn!(
-                        token = %stage.token,
-                        workflow_id = %chain.workflow_id,
-                        "Leaving a stream stage the store refuses to settle: {error}"
-                    )
-                }
-                Err(error) => return Err(error),
-            }
-        }
         Ok(())
     }
 
@@ -884,40 +732,26 @@ mod tests {
             StreamRecordKind,
         },
     };
-    use crate::{
-        proto::{StagedBatch, StagedRecord},
-        repair::tests::{event, marker},
-        stored_output_record,
-    };
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temporalio_common::protos::temporal::api::{
-        common::v1::Payload,
-        enums::v1::{EventType, WorkflowExecutionStatus},
-        history::v1::HistoryEvent,
+        common::v1::Payload, enums::v1::WorkflowExecutionStatus,
     };
 
-    /// Temporal as the tests need it: the latest run of each Workflow id, pinned runs, and the
-    /// History of each run.
+    /// Temporal as the tests need it: the latest run of each Workflow id, and pinned runs.
     #[derive(Default)]
     struct Owners {
         latest: Mutex<HashMap<String, Result<OwnerDescription, OwnerError>>>,
         runs: Mutex<HashMap<String, OwnerDescription>>,
-        histories: Mutex<HashMap<String, Vec<HistoryEvent>>>,
-        failing_runs: Mutex<Vec<String>>,
-        described_runs: Mutex<Vec<String>>,
         describes: AtomicUsize,
-        history_reads: AtomicUsize,
     }
 
     impl Owners {
         fn run(&self, workflow_id: &str, run_id: &str, first_run_id: &str) {
-            let started = self.runs.lock().unwrap().len() as u64;
             let described = OwnerDescription {
                 run_id: run_id.to_string(),
                 first_run_id: first_run_id.to_string(),
                 status: WorkflowExecutionStatus::Running,
-                start_time: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(started)),
             };
             self.runs
                 .lock()
@@ -957,16 +791,6 @@ mod tests {
         ) -> Result<OwnerDescription, OwnerError> {
             self.describes.fetch_add(1, Ordering::Relaxed);
             if !run_id.is_empty() {
-                self.described_runs.lock().unwrap().push(run_id.to_string());
-                if self
-                    .failing_runs
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|run| run == run_id)
-                {
-                    return Err(OwnerError::Failed("unavailable".to_string()));
-                }
                 return self
                     .runs
                     .lock()
@@ -981,25 +805,6 @@ mod tests {
                 .get(workflow_id)
                 .cloned()
                 .unwrap_or_else(|| Err(OwnerError::NotFound(workflow_id.to_string())))
-        }
-
-        async fn history_after(
-            &self,
-            _namespace: &str,
-            _workflow_id: &str,
-            run_id: &str,
-            floor: i64,
-        ) -> Result<Vec<HistoryEvent>, OwnerError> {
-            self.history_reads.fetch_add(1, Ordering::Relaxed);
-            let histories = self.histories.lock().unwrap();
-            let events = histories
-                .get(run_id)
-                .ok_or_else(|| OwnerError::NotFound(run_id.to_string()))?;
-            Ok(events
-                .iter()
-                .filter(|event| event.event_id > floor)
-                .cloned()
-                .collect())
         }
     }
 
@@ -1368,7 +1173,6 @@ mod tests {
                 run_id: String::new(),
                 first_run_id: String::new(),
                 status,
-                start_time: None,
             }
             .chain_ended()
         };
@@ -1728,272 +1532,6 @@ mod tests {
         assert_eq!(setup.owners.describes(), before);
     }
 
-    /// A stage of `run_id` at `floor` that a Worker left behind, holding `value` on `out`.
-    async fn left_behind(store: &MemoryStore, run_id: &str, token: &str, floor: i64, value: &str) {
-        let record = data(value);
-        store
-            .stage(StagedBatch {
-                chain: Some(chain("run-1")),
-                run_id: run_id.to_string(),
-                token: token.to_string(),
-                history_floor_event_id: floor,
-                records: vec![StagedRecord {
-                    topic: "out".to_string(),
-                    record: stored_output_record(
-                        "out",
-                        record.kind,
-                        record.body,
-                        &record.content_hash,
-                        run_id,
-                    )
-                    .unwrap()
-                    .encode_to_vec(),
-                }],
-            })
-            .await
-            .unwrap();
-    }
-
-    fn history(owners: &Owners, run_id: &str, events: Vec<HistoryEvent>) {
-        owners
-            .histories
-            .lock()
-            .unwrap()
-            .insert(run_id.to_string(), events);
-    }
-
-    fn values(page: &ReadResponse) -> Vec<String> {
-        page.records
-            .iter()
-            .filter_map(|record| match record.record.as_ref() {
-                Some(crate::proto::read_record::Record::Stored(stored)) => {
-                    Some(String::from_utf8(stored.body.clone().unwrap_or_default().data).unwrap())
-                }
-                _ => None,
-            })
-            .collect()
-    }
-
-    async fn pending(store: &MemoryStore) -> Vec<String> {
-        store
-            .pending_stages(&chain("run-1"))
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|stage| stage.token)
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn a_reader_promotes_output_a_stopped_worker_committed() {
-        // The run finished, so no Worker will ever replay it, and only a reader finds the stage.
-        let setup = setup(quick());
-        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
-        history(
-            &setup.owners,
-            "run-1",
-            vec![
-                event(4, EventType::WorkflowTaskCompleted),
-                marker(5, "t1", 3),
-            ],
-        );
-        let page = setup
-            .streams
-            .read(read_after("", &[], Duration::ZERO))
-            .await
-            .unwrap();
-        assert_eq!(values(&page), ["1"]);
-        assert!(pending(&setup.store).await.is_empty());
-        // A second reader finds nothing left to repair and sees the record once.
-        let again = setup
-            .streams
-            .read(read_after("", &[], Duration::ZERO))
-            .await
-            .unwrap();
-        assert_eq!(values(&again), ["1"]);
-    }
-
-    #[tokio::test]
-    async fn rule_24_1_a_reader_aborts_a_stage_a_later_attempt_superseded() {
-        // A transient attempt's failure is not in History, but the attempt that completed
-        // carries every commit made at that floor.
-        let setup = setup(quick());
-        left_behind(&setup.store, "run-1", "orphan", 3, "0").await;
-        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
-        history(
-            &setup.owners,
-            "run-1",
-            vec![
-                event(4, EventType::WorkflowTaskCompleted),
-                marker(5, "t1", 3),
-            ],
-        );
-        let page = setup
-            .streams
-            .read(read_after("", &[], Duration::ZERO))
-            .await
-            .unwrap();
-        assert_eq!(values(&page), ["1"]);
-        assert!(pending(&setup.store).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn rule_24_3_a_reader_repairs_pending_stages_in_commit_order() {
-        let setup = setup(quick());
-        setup.owners.run("wf", "run-2", "run-1");
-        // A store keeps no order a reader can rely on, so the stages are left in reverse.
-        left_behind(&setup.store, "run-2", "t4", 3, "4").await;
-        left_behind(&setup.store, "run-1", "t3", 9, "3").await;
-        left_behind(&setup.store, "run-1", "t2", 6, "2").await;
-        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
-        history(
-            &setup.owners,
-            "run-1",
-            vec![marker(5, "t1", 3), marker(8, "t2", 6), marker(11, "t3", 9)],
-        );
-        history(&setup.owners, "run-2", vec![marker(5, "t4", 3)]);
-        let page = setup
-            .streams
-            .read(read_after("", &[], Duration::ZERO))
-            .await
-            .unwrap();
-        assert_eq!(values(&page), ["1", "2", "3", "4"]);
-        // One describe per run, however many stages it left.
-        let mut described = setup.owners.described_runs.lock().unwrap().clone();
-        described.sort();
-        assert_eq!(described, ["run-1", "run-2"]);
-    }
-
-    /// Takes every notification and sends nothing.
-    struct Quiet;
-
-    #[async_trait::async_trait]
-    impl crate::NotifierClient for Quiet {
-        async fn notify(&self, _: crate::StreamNotification) -> Result<(), crate::NotifyError> {
-            Ok(())
-        }
-    }
-
-    #[tokio::test]
-    async fn a_reader_repairs_through_the_notifying_store() {
-        // Every process with a client wraps its store, so repair must work through the wrapper.
-        let setup = setup(quick());
-        let notifying = Arc::new(crate::NotifyingStore::new(
-            setup.store.clone(),
-            Arc::new(crate::Notifier::new(Arc::new(Quiet), 10)),
-        ));
-        let streams = Streams::new(notifying, setup.owners.clone(), quick());
-        left_behind(&setup.store, "run-1", "t2", 6, "2").await;
-        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
-        history(
-            &setup.owners,
-            "run-1",
-            vec![marker(5, "t1", 3), marker(8, "t2", 6)],
-        );
-        let page = streams
-            .read(read_after("", &[], Duration::ZERO))
-            .await
-            .unwrap();
-        assert_eq!(values(&page), ["1", "2"]);
-        assert!(pending(&setup.store).await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn rule_24_3_a_stage_history_has_not_decided_holds_back_the_ones_after_it() {
-        let setup = setup(quick());
-        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
-        left_behind(&setup.store, "run-1", "t2", 6, "2").await;
-        // A Local Activity may hold the first task open, so neither may land yet.
-        history(
-            &setup.owners,
-            "run-1",
-            vec![
-                event(4, EventType::WorkflowTaskCompleted),
-                marker(8, "t2", 6),
-            ],
-        );
-        let page = setup
-            .streams
-            .read(read_after("", &[], Duration::ZERO))
-            .await
-            .unwrap();
-        assert!(page.records.is_empty());
-        assert_eq!(pending(&setup.store).await.len(), 2);
-    }
-
-    #[tokio::test]
-    async fn rule_24_4_a_reader_repairs_past_a_stage_whose_run_is_gone() {
-        let setup = setup(quick());
-        left_behind(&setup.store, "gone", "lost", 3, "0").await;
-        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
-        history(&setup.owners, "run-1", vec![marker(5, "t1", 3)]);
-        let page = setup
-            .streams
-            .read(read_after("", &[], Duration::ZERO))
-            .await
-            .unwrap();
-        assert_eq!(values(&page), ["1"]);
-        // Not found can mean a replica behind a failover, so the stage waits for its expiry.
-        assert_eq!(pending(&setup.store).await, ["lost"]);
-    }
-
-    #[tokio::test]
-    async fn a_failed_repair_leaves_the_read_running() {
-        let setup = setup(quick());
-        setup.streams.append(append("p", 1, "1")).await.unwrap();
-        left_behind(&setup.store, "run-x", "t1", 3, "0").await;
-        setup
-            .owners
-            .failing_runs
-            .lock()
-            .unwrap()
-            .push("run-x".to_string());
-        let page = setup
-            .streams
-            .read(read_after("", &[], Duration::ZERO))
-            .await
-            .unwrap();
-        assert_eq!(values(&page), ["1"]);
-        assert_eq!(pending(&setup.store).await, ["t1"]);
-    }
-
-    #[tokio::test]
-    async fn a_read_repairs_again_when_its_owner_ends() {
-        let setup = setup(quick());
-        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
-        history(
-            &setup.owners,
-            "run-1",
-            vec![event(4, EventType::WorkflowTaskStarted)],
-        );
-        let first = setup
-            .streams
-            .read(read_after("", &[], Duration::ZERO))
-            .await
-            .unwrap();
-        assert!(first.records.is_empty());
-        // The Worker committed and stopped before promoting, then the run finished.
-        history(
-            &setup.owners,
-            "run-1",
-            vec![
-                marker(5, "t1", 3),
-                event(9, EventType::WorkflowExecutionCompleted),
-            ],
-        );
-        setup.owners.end("wf", WorkflowExecutionStatus::Completed);
-        let page = setup
-            .streams
-            .read(read_after(
-                &first.cursor,
-                &first.state,
-                Duration::from_secs(5),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(values(&page), ["1"]);
-    }
-
     #[tokio::test]
     async fn an_owner_delete_asks_temporal_nothing() {
         let setup = setup(StreamsOptions::default());
@@ -2090,128 +1628,5 @@ mod tests {
             );
         }
         assert_eq!(setup.owners.describes(), 0);
-    }
-
-    /// A memory store that refuses for good to promote one stage.
-    struct Refusing {
-        inner: MemoryStore,
-        token: String,
-    }
-
-    #[async_trait::async_trait]
-    impl StreamStore for Refusing {
-        fn name(&self) -> &str {
-            self.inner.name()
-        }
-        async fn append(
-            &self,
-            r: crate::proto::StoreAppendRequest,
-        ) -> StreamResult<crate::proto::StoreAppendResponse> {
-            self.inner.append(r).await
-        }
-        async fn read(
-            &self,
-            r: crate::proto::StoreReadRequest,
-        ) -> StreamResult<crate::proto::StoreReadResponse> {
-            self.inner.read(r).await
-        }
-        async fn latest(
-            &self,
-            r: crate::proto::StoreLatestRequest,
-        ) -> StreamResult<crate::proto::StoreLatestResponse> {
-            self.inner.latest(r).await
-        }
-        async fn record_at(&self, c: &ChainId, t: &str, p: &str) -> StreamResult<Option<Vec<u8>>> {
-            self.inner.record_at(c, t, p).await
-        }
-        async fn stage(&self, b: StagedBatch) -> StreamResult<()> {
-            self.inner.stage(b).await
-        }
-        async fn promote(&self, s: &StageRef) -> StreamResult<crate::proto::PromoteResult> {
-            if s.token == self.token {
-                return Err(StreamError::refused(
-                    "the stage names a topic the store can't key",
-                ));
-            }
-            self.inner.promote(s).await
-        }
-        async fn abort(&self, s: &StageRef) -> StreamResult<()> {
-            self.inner.abort(s).await
-        }
-        async fn close_chain(&self, c: &ChainId) -> StreamResult<()> {
-            self.inner.close_chain(c).await
-        }
-        async fn close_topic(
-            &self,
-            c: &ChainId,
-            t: &str,
-            result: Option<crate::proto::Payload>,
-        ) -> StreamResult<()> {
-            self.inner.close_topic(c, t, result).await
-        }
-        async fn pending_stages(
-            &self,
-            c: &ChainId,
-        ) -> StreamResult<Vec<crate::proto::PendingStage>> {
-            self.inner.pending_stages(c).await
-        }
-        async fn delete_owner(
-            &self,
-            r: crate::proto::DeleteOwnerRequest,
-        ) -> StreamResult<crate::proto::DeleteOwnerResponse> {
-            self.inner.delete_owner(r).await
-        }
-    }
-
-    #[tokio::test]
-    async fn rule_12_2_repair_goes_past_a_stage_the_store_refuses_for_good() {
-        let store = Arc::new(Refusing {
-            inner: MemoryStore::new(),
-            token: "bad".to_string(),
-        });
-        let owners = Arc::new(Owners::default());
-        owners.run("wf", "run-1", "run-1");
-        let streams = Streams::new(store.clone(), owners.clone(), quick());
-        left_behind(&store.inner, "run-1", "bad", 3, "0").await;
-        left_behind(&store.inner, "run-1", "t1", 6, "1").await;
-        history(
-            &owners,
-            "run-1",
-            vec![marker(5, "bad", 3), marker(8, "t1", 6)],
-        );
-        let page = streams
-            .read(read_after("", &[], Duration::ZERO))
-            .await
-            .unwrap();
-        assert_eq!(values(&page), ["1"]);
-        let left: Vec<_> = store
-            .inner
-            .pending_stages(&chain("run-1"))
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|stage| stage.token)
-            .collect();
-        assert_eq!(left, ["bad"]);
-    }
-
-    #[tokio::test]
-    async fn rule_12_3_an_undecided_stage_is_not_read_again_by_every_new_reader() {
-        // A long Local Activity holds the task open, so History can't decide the stage yet.
-        let setup = setup(quick());
-        left_behind(&setup.store, "run-1", "t1", 3, "1").await;
-        history(
-            &setup.owners,
-            "run-1",
-            vec![event(4, EventType::WorkflowTaskStarted)],
-        );
-        for _ in 0..3 {
-            setup
-                .streams
-                .read(read_after("", &[], Duration::ZERO))
-                .await
-                .unwrap();
-        }
-        assert_eq!(setup.owners.history_reads.load(Ordering::Relaxed), 1);
     }
 }

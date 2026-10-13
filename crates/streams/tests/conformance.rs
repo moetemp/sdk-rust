@@ -16,9 +16,9 @@ use std::{
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     BEGINNING, END, MemoryStore, NewestOrArm, Notifier, NotifierClient, NotifyError,
-    NotifyingStore, OwnerClient, OwnerDescription, OwnerError, ReadTarget, StreamNotification,
-    StreamResult, StreamStore, Streams, StreamsOptions, mint_cursor, proto::*, read_page,
-    stored_append_record, stored_output_record, stream_hash,
+    NotifyingStore, ReadTarget, StreamNotification, StreamResult, StreamStore, mint_cursor,
+    proto::*, read_page, stored_append_record, stored_output_record, stream_hash,
+    workflow_producer_id,
 };
 
 #[async_trait::async_trait]
@@ -556,149 +556,6 @@ async fn latest(case: &dyn Case, chain: &ChainId, topic: &str) -> String {
         .position
 }
 
-fn staged(chain: &ChainId, run_id: &str, token: &str, records: &[(&str, &str)]) -> StagedBatch {
-    StagedBatch {
-        chain: Some(chain.clone()),
-        run_id: run_id.to_string(),
-        token: token.to_string(),
-        history_floor_event_id: 3,
-        records: records
-            .iter()
-            .map(|(topic, value)| {
-                let record = data(value);
-                StagedRecord {
-                    topic: topic.to_string(),
-                    record: stored_output_record(
-                        topic,
-                        record.kind,
-                        record.body,
-                        &record.content_hash,
-                        run_id,
-                    )
-                    .unwrap()
-                    .encode_to_vec(),
-                }
-            })
-            .collect(),
-    }
-}
-
-fn stage_ref(chain: &ChainId, token: &str, topics: &[&str]) -> StageRef {
-    StageRef {
-        chain: Some(chain.clone()),
-        token: token.to_string(),
-        topics: topics.iter().map(|topic| topic.to_string()).collect(),
-    }
-}
-
-use temporalio_common::protos::temporal::api::{
-    enums::v1::WorkflowExecutionStatus, history::v1::HistoryEvent,
-};
-
-/// Temporal for one chain whose Workflow is still running, for cases that go through [Streams],
-/// with the History its first run holds.
-struct RunningChain(ChainId, std::sync::Mutex<Vec<HistoryEvent>>);
-
-#[async_trait::async_trait]
-impl OwnerClient for RunningChain {
-    async fn describe(
-        &self,
-        _namespace: &str,
-        _workflow_id: &str,
-        _run_id: &str,
-    ) -> Result<OwnerDescription, OwnerError> {
-        Ok(OwnerDescription {
-            run_id: self.0.first_run_id.clone(),
-            first_run_id: self.0.first_run_id.clone(),
-            status: WorkflowExecutionStatus::Running,
-            start_time: None,
-        })
-    }
-
-    async fn history_after(
-        &self,
-        _namespace: &str,
-        _workflow_id: &str,
-        _run_id: &str,
-        floor: i64,
-    ) -> Result<Vec<HistoryEvent>, OwnerError> {
-        Ok(self
-            .1
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|event| event.event_id > floor)
-            .cloned()
-            .collect())
-    }
-}
-
-fn streams_over(case: &dyn Case, chain: &ChainId) -> (Streams, Arc<RunningChain>) {
-    let owner = Arc::new(RunningChain(chain.clone(), Default::default()));
-    let streams = Streams::new(
-        case.store(),
-        owner.clone(),
-        StreamsOptions {
-            owner_check_min: Duration::from_millis(20),
-            owner_check_max: Duration::from_millis(80),
-            ..StreamsOptions::default()
-        },
-    );
-    (streams, owner)
-}
-
-fn stream_read(chain: &ChainId, after: &str, state: &[u8], wait: Duration) -> ReadRequest {
-    ReadRequest {
-        stream: Some(StreamAddress {
-            namespace: chain.namespace.clone(),
-            owner_kind: StreamOwnerKind::Workflow as i32,
-            workflow_id: chain.workflow_id.clone(),
-            run_id: String::new(),
-            topic: OUT.to_string(),
-        }),
-        after: after.to_string(),
-        state: state.to_vec(),
-        wait: Some(wait.try_into().unwrap()),
-        ..Default::default()
-    }
-}
-
-/// The marker a Workflow Task writes when it commits the stage `token` made at `floor`.
-fn marker(event_id: i64, token: &str, floor: i64) -> HistoryEvent {
-    use temporalio_common::protos::{
-        constants::EXTERNAL_STREAM_MARKER_NAME,
-        coresdk::external_data::{
-            ExternalOutputStreamManifest, ExternalStreamMarkerData,
-            build_external_stream_marker_details,
-        },
-        temporal::api::{
-            enums::v1::EventType,
-            history::v1::{MarkerRecordedEventAttributes, history_event::Attributes},
-        },
-    };
-    let data = ExternalStreamMarkerData {
-        schema_version: 1,
-        output: Some(ExternalOutputStreamManifest {
-            stage_token: token.to_string(),
-            history_floor_event_id: floor,
-            ..Default::default()
-        }),
-        ..Default::default()
-    };
-    HistoryEvent {
-        event_id,
-        event_type: EventType::MarkerRecorded as i32,
-        attributes: Some(Attributes::MarkerRecordedEventAttributes(
-            MarkerRecordedEventAttributes {
-                marker_name: EXTERNAL_STREAM_MARKER_NAME.to_string(),
-                details: build_external_stream_marker_details(&data),
-                ..Default::default()
-            },
-        )),
-        ..Default::default()
-    }
-}
-
 fn kind(result: StreamResult<impl std::fmt::Debug>) -> StreamFailureKind {
     result.unwrap_err().kind
 }
@@ -1127,6 +984,53 @@ mod cases {
         assert_eq!(values(&resumed), ["SUPERSEDED", "3"]);
     }
 
+    pub(crate) async fn a_workflow_rerun_supersedes_its_failed_attempt(case: &dyn Case) {
+        let chain = case.chain();
+        // A rerun of a Workflow Task sends the same sequences under its run's next attempt.
+        for attempt in [1, 2] {
+            let records = [data("a"), data("b")];
+            let request = StoreAppendRequest {
+                chain: Some(chain.clone()),
+                topic: OUT.to_string(),
+                producer_id: workflow_producer_id("run-1"),
+                attempt,
+                sequence: 1,
+                digest: digest(&records),
+                records: records
+                    .iter()
+                    .enumerate()
+                    .map(|(index, record)| {
+                        stored_output_record(
+                            OUT,
+                            record.kind,
+                            record.body.clone(),
+                            &record.content_hash,
+                            "run-1",
+                            attempt,
+                            1 + index as i64,
+                        )
+                        .unwrap()
+                        .encode_to_vec()
+                    })
+                    .collect(),
+            };
+            case.store().append(request).await.unwrap();
+        }
+        let read = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert_eq!(values(&read), ["a", "b", "SUPERSEDED", "a", "b"]);
+        let Some(read_record::Record::Superseded(superseded)) = &read.records[2].record else {
+            panic!("no supersession");
+        };
+        assert_eq!(
+            (
+                superseded.producer_id.as_str(),
+                superseded.previous_attempt,
+                superseded.attempt
+            ),
+            ("@run-1", 1, 2)
+        );
+    }
+
     pub(crate) async fn a_record_that_does_not_parse_fails_with_its_cursor(case: &dyn Case) {
         let chain = case.chain();
         let producer = Producer::new(case, &chain, OUT, "p", 1);
@@ -1331,284 +1235,20 @@ mod cases {
         Producer::new(case, &chain, odd, "p", 1)
             .append(&["1"])
             .await;
-        store
-            .stage(staged(&chain, "run-1", "t1", &[("staged", "1")]))
-            .await
-            .unwrap();
-        store
-            .stage(staged(&chain, "run-1", "t2", &[("aborted", "1")]))
-            .await
-            .unwrap();
-        store
-            .abort(&stage_ref(&chain, "t2", &["aborted"]))
-            .await
-            .unwrap();
-        assert_eq!(
-            open(chain.clone()).await,
-            [odd, "aborted", OUT, "staged"],
-            "a staged topic is known once staged, and an abort doesn't forget it"
-        );
-        store
-            .promote(&stage_ref(&chain, "t1", &["staged"]))
-            .await
-            .unwrap();
+        assert_eq!(open(chain.clone()).await, [odd, OUT]);
         store.close_topic(&chain, OUT, None).await.unwrap();
-        assert_eq!(open(chain.clone()).await, [odd, "aborted", "staged"]);
+        assert_eq!(open(chain.clone()).await, [odd]);
         let other = case.chain();
         Producer::new(case, &other, OTHER, "p", 1)
             .append(&["1"])
             .await;
-        assert_eq!(
-            open(chain.clone()).await,
-            [odd, "aborted", "staged"],
-            "chains are apart"
-        );
+        assert_eq!(open(chain.clone()).await, [odd], "chains are apart");
         store.close_chain(&chain).await.unwrap();
         assert_eq!(
             open(chain).await,
-            [odd, "aborted", "staged"],
+            [odd],
             "a chain close leaves its topics to be listed"
         );
-    }
-
-    pub(crate) async fn a_stage_is_invisible_until_promoted(case: &dyn Case) {
-        let store = case.store();
-        let chain = case.chain();
-        store
-            .stage(staged(
-                &chain,
-                "run-1",
-                "t1",
-                &[(OUT, "1"), (OTHER, "2"), (OUT, "3")],
-            ))
-            .await
-            .unwrap();
-        assert!(
-            read(case, &chain, OUT, BEGINNING)
-                .await
-                .unwrap()
-                .records
-                .is_empty()
-        );
-        assert_eq!(
-            store.pending_stages(&chain).await.unwrap(),
-            [PendingStage {
-                token: "t1".to_string(),
-                run_id: "run-1".to_string(),
-                history_floor_event_id: 3,
-                topics: vec![OUT.to_string(), OTHER.to_string()],
-            }]
-        );
-        let promoted = store
-            .promote(&stage_ref(&chain, "t1", &[OUT, OTHER]))
-            .await
-            .unwrap();
-        assert_eq!(
-            (promoted.outcome, promoted.records),
-            (PromoteOutcome::Promoted as i32, 3)
-        );
-        assert_eq!(
-            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
-            ["1", "3"]
-        );
-        assert_eq!(
-            values(&read(case, &chain, OTHER, BEGINNING).await.unwrap()),
-            ["2"]
-        );
-        assert!(store.pending_stages(&chain).await.unwrap().is_empty());
-        // The records become visible once.
-        let again = store
-            .promote(&stage_ref(&chain, "t1", &[OUT, OTHER]))
-            .await
-            .unwrap();
-        assert_eq!(again.outcome, PromoteOutcome::Settled as i32);
-        assert_eq!(
-            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
-            ["1", "3"]
-        );
-    }
-
-    pub(crate) async fn a_repeated_stage_holds_its_records_once(case: &dyn Case) {
-        let store = case.store();
-        let chain = case.chain();
-        let batch = staged(&chain, "run-1", "t1", &[(OUT, "1"), (OUT, "2")]);
-        store.stage(batch.clone()).await.unwrap();
-        store.stage(batch).await.unwrap();
-        assert_eq!(store.pending_stages(&chain).await.unwrap().len(), 1);
-        let promoted = store
-            .promote(&stage_ref(&chain, "t1", &[OUT]))
-            .await
-            .unwrap();
-        assert_eq!(promoted.records, 2);
-        assert_eq!(
-            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
-            ["1", "2"]
-        );
-    }
-
-    pub(crate) async fn rule_11_1_a_read_ends_only_after_the_chains_last_stage_lands(
-        case: &dyn Case,
-    ) {
-        // A close doesn't prove the chain's output is visible. A stage can still be pending.
-        let store = case.store();
-        let chain = case.chain();
-        store
-            .stage(staged(&chain, &chain.first_run_id, "t1", &[(OUT, "last")]))
-            .await
-            .unwrap();
-        store.close_chain(&chain).await.unwrap();
-        let (streams, _) = streams_over(case, &chain);
-        let first = streams
-            .read(stream_read(
-                &chain,
-                BEGINNING,
-                &[],
-                Duration::from_millis(200),
-            ))
-            .await
-            .unwrap();
-        assert!(first.records.is_empty());
-        assert!(!first.done, "a read ended with a stage still pending");
-        store
-            .promote(&stage_ref(&chain, "t1", &[OUT]))
-            .await
-            .unwrap();
-        let mut request = stream_read(&chain, &first.cursor, &first.state, Duration::from_secs(5));
-        let mut delivered = Vec::new();
-        for _ in 0..10 {
-            let page = streams.read(request.clone()).await.unwrap();
-            delivered.extend(values(&page));
-            if page.done {
-                assert_eq!(delivered, ["last"]);
-                return;
-            }
-            request = stream_read(&chain, &page.cursor, &page.state, Duration::from_secs(5));
-        }
-        panic!("the read never ended, and delivered {delivered:?}");
-    }
-
-    pub(crate) async fn rule_12_1_a_read_that_ends_on_a_close_repairs_the_chain(case: &dyn Case) {
-        // A Worker that stopped after the final commit leaves its stage pending, and only the
-        // read that sees the close is there to promote it.
-        let store = case.store();
-        let chain = case.chain();
-        let (streams, owner) = streams_over(case, &chain);
-        let first = streams
-            .read(stream_read(&chain, BEGINNING, &[], Duration::ZERO))
-            .await
-            .unwrap();
-        assert!(first.records.is_empty() && !first.done);
-        store
-            .stage(staged(&chain, &chain.first_run_id, "t1", &[(OUT, "last")]))
-            .await
-            .unwrap();
-        owner.1.lock().unwrap().push(marker(5, "t1", 3));
-        store.close_chain(&chain).await.unwrap();
-        let mut request = stream_read(&chain, &first.cursor, &first.state, Duration::from_secs(5));
-        let mut delivered = Vec::new();
-        for _ in 0..5 {
-            let page = tokio::time::timeout(Duration::from_secs(10), streams.read(request.clone()))
-                .await
-                .expect("the read waited for a stage nothing would promote")
-                .unwrap();
-            delivered.extend(values(&page));
-            if page.done {
-                assert_eq!(delivered, ["last"]);
-                return;
-            }
-            request = stream_read(&chain, &page.cursor, &page.state, Duration::from_secs(5));
-        }
-        panic!("the read never ended, and delivered {delivered:?}");
-    }
-
-    pub(crate) async fn an_aborted_stage_never_lands(case: &dyn Case) {
-        let store = case.store();
-        let chain = case.chain();
-        store
-            .stage(staged(&chain, "run-1", "t1", &[(OUT, "1")]))
-            .await
-            .unwrap();
-        let reference = stage_ref(&chain, "t1", &[OUT]);
-        store.abort(&reference).await.unwrap();
-        store.abort(&reference).await.unwrap();
-        assert!(store.pending_stages(&chain).await.unwrap().is_empty());
-        let promoted = store.promote(&reference).await.unwrap();
-        assert_eq!(promoted.outcome, PromoteOutcome::Settled as i32);
-        assert_eq!(latest(case, &chain, OUT).await, "");
-    }
-
-    pub(crate) async fn a_promotion_naming_too_few_topics_writes_nothing(case: &dyn Case) {
-        let store = case.store();
-        let chain = case.chain();
-        store
-            .stage(staged(&chain, "run-1", "t1", &[(OUT, "1"), (OTHER, "2")]))
-            .await
-            .unwrap();
-        let error = store
-            .promote(&stage_ref(&chain, "t1", &[OUT]))
-            .await
-            .unwrap_err();
-        assert!(error.message.contains(OTHER), "{error}");
-        // A retry names the same topics, so the store refuses it for good.
-        assert_eq!(error.kind, StreamFailureKind::Refused);
-        assert_eq!(latest(case, &chain, OUT).await, "");
-        assert_eq!(store.pending_stages(&chain).await.unwrap().len(), 1);
-    }
-
-    pub(crate) async fn a_promotion_lands_on_a_closed_chain(case: &dyn Case) {
-        // A Workflow's committed output is never refused.
-        let store = case.store();
-        let chain = case.chain();
-        store
-            .stage(staged(&chain, "run-1", "t1", &[(OUT, "1")]))
-            .await
-            .unwrap();
-        store.close_chain(&chain).await.unwrap();
-        let promoted = store
-            .promote(&stage_ref(&chain, "t1", &[OUT]))
-            .await
-            .unwrap();
-        assert_eq!(promoted.outcome, PromoteOutcome::Promoted as i32);
-        assert_eq!(
-            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
-            ["1"]
-        );
-    }
-
-    pub(crate) async fn rule_19_3_a_reset_run_writes_on_and_keeps_the_chain_open(case: &dyn Case) {
-        // A reset run keeps the chain's first run, so its output follows the base run's on the
-        // same streams, and producers still write.
-        let store = case.store();
-        let chain = case.chain();
-        store
-            .stage(staged(&chain, "base", "t1", &[(OUT, "1")]))
-            .await
-            .unwrap();
-        store
-            .promote(&stage_ref(&chain, "t1", &[OUT]))
-            .await
-            .unwrap();
-        store
-            .stage(staged(&chain, "reset", "t2", &[(OUT, "1")]))
-            .await
-            .unwrap();
-        store
-            .promote(&stage_ref(&chain, "t2", &[OUT]))
-            .await
-            .unwrap();
-        Producer::new(case, &chain, OTHER, "p", 1)
-            .append(&["2"])
-            .await;
-        let read = read(case, &chain, OUT, BEGINNING).await.unwrap();
-        let runs: Vec<_> = read
-            .records
-            .iter()
-            .map(|record| {
-                let run = &stored(record).metadata[temporalio_common::streams::RUN_ID_KEY];
-                String::from_utf8(run.data.clone()).unwrap()
-            })
-            .collect();
-        assert_eq!(runs, ["base", "reset"]);
     }
 
     pub(crate) async fn deleting_an_owner_drops_every_chain_of_it(case: &dyn Case) {
@@ -1623,10 +1263,6 @@ mod cases {
             .append(&["1"])
             .await;
         Producer::new(case, &next, OUT, "p", 1).append(&["1"]).await;
-        store
-            .stage(staged(&next, "run-2", "t1", &[(OUT, "2")]))
-            .await
-            .unwrap();
         Producer::new(case, &bystander, OUT, "p", 1)
             .append(&["1"])
             .await;
@@ -1638,7 +1274,6 @@ mod cases {
         assert!(store.delete_owner(request.clone()).await.unwrap().deleted > 0);
         assert_eq!(store.delete_owner(request).await.unwrap().deleted, 0);
         assert_eq!(latest(case, &chain, OUT).await, "");
-        assert!(store.pending_stages(&next).await.unwrap().is_empty());
         // Nothing is known about what followed the cursor any more.
         let after = cursor(case, &chain, OUT, &landed.last_position);
         assert_eq!(
@@ -1732,21 +1367,20 @@ mod cases {
         store.disarm(&chain, OTHER, newer).await.unwrap();
     }
 
-    pub(crate) async fn a_promotion_reports_each_topics_arm(case: &dyn Case) {
-        let store = case.store();
+    pub(crate) async fn a_workflow_append_reports_each_topics_arm(case: &dyn Case) {
+        // A Workflow's output is an append as its run's producer, so it reports the arm the same
+        // way.
         let chain = case.chain();
         assert!(arming_read(case, &chain, OUT, "").await.armed);
-        store
-            .stage(staged(&chain, "run-1", "t1", &[(OUT, "1"), (OTHER, "2")]))
-            .await
-            .unwrap();
-        let promoted = store
-            .promote(&stage_ref(&chain, "t1", &[OUT, OTHER]))
-            .await
-            .unwrap();
-        assert_eq!(promoted.outcome(), PromoteOutcome::Promoted);
-        assert!(promoted.arms[OUT] > 0, "{promoted:?}");
-        assert_eq!(promoted.arms[OTHER], 0, "{promoted:?}");
+        let producer = workflow_producer_id(&chain.first_run_id);
+        let armed = Producer::new(case, &chain, OUT, &producer, 1)
+            .append(&["1"])
+            .await;
+        assert!(armed.arm.unwrap() > 0, "{armed:?}");
+        let unarmed = Producer::new(case, &chain, OTHER, &producer, 1)
+            .append(&["2"])
+            .await;
+        assert_eq!(unarmed.arm, Some(0), "{unarmed:?}");
     }
 
     pub(crate) async fn newest_or_arm_arms_only_an_empty_topic(case: &dyn Case) {
@@ -1817,6 +1451,7 @@ macro_rules! store_cases {
             producers_and_attempts_dedupe_apart,
             a_new_attempt_supersedes_the_old_one,
             a_read_resumed_before_a_new_attempt_reports_it,
+        a_workflow_rerun_supersedes_its_failed_attempt,
             a_record_that_does_not_parse_fails_with_its_cursor,
             finish_is_a_record_of_its_own,
             topics_and_chains_are_apart,
@@ -1824,14 +1459,6 @@ macro_rules! store_cases {
             a_closed_chain_refuses_new_batches_but_answers_a_repeat,
             a_closed_topic_leaves_the_others_open,
             a_closed_topic_answers_a_repeat_and_ends_reads,
-            a_stage_is_invisible_until_promoted,
-            a_repeated_stage_holds_its_records_once,
-            an_aborted_stage_never_lands,
-            rule_11_1_a_read_ends_only_after_the_chains_last_stage_lands,
-            rule_12_1_a_read_that_ends_on_a_close_repairs_the_chain,
-            a_promotion_naming_too_few_topics_writes_nothing,
-            a_promotion_lands_on_a_closed_chain,
-            rule_19_3_a_reset_run_writes_on_and_keeps_the_chain_open,
             // Also run by the documented ACL user, which has no `+scan`, so a chain end never
             // scans the keyspace.
             a_chain_lists_its_open_topics,
@@ -1847,7 +1474,7 @@ macro_rules! arm_cases {
             an_append_with_nothing_armed_reports_zero,
             an_arm_that_finds_a_newer_record_stays_unarmed,
             a_disarm_of_an_older_generation_keeps_the_newer_arm,
-            a_promotion_reports_each_topics_arm,
+            a_workflow_append_reports_each_topics_arm,
             newest_or_arm_arms_only_an_empty_topic,
             a_closed_topic_never_arms,
         );
