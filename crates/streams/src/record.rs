@@ -6,7 +6,7 @@ use crate::{
 };
 use temporalio_common::{
     protos::temporal::api::common::v1::Payload,
-    streams::{CONTENT_HASH_KEY, METADATA_ENCODING, content_hash_text},
+    streams::{CONTENT_HASH_KEY, METADATA_ENCODING, RUN_ID_KEY, content_hash_text},
 };
 
 /// The owner kind a Workflow's streams hash under in their cursors.
@@ -58,6 +58,24 @@ pub fn stored_append_record(
     stored.producer_id = producer_id.to_string();
     stored.attempt = attempt;
     stored.sequence = sequence;
+    Ok(stored)
+}
+
+/// The record a store keeps for one record a Workflow run published.
+///
+/// The run id is stamped, since a stream follows the run chain and readers tell a successor run
+/// or a reset branch apart by it. Fails like [stored_append_record].
+pub fn stored_output_record(
+    topic: &str,
+    kind: i32,
+    body: Option<Payload>,
+    content_hash: &[u8],
+    run_id: &str,
+) -> StreamResult<StreamRecord> {
+    let mut stored = stored_record(topic, kind, body, content_hash)?;
+    stored
+        .metadata
+        .insert(RUN_ID_KEY.to_string(), metadata_payload(run_id.as_bytes()));
     Ok(stored)
 }
 
@@ -174,6 +192,18 @@ mod tests {
             (stored.producer_id.as_str(), stored.attempt, stored.sequence),
             ("p", 2, 5)
         );
+        assert!(!stored.metadata.contains_key(RUN_ID_KEY));
+    }
+
+    #[test]
+    fn a_workflow_record_carries_its_run() {
+        let stored =
+            stored_output_record("out", StreamRecordKind::Finish as i32, None, &[], "run-7")
+                .unwrap();
+        assert_eq!(stored.metadata[RUN_ID_KEY].data, b"run-7");
+        assert_eq!(stored.producer_id, "");
+        assert!(stored.body.is_none());
+        assert!(!stored.metadata.contains_key(CONTENT_HASH_KEY));
     }
 
     #[test]

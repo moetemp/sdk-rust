@@ -25,11 +25,11 @@ use temporalio_streams::{
     OwnerClient, OwnerDescription, OwnerError, ReadTarget, RedisStore, RedisStoreOptions,
     StreamStore, Streams, StreamsOptions, mint_cursor,
     proto::{
-        AppendRecord, AppendRequest, ChainId, NamedProducer, ReadRequest, StoreAppendRequest,
-        StreamAddress, StreamFailureKind, StreamOwnerKind, StreamRecordKind,
-        append_request::Producer, read_record,
+        AppendRecord, AppendRequest, ChainId, NamedProducer, ReadRequest, StageRef, StagedBatch,
+        StagedRecord, StoreAppendRequest, StreamAddress, StreamFailureKind, StreamOwnerKind,
+        StreamRecordKind, append_request::Producer, read_record,
     },
-    read_page, stored_append_record, stream_hash,
+    read_page, stored_append_record, stored_output_record, stream_hash,
 };
 
 static IDS: AtomicUsize = AtomicUsize::new(0);
@@ -380,6 +380,87 @@ async fn either_side_sees_a_chain_the_other_closed() {
         .await
         .unwrap_err();
     assert_eq!(error.kind, StreamFailureKind::Closed);
+}
+
+#[tokio::test]
+async fn a_stage_one_side_wrote_the_other_promotes() {
+    let Some(both) = pair(WEEK).await else {
+        return;
+    };
+    let token = both.brook(json!({
+        "op": "stage",
+        "run_id": FIRST_RUN,
+        "floor": 3,
+        "records": [
+            {"topic": "events", "value": {"n": 1}},
+            {"topic": "other", "value": {"n": 2}},
+        ],
+    }));
+    let token = token.as_str().unwrap();
+    let pending = both.core.pending_stages(&both.chain()).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        (
+            pending[0].token.as_str(),
+            pending[0].run_id.as_str(),
+            pending[0].history_floor_event_id,
+            pending[0].topics.clone(),
+        ),
+        (
+            token,
+            FIRST_RUN,
+            3,
+            vec!["events".to_string(), "other".to_string()]
+        )
+    );
+    let promoted = both
+        .core
+        .promote(&StageRef {
+            chain: Some(both.chain()),
+            token: token.to_string(),
+            topics: pending[0].topics.clone(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(promoted.records, 2);
+    let read = both.brook(json!({"op": "read", "count": 1, "topic": "other"}));
+    assert_eq!(values(&read), [json!({"n": 2})]);
+    assert_eq!(read[0]["run_id"], FIRST_RUN);
+
+    let record = json_record(&json!({"n": 3}));
+    both.core
+        .stage(StagedBatch {
+            chain: Some(both.chain()),
+            run_id: FIRST_RUN.to_string(),
+            token: "core-token".to_string(),
+            history_floor_event_id: 7,
+            records: vec![StagedRecord {
+                topic: "events".to_string(),
+                record: stored_output_record(
+                    "events",
+                    record.kind,
+                    record.body,
+                    &record.content_hash,
+                    FIRST_RUN,
+                )
+                .unwrap()
+                .encode_to_vec(),
+            }],
+        })
+        .await
+        .unwrap();
+    both.brook(json!({"op": "promote", "token": "core-token", "topics": ["events"]}));
+    assert_eq!(
+        both.core_read("events", "").await.unwrap(),
+        [json!({"n": 1}), json!({"n": 3})]
+    );
+    assert!(
+        both.core
+            .pending_stages(&both.chain())
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
