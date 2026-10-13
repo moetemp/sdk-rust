@@ -61,6 +61,11 @@ impl StreamError {
         Self::new(StreamFailureKind::NotFound, message)
     }
 
+    /// The call's input breaks its contract, so the same call fails the same way.
+    pub fn invalid_argument(message: impl Into<String>) -> Self {
+        Self::new(StreamFailureKind::InvalidArgument, message)
+    }
+
     /// This release or this store does not offer the capability.
     pub fn unsupported(message: impl Into<String>) -> Self {
         Self::new(StreamFailureKind::Unsupported, message)
@@ -107,6 +112,16 @@ mod tests {
         assert_eq!(failure.kind, StreamFailureKind::Record as i32);
         assert_eq!(failure.cursor, "redis:8162b717:1-0");
         assert_eq!(StreamError::from(failure), error);
+    }
+
+    #[test]
+    fn an_invalid_argument_crosses_as_its_own_kind() {
+        let failure = StreamFailure::from(StreamError::invalid_argument("no producer id"));
+        assert_eq!(failure.kind, 12);
+        assert_eq!(
+            StreamError::from(failure).kind,
+            StreamFailureKind::InvalidArgument
+        );
     }
 
     #[test]
