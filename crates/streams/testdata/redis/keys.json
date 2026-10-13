@@ -7,7 +7,9 @@
     "topic": "events",
     "log": "temporal-streams:{default:wf:run-1}:t:events",
     "meta": "temporal-streams:{default:wf:run-1}:t:events:meta",
-    "chain": "temporal-streams:{default:wf:run-1}:chain"
+    "chain": "temporal-streams:{default:wf:run-1}:chain",
+    "stage_token_abc": "temporal-streams:{default:wf:run-1}:stage:abc",
+    "pending": "temporal-streams:{default:wf:run-1}:stages"
   },
   {
     "prefix": "temporal-streams",
@@ -17,7 +19,9 @@
     "topic": "out",
     "log": "temporal-streams:{my-ns:order%3A42:01a1-xyz}:t:out",
     "meta": "temporal-streams:{my-ns:order%3A42:01a1-xyz}:t:out:meta",
-    "chain": "temporal-streams:{my-ns:order%3A42:01a1-xyz}:chain"
+    "chain": "temporal-streams:{my-ns:order%3A42:01a1-xyz}:chain",
+    "stage_token_abc": "temporal-streams:{my-ns:order%3A42:01a1-xyz}:stage:abc",
+    "pending": "temporal-streams:{my-ns:order%3A42:01a1-xyz}:stages"
   },
   {
     "prefix": "p{x}",
@@ -27,7 +31,9 @@
     "topic": "t/1",
     "log": "p%7Bx%7D:{ns%3Aa:wf%7Bb%7D:r%3A1}:t:t%2F1",
     "meta": "p%7Bx%7D:{ns%3Aa:wf%7Bb%7D:r%3A1}:t:t%2F1:meta",
-    "chain": "p%7Bx%7D:{ns%3Aa:wf%7Bb%7D:r%3A1}:chain"
+    "chain": "p%7Bx%7D:{ns%3Aa:wf%7Bb%7D:r%3A1}:chain",
+    "stage_token_abc": "p%7Bx%7D:{ns%3Aa:wf%7Bb%7D:r%3A1}:stage:abc",
+    "pending": "p%7Bx%7D:{ns%3Aa:wf%7Bb%7D:r%3A1}:stages"
   },
   {
     "prefix": "temporal-streams",
@@ -37,7 +43,9 @@
     "topic": "tópic é",
     "log": "temporal-streams:{ns:w%C3%B6rk%20flow:run}:t:t%C3%B3pic%20%C3%A9",
     "meta": "temporal-streams:{ns:w%C3%B6rk%20flow:run}:t:t%C3%B3pic%20%C3%A9:meta",
-    "chain": "temporal-streams:{ns:w%C3%B6rk%20flow:run}:chain"
+    "chain": "temporal-streams:{ns:w%C3%B6rk%20flow:run}:chain",
+    "stage_token_abc": "temporal-streams:{ns:w%C3%B6rk%20flow:run}:stage:abc",
+    "pending": "temporal-streams:{ns:w%C3%B6rk%20flow:run}:stages"
   },
   {
     "prefix": "pre fix",
@@ -47,6 +55,8 @@
     "topic": "x y",
     "log": "pre%20fix:{n%25s:a~b.c_d-e:r}:t:x%20y",
     "meta": "pre%20fix:{n%25s:a~b.c_d-e:r}:t:x%20y:meta",
-    "chain": "pre%20fix:{n%25s:a~b.c_d-e:r}:chain"
+    "chain": "pre%20fix:{n%25s:a~b.c_d-e:r}:chain",
+    "stage_token_abc": "pre%20fix:{n%25s:a~b.c_d-e:r}:stage:abc",
+    "pending": "pre%20fix:{n%25s:a~b.c_d-e:r}:stages"
   }
 ]

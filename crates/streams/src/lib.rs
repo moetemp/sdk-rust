@@ -4,9 +4,10 @@
 //!
 //! A stream is a topic of a Workflow, kept in a store outside Temporal and keyed by the
 //! Workflow's run chain. This crate holds what every store and every SDK share: the
-//! [StreamStore] trait a store implements, the cursor format, the record helpers that stamp
-//! records, and the error every call fails with. Lang reaches a store through Core's
-//! `StreamService`.
+//! [StreamStore] trait a store implements, the cursor format, the record helpers that stamp and
+//! fingerprint records, and the error every call fails with. Lang reaches a store through Core's
+//! `StreamService`, and Core's Worker stages and promotes a Workflow's own output through the
+//! same trait.
 
 mod cursor;
 mod error;
@@ -30,6 +31,7 @@ pub use owner::{OwnerClient, OwnerDescription, OwnerError};
 pub use reader::{DEFAULT_MAX_RECORDS, MAX_TRACKED_PRODUCERS, ReadTarget, read_page};
 pub use record::{
     WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, stored_append_record,
+    stored_output_record,
 };
 pub use service::StreamService;
 pub use store::StreamStore;

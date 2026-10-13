@@ -17,6 +17,9 @@ slides the expiry of the log and its meta, so a stream dies a retention after it
 and nobody cleans up when the Workflow closes. The meta outlives its log by a 30-day grace, as
 the tombstone that tells a log that expired from one that never existed.
 
+**Stages.** A Workflow's own output is staged next to its logs and moved into them by one
+script, so readers see a Workflow Task's records together or not at all.
+
 **Deletes.** Deleting an owner's streams scans every primary for the Workflow id's keys. `SCAN`
 makes no promise about keys that move to another node while it runs, so a delete during a
 cluster reshard can miss some. Run it again once the reshard is done.
