@@ -236,6 +236,10 @@ enum StreamFailureKind {
   STREAM_FAILURE_KIND_STORAGE = 10;
   // This release or this store does not offer the capability.
   STREAM_FAILURE_KIND_UNSUPPORTED = 11;
+  // The call's input breaks the contract, such as a missing member or a value out of range, so
+  // the same call fails the same way. A lang built before this kind maps it, as any kind it
+  // doesn't know, to a storage failure.
+  STREAM_FAILURE_KIND_INVALID_ARGUMENT = 12;
 }
 
 message StreamFailure {

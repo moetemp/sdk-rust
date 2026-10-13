@@ -126,7 +126,7 @@ fn capped(mut request: ReadRequest) -> ReadRequest {
 
 fn decode<T: Message + Default>(rpc: &str, request: &[u8]) -> Result<T, StreamFailure> {
     T::decode(request).map_err(|error| {
-        StreamError::refused(format!("the {rpc} request did not decode ({error})")).into()
+        StreamError::invalid_argument(format!("the {rpc} request did not decode ({error})")).into()
     })
 }
 
@@ -392,7 +392,7 @@ mod tests {
         assert_eq!(unknown.kind(), StreamFailureKind::Unsupported);
         assert!(unknown.message.contains("Truncate"));
         let garbled = service.call("Append", &[0xff, 0xff]).await.unwrap_err();
-        assert_eq!(garbled.kind(), StreamFailureKind::Refused);
+        assert_eq!(garbled.kind(), StreamFailureKind::InvalidArgument);
         assert!(garbled.message.contains("did not decode"));
     }
 
@@ -418,7 +418,7 @@ mod tests {
             .call("DeleteOwner", &no_id.encode_to_vec())
             .await
             .unwrap_err();
-        assert_eq!(failure.kind(), StreamFailureKind::Refused);
+        assert_eq!(failure.kind(), StreamFailureKind::InvalidArgument);
     }
 
     #[tokio::test]
