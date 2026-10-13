@@ -8,14 +8,13 @@
 use crate::{
     StreamError, StreamResult, StreamStore,
     proto::{
-        ChainId, DeleteOwnerRequest, DeleteOwnerResponse, PendingStage, PromoteOutcome,
-        PromoteResult, StageRef, StagedBatch, StoreAppendRequest, StoreAppendResponse,
+        ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredRecord,
         StreamOwnerKind,
     },
 };
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, VecDeque},
     sync::Mutex,
     time::Duration,
 };
@@ -73,8 +72,6 @@ impl Topic {
 struct Chain {
     topics: HashMap<String, Topic>,
     closed: bool,
-    /// In staging order, which is the order a Worker commits them in.
-    stages: Vec<StagedBatch>,
 }
 
 /// A [StreamStore] in process memory. For tests only.
@@ -339,65 +336,6 @@ impl StreamStore for MemoryStore {
             .map(|offset| offset.to_string()))
     }
 
-    async fn stage(&self, batch: StagedBatch) -> StreamResult<()> {
-        let mut chains = self.chains.lock().unwrap();
-        let chain = chains
-            .entry(chain_key(chain_of(batch.chain.as_ref())?))
-            .or_default();
-        chain.stages.retain(|held| held.token != batch.token);
-        chain.stages.push(batch);
-        Ok(())
-    }
-
-    async fn promote(&self, stage: &StageRef) -> StreamResult<PromoteResult> {
-        let mut chains = self.chains.lock().unwrap();
-        let Some(chain) = chains.get_mut(&chain_key(chain_of(stage.chain.as_ref())?)) else {
-            return Ok(settled());
-        };
-        let Some(index) = chain
-            .stages
-            .iter()
-            .position(|held| held.token == stage.token)
-        else {
-            return Ok(settled());
-        };
-        // Checked before any write, so a promotion that names too few topics writes nothing and
-        // the stage stays pending.
-        if let Some(stray) = chain.stages[index]
-            .records
-            .iter()
-            .find(|record| !stage.topics.contains(&record.topic))
-        {
-            return Err(StreamError::refused(format!(
-                "the stage holds topic {:?}, which the promotion did not name",
-                stray.topic
-            )));
-        }
-        let batch = chain.stages.remove(index);
-        let records = batch.records.len() as u32;
-        for record in batch.records {
-            chain
-                .topics
-                .entry(record.topic)
-                .or_default()
-                .push(record.record);
-        }
-        drop(chains);
-        self.wrote();
-        Ok(PromoteResult {
-            outcome: PromoteOutcome::Promoted as i32,
-            records,
-        })
-    }
-
-    async fn abort(&self, stage: &StageRef) -> StreamResult<()> {
-        let mut chains = self.chains.lock().unwrap();
-        if let Some(chain) = chains.get_mut(&chain_key(chain_of(stage.chain.as_ref())?)) {
-            chain.stages.retain(|held| held.token != stage.token);
-        }
-        Ok(())
-    }
-
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {
         self.chains
             .lock()
@@ -423,14 +361,6 @@ impl StreamStore for MemoryStore {
         Ok(())
     }
 
-    async fn pending_stages(&self, chain: &ChainId) -> StreamResult<Vec<PendingStage>> {
-        let chains = self.chains.lock().unwrap();
-        Ok(chains
-            .get(&chain_key(chain))
-            .map(|chain| chain.stages.iter().map(pending).collect())
-            .unwrap_or_default())
-    }
-
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
         if request.owner_kind != StreamOwnerKind::Workflow as i32 {
             return Err(StreamError::unsupported(format!(
@@ -443,34 +373,11 @@ impl StreamStore for MemoryStore {
         chains.retain(|(namespace, workflow_id, _), chain| {
             let owned = *namespace == request.namespace && *workflow_id == request.workflow_id;
             if owned {
-                deleted += 1 + chain.topics.len() as u64 + chain.stages.len() as u64;
+                deleted += 1 + chain.topics.len() as u64;
             }
             !owned
         });
         Ok(DeleteOwnerResponse { deleted })
-    }
-}
-
-fn settled() -> PromoteResult {
-    PromoteResult {
-        outcome: PromoteOutcome::Settled as i32,
-        records: 0,
-    }
-}
-
-fn pending(batch: &StagedBatch) -> PendingStage {
-    let mut topics: Vec<String> = Vec::new();
-    let mut seen = HashSet::new();
-    for record in &batch.records {
-        if seen.insert(record.topic.as_str()) {
-            topics.push(record.topic.clone());
-        }
-    }
-    PendingStage {
-        token: batch.token.clone(),
-        run_id: batch.run_id.clone(),
-        history_floor_event_id: batch.history_floor_event_id,
-        topics,
     }
 }
 

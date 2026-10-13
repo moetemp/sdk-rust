@@ -8,8 +8,6 @@
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:t:<topic>        the log
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:t:<topic>:meta   its meta
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:chain            the close flag
-//! <prefix>:{<namespace>:<workflow id>:<first run id>}:stages           pending stages
-//! <prefix>:{<namespace>:<workflow id>:<first run id>}:stage:<token>    one stage
 //! ```
 //!
 //! Each part, the prefix included, is percent-encoded, so a `:` or a brace in an id cannot make
@@ -60,14 +58,6 @@ impl ChainKeys {
     pub(crate) fn chain(&self) -> String {
         format!("{}:chain", self.base)
     }
-
-    pub(crate) fn pending(&self) -> String {
-        format!("{}:stages", self.base)
-    }
-
-    pub(crate) fn stage(&self, token: &str) -> String {
-        format!("{}:stage:{}", self.base, part(token))
-    }
 }
 
 /// The meta field that holds one producer attempt's newest batch.
@@ -116,8 +106,6 @@ mod tests {
             assert_eq!(keys.log(topic), text(case, "log"));
             assert_eq!(keys.meta(topic), text(case, "meta"));
             assert_eq!(keys.chain(), text(case, "chain"));
-            assert_eq!(keys.stage("abc"), text(case, "stage_token_abc"));
-            assert_eq!(keys.pending(), text(case, "pending"));
         }
     }
 

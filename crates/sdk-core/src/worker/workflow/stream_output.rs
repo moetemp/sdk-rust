@@ -20,7 +20,7 @@ use temporalio_common::{
 /// The marker version Core writes. Readers must accept every version up to this one.
 pub(super) const MARKER_SCHEMA_VERSION: u32 = 1;
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
-/// The layout a store keeps records in. A store that changes it must refuse older stages.
+/// The layout a store keeps records in, recorded so a reader of History knows how to find them.
 const STORE_FORMAT_VERSION: u32 = 1;
 /// Keeps one output proof well inside the server's per-event payload limits.
 const MAX_MANIFEST_BYTES: usize = 64 * 1024;
@@ -36,7 +36,7 @@ type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 /// Builds the manifest for the records one completion committed.
 ///
 /// `replaying` allows records without bodies, since lang sends no body when nothing is stored
-/// again. The run id and stage token are recorded but replay never compares them. Fails the
+/// again. The run id is recorded but replay never compares it. Fails the
 /// Workflow Task when a record is one no writer stores, when Core can't name the task's history
 /// floor, or when the manifest is over its budget. Each failure names what to fix, because the
 /// task fails the same way on every retry.
@@ -44,7 +44,6 @@ pub(super) fn build_output_manifest(
     records: &[OutputRecord],
     history_floor_event_id: Option<i64>,
     run_id: &str,
-    stage_token: String,
     replaying: bool,
 ) -> Result<ExternalOutputStreamManifest> {
     let Some(history_floor_event_id) = history_floor_event_id.filter(|id| *id > 0) else {
@@ -107,7 +106,6 @@ pub(super) fn build_output_manifest(
     let manifest = ExternalOutputStreamManifest {
         schema_version: MANIFEST_SCHEMA_VERSION,
         fingerprint_version: FINGERPRINT_VERSION,
-        stage_token,
         history_floor_event_id,
         run_id: run_id.to_string(),
         segments: vec![ExternalOutputSegmentManifest {
@@ -132,8 +130,7 @@ pub(super) fn build_output_manifest(
 /// Compares the manifest Core built from the records lang committed while replaying with the one
 /// History recorded.
 ///
-/// The stage token is left out because nothing is staged on replay, so there is no token. The
-/// run id is left out because a reset forks the base run's History, so the new run replays
+/// The run id is left out because a reset forks the base run's History, so the new run replays
 /// markers that name the base run. Everything else derives from the Workflow's own output.
 pub(super) fn check_replayed_output_manifest(
     mut replayed: ExternalOutputStreamManifest,
@@ -146,10 +143,9 @@ pub(super) fn check_replayed_output_manifest(
         ));
     };
     // Only the logical output must replay the same. A reset run replays markers that name its
-    // base run, a stage token is new on every attempt, and a provider can be renamed, swapped for
-    // a Replayer or change its stage layout without changing what the Workflow published.
+    // base run, and a provider can be renamed, swapped for a Replayer or change its layout without
+    // changing what the Workflow published.
     for manifest in [&mut replayed, &mut recorded] {
-        manifest.stage_token.clear();
         manifest.run_id.clear();
         manifest.provider_id.clear();
         manifest.provider_format_version = 0;
@@ -264,7 +260,7 @@ mod tests {
     }
 
     fn build(records: &[OutputRecord]) -> Result<ExternalOutputStreamManifest> {
-        build_output_manifest(records, Some(FLOOR), RUN_ID, "token".to_string(), false)
+        build_output_manifest(records, Some(FLOOR), RUN_ID, false)
     }
 
     fn rejection(records: &[OutputRecord]) -> String {
@@ -284,7 +280,6 @@ mod tests {
         let manifest = build(&records).unwrap();
         assert_eq!(manifest.schema_version, 1);
         assert_eq!(manifest.fingerprint_version, 2);
-        assert_eq!(manifest.stage_token, "token");
         assert_eq!(manifest.history_floor_event_id, FLOOR);
         assert_eq!(manifest.run_id, RUN_ID);
         assert_eq!(manifest.provider_format_version, 1);
@@ -322,23 +317,16 @@ mod tests {
         replayed.body = None;
         let live = build(&[data("t", 1, 3)]).unwrap();
         assert_eq!(build(&[reencrypted]).unwrap(), live);
-        let replay =
-            build_output_manifest(&[replayed], Some(FLOOR), RUN_ID, String::new(), true).unwrap();
+        let replay = build_output_manifest(&[replayed], Some(FLOOR), RUN_ID, true).unwrap();
         assert_eq!(replay.topics, live.topics);
     }
 
     #[test]
     fn an_unknown_floor_is_refused_rather_than_guessed() {
         for floor in [None, Some(0)] {
-            let error = build_output_manifest(
-                &[data("t", 1, 1)],
-                floor,
-                RUN_ID,
-                "token".to_string(),
-                false,
-            )
-            .unwrap_err()
-            .to_string();
+            let error = build_output_manifest(&[data("t", 1, 1)], floor, RUN_ID, false)
+                .unwrap_err()
+                .to_string();
             assert!(error.contains("exact event"), "{error}");
         }
     }
@@ -373,10 +361,8 @@ mod tests {
     }
 
     #[test]
-    fn a_replayed_commit_matches_the_recorded_manifest_whatever_its_token() {
-        let mut replayed = manifest();
-        replayed.stage_token.clear();
-        check_replayed_output_manifest(replayed, Some(manifest())).unwrap();
+    fn a_replayed_commit_matches_the_recorded_manifest() {
+        check_replayed_output_manifest(manifest(), Some(manifest())).unwrap();
     }
 
     #[test]
@@ -395,7 +381,7 @@ mod tests {
 
     #[test]
     fn a_replayed_commit_matches_a_manifest_recorded_under_another_store_format() {
-        // A later Core may lay out stages differently. That is the store's concern, not output
+        // A later Core may lay out records differently. That is the store's concern, not output
         // the Workflow published.
         let mut recorded = manifest();
         recorded.provider_format_version = 2;
@@ -421,7 +407,7 @@ mod tests {
 
     #[test]
     fn a_topic_no_store_keys_reliably_is_refused() {
-        // A store joins a stage's topics with a control character.
+        // A store may separate the parts of its keys with a control character.
         let long = "t".repeat(257);
         for (topic, expected) in [
             ("a\u{1f}b", "holds a control character"),
