@@ -69,7 +69,7 @@ impl StreamService {
         Self { store, streams }
     }
 
-    /// The store, for the Workers that stage and promote Workflow output in it.
+    /// The store, for the Workers that append Workflow output to it.
     pub fn store(&self) -> Arc<dyn StreamStore> {
         self.store.clone()
     }

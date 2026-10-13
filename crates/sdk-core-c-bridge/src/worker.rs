@@ -61,8 +61,8 @@ pub struct WorkerOptions {
     /// Maximum number of activity slots that may be reserved for eager execution when completing
     /// a workflow task. Zero disables eager activity execution.
     pub max_eager_activity_reservations_per_workflow_task: u32,
-    /// The store this worker stages and promotes workflow stream output in, or null for none. It
-    /// must outlive the worker.
+    /// The store this worker appends workflow stream output to, or null for none. It must
+    /// outlive the worker.
     /// NOTE: Experimental
     pub stream_store: *const crate::streams::StreamStore,
 }
