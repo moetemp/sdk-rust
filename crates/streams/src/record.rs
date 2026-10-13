@@ -22,6 +22,15 @@ pub fn activity_producer_id(activity: &ActivityProducer) -> String {
     format!("{}@{}", activity.activity_id, activity.run_id)
 }
 
+/// The producer id a Workflow run writes its own records as.
+///
+/// It is an Activity's id form with no Activity id. An Activity id is never empty, so no Activity
+/// writes as a run. Each run of a chain is a producer of its own, so Continue-as-New and a reset
+/// start a new producer rather than superseding the earlier run.
+pub fn workflow_producer_id(run_id: &str) -> String {
+    format!("@{run_id}")
+}
+
 /// Refuses an append batch digest that isn't the 32-byte SHA-256 lang takes before the codec.
 ///
 /// Stores compare it unchanged when a producer repeats its newest batch, so a digest Core made
@@ -61,18 +70,24 @@ pub fn stored_append_record(
     Ok(stored)
 }
 
-/// The record a store keeps for one record a Workflow run published.
+/// The record a store keeps for one record a Workflow run published, as its run's producer at
+/// `attempt` and `sequence`.
 ///
-/// The run id is stamped, since a stream follows the run chain and readers tell a successor run
-/// or a reset branch apart by it. Fails like [stored_append_record].
+/// The run id is also stamped, since a stream follows the run chain and readers tell a successor
+/// run or a reset branch apart by it. Fails like [stored_append_record].
 pub fn stored_output_record(
     topic: &str,
     kind: i32,
     body: Option<Payload>,
     content_hash: &[u8],
     run_id: &str,
+    attempt: i64,
+    sequence: i64,
 ) -> StreamResult<StreamRecord> {
     let mut stored = stored_record(topic, kind, body, content_hash)?;
+    stored.producer_id = workflow_producer_id(run_id);
+    stored.attempt = attempt;
+    stored.sequence = sequence;
     stored
         .metadata
         .insert(RUN_ID_KEY.to_string(), metadata_payload(run_id.as_bytes()));
@@ -177,6 +192,20 @@ mod tests {
     }
 
     #[test]
+    fn a_workflow_run_writes_as_no_activity_can() {
+        let activity = ActivityProducer {
+            activity_id: "x".to_string(),
+            run_id: "run-1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(workflow_producer_id("run-1"), "@run-1");
+        assert_ne!(
+            workflow_producer_id("run-1"),
+            activity_producer_id(&activity)
+        );
+    }
+
+    #[test]
     fn a_stored_data_record_carries_its_plaintext_hash() {
         let stored = stored_append_record("out", "p", 2, 5, &data(0xab)).unwrap();
         assert_eq!(stored.body, Some(body()));
@@ -196,12 +225,22 @@ mod tests {
     }
 
     #[test]
-    fn a_workflow_record_carries_its_run() {
-        let stored =
-            stored_output_record("out", StreamRecordKind::Finish as i32, None, &[], "run-7")
-                .unwrap();
+    fn a_workflow_record_is_written_by_its_run() {
+        let stored = stored_output_record(
+            "out",
+            StreamRecordKind::Finish as i32,
+            None,
+            &[],
+            "run-7",
+            2,
+            9,
+        )
+        .unwrap();
         assert_eq!(stored.metadata[RUN_ID_KEY].data, b"run-7");
-        assert_eq!(stored.producer_id, "");
+        assert_eq!(
+            (stored.producer_id.as_str(), stored.attempt, stored.sequence),
+            ("@run-7", 2, 9)
+        );
         assert!(stored.body.is_none());
         assert!(!stored.metadata.contains_key(CONTENT_HASH_KEY));
     }
