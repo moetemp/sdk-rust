@@ -914,8 +914,8 @@ typedef struct TemporalCoreWorkerOptions {
    */
   uint32_t max_eager_activity_reservations_per_workflow_task;
   /**
-   * The store this worker stages and promotes workflow stream output in, or null for none. It
-   * must outlive the worker.
+   * The store this worker appends workflow stream output to, or null for none. It must
+   * outlive the worker.
    * NOTE: Experimental
    */
   const struct TemporalCoreStreamStore *stream_store;

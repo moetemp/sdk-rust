@@ -320,9 +320,7 @@ mod tests {
     };
     use prost::Message;
     use std::{collections::HashMap, sync::Mutex, time::UNIX_EPOCH};
-    use temporalio_common::protos::temporal::api::{
-        enums::v1::WorkflowExecutionStatus, history::v1::HistoryEvent,
-    };
+    use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
 
     /// Answers each Workflow id's chain as `chains` holds it, `chain-1` by default, and records
     /// the runs it was asked about.
@@ -360,18 +358,7 @@ mod tests {
                 },
                 first_run_id,
                 status: WorkflowExecutionStatus::Running,
-                start_time: None,
             })
-        }
-
-        async fn history_after(
-            &self,
-            _: &str,
-            _: &str,
-            _: &str,
-            _: i64,
-        ) -> Result<Vec<HistoryEvent>, OwnerError> {
-            Ok(vec![])
         }
     }
 

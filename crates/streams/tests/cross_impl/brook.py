@@ -19,7 +19,6 @@ import temporalio.converter
 from temporalio.client import WorkflowExecutionStatus
 from temporalio.contrib.streams import Cursor, RecordKind, StreamError, StreamRef
 from temporalio.contrib.streams._body import content_fingerprint
-from temporalio.contrib.streams._output import StagedBatch, StageRef
 from temporalio.contrib.streams._wire import to_wire
 from temporalio.contrib.streams.redis import RedisStreams
 
@@ -122,39 +121,6 @@ async def run(op: dict[str, Any]) -> Any:
             return out
         if op["op"] == "latest":
             return (await stream.latest(topic=topic)).token
-        if op["op"] == "stage":
-            converter = owner.data_converter.payload_converter
-            records = [
-                to_wire(
-                    converter,
-                    topic=item["topic"],
-                    kind=RecordKind.DATA,
-                    value=item["value"],
-                    run_id=op["run_id"],
-                )
-                for item in op["records"]
-            ]
-            return await provider._stage(
-                StagedBatch(
-                    op["namespace"],
-                    op["workflow_id"],
-                    op["first_run"],
-                    op["run_id"],
-                    records,
-                    history_floor_event_id=op["floor"],
-                )
-            )
-        if op["op"] == "promote":
-            await provider._promote(
-                StageRef(
-                    op["namespace"],
-                    op["workflow_id"],
-                    op["first_run"],
-                    op["token"],
-                    tuple(op["topics"]),
-                )
-            )
-            return None
         if op["op"] == "close":
             await provider._mark_closed(
                 provider._chain_keys(
