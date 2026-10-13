@@ -554,6 +554,89 @@ async fn store_errors_on_reads_arrive_as_storage_failures() {
     assert_eq!(error.kind, StreamFailureKind::Storage, "{error}");
 }
 
+async fn retained_for(retention: Duration) -> Option<Setup> {
+    let url = url()?;
+    Some(
+        setup_with(&url, &url, &unique("retention"), |options| {
+            options.retention = retention
+        })
+        .await,
+    )
+}
+
+const GRACE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+
+#[tokio::test]
+async fn retention_must_be_positive() {
+    let mut options = RedisStoreOptions::new("redis://localhost:1");
+    options.retention = Duration::ZERO;
+    let error = RedisStore::connect(options).await.unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Refused);
+    assert!(error.message.contains("retention"), "{error}");
+}
+
+#[tokio::test]
+async fn appends_trim_to_retention_and_slide_the_expiry() {
+    let Some(mut setup) = retained_for(Duration::from_millis(200)).await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 2, b"\x01"))
+        .await
+        .unwrap();
+    let log = log_key(&setup.prefix, &chain, "events");
+    let meta = format!("{log}:meta");
+    let ttl: i64 = setup.raw.pttl(&log).await.unwrap();
+    assert!(0 < ttl && ttl <= 200, "{ttl}");
+    // The meta outlives the log by the tombstone grace.
+    let ttl: i64 = setup.raw.pttl(&meta).await.unwrap();
+    assert!(ttl > GRACE_MS - 60_000, "{ttl}");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let landed = setup
+        .store
+        .append(append(&chain, "p", 3, 1, b"\x02"))
+        .await
+        .unwrap();
+    let entries: Vec<(String, HashMap<String, Vec<u8>>)> =
+        setup.raw.xrange_all(&log).await.unwrap();
+    let sequences: Vec<_> = entries
+        .iter()
+        .map(|(_, fields)| StreamRecord::decode(&*fields["r"]).unwrap().sequence)
+        .collect();
+    assert_eq!(sequences, [3]);
+    let fields: HashMap<String, String> = setup.raw.hgetall(&meta).await.unwrap();
+    assert_eq!(fields["added"], "3");
+    assert_eq!(fields["last"], landed.last_position);
+    // The trim leaves the newest dropped id, since XTRIM leaves no trace a reader could compare.
+    assert!(fields.contains_key("trimmed"));
+}
+
+#[tokio::test]
+async fn rule_18_1_a_session_older_than_the_retention_leaves_the_meta() {
+    // One field per session would otherwise grow the meta for as long as the topic is written,
+    // long after the records it guards are gone.
+    let Some(mut setup) = retained_for(Duration::from_millis(200)).await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .append(append(&chain, "old", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    setup
+        .store
+        .append(append(&chain, "new", 1, 1, b"\x02"))
+        .await
+        .unwrap();
+    let meta = format!("{}:meta", log_key(&setup.prefix, &chain, "events"));
+    let held = held(&mut setup.raw, &meta).await;
+    assert_eq!(held.keys().collect::<Vec<_>>(), ["hw:3:new:1"]);
+}
+
 fn waiting_read(chain: &ChainId, wait: Duration) -> StoreReadRequest {
     StoreReadRequest {
         chain: Some(chain.clone()),
