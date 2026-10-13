@@ -7,8 +7,8 @@ use crate::{
         LEGACY_QUERY_ID, LocalActRequest, WorkflowErrorType,
         workflow::{
             ActivationAction, ActivationCompleteOutcome, ActivationCompleteResult,
-            ActivationOrAuto, BufferedTasks, DrivenWorkflow, EvictionRequestResult,
-            FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
+            ActivationOrAuto, ActivationOutput, BufferedTasks, DrivenWorkflow,
+            EvictionRequestResult, FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
             LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
             OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
             ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
@@ -18,14 +18,14 @@ use crate::{
             machines::{MachinesWFTResponseContent, WorkflowMachines},
             stream_output::{
                 MARKER_SCHEMA_VERSION, OutputBatch, build_output_manifest, check_output_closes,
-                check_replayed_output_manifest,
+                check_replayed_output_manifest, count_replayed_output, output_by_topic,
             },
         },
     },
 };
 use futures_util::future::AbortHandle;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     mem,
     ops::{Add, Sub},
     rc::Rc,
@@ -101,9 +101,9 @@ pub(super) struct ManagedRun {
     /// duplicating field values. Remove this once https://github.com/tokio-rs/tracing/issues/2334
     /// is fixed.
     recorded_span_ids: HashSet<tracing::Id>,
-    /// Stream output this run committed and has not reported with a completion yet, in commit
-    /// order.
-    pending_output: Vec<OutputBatch>,
+    /// How many stream records this run committed to each topic, live or in replay, which is
+    /// where its next commit's sequences start.
+    committed_by_topic: HashMap<String, i64>,
     metrics: MetricsContext,
     /// We store the paginator used for our own run's history fetching
     paginator: Option<HistoryPaginator>,
@@ -129,7 +129,7 @@ impl ManagedRun {
             task_buffer: Default::default(),
             trying_to_evict: None,
             recorded_span_ids: Default::default(),
-            pending_output: vec![],
+            committed_by_topic: Default::default(),
             metrics,
             paginator: None,
             completion_waiting_on_page_fetch: None,
@@ -784,12 +784,22 @@ impl ManagedRun {
         }
 
         let mut lang_commands = completion.commands;
-        if let Err(source) = self.commit_external_output(&mut lang_commands) {
-            return Err(RunUpdateErr {
-                source,
-                complete_resp_chan: completion.resp_chan,
-            });
-        }
+        let output = match self.commit_external_output(&mut lang_commands) {
+            Ok(output) => output.map(|batch| {
+                Box::new(ActivationOutput {
+                    batch,
+                    task_token: data.task_token.clone(),
+                    attempt: self.wft.as_ref().map(|t| t.info.attempt).unwrap_or(1),
+                    metrics: self.metrics.clone(),
+                })
+            }),
+            Err(source) => {
+                return Err(RunUpdateErr {
+                    source,
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+        };
 
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
@@ -824,7 +834,7 @@ impl ManagedRun {
             }
         })();
 
-        match outcome {
+        let completed = match outcome {
             Ok(None) => {
                 if let Some(waiting) = self.waiting_on_la.take() {
                     waiting.hb_timeout_handle.abort();
@@ -877,6 +887,7 @@ impl ManagedRun {
                         result: ActivationCompleteResult {
                             outcome: ActivationCompleteOutcome::DoNothing,
                             replaying: self.wfm.machines.replaying,
+                            output: None,
                         },
                         resp_chan: completion.resp_chan,
                     }))
@@ -886,15 +897,27 @@ impl ManagedRun {
                 source: e,
                 complete_resp_chan: completion.resp_chan,
             }),
-        }
+        };
+        // Only a completion the run took has output to append.
+        completed.map(|done| {
+            done.map(|mut done| {
+                done.result.output = output;
+                done
+            })
+        })
     }
 
     /// Records the stream output lang committed, if any, as a marker ahead of its other commands.
     ///
     /// The marker is what replay checks the Workflow's output against.
-    fn commit_external_output(&mut self, commands: &mut Vec<WFCommand>) -> Result<()> {
+    ///
+    /// Returns the records to append, when the commit is live.
+    fn commit_external_output(
+        &mut self,
+        commands: &mut Vec<WFCommand>,
+    ) -> Result<Option<OutputBatch>> {
         let Some(commit) = take_output_stream_commit(commands)? else {
-            return Ok(());
+            return Ok(None);
         };
         check_output_closes(&commit.records, &commit.closes)?;
         if self.wfm.machines.replaying {
@@ -904,8 +927,10 @@ impl ManagedRun {
                 &self.wfm.machines.run_id,
                 true,
             )?;
+            count_replayed_output(&replayed, &mut self.committed_by_topic);
             let recorded = self.wfm.machines.take_replayed_output_manifest();
-            return check_replayed_output_manifest(replayed, recorded);
+            check_replayed_output_manifest(replayed, recorded)?;
+            return Ok(None);
         }
         let Some(store_name) = self.stream_store_name() else {
             return Err(WFMachinesError::Fatal(
@@ -928,12 +953,11 @@ impl ManagedRun {
             ));
         }
         let batch = OutputBatch {
-            token: manifest.stage_token.clone(),
-            history_floor_event_id: manifest.history_floor_event_id,
             workflow_id: self.wfm.machines.workflow_id.clone(),
             run_id: self.wfm.machines.run_id.clone(),
             first_run_id: self.wfm.machines.first_execution_run_id.clone(),
-            records: commit.records,
+            attempt: self.wfm.machines.stream_producer_attempt(),
+            topics: output_by_topic(commit.records, &manifest, &mut self.committed_by_topic),
         };
         // It covers this activation's commands only. With a Local Activity, an earlier activation
         // of the same task may have produced commands, and nothing reads the field yet.
@@ -956,8 +980,7 @@ impl ManagedRun {
                 terminal_boundary: terminal_boundary as i32,
                 output: Some(manifest),
             })?;
-        self.pending_output.push(batch);
-        Ok(())
+        Ok(Some(batch))
     }
 
     /// The name of the Worker's stream store, or `None` when it has none.
@@ -1361,7 +1384,6 @@ impl ManagedRun {
                     sdk_metadata: machines_wft_response.metadata_for_complete(),
                     versioning_behavior: data.versioning_behavior,
                     attempt,
-                    output: mem::take(&mut self.pending_output),
                 },
                 metrics: self.metrics.clone(),
             })
@@ -1373,7 +1395,11 @@ impl ManagedRun {
             self.wfm.wft_completion_reported();
         }
         FulfillableActivationComplete {
-            result: ActivationCompleteResult { outcome, replaying },
+            result: ActivationCompleteResult {
+                outcome,
+                replaying,
+                output: None,
+            },
             resp_chan,
         }
     }
@@ -1407,6 +1433,7 @@ impl ManagedRun {
                 .send(ActivationCompleteResult {
                     outcome,
                     replaying: self.wfm.machines.replaying,
+                    output: None,
                 })
                 .is_err()
         {

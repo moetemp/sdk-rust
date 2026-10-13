@@ -73,7 +73,7 @@ use temporalio_common::{
         temporal::api::{
             command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
             common::v1::SearchAttributes,
-            enums::v1::EventType,
+            enums::v1::{EventType, TimeoutType},
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
@@ -83,6 +83,25 @@ use temporalio_common::{
 };
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
+
+/// The Workflow Task attempts that `event` shows ran and did not complete.
+///
+/// The server writes a failed or timed-out event only for a first attempt, and for every attempt
+/// on a sticky queue. Each later attempt that fails adds one to the attempt of the next
+/// WorkflowTaskScheduled event, so attempt `a` at 2 or above follows one written failure and
+/// `a - 2` unwritten ones. A schedule-to-start timeout means no Worker ran the task.
+fn workflow_task_reruns_in(event: &HistoryEvent) -> i64 {
+    match &event.attributes {
+        Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(attrs)) => {
+            i64::from(attrs.attempt.saturating_sub(2).max(0))
+        }
+        Some(history_event::Attributes::WorkflowTaskFailedEventAttributes(_)) => 1,
+        Some(history_event::Attributes::WorkflowTaskTimedOutEventAttributes(attrs)) => {
+            i64::from(attrs.timeout_type() != TimeoutType::ScheduleToStart)
+        }
+        _ => 0,
+    }
+}
 
 slotmap::new_key_type! { struct MachineKey; }
 /// Handles all the logic for driving a workflow. It orchestrates many state machines that together
@@ -112,6 +131,10 @@ pub(crate) struct WorkflowMachines {
     /// one, since History is applied in order. `None` only before the first task is scheduled
     /// and after a speculative task is dropped, and a live output commit must fail then.
     current_wft_history_floor_event_id: Option<i64>,
+    /// How many Workflow Task attempts of this run failed or timed out after a Worker ran them,
+    /// as the History applied so far shows. Each could have published stream output that never
+    /// reached History, so it raises the attempt the run publishes under.
+    workflow_task_reruns: i64,
     /// The event id of the next workflow task started event that the machines need to process.
     /// Eventually, this number should reach the started id in the latest history update, but
     /// we must incrementally apply the history while communicating with lang.
@@ -307,6 +330,7 @@ impl WorkflowMachines {
             // In an ideal world one could say ..Default::default() here and it'd still work.
             current_started_event_id: 0,
             current_wft_history_floor_event_id: None,
+            workflow_task_reruns: 0,
             next_started_event_id: 0,
             last_processed_event: 0,
             workflow_start_time: None,
@@ -442,6 +466,12 @@ impl WorkflowMachines {
 
     pub(crate) fn current_wft_history_floor_event_id(&self) -> Option<i64> {
         self.current_wft_history_floor_event_id
+    }
+
+    /// The producer attempt this run publishes its stream output under, from one. It is the same
+    /// for successive tasks, and higher for a task whose earlier attempts may have published.
+    pub(crate) fn stream_producer_attempt(&self) -> i64 {
+        1 + self.workflow_task_reruns
     }
 
     pub(crate) fn history_size_bytes(&self) -> u64 {
@@ -764,6 +794,7 @@ impl WorkflowMachines {
             if event.event_type() == EventType::WorkflowTaskScheduled {
                 self.current_wft_history_floor_event_id = Some(self.last_processed_event);
             }
+            self.workflow_task_reruns += workflow_task_reruns_in(&event);
             let next_event = history.peek();
 
             // This definition of replaying here is that we are no longer replaying as soon as we

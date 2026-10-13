@@ -148,9 +148,9 @@ pub(crate) struct Workflows {
     default_versioning_behavior: Option<VersioningBehavior>,
     namespace_capabilities: Arc<NamespaceCapabilities>,
     shutdown_token: CancellationToken,
-    /// Stages Workflow stream output, when the Worker has a stream store.
+    /// Appends Workflow stream output, when the Worker has a stream store.
     #[cfg(feature = "streams")]
-    output_stager: Option<stream_output::OutputStager>,
+    output_store: Option<stream_output::OutputStore>,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -201,8 +201,8 @@ impl Workflows {
         let namespace_capabilities = basics.namespace_capabilities.clone();
         let shutdown_token = basics.shutdown_token.clone();
         #[cfg(feature = "streams")]
-        let output_stager = basics.worker_config.stream_store.clone().map(|store| {
-            stream_output::OutputStager::new(store, basics.worker_config.namespace.clone())
+        let output_store = basics.worker_config.stream_store.clone().map(|store| {
+            stream_output::OutputStore::new(store, basics.worker_config.namespace.clone())
         });
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
@@ -302,7 +302,7 @@ impl Workflows {
             namespace_capabilities,
             shutdown_token,
             #[cfg(feature = "streams")]
-            output_stager,
+            output_store,
         }
     }
 
@@ -392,7 +392,6 @@ impl Workflows {
                         sdk_metadata,
                         mut versioning_behavior,
                         attempt,
-                        output,
                     },
                 metrics: run_metrics,
             } => {
@@ -443,29 +442,6 @@ impl Workflows {
 
                 let mut reset_last_started_to = None;
                 self.handle_wft_reporting_errs(run_id, || async {
-                    // Staged before the completion, so a task the server accepts always has its
-                    // output in the store, ready to promote.
-                    if let Err(failure) = self.stage_output(&output).await {
-                        let message = failure
-                            .failure
-                            .as_ref()
-                            .map(|f| f.message.clone())
-                            .unwrap_or_default();
-                        self.handle_activation_failed(
-                            run_id,
-                            completion_time,
-                            FailedActivationWFTReport::new(
-                                task_token,
-                                attempt,
-                                WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
-                                failure,
-                                WftFailureKind::Task,
-                                &run_metrics,
-                            ),
-                        )
-                        .await;
-                        return Err(tonic::Status::unavailable(message));
-                    }
                     match self
                         .client
                         .complete_workflow_task(completion, self.shutdown_token.clone())
@@ -552,21 +528,53 @@ impl Workflows {
         }
     }
 
-    /// Stages a completion's stream output in the Worker's store, in commit order.
-    async fn stage_output(&self, output: &[stream_output::OutputBatch]) -> Result<(), Failure> {
-        if output.is_empty() {
-            return Ok(());
-        }
+    /// Appends the stream output `result` carries, if any, before anything else happens with the
+    /// completion.
+    ///
+    /// The run has one outstanding activation until [Self::post_activation], so its appends never
+    /// overlap and land in commit order. When the append fails, the Workflow Task fails instead of
+    /// whatever the completion would have done, and the run is evicted, since its machines hold
+    /// the output's marker.
+    async fn append_output(
+        &self,
+        run_id: &str,
+        mut result: ActivationCompleteResult,
+    ) -> ActivationCompleteResult {
+        let Some(output) = result.output.take() else {
+            return result;
+        };
+        let Err(failure) = self.append_to_store(&output.batch).await else {
+            return result;
+        };
+        self.request_eviction(
+            run_id,
+            "The Workflow Task's stream output could not be appended",
+            EvictionReason::Fatal,
+        );
+        result.outcome =
+            ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport::new(
+                output.task_token,
+                output.attempt,
+                WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                failure,
+                WftFailureKind::Task,
+                &output.metrics,
+            )));
+        result
+    }
+
+    async fn append_to_store(&self, batch: &stream_output::OutputBatch) -> Result<(), Failure> {
         #[cfg(feature = "streams")]
-        if let Some(stager) = &self.output_stager {
-            return stager.stage(output).await.map_err(|e| {
+        if let Some(store) = &self.output_store {
+            return store.append(batch).await.map_err(|e| {
                 make_stream_output_failure(&format!(
-                    "Could not stage the Workflow Task's stream output ({e})"
+                    "Could not append the Workflow Task's stream output ({e})"
                 ))
             });
         }
+        let _ = batch;
         Err(make_stream_output_failure(
-            "This Worker has no stream store to stage the Workflow Task's stream output in",
+            "This Worker has no stream store to append the Workflow Task's stream output to",
         ))
     }
 
@@ -691,6 +699,7 @@ impl Workflows {
             );
             return Ok(());
         };
+        let completion_outcome = self.append_output(&run_id, completion_outcome).await;
         let replaying = completion_outcome.replaying;
 
         let mut wft_from_complete = None;
@@ -1230,8 +1239,6 @@ pub(crate) enum ActivationAction {
         sdk_metadata: WorkflowTaskCompletedMetadata,
         versioning_behavior: VersioningBehavior,
         attempt: u32,
-        /// Stream output to stage before the completion is sent, in commit order.
-        output: Vec<stream_output::OutputBatch>,
     },
     /// We should respond to a legacy query request
     RespondLegacyQuery { result: Box<QueryResult> },
@@ -1361,6 +1368,25 @@ struct GetStateInfoMsg {
 struct ActivationCompleteResult {
     replaying: bool,
     outcome: ActivationCompleteOutcome,
+    /// The stream output this activation committed, to append before anything else is done.
+    output: Option<Box<ActivationOutput>>,
+}
+
+/// One activation's stream output, and what failing its Workflow Task takes.
+struct ActivationOutput {
+    batch: stream_output::OutputBatch,
+    task_token: TaskToken,
+    attempt: u32,
+    metrics: MetricsContext,
+}
+impl Debug for ActivationOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivationOutput")
+            .field("batch", &self.batch)
+            .field("task_token", &self.task_token)
+            .field("attempt", &self.attempt)
+            .finish()
+    }
 }
 
 /// What needs to be done after calling [Workflows::activation_completed]
@@ -2039,7 +2065,7 @@ fn make_stream_output_failure(message: &str) -> Failure {
                 message: message.to_string(),
                 failure_info: Some(FailureInfo::ApplicationFailureInfo(
                     ApplicationFailureInfo {
-                        r#type: "StreamOutputNotStaged".to_string(),
+                        r#type: "StreamOutputNotAppended".to_string(),
                         non_retryable: false,
                         ..Default::default()
                     },

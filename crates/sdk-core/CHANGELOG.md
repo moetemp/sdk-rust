@@ -37,28 +37,20 @@ relevant information.
 * Experimental: a workflow can commit the stream records it published with the new
   `WorkflowOutputStreamCommit` command, each with its plaintext content hash and size. Core
   builds the output manifest from them and records it in a `core_external_stream` marker ahead
-  of the completion's other commands, so the output becomes visible only when the workflow task
-  is accepted. While replaying, lang commits the same records again without bodies, and Core
-  checks the manifest it builds from them against the recorded one (the stage token, run id and
-  store name aside), or the task fails as nondeterministic. A workflow that wrote this marker
-  can only move forward. A Worker on an older Core, or one whose lang doesn't commit the records
-  again on replay, fails that workflow's next task, so don't roll such a fleet back.
-* Experimental: behind the new `streams` feature, `WorkerConfig::stream_store` takes the store a
-  workflow's stream output goes to. Core stages each completion's records in it before the
-  completion is sent, and fails the workflow task when the store refuses them or the Worker has
-  none, so a task the server accepts always has its output staged.
-* Experimental: behind `streams`, `streams::connect_stream_service` builds one stream store from
-  a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in process: append, read,
-  latest, close and owner delete, as serialized `coresdk.streams` requests.
   of the completion's other commands. While replaying, lang commits the same records again
   without bodies, and Core checks the manifest it builds from them against the recorded one (the
   run id and store name aside), or the task fails as nondeterministic. A workflow that wrote this
   marker can only move forward. A Worker on an older Core, or one whose lang doesn't commit the
   records again on replay, fails that workflow's next task, so don't roll such a fleet back.
-* Experimental: behind the new `streams` feature, `streams::connect_stream_service` builds one
-  stream store from a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in
-  process: append, read, latest, close and owner delete, as serialized `coresdk.streams`
-  requests.
+* Experimental: behind the new `streams` feature, `WorkerConfig::stream_store` takes the store a
+  workflow's stream output goes to. Core appends each activation's records to it when the
+  activation completes, before the workflow task completes, as the run's producer `@<run id>`.
+  The producer attempt rises only after a workflow task failed or timed out, so readers see one
+  supersession when a task runs again. Core fails the workflow task when the store refuses the
+  records or the Worker has none.
+* Experimental: behind `streams`, `streams::connect_stream_service` builds one stream store from
+  a `StreamStoreConfig` (Redis or memory) and serves lang's stream calls in process: append, read,
+  latest, close and owner delete, as serialized `coresdk.streams` requests.
 * Experimental: the C bridge has `temporal_core_stream_store_new`, `_call` and `_free` for the
   stream service, built with the Redis store.
 

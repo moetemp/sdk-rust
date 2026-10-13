@@ -33,27 +33,90 @@ const MAX_COMMIT_BYTES: u64 = 16 * 1024 * 1024;
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 
-/// One publishing completion's records, held until its Workflow Task's completion is reported.
+/// The records one activation committed, appended when its completion reaches Core.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct OutputBatch {
-    /// The stage token the completion's marker names.
-    pub(crate) token: String,
-    pub(crate) history_floor_event_id: i64,
     pub(crate) workflow_id: String,
     pub(crate) run_id: String,
     pub(crate) first_run_id: String,
+    /// The run's producer attempt, from History.
+    pub(crate) attempt: i64,
+    /// One append per topic, in order of first publish.
+    pub(crate) topics: Vec<TopicOutput>,
+}
+
+/// The records one activation committed to one topic.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TopicOutput {
+    pub(crate) topic: String,
+    /// The first record's sequence in the run's producer. Records the run committed to the topic
+    /// before this activation come first, so a rerun of a task sends the same sequences.
+    pub(crate) sequence: i64,
+    /// The topic's logical fingerprint from the manifest. It names the batch whatever the codec
+    /// made of the bodies, so a repeat of the append always deduplicates.
+    pub(crate) digest: Vec<u8>,
     pub(crate) records: Vec<OutputRecord>,
 }
 
-/// Stages a Workflow's output in the Worker's stream store.
+/// Splits `records`, which `manifest` describes, into one append per topic, and counts them into
+/// `committed`, the records the run committed to each topic so far.
+pub(super) fn output_by_topic(
+    records: Vec<OutputRecord>,
+    manifest: &ExternalOutputStreamManifest,
+    committed: &mut HashMap<String, i64>,
+) -> Vec<TopicOutput> {
+    let mut topics: Vec<TopicOutput> = manifest
+        .topics
+        .iter()
+        .map(|topic| {
+            let count = committed.entry(topic.topic.clone()).or_default();
+            let sequence = *count + 1;
+            *count += i64::from(topic.record_count);
+            TopicOutput {
+                topic: topic.topic.clone(),
+                sequence,
+                digest: topic.logical_fingerprint.clone(),
+                records: Vec::with_capacity(topic.record_count as usize),
+            }
+        })
+        .collect();
+    for record in records {
+        if let Some(topic) = topics.iter_mut().find(|t| t.topic == record.topic) {
+            topic.records.push(record);
+        }
+    }
+    topics
+}
+
+/// Counts the records a replayed commit's `manifest` holds into `committed`, as
+/// [output_by_topic] does for a live one.
+pub(super) fn count_replayed_output(
+    manifest: &ExternalOutputStreamManifest,
+    committed: &mut HashMap<String, i64>,
+) {
+    for topic in &manifest.topics {
+        *committed.entry(topic.topic.clone()).or_default() += i64::from(topic.record_count);
+    }
+}
+
+/// How often an append that may not have landed is sent again before the task fails.
 #[cfg(feature = "streams")]
-pub(crate) struct OutputStager {
+const APPEND_TRIES: u32 = 4;
+#[cfg(all(feature = "streams", not(test)))]
+const APPEND_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(100);
+// Keeps the retry tests fast.
+#[cfg(all(feature = "streams", test))]
+const APPEND_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// The Worker's side of a Workflow's stream output: appends what each activation committed.
+#[cfg(feature = "streams")]
+pub(crate) struct OutputStore {
     store: std::sync::Arc<dyn temporalio_streams::StreamStore>,
     namespace: String,
 }
 
 #[cfg(feature = "streams")]
-impl OutputStager {
+impl OutputStore {
     pub(crate) fn new(
         store: std::sync::Arc<dyn temporalio_streams::StreamStore>,
         namespace: String,
@@ -61,45 +124,69 @@ impl OutputStager {
         Self { store, namespace }
     }
 
-    /// Stages `batches` in commit order, each whole. Nothing is visible until promoted, so a
-    /// completion the server refuses publishes nothing.
-    pub(crate) async fn stage(
+    /// Appends `batch` as its run's producer, one topic after another.
+    ///
+    /// A failure that may have landed is sent again with a short backoff. The store answers a
+    /// repeat of the attempt's newest batch with its positions, so this never writes twice. Any
+    /// other failure, or one that lasts, is returned, and the Workflow Task must fail.
+    pub(crate) async fn append(
         &self,
-        batches: &[OutputBatch],
+        batch: &OutputBatch,
     ) -> std::result::Result<(), temporalio_streams::StreamError> {
         use prost::Message;
-        use temporalio_streams::proto::{ChainId, StagedBatch, StagedRecord};
-        for batch in batches {
-            let records = batch
+        use temporalio_streams::proto::{ChainId, StoreAppendRequest, StreamFailureKind};
+        let producer_id = temporalio_streams::workflow_producer_id(&batch.run_id);
+        for topic in &batch.topics {
+            let records = topic
                 .records
                 .iter()
-                .map(|record| {
+                .zip(topic.sequence..)
+                .map(|(record, sequence)| {
                     temporalio_streams::stored_output_record(
                         &record.topic,
                         record.kind,
                         record.body.clone(),
                         &record.content_hash,
                         &batch.run_id,
+                        batch.attempt,
+                        sequence,
                     )
-                    .map(|stored| StagedRecord {
-                        topic: record.topic.clone(),
-                        record: stored.encode_to_vec(),
-                    })
+                    .map(|stored| stored.encode_to_vec())
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            self.store
-                .stage(StagedBatch {
-                    chain: Some(ChainId {
-                        namespace: self.namespace.clone(),
-                        workflow_id: batch.workflow_id.clone(),
-                        first_run_id: batch.first_run_id.clone(),
-                    }),
-                    run_id: batch.run_id.clone(),
-                    token: batch.token.clone(),
-                    history_floor_event_id: batch.history_floor_event_id,
-                    records,
-                })
-                .await?;
+            let request = StoreAppendRequest {
+                chain: Some(ChainId {
+                    namespace: self.namespace.clone(),
+                    workflow_id: batch.workflow_id.clone(),
+                    first_run_id: batch.first_run_id.clone(),
+                }),
+                topic: topic.topic.clone(),
+                producer_id: producer_id.clone(),
+                attempt: batch.attempt,
+                sequence: topic.sequence,
+                digest: topic.digest.clone(),
+                records,
+            };
+            let mut delay = APPEND_RETRY_FIRST;
+            let mut tries = 1;
+            loop {
+                match self.store.append(request.clone()).await {
+                    Ok(_) => break,
+                    Err(error)
+                        if tries < APPEND_TRIES
+                            && matches!(
+                                error.kind,
+                                StreamFailureKind::OutcomeUnknown | StreamFailureKind::Storage
+                            ) =>
+                    {
+                        debug!(topic = %topic.topic, %error, "Appending stream output again");
+                        tokio::time::sleep(delay).await;
+                        delay *= 2;
+                        tries += 1;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
         }
         Ok(())
     }
