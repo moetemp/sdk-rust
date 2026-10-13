@@ -51,7 +51,6 @@ use temporalio_common::protos::{
 };
 use tokio::sync::oneshot;
 use tracing::Span;
-use uuid::Uuid;
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 pub(super) type RunUpdateAct = Option<ActivationOrAuto>;
@@ -888,8 +887,7 @@ impl ManagedRun {
 
     /// Records the stream output lang committed, if any, as a marker ahead of its other commands.
     ///
-    /// The marker is what makes the output visible. It's promoted only once the marker is in
-    /// History, so a Workflow Task that fails or times out publishes nothing.
+    /// The marker is what replay checks the Workflow's output against.
     fn commit_external_output(&mut self, commands: &mut Vec<WFCommand>) -> Result<()> {
         let Some(commit) = take_output_stream_commit(commands)? else {
             return Ok(());
@@ -900,7 +898,6 @@ impl ManagedRun {
                 &commit.records,
                 self.wfm.machines.current_wft_history_floor_event_id(),
                 &self.wfm.machines.run_id,
-                String::new(),
                 true,
             )?;
             let recorded = self.wfm.machines.take_replayed_output_manifest();
@@ -910,7 +907,6 @@ impl ManagedRun {
             &commit.records,
             self.wfm.machines.current_wft_history_floor_event_id(),
             &self.wfm.machines.run_id,
-            Uuid::new_v4().simple().to_string(),
             false,
         )?;
         // It covers this activation's commands only. With a Local Activity, an earlier activation
@@ -2912,7 +2908,6 @@ mod tests {
             ExternalOutputStreamManifest {
                 schema_version: 1,
                 fingerprint_version: 1,
-                stage_token: format!("{topic}-token"),
                 history_floor_event_id: 1,
                 run_id: "run".to_owned(),
                 topics: vec![ExternalOutputTopicManifest {
