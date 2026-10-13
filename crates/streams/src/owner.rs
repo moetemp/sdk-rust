@@ -4,7 +4,10 @@
 //! keyed by, to refuse a producer once the chain ended, and to end a read. Core implements this
 //! over its client, and tests use a fake.
 
-use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
+use std::time::SystemTime;
+use temporalio_common::protos::temporal::api::{
+    enums::v1::WorkflowExecutionStatus, history::v1::HistoryEvent,
+};
 
 /// One run of a Workflow, as Temporal describes it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +18,8 @@ pub struct OwnerDescription {
     pub first_run_id: String,
     /// How the run stands.
     pub status: WorkflowExecutionStatus,
+    /// When the run started. Runs of one chain commit in the order they started.
+    pub start_time: Option<SystemTime>,
 }
 
 impl OwnerDescription {
@@ -54,4 +59,14 @@ pub trait OwnerClient: Send + Sync {
         workflow_id: &str,
         run_id: &str,
     ) -> Result<OwnerDescription, OwnerError>;
+
+    /// Run `run_id`'s History events after event `floor`, in order. Implementations read from
+    /// the end, since the events a repair needs are the newest.
+    async fn history_after(
+        &self,
+        namespace: &str,
+        workflow_id: &str,
+        run_id: &str,
+        floor: i64,
+    ) -> Result<Vec<HistoryEvent>, OwnerError>;
 }
