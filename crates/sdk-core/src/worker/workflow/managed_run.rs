@@ -898,7 +898,6 @@ impl ManagedRun {
                 &commit.records,
                 self.wfm.machines.current_wft_history_floor_event_id(),
                 &self.wfm.machines.run_id,
-                String::new(),
                 true,
             )?;
             let recorded = self.wfm.machines.take_replayed_output_manifest();
@@ -2909,7 +2908,6 @@ mod tests {
             ExternalOutputStreamManifest {
                 schema_version: 1,
                 fingerprint_version: 1,
-                stage_token: format!("{topic}-token"),
                 history_floor_event_id: 1,
                 run_id: "run".to_owned(),
                 topics: vec![ExternalOutputTopicManifest {

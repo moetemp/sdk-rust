@@ -567,12 +567,12 @@ async fn the_output_marker_survives_a_cache_eviction() {
     worker.drain_pollers_and_shutdown().await;
 
     assert_eq!(
-        without_tokens(&markers.lock()),
+        markers.lock().clone(),
         vec![
-            vec![without_token(output_marker(
+            vec![output_marker(
                 ExternalStreamBoundary::CommandsProduced,
                 manifest
-            ))],
+            )],
             vec![],
         ],
         "only the live task writes the marker; the replayed one does not"
@@ -1023,14 +1023,14 @@ async fn commits_around_a_local_activity_write_one_marker_each_in_order() {
     );
     // Both activations belong to the same Workflow Task, so both commits name its floor.
     assert_eq!(
-        without_tokens(&[stream_markers_in(first_task)]),
+        vec![stream_markers_in(first_task)],
         vec![
             [first_commit, second_commit]
                 .iter()
-                .map(|records| without_token(output_marker(
+                .map(|records| output_marker(
                     ExternalStreamBoundary::CommandsProduced,
                     manifest_for(records, &run_id, 1)
-                )))
+                ))
                 .collect::<Vec<_>>()
         ]
     );
@@ -1187,16 +1187,16 @@ async fn commits_around_a_local_activity_replay_then_go_live_in_the_next_task() 
     let completions = completions.lock();
     assert_eq!(completions.len(), 1, "only the live task completes");
     assert_eq!(
-        without_tokens(&[stream_markers_in(&completions[0])]),
+        vec![stream_markers_in(&completions[0])],
         vec![vec![
-            without_token(output_marker(
+            output_marker(
                 ExternalStreamBoundary::CommandsProduced,
                 manifest_for(&first_commit, &run_id, live_floor)
-            )),
-            without_token(output_marker(
+            ),
+            output_marker(
                 ExternalStreamBoundary::WorkflowCompleted,
                 manifest_for(&second_commit, &run_id, live_floor)
-            )),
+            ),
         ]]
     );
     assert_eq!(

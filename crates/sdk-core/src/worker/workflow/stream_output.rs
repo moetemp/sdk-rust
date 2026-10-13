@@ -130,8 +130,7 @@ pub(super) fn build_output_manifest(
 /// Compares the manifest Core built from the records lang committed while replaying with the one
 /// History recorded.
 ///
-/// The stage token is left out because nothing is staged on replay, so there is no token. The
-/// run id is left out because a reset forks the base run's History, so the new run replays
+/// The run id is left out because a reset forks the base run's History, so the new run replays
 /// markers that name the base run. Everything else derives from the Workflow's own output.
 pub(super) fn check_replayed_output_manifest(
     mut replayed: ExternalOutputStreamManifest,
@@ -144,10 +143,9 @@ pub(super) fn check_replayed_output_manifest(
         ));
     };
     // Only the logical output must replay the same. A reset run replays markers that name its
-    // base run, a stage token is new on every attempt, and a provider can be renamed, swapped for
-    // a Replayer or change its stage layout without changing what the Workflow published.
+    // base run, and a provider can be renamed, swapped for a Replayer or change its layout without
+    // changing what the Workflow published.
     for manifest in [&mut replayed, &mut recorded] {
-        manifest.stage_token.clear();
         manifest.run_id.clear();
         manifest.provider_id.clear();
         manifest.provider_format_version = 0;
@@ -363,10 +361,8 @@ mod tests {
     }
 
     #[test]
-    fn a_replayed_commit_matches_the_recorded_manifest_whatever_its_token() {
-        let mut replayed = manifest();
-        replayed.stage_token.clear();
-        check_replayed_output_manifest(replayed, Some(manifest())).unwrap();
+    fn a_replayed_commit_matches_the_recorded_manifest() {
+        check_replayed_output_manifest(manifest(), Some(manifest())).unwrap();
     }
 
     #[test]
@@ -385,7 +381,7 @@ mod tests {
 
     #[test]
     fn a_replayed_commit_matches_a_manifest_recorded_under_another_store_format() {
-        // A later Core may lay out stages differently. That is the store's concern, not output
+        // A later Core may lay out records differently. That is the store's concern, not output
         // the Workflow published.
         let mut recorded = manifest();
         recorded.provider_format_version = 2;

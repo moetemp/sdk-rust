@@ -6,7 +6,7 @@
 //! it.
 //!
 //! The two paths are created by different callers and never by the same one: the live marker comes
-//! from a completion that committed staged output, and the replay marker comes from the lookahead
+//! from a completion that committed stream output, and the replay marker comes from the lookahead
 //! in [`super::WorkflowMachines`].
 
 use super::{
