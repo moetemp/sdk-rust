@@ -37,8 +37,7 @@ relevant information.
 * Experimental: a workflow can commit the stream records it published with the new
   `WorkflowOutputStreamCommit` command, each with its plaintext content hash and size. Core
   builds the output manifest from them and records it in a `core_external_stream` marker ahead
-  of the completion's other commands, so the output becomes visible only when the workflow task
-  is accepted. A workflow that wrote this marker can only move forward. A Worker on an older
+  of the completion's other commands, so replay can check the output. A workflow that wrote this marker can only move forward. A Worker on an older
   Core, or one whose lang doesn't commit the records again on replay, fails that workflow's next
   task, so don't roll such a fleet back.
 * Experimental: behind the new `streams` feature, `streams::connect_stream_service` builds one
