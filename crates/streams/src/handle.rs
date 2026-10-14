@@ -525,15 +525,9 @@ impl Streams {
                 request.after
             )));
         }
-        if page.cursor != request.to {
-            return Err(mismatch(format!(
-                "the replayed read ends at {:?}, not at {:?}",
-                page.cursor, request.to
-            )));
-        }
-        if page.records_digest != request.records_digest {
+        if page.cursor != request.to || page.records_digest != request.records_digest {
             // A read from the beginning has no position to check, so a trim since the read shows
-            // as other records.
+            // as other records, which end elsewhere or differ.
             if request.after.is_empty()
                 && self
                     .store
@@ -545,6 +539,12 @@ impl Streams {
                     "retention trimmed the start of the stream, which the read began at"
                         .to_string(),
                 ));
+            }
+            if page.cursor != request.to {
+                return Err(mismatch(format!(
+                    "the replayed read ends at {:?}, not at {:?}",
+                    page.cursor, request.to
+                )));
             }
             return Err(mismatch(
                 "the replayed records differ from the records the read got".to_string(),
@@ -1822,6 +1822,31 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind, StreamFailureKind::ReplayRangeLost, "{error}");
         assert!(error.message.starts_with("REC-01"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_replay_read_from_a_trimmed_start_is_rec_01() {
+        let setup = setup(quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup.streams.append(append("p", 2, "2")).await.unwrap();
+        let request = read_after("", &[], Duration::ZERO);
+        let page = setup.streams.read(request.clone()).await.unwrap();
+        assert_eq!(page.start_cursor, "");
+        // Later records stand where the range began, so the replay finds as many as it wants.
+        setup.store.truncate(&chain("run-1"), "out", 0);
+        for sequence in 3..=4 {
+            setup
+                .streams
+                .append(append("p", sequence, &sequence.to_string()))
+                .await
+                .unwrap();
+        }
+        let error = setup
+            .streams
+            .read_range(replay_of(&request, &page))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::ReplayRangeLost, "{error}");
     }
 
     #[tokio::test]
