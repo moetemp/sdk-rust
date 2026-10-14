@@ -47,4 +47,47 @@ message StreamCallbackInfo {
     google.protobuf.Timestamp last_attempt_complete_time = 7;
     // The failure of the last attempt, if it failed.
     temporal.api.failure.v1.Failure last_attempt_failure = 8;
+    // The Workflow the callback wakes, when it was attached with a `workflow_target` and not a
+    // Nexus callback. Then `callback` is unset.
+    WorkflowWakeTarget workflow_target = 9;
+}
+
+// A Workflow that a stream notifier wakes when the stream moves or closes. The Workflow is in the
+// namespace of the request that attached it.
+message WorkflowWakeTarget {
+    string workflow_id = 1;
+    string run_id = 2;
+    // Names one reader of the stream in that run. The Workflow gets the wakes of each reader as
+    // their own `StreamWake`. At most 256 bytes.
+    string subscription_id = 3;
+}
+
+// A wake for one reader of a stream in a Workflow. The server records it on the next Workflow
+// Task scheduled event, so it adds no event of its own.
+//
+// A wake says that the stream moved, not what it holds. The reader reads the stream itself. Wakes
+// of one reader are folded, so the reader sees the latest one, with the highest `counter`.
+message StreamWake {
+    // The `subscription_id` of the `WorkflowWakeTarget` this wake is for.
+    string subscription_id = 1;
+    // The position that came with `counter`, in the producer's terms.
+    string position = 2;
+    // The highest counter the notifier has seen. A reader that armed its read at a counter wakes
+    // when this value is above it. Zero when the notifier has seen no notification.
+    int64 counter = 3;
+    // The metadata that came with `counter`.
+    map<string, string> metadata = 4;
+    // Set when the notifier asks the reader to read again with no new counter. The notifier sends
+    // it after a quiet period, so a reader also finds records whose notification was lost.
+    bool recheck = 5;
+    // Set when the stream closed. The reader reads to the end of the stream, then sees the
+    // outcome.
+    bool closed = 6;
+    // The result the stream closed with, when `closed` is set. Optional.
+    temporal.api.common.v1.Payload close_result = 7;
+    // The failure the stream closed with, when `closed` is set and it closed with one.
+    temporal.api.failure.v1.Failure close_failure = 8;
+    // Set when the notifier dropped this reader, for example at the notifier's idle timeout. The
+    // reader attaches again under a new request ID.
+    bool resubscribe = 9;
 }
