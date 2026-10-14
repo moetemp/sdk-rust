@@ -35,7 +35,12 @@ PROTO_PATHS = paths=source_relative:$(PROTO_OUT)
 OAPI_OUT := openapi
 OAPI3_PATH := .components.schemas.Payload
 
-NEX_GEN ?= nex-gen
+# nexgen escapes WIT keywords in field names and scaffolds proto maps and bytes in the
+# forms its generators accept. Pinned by revision so every machine writes the same WIT.
+NEXGEN_GIT ?= https://github.com/moetemp/nexgen
+NEXGEN_REV ?= 6f46948678f764c68bb76f103ab43713047187b2
+NEXGEN_ROOT := $(STAMPDIR)/nexgen-$(NEXGEN_REV)
+NEX_GEN := $(NEXGEN_ROOT)/bin/nexgen
 
 $(PROTO_OUT):
 	mkdir $(PROTO_OUT)
@@ -156,8 +161,8 @@ system-nexus-wit-install:
 	@cd cmd/protoc-gen-system-nexus-wit && go install .
 
 nex-gen-install:
-	printf $(COLOR) "Install nex-gen if missing..."
-	command -v $(NEX_GEN) >/dev/null || cargo install nex-gen --version ^0.1
+	printf $(COLOR) "Install nexgen $(NEXGEN_REV) if missing..."
+	command -v $(NEX_GEN) >/dev/null || CARGO_NET_GIT_FETCH_WITH_CLI=true cargo install --locked --git $(NEXGEN_GIT) --rev $(NEXGEN_REV) --features advanced --root $(NEXGEN_ROOT) nexgen
 
 ##### Clean #####
 clean:
