@@ -60,6 +60,7 @@ fn full_input(contract: &Value, name: &str, workflow_id: &str) -> Value {
             ("ReadInput", "state") => Value::Null,
             // So the answer carries `armed`, which the output check holds to the contract.
             ("ReadInput", "arm") => json!(true),
+            ("ReadInput", "floor_holder") => json!("ns/run-1/reader"),
             (model, member) => panic!("the contract added {model}.{member}; teach this test"),
         };
         out.insert(member, value);
@@ -101,7 +102,15 @@ fn the_contract_names_the_operations_core_serves() {
     );
     assert_eq!(operations["read"]["input"]["$ref"], "#/$defs/ReadInput");
     assert_eq!(operations["read"]["output"]["$ref"], "#/$defs/ReadOutput");
-    for input in ["StreamRef", "AppendInput", "ReadInput"] {
+    assert_eq!(
+        operations["read_range"]["input"]["$ref"],
+        "#/$defs/ReadRangeInput"
+    );
+    assert_eq!(
+        operations["read_range"]["output"]["$ref"],
+        "#/$defs/ReadOutput"
+    );
+    for input in ["StreamRef", "AppendInput", "ReadInput", "ReadRangeInput"] {
         assert_eq!(
             model(&contract, input)["additionalProperties"],
             false,
@@ -128,6 +137,50 @@ fn a_read_carries_its_state_through_the_generated_long_poll() {
             "{model_name}"
         );
     }
+}
+
+#[test]
+fn a_replay_range_names_what_read_range_takes() {
+    // A replay passes the answer's range back as it got it, so every member of `ReplayRange`
+    // is a required member of `ReadRangeInput` of the same type, and the answer names it.
+    let contract = contract();
+    assert_eq!(
+        model(&contract, "ReadOutput")["properties"]["replay"]["$ref"],
+        "#/$defs/ReplayRange"
+    );
+    let range = model(&contract, "ReplayRange");
+    let input = model(&contract, "ReadRangeInput");
+    let mut members = required(range);
+    members.sort();
+    assert_eq!(
+        members,
+        [
+            "after_token",
+            "chain_first_run_id",
+            "records_digest",
+            "stored_records"
+        ]
+    );
+    for member in members {
+        assert!(required(input).contains(&member), "{member}");
+        assert_eq!(
+            range["properties"][&member]["type"], input["properties"][&member]["type"],
+            "{member}"
+        );
+    }
+    for member in ["stream", "to_token"] {
+        assert!(required(input).contains(&member.to_string()), "{member}");
+    }
+    for member in ["state", "floor_holder"] {
+        assert!(!required(input).contains(&member.to_string()), "{member}");
+    }
+    assert_eq!(
+        input["properties"]["records_digest"]["contentEncoding"],
+        "base64"
+    );
+    let holder = &model(&contract, "ReadInput")["properties"]["floor_holder"];
+    assert_eq!(holder["type"], "string");
+    assert!(!required(model(&contract, "ReadInput")).contains(&"floor_holder".to_string()));
 }
 
 #[test]

@@ -98,6 +98,32 @@ pub(crate) struct ReadInput {
     pub(crate) state: Option<String>,
     #[serde(default)]
     pub(crate) arm: Option<bool>,
+    #[serde(default)]
+    pub(crate) floor_holder: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the contract declares the model before Core serves it"
+    )
+)]
+pub(crate) struct ReadRangeInput {
+    pub(crate) stream: StreamRef,
+    pub(crate) chain_first_run_id: String,
+    pub(crate) after_token: String,
+    pub(crate) to_token: String,
+    #[serde(deserialize_with = "spec_integer")]
+    pub(crate) stored_records: i64,
+    /// Left as base64, so an oversized state is refused before it is decoded.
+    #[serde(default)]
+    pub(crate) state: Option<String>,
+    pub(crate) records_digest: Base64,
+    #[serde(default)]
+    pub(crate) floor_holder: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -109,6 +135,16 @@ pub(crate) struct ReadOutput {
     pub(crate) state: Option<Base64>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) armed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) replay: Option<ReplayRange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ReplayRange {
+    pub(crate) chain_first_run_id: String,
+    pub(crate) after_token: String,
+    pub(crate) stored_records: i64,
+    pub(crate) records_digest: Base64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -209,6 +245,57 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&wire).unwrap(),
             r#"{"token":"c","record":"AQ=="}"#
+        );
+    }
+
+    #[test]
+    fn a_read_range_input_takes_its_members_and_refuses_others() {
+        let input: ReadRangeInput = serde_json::from_str(
+            r#"{"stream":{"kind":"workflow","workflow_id":"wf","topic":"t"},
+                "chain_first_run_id":"run-1","after_token":"","to_token":"c","stored_records":2.0,
+                "state":null,"records_digest":"AQI=","floor_holder":"ns/run/r"}"#,
+        )
+        .unwrap();
+        assert_eq!(input.stored_records, 2);
+        assert_eq!(input.records_digest.0, [1, 2]);
+        assert_eq!(input.state, None);
+        assert_eq!(input.floor_holder.as_deref(), Some("ns/run/r"));
+        let unknown = serde_json::from_str::<ReadRangeInput>(
+            r#"{"stream":{"kind":"workflow","workflow_id":"wf","topic":"t"},
+                "chain_first_run_id":"run-1","after_token":"","to_token":"c","stored_records":0,
+                "records_digest":"","wait_ms":5}"#,
+        )
+        .unwrap_err();
+        assert!(unknown.to_string().contains("unknown field"), "{unknown}");
+        let missing = serde_json::from_str::<ReadRangeInput>(
+            r#"{"stream":{"kind":"workflow","workflow_id":"wf","topic":"t"},
+                "chain_first_run_id":"run-1","after_token":"","stored_records":0,
+                "records_digest":""}"#,
+        )
+        .unwrap_err();
+        assert!(missing.to_string().contains("to_token"), "{missing}");
+    }
+
+    #[test]
+    fn a_replay_range_crosses_with_its_digest_as_base64() {
+        let output = ReadOutput {
+            records: Vec::new(),
+            next_token: "c".to_string(),
+            done: false,
+            state: None,
+            armed: false,
+            replay: Some(ReplayRange {
+                chain_first_run_id: "run-1".to_string(),
+                after_token: String::new(),
+                stored_records: 0,
+                records_digest: Base64(vec![1, 2]),
+            }),
+        };
+        assert_eq!(
+            serde_json::to_value(&output).unwrap(),
+            serde_json::json!({"records": [], "next_token": "c", "done": false,
+                "replay": {"chain_first_run_id": "run-1", "after_token": "", "stored_records": 0,
+                    "records_digest": "AQI="}})
         );
     }
 

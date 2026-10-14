@@ -51,6 +51,20 @@ services:
           state-field: state
         input: { $ref: "#/$defs/ReadInput" }
         output: { $ref: "#/$defs/ReadOutput" }
+      read_range:
+        fqn: read_range
+        description: >-
+          Answer again the records of an earlier read that named a
+          floor_holder, for a Workflow that replays that read. The call reads
+          the range its replay names with the read's input state, so the
+          superseded and stale marks come out the same, and checks the records
+          against the read's digest. It waits for nothing, asks nothing of the
+          owner and has no byte budget, since it must answer exactly what the
+          read answered. Records with other content are refused as
+          StreamReplayMismatchError, and records the store no longer holds as
+          StreamReplayRangeLostError.
+        input: { $ref: "#/$defs/ReadRangeInput" }
+        output: { $ref: "#/$defs/ReadOutput" }
 
 $defs:
   StreamRef:
@@ -196,7 +210,58 @@ $defs:
           the call waits its whole wait_ms and collects nothing, the endpoint
           arms the stream, so the next append notifies the stream's callers.
           A reader with no callback leaves it out.
+      floor_holder:
+        type: string
+        description: >-
+          Names a reader that keeps the range of each answer in place of its
+          records and reads the range again through read_range on replay. With
+          it the endpoint holds the records after the read's start against
+          retention for this holder, and the answer carries replay. Each read
+          and read_range of the holder renews the hold, which lapses the
+          store's floor lease after the last one. At most 512 bytes. Refused
+          beside latest_only, which answers no records.
     required: [stream]
+    additionalProperties: false
+
+  ReadRangeInput:
+    type: object
+    description: >-
+      One replay of an earlier read that named a floor_holder. Every member
+      but stream and floor_holder comes from that read's input and answer.
+    properties:
+      stream: { $ref: "#/$defs/StreamRef" }
+      chain_first_run_id:
+        type: string
+        description: "The replay's chain_first_run_id."
+      after_token:
+        type: string
+        x-nexus-cursor: StreamCursor
+        description: "The replay's after_token."
+      to_token:
+        type: string
+        x-nexus-cursor: StreamCursor
+        description: "The read answer's next_token."
+      stored_records:
+        type: integer
+        minimum: 0
+        maximum: 1000
+        description: "The replay's stored_records."
+      state:
+        type: string
+        contentEncoding: base64
+        description: >-
+          The state the read sent, so the replay's superseded and stale marks
+          are the read's. Absent when the read sent none.
+      records_digest:
+        type: string
+        contentEncoding: base64
+        description: "The replay's records_digest."
+      floor_holder:
+        type: string
+        description: >-
+          As on read, so a replay renews the hold, also after a reset that
+          replays a run whose reads stopped long ago.
+    required: [stream, chain_first_run_id, after_token, to_token, stored_records, records_digest]
     additionalProperties: false
 
   RecordWire:
@@ -293,7 +358,46 @@ $defs:
           The call asked to arm, collected nothing and armed the stream, so
           the caller waits for progress. Never true with records or with done.
           An empty answer without it falls back to waiting for progress too.
+      replay:
+        $ref: "#/$defs/ReplayRange"
+        description: >-
+          Set when the call named a floor_holder. What a replay passes to
+          read_range to get these records again.
     required: [records, next_token, done]
+    additionalProperties: true
+
+  ReplayRange:
+    type: object
+    description: >-
+      The range one read answered, after its byte budget cut it. A Workflow
+      keeps it with the answer's next_token and state in place of the records.
+    properties:
+      chain_first_run_id:
+        type: string
+        description: "The first run of the run chain the read read."
+      after_token:
+        type: string
+        x-nexus-cursor: StreamCursor
+        description: >-
+          The cursor the answer reads strictly after, with the read's start
+          resolved. Empty when the answer starts at the oldest record. An
+          answer whose only record is an error the store's reader raised has
+          an empty range at that record's cursor.
+      stored_records:
+        type: integer
+        minimum: 0
+        description: >-
+          How many stored records the answer holds, the ones that crossed as
+          an error included and supersessions not counted.
+      records_digest:
+        type: string
+        contentEncoding: base64
+        description: >-
+          SHA-256 over the answer's records. Per record it covers the cursor,
+          the stale mark, and the kind, producer, attempt, sequence and
+          content hash of a stored record or the producer and both attempts of
+          a supersession. It leaves out the bodies, so a codec change keeps it.
+    required: [chain_first_run_id, after_token, stored_records, records_digest]
     additionalProperties: true
 
   StreamOperationToken:

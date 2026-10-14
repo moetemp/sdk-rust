@@ -312,6 +312,7 @@ impl NexusCalls {
                     done: false,
                     state: None,
                     armed: false,
+                    replay: None,
                 }),
                 Err(error) => failed(failure::of_stream(&error)),
             };
@@ -645,6 +646,7 @@ impl Budget {
             done: false,
             state: Some(Base64::default()),
             armed: false,
+            replay: None,
         });
         let state = crossing_size(read.state.encoded_len().min(MAX_STATE_BYTES));
         Self {
@@ -742,6 +744,7 @@ fn finish_read(
         done,
         state: Some(Base64(state.encode_to_vec())),
         armed,
+        replay: None,
     })
 }
 
@@ -816,6 +819,7 @@ fn read_failure(error: StreamError, state: Vec<u8>) -> NexusStep {
             done: false,
             state: (!state.is_empty()).then_some(Base64(state)),
             armed: false,
+            replay: None,
         }),
         _ => failed(failure::of_stream(&error)),
     }
