@@ -119,6 +119,33 @@ impl OwnerClient for Ended {
     }
 }
 
+/// Temporal where run `run-1` continued as new into `run-2`, which still runs.
+struct Continued;
+
+#[async_trait::async_trait]
+impl OwnerClient for Continued {
+    async fn describe(
+        &self,
+        _: &str,
+        _: &str,
+        run_id: &str,
+    ) -> Result<OwnerDescription, OwnerError> {
+        Ok(if run_id == "run-1" {
+            OwnerDescription {
+                run_id: "run-1".to_string(),
+                first_run_id: "run-1".to_string(),
+                status: WorkflowExecutionStatus::ContinuedAsNew,
+            }
+        } else {
+            OwnerDescription {
+                run_id: "run-2".to_string(),
+                first_run_id: "run-1".to_string(),
+                status: WorkflowExecutionStatus::Running,
+            }
+        })
+    }
+}
+
 mod cases {
     use super::*;
 
@@ -481,6 +508,34 @@ mod cases {
         panic!("the read never said done, after {collected:?}");
     }
 
+    pub(crate) async fn a_refs_run_picks_the_chain_and_never_ends_a_read_there(
+        store: Arc<dyn StreamStore>,
+    ) {
+        let wf = workflow();
+        let calls = NexusCalls::new(
+            Arc::new(Streams::new(
+                store,
+                Arc::new(Continued),
+                StreamsOptions {
+                    owner_check_min: std::time::Duration::from_millis(10),
+                    ..StreamsOptions::default()
+                },
+            )),
+            NexusOptions::default(),
+        );
+        write(&calls, &wf, 1, &["one"]).await;
+        let mut input = read_input(&wf, "");
+        input["stream"]["chain_run_id"] = json!("run-1");
+        input["wait_ms"] = json!(300);
+        let answer = read(&calls, input.clone()).await.unwrap();
+        assert_eq!(texts(&answer), ["one"]);
+        // `run-1` continued as new, so a read pinned to that run would end here.
+        input["after_token"] = answer["next_token"].clone();
+        input["state"] = answer["state"].clone();
+        let answer = read(&calls, input).await.unwrap();
+        assert_eq!(answer["done"], false, "{answer}");
+    }
+
     pub(crate) async fn two_readers_on_one_stream_keep_their_own_places(
         store: Arc<dyn StreamStore>,
     ) {
@@ -767,6 +822,7 @@ macro_rules! all_cases {
             argument_mistakes_are_bad_requests,
             a_reference_this_release_cannot_open_is_refused,
             a_read_says_done_once_the_owner_ends,
+            a_refs_run_picks_the_chain_and_never_ends_a_read_there,
             two_readers_on_one_stream_keep_their_own_places,
             a_read_that_does_not_wait_answers_with_what_the_store_holds,
             a_read_answer_stays_within_its_byte_budget,

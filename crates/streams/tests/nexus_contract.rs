@@ -46,7 +46,7 @@ fn full_input(contract: &Value, name: &str, workflow_id: &str) -> Value {
         let value = match (name, member.as_str()) {
             (_, "stream") => {
                 let mut stream = stream(workflow_id, "out");
-                stream["run_id"] = Value::Null;
+                stream["chain_run_id"] = Value::Null;
                 stream
             }
             ("AppendInput", "producer_id") => json!("p"),
