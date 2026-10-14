@@ -19,6 +19,7 @@ redis = ["dep:redis", "dep:crc16"]
 
 [dependencies]
 async-trait = "0.1"
+base64 = "0.23"
 crc16 = { version = "0.4", optional = true }
 lru = "0.18"
 prost = { workspace = true }
@@ -29,9 +30,11 @@ redis = { version = "1.7", optional = true, default-features = false, features =
     "streams",
     "tokio-rustls-comp",
 ] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { workspace = true }
 sha2 = "0.10"
 thiserror = { workspace = true }
-tokio = { version = "1.47", default-features = false, features = ["sync", "time"] }
+tokio = { version = "1.47", default-features = false, features = ["rt", "sync", "time"] }
 tracing = "0.1"
 
 [dependencies.temporalio-common]
@@ -40,7 +43,8 @@ version = "~1.1.0"
 default-features = false
 
 [dev-dependencies]
-serde_json = { workspace = true }
+prost-types = { workspace = true }
+serde_yaml = "0.9"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 tokio = { version = "1.47", features = [
     "io-util",
