@@ -10,7 +10,7 @@ if held then
   local next_sequence = held_sequence + tonumber(held_count)
   if sequence == held_sequence then
     if digest == digest_arg then
-      return {first, last}
+      return {first, last, redis.call('HGET', KEYS[2], 'arm') or '0'}
     end
     return redis.error_reply('STREAMS_DIVERGENT sequence ' .. ARGV[4] ..
       ' was already written with different content')
@@ -35,4 +35,4 @@ end
 redis.call('HSET', KEYS[2], field,
   ARGV[4] .. '|' .. (#ARGV - 5) .. '|' .. first .. '|' .. last .. '|' .. digest_arg)
 keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace)
-return {first, last}
+return {first, last, redis.call('HGET', KEYS[2], 'arm') or '0'}

@@ -6,7 +6,7 @@ mod keys;
 mod scripts;
 
 use crate::{
-    StreamError, StreamResult, StreamStore,
+    NewestOrArm, StreamError, StreamResult, StreamStore,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredRecord,
@@ -134,6 +134,28 @@ impl RedisStore {
             .arg(keys.meta(topic))
             .arg(CLOSED_FIELD);
         eval
+    }
+
+    /// The newest record after `after`, or, when the log holds none, an arm set in the same
+    /// script. The arm keeps the meta's expiry, or sets one on a meta it creates.
+    async fn arm(&self, keys: &ChainKeys, topic: &str, after: &str) -> StreamResult<NewestOrArm> {
+        let found: Value = scripts::ARM_SCRIPT
+            .key(keys.log(topic))
+            .key(keys.meta(topic))
+            .arg(after)
+            .arg(self.retention_ms + self.grace_ms)
+            .invoke_async(&mut self.shared.clone())
+            .await
+            .mapped(Call::Write)?;
+        match found {
+            Value::Int(generation) if generation > 0 => Ok(NewestOrArm::Armed(generation as u64)),
+            Value::BulkString(id) => Ok(NewestOrArm::Newest(
+                String::from_utf8_lossy(&id).into_owned(),
+            )),
+            other => Err(StreamError::storage(format!(
+                "Redis answered the arm with {other:?}"
+            ))),
+        }
     }
 
     fn xread(
@@ -383,6 +405,12 @@ fn wait_of(request: &StoreReadRequest) -> Duration {
     })
 }
 
+/// A topic's arm as a script answered it, zero when none.
+fn generation(arm: &str) -> StreamResult<u64> {
+    arm.parse()
+        .map_err(|_| StreamError::storage(format!("a topic's arm is {arm:?}, not a generation")))
+}
+
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -414,14 +442,14 @@ impl StreamStore for RedisStore {
         for record in &request.records {
             script.arg(record.as_slice());
         }
-        let (first_position, last_position): (String, String) = script
+        let (first_position, last_position, arm): (String, String, String) = script
             .invoke_async(&mut self.shared.clone())
             .await
             .mapped(Call::Append)?;
         Ok(StoreAppendResponse {
             first_position,
             last_position,
-            arm: None,
+            arm: Some(generation(&arm)?),
         })
     }
 
@@ -463,10 +491,30 @@ impl StreamStore for RedisStore {
         if let Some(error) = state.lost(topic, position, &found)? {
             return Err(error);
         }
+        let closed = state.chain_closed || state.topic_closed;
+        let mut armed = false;
+        if request.arm && found.is_empty() && !closed {
+            match self.arm(&keys, topic, after).await? {
+                NewestOrArm::Armed(_) => armed = true,
+                // A record landed between the read and the arm, so the answer carries it.
+                _ => {
+                    let xread = Self::xread(&keys, topic, after, request.max_records, None);
+                    found = records(
+                        xread
+                            .query_async(&mut self.shared.clone())
+                            .await
+                            .mapped(Call::Read)?,
+                    )?;
+                    if let Some(error) = state.lost(topic, position, &found)? {
+                        return Err(error);
+                    }
+                }
+            }
+        }
         Ok(StoreReadResponse {
             records: found,
-            closed: state.chain_closed || state.topic_closed,
-            armed: false,
+            closed,
+            armed,
         })
     }
 
@@ -568,6 +616,22 @@ impl StreamStore for RedisStore {
             .query_async::<()>(&mut self.shared.clone())
             .await
             .mapped(Call::Write)
+    }
+
+    async fn disarm(&self, chain: &ChainId, topic: &str, generation: u64) -> StreamResult<()> {
+        let meta = ChainKeys::new(&self.prefix, chain).meta(topic);
+        scripts::DISARM_SCRIPT
+            .key(meta)
+            .arg(generation)
+            .invoke_async::<i64>(&mut self.shared.clone())
+            .await
+            .mapped(Call::Write)
+            .map(drop)
+    }
+
+    async fn newest_or_arm(&self, chain: &ChainId, topic: &str) -> StreamResult<NewestOrArm> {
+        self.arm(&ChainKeys::new(&self.prefix, chain), topic, "0-0")
+            .await
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
