@@ -178,11 +178,11 @@ struct TokenBody {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TokenRef {
-    kind: String,
-    // An unpinned ref has none, as the generated SDK writers leave an unset member out. SDK
-    // releases before Core wrote null, which reads the same.
+    // A ref to the newest chain has none, as the generated SDK writers leave an unset member out.
+    // SDK releases before Core wrote null, which reads the same.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    run_id: Option<String>,
+    chain_run_id: Option<String>,
+    kind: String,
     topic: String,
     workflow_id: String,
 }
@@ -196,8 +196,8 @@ impl OperationToken {
             attach: self.attach_request_id.clone(),
             chain: self.chain_first_run_id.clone(),
             stream: TokenRef {
+                chain_run_id: (!self.stream.run_id.is_empty()).then(|| self.stream.run_id.clone()),
                 kind: WORKFLOW_KIND.to_string(),
-                run_id: (!self.stream.run_id.is_empty()).then(|| self.stream.run_id.clone()),
                 topic: self.stream.topic.clone(),
                 workflow_id: self.stream.workflow_id.clone(),
             },
@@ -234,7 +234,7 @@ impl OperationToken {
                 namespace: namespace.to_string(),
                 owner_kind: StreamOwnerKind::Workflow as i32,
                 workflow_id: body.stream.workflow_id,
-                run_id: body.stream.run_id.unwrap_or_default(),
+                run_id: body.stream.chain_run_id.unwrap_or_default(),
                 topic: body.stream.topic,
             },
             attach_request_id: body.attach,
@@ -832,7 +832,7 @@ mod tests {
                 namespace: "ns".to_string(),
                 owner_kind: StreamOwnerKind::Workflow as i32,
                 workflow_id: vector.stream.workflow_id.clone(),
-                run_id: vector.stream.run_id.clone().unwrap_or_default(),
+                run_id: vector.stream.chain_run_id.clone().unwrap_or_default(),
                 topic: vector.stream.topic.clone(),
             },
             attach_request_id: vector.attach.clone(),
