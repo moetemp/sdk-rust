@@ -100,6 +100,9 @@ message RedisStoreConfig {
   google.protobuf.Duration floor_lease = 7;
   // How long a hold lasts after its reader released it. Unset keeps one day.
   google.protobuf.Duration floor_release_grace = 8;
+  // With `StreamStoreConfig.notification_log`, how many doorbell streams the log rings, each one
+  // a driver blocks on. Zero uses 16.
+  uint32 notify_doorbells = 9;
 }
 
 // Streams in this process's memory, for tests and local development. Nothing survives the

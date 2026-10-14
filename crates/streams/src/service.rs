@@ -67,7 +67,9 @@ impl StreamService {
                 };
                 (Arc::new(store), DEFAULT_RETENTION)
             }
-            Some(stream_store_config::Store::Redis(redis)) => connect_redis(redis).await?,
+            Some(stream_store_config::Store::Redis(redis)) => {
+                connect_redis(redis, config.notification_log).await?
+            }
             None => {
                 return Err(StreamError::refused(
                     "the stream store config names no store",
@@ -236,8 +238,13 @@ fn decode<T: Message + Default>(rpc: &str, request: &[u8]) -> Result<T, StreamFa
 #[cfg(feature = "redis")]
 async fn connect_redis(
     config: crate::proto::RedisStoreConfig,
+    notification_log: bool,
 ) -> StreamResult<(Arc<dyn StreamStore>, Duration)> {
     let mut options = crate::RedisStoreOptions::new(String::new());
+    options.notification_log = notification_log;
+    if config.notify_doorbells > 0 {
+        options.notify_doorbells = config.notify_doorbells;
+    }
     options.urls = config.urls;
     options.cluster = config.cluster;
     if !config.key_prefix.is_empty() {
@@ -266,6 +273,7 @@ async fn connect_redis(
 #[cfg(not(feature = "redis"))]
 async fn connect_redis(
     _: crate::proto::RedisStoreConfig,
+    _: bool,
 ) -> StreamResult<(Arc<dyn StreamStore>, Duration)> {
     Err(StreamError::unsupported(
         "this build has no Redis store; build temporalio-streams with its redis feature",
@@ -699,26 +707,33 @@ mod tests {
 
     #[cfg(feature = "redis")]
     #[tokio::test]
-    async fn a_store_without_a_notification_log_refuses_one() {
+    async fn the_redis_store_keeps_a_notification_log_when_asked() {
         let Ok(url) = std::env::var("STREAMS_REDIS_URL") else {
             return;
         };
-        let error = StreamService::connect(
-            StreamStoreConfig {
-                store: Some(stream_store_config::Store::Redis(
-                    crate::proto::RedisStoreConfig {
-                        urls: vec![url],
-                        ..Default::default()
-                    },
-                )),
-                notification_log: true,
-                ..Default::default()
-            },
-            Arc::new(Running),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.kind, StreamFailureKind::Refused);
+        for notification_log in [false, true] {
+            let service = StreamService::connect(
+                StreamStoreConfig {
+                    store: Some(stream_store_config::Store::Redis(
+                        crate::proto::RedisStoreConfig {
+                            urls: vec![url.clone()],
+                            notify_doorbells: 4,
+                            ..Default::default()
+                        },
+                    )),
+                    notification_log,
+                    ..Default::default()
+                },
+                Arc::new(Running),
+            )
+            .await
+            .unwrap();
+            let log = service.store().notification_log();
+            assert_eq!(log.is_some(), notification_log);
+            if let Some(log) = log {
+                assert_eq!((log.partitions(), log.doorbells()), (16_384, 4));
+            }
+        }
     }
 
     #[tokio::test]

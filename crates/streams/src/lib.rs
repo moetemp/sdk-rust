@@ -24,7 +24,7 @@ mod store;
 mod subscribe;
 
 #[cfg(feature = "redis")]
-pub use self::redis::{RedisStore, RedisStoreOptions};
+pub use self::redis::{DEFAULT_NOTIFY_DOORBELLS, RedisStore, RedisStoreOptions};
 pub use cursor::{BEGINNING, END, cursor_position, mint_cursor, stream_hash};
 pub use error::{StreamError, StreamResult};
 pub use handle::{OWNER_RECHECK, OWNER_START_GRACE, Streams, StreamsOptions};

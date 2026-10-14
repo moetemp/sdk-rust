@@ -53,6 +53,11 @@ relevant information.
   memory store keeps one, and a store without one refuses the setting. `NotifierClient` gains
   `notify_streams`, which Core's client sends as one `NotifyStreams` call per namespace, and the C
   bridge takes `NotifyStreams` as a raw call.
+* Experimental: the Redis store keeps a notification log with `notification_log`. The append
+  script (hash `9fdc33e7`) also adds an entry to the stream of the chain's Cluster slot,
+  `<prefix>:{<slot tag>}:n`, and Core rings one of `notify_doorbells` (16 when zero) doorbell
+  streams when that stream takes its first entry. `testdata/redis/notify_slots.json` pins the slot
+  tags for other SDKs. Drivers read as the consumer group `streams-driver`.
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with

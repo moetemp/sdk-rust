@@ -300,15 +300,42 @@ mod on_redis {
         cluster: bool,
         extra: &[&str],
     ) -> Option<Redis> {
+        redis_as_documented_user_with(variable, cluster, extra, false).await
+    }
+
+    /// [redis_as_documented_user] with the notification log on, and the documented rules for
+    /// its keys.
+    pub(crate) async fn redis_as_documented_user_with_log(
+        variable: &str,
+        cluster: bool,
+    ) -> Option<Redis> {
+        redis_as_documented_user_with(variable, cluster, &[], true).await
+    }
+
+    async fn redis_as_documented_user_with(
+        variable: &str,
+        cluster: bool,
+        extra: &[&str],
+        notification_log: bool,
+    ) -> Option<Redis> {
         let Ok(url) = std::env::var(variable) else {
             eprintln!("set {variable} to run the Redis store cases");
             return None;
         };
         let prefix = unique("conformance-acl");
-        let user = DocumentedUser::create(&url, &prefix, "default", extra).await;
+        let log_rules = [
+            format!("~{}:{{*}}:n", part(&prefix)),
+            format!("%W~{}:{{*}}:bell", part(&prefix)),
+        ];
+        let mut rules: Vec<&str> = extra.to_vec();
+        if notification_log {
+            rules.extend(log_rules.iter().map(String::as_str));
+        }
+        let user = DocumentedUser::create(&url, &prefix, "default", &rules).await;
         let mut options = RedisStoreOptions::new(user.url.clone());
         options.key_prefix = prefix.clone();
         options.cluster = cluster;
+        options.notification_log = notification_log;
         Some(Redis {
             store: Arc::new(RedisStore::connect(options).await.unwrap()),
             raw: Raw::connect(&url, cluster).await,
@@ -318,15 +345,25 @@ mod on_redis {
     }
 
     pub(crate) async fn redis(variable: &str, cluster: bool) -> Option<Redis> {
+        redis_with(variable, cluster, false).await
+    }
+
+    /// [redis] with a notification log.
+    pub(crate) async fn redis_with_log(variable: &str, cluster: bool) -> Option<Redis> {
+        redis_with(variable, cluster, true).await
+    }
+
+    async fn redis_with(variable: &str, cluster: bool, notification_log: bool) -> Option<Redis> {
         let Ok(url) = std::env::var(variable) else {
             eprintln!("set {variable} to run the Redis store cases");
             return None;
         };
-        // A prefix per case keeps cases apart in one Redis.
+        // A prefix per case keeps cases apart in one Redis, its notification streams too.
         let prefix = unique("conformance");
         let mut options = RedisStoreOptions::new(url.clone());
         options.cluster = cluster;
         options.key_prefix = prefix.clone();
+        options.notification_log = notification_log;
         Some(Redis {
             store: Arc::new(RedisStore::connect(options).await.unwrap()),
             raw: Raw::connect(&url, cluster).await,
@@ -1650,6 +1687,24 @@ mod cluster_redis {
 }
 
 #[cfg(feature = "redis")]
+mod standalone_redis_with_log {
+    store_cases!(super::on_redis::redis_with_log("STREAMS_REDIS_URL", false));
+    log_cases!(super::on_redis::redis_with_log("STREAMS_REDIS_URL", false));
+}
+
+#[cfg(feature = "redis")]
+mod cluster_redis_with_log {
+    store_cases!(super::on_redis::redis_with_log(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    ));
+    log_cases!(super::on_redis::redis_with_log(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    ));
+}
+
+#[cfg(feature = "redis")]
 mod notifying_redis {
     store_cases!(super::notifying(super::on_redis::redis(
         "STREAMS_REDIS_URL",
@@ -1668,6 +1723,22 @@ mod documented_acl_redis {
     conformance!(super::on_redis::redis_as_documented_user("STREAMS_REDIS_URL", false, &["+scan"]);
         deleting_an_owner_drops_every_chain_of_it,
     );
+}
+
+#[cfg(feature = "redis")]
+mod documented_acl_redis_with_log {
+    store_cases!(super::on_redis::redis_as_documented_user_with_log(
+        "STREAMS_REDIS_URL",
+        false
+    ));
+}
+
+#[cfg(feature = "redis")]
+mod documented_acl_cluster_redis_with_log {
+    store_cases!(super::on_redis::redis_as_documented_user_with_log(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    ));
 }
 
 #[cfg(feature = "redis")]

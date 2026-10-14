@@ -41,6 +41,19 @@ doesn't read the floors hash, so its appends can trim records that a positions-o
 A topic that a positions-only reader reads must take its appends only through Core's store. Other
 providers on such a topic are unsupported.
 
+**Notification log.** With `notification_log` on, the append script also adds an entry to the
+notification stream of the chain's Cluster slot, `<prefix>:{<tag>}:n`, where the tag is the one
+`testdata/redis/notify_slots.json` pins for that slot. So the log, the meta and the entry share a
+slot, one script writes them, and a reshard moves them together. A standalone server uses the
+same keys. An entry holds `k`, the log key, and `p`, the append's last entry id. The stream keeps
+about the newest 10,000 entries. A repeat of the newest batch adds none. The script answers the
+stream's length too, and when it is 1, Core adds the slot to doorbell `<prefix>:{<tag of slot
+s % doorbells>}:bell`, apart from the script, so a lost ring is possible. Drivers read the slot
+streams and the doorbells as the consumer group `streams-driver` (`XREADGROUP`, `XAUTOCLAIM`,
+`XACK`, `XDEL`, `XGROUP CREATE`), and sweep with `XLEN` over each primary's slots from `CLUSTER
+SLOTS`. The slot streams have no expiry, and a driver empties them. The logged append script has
+its own hash. The plain one is unchanged, and an SDK's provider writes no entries.
+
 **Retired producers.** A field stays until a write's trim finds it older than the retention, so
 a topic written by many short-lived producers holds one field per producer attempt of the last
 retention window, about 235 bytes each. `RetireProducer` deletes one attempt's field with
@@ -73,7 +86,10 @@ ACL SETUSER streams-app on >secret resetkeys ~temporal-streams:{my-ns:* resetcha
 
 A cluster client reads the topology with `CLUSTER SLOTS` first. An ACL user lives on one node,
 so on a cluster the user must exist on every node. Deleting an owner's streams also needs
-`+scan`. `+config|get` only reads
+`+scan`. With the notification log on, an application also needs `~temporal-streams:{*}:n
+%W~temporal-streams:{*}:bell`, since its appends write the slot streams. Those entries name
+other namespaces' streams and positions, never records. A driver needs those keys with read and
+write, and `+xreadgroup +xautoclaim +xack +xdel +xgroup|create +xlen +xadd +cluster|slots`. `+config|get` only reads
 `maxmemory-policy`, and the store goes on when a server refuses it.
 
 **Tests.** The Redis tests run when `STREAMS_REDIS_URL` names a standalone server and
