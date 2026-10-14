@@ -257,9 +257,9 @@ impl Streams {
     /// the interval over. So many readers parked on a quiet stream don't load the server. Once
     /// the owner ended, or the store marked the stream closed, the read delivers what is left
     /// and answers `done`. A read pinned to a run ends when that run closes, even if the chain
-    /// continued as new. A read with `arm` that waits its whole `wait` and finds nothing arms the
-    /// stream and answers `armed`. A read whose owner Temporal doesn't know yet answers empty
-    /// within [StreamsOptions::owner_start_grace], so it can start before its owner does.
+    /// continued as new. An empty answer carries the notification counter of its position as
+    /// `wake_after`. A read whose owner Temporal doesn't know yet answers empty within
+    /// [StreamsOptions::owner_start_grace], so it can start before its owner does.
     pub async fn read(&self, request: ReadRequest) -> StreamResult<ReadResponse> {
         let stream = address(request.stream.as_ref())?;
         let mut state = ReadState::decode_from(&request.state)?;
@@ -310,9 +310,6 @@ impl Streams {
                 remaining.min(until_check)
             };
             page_request.wait = wait.try_into().ok();
-            // Only the pass that waits out the read's own wait arms, so a shorter pass before an
-            // owner check doesn't wake the caller for a gap shorter than the reader chose.
-            page_request.arm = request.arm && !state.owner_ended && remaining <= until_check;
             let (mut page, closed, close) =
                 read_with(&*self.store, &target, &page_request, &mut state).await?;
             if close.is_some() {
@@ -331,7 +328,6 @@ impl Streams {
             }
             if state.owner_ended {
                 page.done = true;
-                page.armed = false;
                 page.wake_after = 0;
                 // A reader can reach the end before a close wake does, so the end carries what the
                 // stream closed with.
@@ -1976,45 +1972,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_the_pass_that_waits_out_the_read_arms() {
-        // Owner checks every 20 ms cut the wait into passes. One arm for the whole wait keeps a
-        // gap shorter than the reader's wait from costing a notification.
-        let setup = setup(quick());
-        let page = setup
+    async fn an_empty_read_waits_for_a_counter_above_its_position() {
+        let setup = setup(StreamsOptions::default());
+        let empty = setup
             .streams
-            .read(ReadRequest {
-                arm: true,
-                ..read_after("", &[], Duration::from_millis(300))
-            })
+            .read(read_after("", &[], Duration::from_millis(20)))
             .await
             .unwrap();
-        assert!(page.armed && page.records.is_empty() && !page.done);
-        assert_eq!(page.wake_after, 0, "an empty stream wakes on any counter");
-        assert_eq!(
-            setup
-                .store
-                .newest_or_arm(&chain("run-1"), "out")
-                .await
-                .unwrap(),
-            crate::NewestOrArm::Armed(2),
-            "the read armed once"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_armed_read_waits_for_a_counter_above_its_position() {
-        let setup = setup(StreamsOptions::default());
+        assert!(empty.records.is_empty() && !empty.done);
+        assert_eq!(empty.wake_after, 0, "an empty stream wakes on any counter");
         setup.streams.append(append("p", 1, "1")).await.unwrap();
         let landed = setup.streams.append(append("p", 2, "2")).await.unwrap();
         let page = setup
             .streams
-            .read(ReadRequest {
-                arm: true,
-                ..read_after(&landed.last_cursor, &[], Duration::from_millis(20))
-            })
+            .read(read_after(
+                &landed.last_cursor,
+                &[],
+                Duration::from_millis(20),
+            ))
             .await
             .unwrap();
-        assert!(page.armed);
+        assert!(page.records.is_empty());
         let at = |cursor: &str| {
             crate::cursor_position(
                 cursor,
@@ -2037,19 +2015,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_read_that_finds_its_owner_ended_answers_done_unarmed() {
+    async fn a_read_that_finds_its_owner_ended_answers_done_with_no_wake_counter() {
         let setup = setup(quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
         setup.owners.end("wf", WorkflowExecutionStatus::Completed);
         let page = setup
             .streams
-            .read(ReadRequest {
-                arm: true,
-                ..read_after("", &[], Duration::from_secs(5))
-            })
+            .read(read_after(END, &[], Duration::from_secs(5)))
             .await
             .unwrap();
         assert!(page.done);
-        assert!(!page.armed);
+        assert_eq!(page.wake_after, 0);
     }
 
     #[tokio::test]
