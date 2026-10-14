@@ -28,6 +28,10 @@ pub const DEFAULT_MAX_NOTIFIERS: usize = 1000;
 /// How long a stopping process waits for the notifications still out.
 pub const FLUSH_LIMIT: Duration = Duration::from_secs(10);
 
+/// How long a stream's slot may send nothing before an append sends its last counter again, so
+/// the notifier of a busy stream that never arms sees activity before its idle timeout.
+pub const NOTIFIER_REFRESH: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// The wait before a failed notifier close is tried again. It doubles up to [CLOSE_RETRY_CAP].
 pub const CLOSE_RETRY_FIRST: Duration = Duration::from_secs(1);
 /// The longest wait between two tries of a notifier close.
@@ -178,6 +182,10 @@ struct SlotState {
     pending: Option<Pending>,
     sending: bool,
     closed: bool,
+    /// The last notification that landed, which a refresh sends again.
+    last_sent: Option<(String, i64)>,
+    /// When the slot last sent or scheduled a send, or was made.
+    active_at: Option<tokio::time::Instant>,
 }
 
 /// One stream's notifications: folded, with one call in flight per slot.
@@ -192,9 +200,29 @@ impl Slot {
     fn new(key: StreamKey) -> Arc<Self> {
         Arc::new(Self {
             key,
-            state: Mutex::default(),
+            state: Mutex::new(SlotState {
+                active_at: Some(tokio::time::Instant::now()),
+                ..SlotState::default()
+            }),
             idle: watch::Sender::new(true),
         })
+    }
+
+    /// Whether the slot sent nothing for [NOTIFIER_REFRESH], answering the last notification
+    /// that landed, if any. Counts as activity, so the writes that follow don't refresh again.
+    fn refresh_due(&self) -> Option<Option<(String, i64)>> {
+        let mut state = self.state.lock().unwrap();
+        let now = tokio::time::Instant::now();
+        if state.closed
+            || state.pending.is_some()
+            || state
+                .active_at
+                .is_some_and(|at| now.duration_since(at) < NOTIFIER_REFRESH)
+        {
+            return None;
+        }
+        state.active_at = Some(now);
+        Some(state.last_sent.clone())
     }
 
     /// Records the newest position and returns at once. While a call is out, later
@@ -221,6 +249,7 @@ impl Slot {
         if state.closed {
             return;
         }
+        state.active_at = Some(tokio::time::Instant::now());
         match &mut state.pending {
             Some(held) => {
                 if counter >= held.counter {
@@ -270,11 +299,12 @@ impl Slot {
             let notification = StreamNotification {
                 chain: self.key.chain(),
                 topic: self.key.topic.clone(),
-                position,
+                position: position.clone(),
                 counter,
                 close: None,
             };
             if self.send(&client, notification).await {
+                self.state.lock().unwrap().last_sent = Some((position, counter));
                 if let Some(arm) = arm {
                     self.disarm(arm).await;
                 }
@@ -461,6 +491,14 @@ impl Notifier {
     ) {
         self.slot(StreamKey::new(chain, topic))
             .notify(&self.client, position, counter, arm);
+    }
+
+    /// For a write that owes no notification: once the stream's slot sent nothing for
+    /// [NOTIFIER_REFRESH], answers what keeps the notifier active. That is the last counter that
+    /// landed, which the notifier takes as activity and delivers to no one, or `None` when the
+    /// slot never sent, for the caller to send the newest record.
+    pub fn refresh_due(&self, chain: &ChainId, topic: &str) -> Option<Option<(String, i64)>> {
+        self.slot(StreamKey::new(chain, topic)).refresh_due()
     }
 
     /// Closes the stream on the server with `outcome`, after the notification in flight, and
@@ -714,9 +752,17 @@ impl StreamStore for NotifyingStore {
         let landed = self.inner.append(request).await?;
         if self.progress
             && let Some(chain) = &chain
-            && let Some(arm) = self.owed(landed.arm)
         {
-            self.notify_at(chain, &topic, &landed.last_position, arm);
+            match self.owed(landed.arm) {
+                Some(arm) => self.notify_at(chain, &topic, &landed.last_position, arm),
+                None => match self.notifier.refresh_due(chain, &topic) {
+                    Some(Some((cursor, counter))) => {
+                        self.notifier.notify(chain, &topic, cursor, counter)
+                    }
+                    Some(None) => self.notify_at(chain, &topic, &landed.last_position, None),
+                    None => {}
+                },
+            }
         }
         Ok(landed)
     }
@@ -1569,7 +1615,6 @@ mod tests {
             .unwrap();
         store.flush_notifications().await;
         assert!(recorder.sent().is_empty(), "no reader sleeps on the stream");
-        assert!(store.notifier().slots.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1704,5 +1749,43 @@ mod tests {
             .collect();
         topics.sort();
         assert_eq!(topics, ["b", "t"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_stream_that_never_arms_refreshes_its_notifier_once_a_day() {
+        // Its readers always find records, so without a refresh the notifier would see no
+        // activity and fail its callers at its idle timeout.
+        let recorder = Arc::new(Recorder::default());
+        let (_, store) = notifying_store(&recorder);
+        let run = chain("run-1");
+        let mut sequence = 0;
+        let mut append_after = async |wait: Duration| {
+            tokio::time::sleep(wait).await;
+            sequence += 1;
+            let landed = store
+                .append(append_request(&run, "t", sequence))
+                .await
+                .unwrap();
+            store.flush_notifications().await;
+            landed
+        };
+        append_after(Duration::ZERO).await;
+        append_after(NOTIFIER_REFRESH - Duration::from_secs(60)).await;
+        assert!(recorder.sent().is_empty(), "a day has not passed");
+        let landed = append_after(Duration::from_secs(60)).await;
+        let first = progress_counter(&landed.last_position).unwrap();
+        assert_eq!(
+            recorder.sent().iter().map(|(_, c)| *c).collect::<Vec<_>>(),
+            [first],
+            "a slot that never sent sends the newest record's counter"
+        );
+        append_after(Duration::from_secs(60)).await;
+        assert_eq!(recorder.sent().len(), 1, "once a day");
+        append_after(NOTIFIER_REFRESH).await;
+        assert_eq!(
+            recorder.sent().iter().map(|(_, c)| *c).collect::<Vec<_>>(),
+            [first, first],
+            "the last counter it sent again, which the notifier takes as activity only"
+        );
     }
 }

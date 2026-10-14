@@ -28,8 +28,8 @@ pub use error::{StreamError, StreamResult};
 pub use handle::{OWNER_RECHECK, Streams, StreamsOptions};
 pub use memory::MemoryStore;
 pub use notify::{
-    Arm, CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT, Notifier,
-    NotifierClient, NotifyError, NotifyingStore, StreamNotification, progress_counter,
+    Arm, CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT, NOTIFIER_REFRESH,
+    Notifier, NotifierClient, NotifyError, NotifyingStore, StreamNotification, progress_counter,
 };
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};
 pub use reader::{DEFAULT_MAX_RECORDS, MAX_TRACKED_PRODUCERS, ReadTarget, read_page};
