@@ -711,6 +711,7 @@ impl StreamStore for RedisStore {
     async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()> {
         self.close_topic_with(chain, topic, StoredClose::default())
             .await
+            .map(drop)
     }
 
     async fn close_topic_with(
@@ -718,18 +719,20 @@ impl StreamStore for RedisStore {
         chain: &ChainId,
         topic: &str,
         close: StoredClose,
-    ) -> StreamResult<()> {
+    ) -> StreamResult<StoredClose> {
         let meta = ChainKeys::new(&self.prefix, chain).meta(topic);
         // The meta is the topic's tombstone, so the mark and the outcome live as long as the topic
         // is known.
-        scripts::CLOSE_SCRIPT
+        let stored = scripts::CLOSE_SCRIPT
             .key(meta)
             .arg(close.encode_to_vec())
             .arg(self.retention_ms + self.grace_ms)
-            .invoke_async::<i64>(&mut self.shared.clone())
+            .invoke_async::<Vec<u8>>(&mut self.shared.clone())
             .await
-            .mapped(Call::Write)
-            .map(drop)
+            .mapped(Call::Write)?;
+        StoredClose::decode(stored.as_slice()).map_err(|error| {
+            StreamError::storage(format!("a topic's close does not decode: {error}"))
+        })
     }
 
     async fn retire_producer(

@@ -792,7 +792,11 @@ async fn a_new_producer_marks_an_ended_chain_closed_until_it_expires() {
     let streams = Streams::new(
         Arc::new(RedisStore::connect(options).await.unwrap()),
         owner.clone(),
-        StreamsOptions::default(),
+        // Producers share their owner's check, so only a check on every batch finds the end now.
+        StreamsOptions {
+            owner_recheck: Duration::ZERO,
+            ..StreamsOptions::default()
+        },
     );
     let chain = chain();
     let request = |producer: &str| AppendRequest {
@@ -1906,6 +1910,7 @@ async fn a_replay_read_on_redis_repeats_the_read_and_survives_retention_under_a_
             state: request.state.clone(),
             records_digest: page.records_digest.clone(),
             floor_holder: "reader-run/1".to_string(),
+            start_from_end: false,
         })
         .await
         .unwrap();
