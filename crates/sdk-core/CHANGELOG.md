@@ -82,6 +82,11 @@ relevant information.
   `stream_wakes` on the task's scheduled events. Replay delivers the same jobs in the same
   activations. A task scheduled with wakes ends a workflow task heartbeat chain, so it keeps an
   activation of its own on replay.
+* Experimental: the stream service's `RetireProducer` call drops one producer attempt's dedupe
+  state on a stream, which the Redis store keeps as one field of the topic's meta hash until
+  retention. A producer that writes once per short-lived attempt calls it after the attempt's
+  last append returned, so the meta hash tracks the attempts in flight. Calling it earlier lets a
+  retried batch land twice.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

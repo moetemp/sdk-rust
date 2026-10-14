@@ -618,6 +618,23 @@ impl StreamStore for RedisStore {
             .mapped(Call::Write)
     }
 
+    async fn retire_producer(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        producer_id: &str,
+        attempt: i64,
+    ) -> StreamResult<()> {
+        // One field of one key, so a plain `HDEL` is atomic, and it creates nothing when the meta
+        // is gone.
+        redis::cmd("HDEL")
+            .arg(ChainKeys::new(&self.prefix, chain).meta(topic))
+            .arg(session_field(producer_id, attempt))
+            .query_async::<()>(&mut self.shared.clone())
+            .await
+            .mapped(Call::Write)
+    }
+
     async fn disarm(&self, chain: &ChainId, topic: &str, generation: u64) -> StreamResult<()> {
         let meta = ChainKeys::new(&self.prefix, chain).meta(topic);
         scripts::DISARM_SCRIPT
