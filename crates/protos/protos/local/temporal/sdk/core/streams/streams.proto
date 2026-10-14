@@ -40,7 +40,7 @@ message StreamStoreConfig {
   // first owner check. Until then the read answers empty, so a reader can start before its
   // owner does. After it the read fails as NOT_FOUND. Unset waits 60 seconds, and zero fails at
   // once.
-  google.protobuf.Duration owner_start_grace = 3;
+  google.protobuf.Duration owner_start_grace = 6;
 }
 
 // Streams in a Redis or Redis Cluster that Core connects to itself.
