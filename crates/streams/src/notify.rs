@@ -837,6 +837,18 @@ impl StreamStore for NotifyingStore {
         Ok(())
     }
 
+    async fn retire_producer(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        producer_id: &str,
+        attempt: i64,
+    ) -> StreamResult<()> {
+        self.inner
+            .retire_producer(chain, topic, producer_id, attempt)
+            .await
+    }
+
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
         self.inner.delete_owner(request).await
     }
@@ -1256,6 +1268,9 @@ mod tests {
         }
         async fn close_topic(&self, c: &ChainId, t: &str) -> StreamResult<()> {
             self.0.close_topic(c, t).await
+        }
+        async fn retire_producer(&self, c: &ChainId, t: &str, p: &str, a: i64) -> StreamResult<()> {
+            self.0.retire_producer(c, t, p, a).await
         }
         async fn delete_owner(&self, r: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
             self.0.delete_owner(r).await
@@ -1737,6 +1752,9 @@ mod tests {
         }
         async fn close_topic(&self, c: &ChainId, t: &str) -> StreamResult<()> {
             self.0.close_topic(c, t).await
+        }
+        async fn retire_producer(&self, c: &ChainId, t: &str, p: &str, a: i64) -> StreamResult<()> {
+            self.0.retire_producer(c, t, p, a).await
         }
         async fn delete_owner(&self, r: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
             self.0.delete_owner(r).await

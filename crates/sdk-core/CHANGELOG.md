@@ -66,6 +66,11 @@ relevant information.
   finds the owner ended closes only the store. The notifier's owner check closes the notifier.
 * Experimental: `StreamStore` has `close_topic_with` and `close_stream`, which carry the close
   outcome to a wrapper that tells the notifier.
+* Experimental: the stream service's `RetireProducer` call drops one producer attempt's dedupe
+  state on a stream, which the Redis store keeps as one field of the topic's meta hash until
+  retention. A producer that writes once per short-lived attempt calls it after the attempt's
+  last append returned, so the meta hash tracks the attempts in flight. Calling it earlier lets a
+  retried batch land twice.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
