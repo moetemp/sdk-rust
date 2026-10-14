@@ -1247,6 +1247,36 @@ mod cases {
         assert_eq!(refused.closed_by.as_deref(), Some("run-1"));
     }
 
+    pub(crate) async fn a_second_close_answers_the_first(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        let first = StoredClose {
+            result: Some(Payload {
+                data: b"x".to_vec(),
+                ..Default::default()
+            }),
+            closed_by: "run-1".to_string(),
+            ..Default::default()
+        };
+        let second = StoredClose {
+            result: Some(Payload {
+                data: b"y".to_vec(),
+                ..Default::default()
+            }),
+            closed_by: "run-2".to_string(),
+            ..Default::default()
+        };
+        let kept = store
+            .close_topic_with(&chain, OUT, first.clone())
+            .await
+            .unwrap();
+        assert_eq!(kept, first);
+        // A wrapper tells the notifier what this answers, so it must be the first close too.
+        let kept = store.close_topic_with(&chain, OUT, second).await.unwrap();
+        assert_eq!(kept, first);
+        assert_eq!(close_of(case, &chain, OUT).await.close, Some(first));
+    }
+
     pub(crate) async fn a_close_with_no_outcome_is_the_first_close_too(case: &dyn Case) {
         let store = case.store();
         let chain = case.chain();
@@ -1580,6 +1610,7 @@ macro_rules! store_cases {
             retiring_a_producer_drops_only_its_dedupe_state,
             a_topic_keeps_its_first_close,
             a_floor_holds_and_releases_for_any_reader,
+            a_second_close_answers_the_first,
             a_close_with_no_outcome_is_the_first_close_too,
             a_chain_close_keeps_no_outcome,
         );
