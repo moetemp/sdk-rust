@@ -7,8 +7,8 @@
 //! the notifier with a long poll.
 
 use crate::{
-    NotifierClient, NotifyError, OWNER_RECHECK, StreamError, StreamResult, StreamStore, Streams,
-    StreamsOptions, WorkflowAttachment,
+    NotifierClient, NotifyError, OWNER_RECHECK, StreamError, StreamResult, Streams, StreamsOptions,
+    WorkflowAttachment,
     handle::{Remembered, address},
     proto::{
         StreamAddress, SubscribeRequest, SubscribeResponse, UnsubscribeRequest,
@@ -102,12 +102,11 @@ impl Subscriptions {
         })
     }
 
-    /// Attaches the reader once per process. On an empty stream the attach also arms the stream,
-    /// in the same store step that finds it empty, so the first append wakes the Workflow.
+    /// Attaches the reader once per process. The attach only announces the reader. Every append
+    /// notifies, so the first one wakes the Workflow.
     pub(crate) async fn subscribe(
         &self,
         streams: &Streams,
-        store: &dyn StreamStore,
         request: SubscribeRequest,
     ) -> StreamResult<SubscribeResponse> {
         let stream = address(request.stream.as_ref())?;
@@ -144,15 +143,6 @@ impl Subscriptions {
             })
             .await
             .map_err(subscribe_error)?;
-        // The reader's first read arms an empty stream too, so a failed arm costs nothing.
-        if let Err(error) = store.newest_or_arm(&chain, &stream.topic).await {
-            tracing::warn!(
-                workflow_id = %chain.workflow_id,
-                topic = %stream.topic,
-                %error,
-                "Could not arm the stream a Workflow reader subscribed to"
-            );
-        }
         self.attached.put(key, &chain.first_run_id, OWNER_RECHECK);
         Ok(SubscribeResponse {
             chain_first_run_id: chain.first_run_id,
@@ -230,7 +220,7 @@ mod tests {
     use crate::{
         MemoryStore, NotifierPoll, OwnerClient, OwnerDescription, OwnerError, StreamNotification,
         StreamService, StreamsOptions,
-        proto::{ChainId, StoreAppendRequest, StreamFailureKind, StreamOwnerKind},
+        proto::{ChainId, StreamFailureKind, StreamOwnerKind},
     };
     use prost::Message;
     use std::sync::Mutex;
@@ -370,23 +360,6 @@ mod tests {
         }
     }
 
-    /// The arm the next append on the stream reports.
-    async fn arm_of_next_append(store: &MemoryStore, first_run_id: &str) -> Option<u64> {
-        store
-            .append(StoreAppendRequest {
-                chain: Some(chain(first_run_id)),
-                topic: "tokens".to_string(),
-                producer_id: "p".to_string(),
-                attempt: 1,
-                sequence: 1,
-                digest: vec![1],
-                records: vec![b"record".to_vec()],
-            })
-            .await
-            .unwrap()
-            .arm
-    }
-
     #[tokio::test]
     async fn a_full_process_forgets_its_subscriptions_and_attaches_again() {
         let setup = setup();
@@ -399,9 +372,7 @@ mod tests {
             setup.owner.clone(),
             StreamsOptions::default(),
         );
-        let subscribe = |id: &str| {
-            subscriptions.subscribe(&streams, setup.store.as_ref(), subscribe_request(id))
-        };
+        let subscribe = |id: &str| subscriptions.subscribe(&streams, subscribe_request(id));
         for id in ["1", "2", "3"] {
             assert!(subscribe(id).await.unwrap().attached);
         }
@@ -483,43 +454,6 @@ mod tests {
             .map(|a| a.request_id.clone())
             .collect();
         assert_eq!(ids, ["jetty/reader-run/1", "jetty/reader-run/2"]);
-    }
-
-    #[tokio::test]
-    async fn a_subscription_to_an_empty_stream_arms_it_for_the_first_append() {
-        let setup = setup();
-        subscribe(&setup.service, subscribe_request("1"))
-            .await
-            .unwrap();
-        assert!(
-            arm_of_next_append(&setup.store, "chain-1")
-                .await
-                .is_some_and(|arm| arm > 0),
-            "the first append wakes the Workflow"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_subscription_to_a_stream_with_records_does_not_arm() {
-        let setup = setup();
-        arm_of_next_append(&setup.store, "chain-1").await;
-        subscribe(&setup.service, subscribe_request("1"))
-            .await
-            .unwrap();
-        let landed = setup
-            .store
-            .append(StoreAppendRequest {
-                chain: Some(chain("chain-1")),
-                topic: "tokens".to_string(),
-                producer_id: "other".to_string(),
-                attempt: 1,
-                sequence: 1,
-                digest: vec![1],
-                records: vec![b"record".to_vec()],
-            })
-            .await
-            .unwrap();
-        assert_eq!(landed.arm, Some(0), "the reader reads the records first");
     }
 
     #[tokio::test]
@@ -663,7 +597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_wait_asks_the_notifier_of_the_streams_chain_for_a_counter_above_the_arm() {
+    async fn a_wait_asks_the_notifier_of_the_streams_chain_for_a_counter_above_the_read() {
         let setup = setup();
         let answer = wait(
             &setup,

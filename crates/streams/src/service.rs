@@ -89,9 +89,7 @@ impl StreamService {
         });
         let store: Arc<dyn StreamStore> = match &folding {
             Some(folding) => Arc::new(
-                NotifyingStore::new(store, folding.clone())
-                    .with_progress(config.notify_on_append)
-                    .with_every_append(config.notify_every_append),
+                NotifyingStore::new(store, folding.clone()).with_progress(config.notify_on_append),
             ),
             None => store,
         };
@@ -144,9 +142,8 @@ impl StreamService {
     /// After a caller's attach, notifies the stream's newest record, so the new caller hears of
     /// the records already there. A caller that only waits for progress would otherwise hear
     /// nothing until the next append. It goes through `notifier`, the one that sends the appends'
-    /// notifications, so it is retried and flushed as they are. On an empty stream the attach
-    /// arms the stream instead, so the first append notifies. `None` turns both off, as the
-    /// config's progress setting does.
+    /// notifications, so it is retried and flushed as they are. An empty stream needs nothing,
+    /// since every append notifies. `None` turns it off, as the config's progress setting does.
     pub fn with_attach_progress(mut self, notifier: Option<Arc<Notifier>>) -> Self {
         self.attach_progress = notifier;
         self
@@ -211,11 +208,7 @@ impl StreamService {
             }
             "Subscribe" => self
                 .subscriptions
-                .subscribe(
-                    &self.streams,
-                    self.store.as_ref(),
-                    decode::<SubscribeRequest>(rpc, request)?,
-                )
+                .subscribe(&self.streams, decode::<SubscribeRequest>(rpc, request)?)
                 .await
                 .map(|r| r.encode_to_vec()),
             "Unsubscribe" => self
@@ -691,35 +684,10 @@ mod tests {
         FlushNotificationsResponse::decode(response.as_slice()).unwrap();
     }
 
-    /// Reads `topic` with `arm`, as a reader that sleeps on the notifier does.
-    async fn armed_read(service: &StreamService, topic: &str) {
-        let read = ReadResponse::decode(
-            service
-                .call(
-                    "Read",
-                    &ReadRequest {
-                        stream: Some(StreamAddress {
-                            topic: topic.to_string(),
-                            ..address()
-                        }),
-                        arm: true,
-                        ..Default::default()
-                    }
-                    .encode_to_vec(),
-                )
-                .await
-                .unwrap()
-                .as_slice(),
-        )
-        .unwrap();
-        assert!(read.armed);
-    }
-
     #[tokio::test]
     async fn an_append_notifies_its_streams_notifier_once_notifications_are_on() {
         let recorder = Arc::new(Recorder::default());
         let service = service_notifying(true, recorder.clone()).await;
-        armed_read(&service, "out").await;
         let appended = AppendResponse::decode(
             service
                 .call("Append", &append(1, &["a", "b"]))
@@ -741,20 +709,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn with_every_append_on_an_append_with_nothing_armed_notifies() {
+    async fn every_append_notifies_with_no_reader_waiting() {
         let recorder = Arc::new(Recorder::default());
-        let service = StreamService::connect_with_notifier(
-            StreamStoreConfig {
-                store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
-                notify_on_append: true,
-                notify_every_append: true,
-                ..Default::default()
-            },
-            Arc::new(Running),
-            Some(recorder.clone()),
-        )
-        .await
-        .unwrap();
+        let service = service_notifying(true, recorder.clone()).await;
         service.call("Append", &append(1, &["a"])).await.unwrap();
         service.call("Append", &append(2, &["b"])).await.unwrap();
         flush(&service).await;
@@ -766,15 +723,6 @@ mod tests {
             .map(|n| n.counter)
             .collect();
         assert_eq!(counters.last(), Some(&2), "{counters:?}");
-    }
-
-    #[tokio::test]
-    async fn without_every_append_an_append_with_nothing_armed_sends_nothing() {
-        let recorder = Arc::new(Recorder::default());
-        let service = service_notifying(true, recorder.clone()).await;
-        service.call("Append", &append(1, &["a"])).await.unwrap();
-        flush(&service).await;
-        assert!(recorder.0.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1085,7 +1033,6 @@ mod tests {
     async fn a_close_with_a_result_closes_the_store_and_then_the_notifier() {
         let recorder = Arc::new(Recorder::default());
         let service = service_notifying(true, recorder.clone()).await;
-        armed_read(&service, "out").await;
         service
             .call("Append", &append(1, &["a", "b"]))
             .await
@@ -1228,7 +1175,6 @@ mod tests {
         use crate::proto::{NexusCall, NexusStep, nexus_step};
         let recorder = Arc::new(Recorder::default());
         let service = service_notifying(true, recorder.clone()).await;
-        armed_read(&service, "t").await;
         let input = serde_json::json!({
             "stream": {"kind": "workflow", "workflow_id": "wf", "topic": "t"},
             "producer_id": "p",
