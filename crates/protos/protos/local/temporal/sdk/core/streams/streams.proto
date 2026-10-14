@@ -65,6 +65,11 @@ message StreamStoreConfig {
   // stream. For a deployment whose readers can't arm,
   // such as a hand-written reader over HTTP. Off by default.
   bool notify_every_append = 5;
+  // How long a read waits for a Workflow that Temporal doesn't know yet, counted from the read's
+  // first owner check. Until then the read answers empty, so a reader can start before its
+  // owner does. After it the read fails as NOT_FOUND. Unset waits 60 seconds, and zero fails at
+  // once.
+  google.protobuf.Duration owner_start_grace = 6;
 }
 
 // Streams in a Redis or Redis Cluster that Core connects to itself.
