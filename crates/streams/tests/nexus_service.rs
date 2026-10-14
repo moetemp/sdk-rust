@@ -1147,3 +1147,120 @@ async fn a_floor_holder_is_at_most_512_bytes_and_never_beside_latest_only() {
     assert_eq!(kind_of(&refused), ("BAD_REQUEST", false, "ValueError"));
     assert!(refused.message.contains("floor"), "{}", refused.message);
 }
+
+/// A cut answer and the answer after it, with a supersession, each read again through
+/// `read_range`, cross the same way the read's did.
+async fn a_range_replays_as_it_crossed(store: Arc<dyn StreamStore>) {
+    let calls = service(store, NexusOptions::default());
+    let wf = workflow();
+    let big = "x".repeat(300 * 1024);
+    write(&calls, &wf, 1, &[&format!("1{big}"), &format!("2{big}")]).await;
+    append(&calls, append_input(&wf, "p", 2, 1, &[&format!("3{big}")]))
+        .await
+        .unwrap();
+    let first = read(&calls, holding(&wf, "")).await.unwrap();
+    assert_eq!(records(&first).len(), 2, "the budget cut the answer");
+    let mut input = holding(&wf, token(&first));
+    input["state"] = first["state"].clone();
+    let second = read(&calls, input).await.unwrap();
+    assert_eq!(values(&second)[0], "SUPERSEDED p 1->2");
+    for (answer, state) in [(&first, Value::Null), (&second, first["state"].clone())] {
+        let replayed = read_range(&calls, replay_input(stream(&wf, TOPIC), answer, state))
+            .await
+            .unwrap();
+        assert_eq!(replayed["records"], answer["records"]);
+        assert_eq!(replayed["next_token"], answer["next_token"]);
+        assert_eq!(replayed["done"], false);
+        assert!(replayed.get("state").is_none() && replayed.get("replay").is_none());
+    }
+}
+
+#[tokio::test]
+async fn a_range_replays_as_it_crossed_on_memory() {
+    a_range_replays_as_it_crossed(memory()).await;
+}
+
+#[cfg(feature = "redis")]
+#[tokio::test]
+async fn a_range_replays_as_it_crossed_on_redis() {
+    let Some(store) = on_redis().await else {
+        return;
+    };
+    a_range_replays_as_it_crossed(store).await;
+}
+
+/// A held read of two records on `wf`, through `calls`.
+async fn held_read(calls: &NexusCalls, wf: &str) -> Value {
+    write(calls, wf, 1, &["one", "two"]).await;
+    read(calls, holding(wf, "")).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_range_with_other_records_is_a_mismatch() {
+    let calls = service(memory(), NexusOptions::default());
+    let wf = workflow();
+    let answer = held_read(&calls, &wf).await;
+    let mut other_digest = replay_input(stream(&wf, TOPIC), &answer, Value::Null);
+    other_digest["records_digest"] = json!(base64_of(&[0; 32]));
+    let mut other_count = replay_input(stream(&wf, TOPIC), &answer, Value::Null);
+    other_count["stored_records"] = json!(1);
+    for input in [other_digest, other_count] {
+        let refused = read_range(&calls, input).await.unwrap_err();
+        assert_eq!(
+            kind_of(&refused),
+            ("BAD_REQUEST", false, "StreamReplayMismatchError")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_range_the_store_dropped_is_lost_and_a_replay_holds_it_again() {
+    let memory = Arc::new(MemoryStore::new());
+    let (streams, calls) = layered(memory.clone());
+    let wf = workflow();
+    let answer = held_read(&calls, &wf).await;
+    let release = |holder: &str| temporalio_streams::proto::ReleaseFloorRequest {
+        stream: replay_of(&wf, &answer, &[]).stream,
+        chain_first_run_id: "run-1".to_string(),
+        floor_holder: holder.to_string(),
+    };
+    streams.release_floor(release(HOLDER)).await.unwrap();
+    // A replay that names a holder holds the range again, as after a reset.
+    let mut renewing = replay_input(stream(&wf, TOPIC), &answer, Value::Null);
+    renewing["floor_holder"] = json!("ns/reset-run/1");
+    read_range(&calls, renewing).await.unwrap();
+    memory.truncate(&chain_of(&wf), TOPIC, 0);
+    let input = replay_input(stream(&wf, TOPIC), &answer, Value::Null);
+    let replayed = read_range(&calls, input.clone()).await.unwrap();
+    assert_eq!(replayed["records"], answer["records"]);
+    streams
+        .release_floor(release("ns/reset-run/1"))
+        .await
+        .unwrap();
+    memory.truncate(&chain_of(&wf), TOPIC, 0);
+    let refused = read_range(&calls, input).await.unwrap_err();
+    assert_eq!(
+        kind_of(&refused),
+        ("BAD_REQUEST", false, "StreamReplayRangeLostError")
+    );
+}
+
+#[tokio::test]
+async fn a_range_names_a_chain_of_the_workflow_and_a_count_a_read_can_answer() {
+    let calls = service(memory(), NexusOptions::default());
+    let wf = workflow();
+    let answer = held_read(&calls, &wf).await;
+    let mut other_chain = replay_input(stream(&wf, TOPIC), &answer, Value::Null);
+    other_chain["chain_first_run_id"] = json!("run-9");
+    let refused = read_range(&calls, other_chain).await.unwrap_err();
+    assert_eq!(
+        kind_of(&refused),
+        ("BAD_REQUEST", false, "StreamCursorError")
+    );
+    for count in [-1, 1001] {
+        let mut input = replay_input(stream(&wf, TOPIC), &answer, Value::Null);
+        input["stored_records"] = json!(count);
+        let refused = read_range(&calls, input).await.unwrap_err();
+        assert_eq!(kind_of(&refused), ("BAD_REQUEST", false, "ValueError"));
+    }
+}

@@ -238,6 +238,11 @@ impl StreamService {
                 .read(decode::<NexusCall>(rpc, request)?)
                 .await
                 .encode_to_vec()),
+            "NexusReadRange" => Ok(self
+                .nexus
+                .read_range(decode::<NexusCall>(rpc, request)?)
+                .await
+                .encode_to_vec()),
             "NexusResume" => Ok(self
                 .nexus
                 .resume(decode::<NexusResumeRequest>(rpc, request)?)
@@ -1285,7 +1290,13 @@ mod tests {
             .unwrap();
         let step = NexusStep::decode(answer.as_slice()).unwrap();
         assert!(matches!(step.step, Some(nexus_step::Step::Failure(_))));
-        let invalid = service.call("NexusRead", b"\xff").await.unwrap_err();
-        assert_eq!(invalid.kind, StreamFailureKind::InvalidArgument as i32);
+        for rpc in ["NexusRead", "NexusReadRange"] {
+            let invalid = service.call(rpc, b"\xff").await.unwrap_err();
+            assert_eq!(
+                invalid.kind,
+                StreamFailureKind::InvalidArgument as i32,
+                "{rpc}"
+            );
+        }
     }
 }

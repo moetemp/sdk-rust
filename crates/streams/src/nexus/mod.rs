@@ -1,10 +1,10 @@
 //! The stream service's Nexus operations, served by Core.
 //!
-//! Lang forwards each `append` and `read` call as N0a's JSON transfer form and gets back a
-//! [NexusStep]. A call whose bodies need lang's payload codec answers first with [CodecWork], and
-//! lang resumes it with the results. Core runs every rule of the contract, so each SDK's handler
-//! keeps only its authorizer and its codec. The state a reader carries makes the endpoint
-//! stateless, so a read goes on at any handler Worker.
+//! Lang forwards each `append`, `read` and `read_range` call as N0a's JSON transfer form and gets
+//! back a [NexusStep]. A call whose bodies need lang's payload codec answers first with
+//! [CodecWork], and lang resumes it with the results. Core runs every rule of the contract, so
+//! each SDK's handler keeps only its authorizer and its codec. The state a reader carries makes
+//! the endpoint stateless, so a read goes on at any handler Worker.
 
 mod failure;
 mod operation;
@@ -18,9 +18,9 @@ use crate::{
     handle::CarriedRead,
     proto::{
         AppendRecord, AppendRequest, CodecResult, CodecWork, LatestRequest, NamedProducer,
-        NexusCall, NexusFailure, NexusResumeRequest, NexusStep, ReadRecord, ReadRequest,
-        StreamAddress, StreamOwnerKind, StreamRecord, StreamRecordKind, append_request::Producer,
-        codec_result, nexus_step, read_record,
+        NexusCall, NexusFailure, NexusResumeRequest, NexusStep, ReadRangeRequest, ReadRecord,
+        ReadRequest, ReadResponse, StreamAddress, StreamOwnerKind, StreamRecord, StreamRecordKind,
+        append_request::Producer, codec_result, nexus_step, read_record,
     },
     reader::{ReadState, records_digest},
 };
@@ -37,8 +37,8 @@ use std::{
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use tokio::time::Instant;
 use wire::{
-    AppendInput, AppendOutput, Base64, ReadInput, ReadOutput, RecordWire, ReplayRange, StreamRef,
-    Supersession, crossing_size, json_size,
+    AppendInput, AppendOutput, Base64, ReadInput, ReadOutput, ReadRangeInput, RecordWire,
+    ReplayRange, StreamRef, Supersession, crossing_size, json_size,
 };
 
 /// The most bytes one read answer takes as JSON past its first record, with its tokens and state.
@@ -144,6 +144,12 @@ enum Work {
         cut: bool,
         /// The call named a floor holder, so the answer carries its replay range.
         positions: bool,
+    },
+    ReadRange {
+        response: Box<ReadResponse>,
+        limits: Limits,
+        /// As for [Work::Read].
+        bodies: Vec<usize>,
     },
 }
 
@@ -336,20 +342,9 @@ impl NexusCalls {
             ))
         });
         let wait = shortened(Duration::from_millis(wait_ms as u64), deadline);
-        let state = match input.state {
-            None => Vec::new(),
-            Some(text) if text.len() > crossing_size(MAX_STATE_BYTES) => {
-                return failed(failure::of_stream(&StreamError::cursor(format!(
-                    "the read state takes {} bytes, above the {} of any state a read answers, so \
-                     no earlier call of this read returned it",
-                    text.len(),
-                    crossing_size(MAX_STATE_BYTES)
-                ))));
-            }
-            Some(text) => match wire::base64_bytes(&text) {
-                Some(state) => state,
-                None => return failed(failure::input_mistake("state must be base64-encoded")),
-            },
+        let state = match carried_state(input.state) {
+            Ok(state) => state,
+            Err(failure) => return failed(*failure),
         };
         // A ref's run only picks the chain, so the read names the chain by its state and follows
         // it past that run's end.
@@ -406,24 +401,86 @@ impl NexusCalls {
         }
         let cut = keep < read.response.records.len();
         read.response.records.truncate(keep);
-        let mut bodies = Vec::new();
-        let mut payloads = Vec::new();
-        let mut bytes = 0;
-        for (index, record) in read.response.records.iter_mut().enumerate() {
-            if let Some(read_record::Record::Stored(stored)) = &mut record.record
-                && let Some(body) = stored.body.take()
-            {
-                bytes += body.encoded_len();
-                bodies.push(index);
-                payloads.push(body);
-            }
-        }
+        let (bodies, payloads, bytes) = take_bodies(&mut read.response.records);
         let work = Work::Read {
             read: Box::new(read),
             limits,
             bodies,
             cut,
             positions,
+        };
+        if payloads.is_empty() {
+            return self.finish(work, Vec::new()).await;
+        }
+        self.ask_codec(
+            work,
+            bytes,
+            false,
+            &call.namespace,
+            &input.stream.workflow_id,
+            payloads,
+        )
+    }
+
+    /// Serves the `read_range` operation: the records of an earlier read that named a floor
+    /// holder, read again and checked against that read's digest.
+    ///
+    /// The answer has no byte budget, since it must hold exactly the records the read answered,
+    /// and those fit an answer once. It carries no state and no replay, because the caller keeps
+    /// the read's own. The chain comes from the caller, so it is checked to be one of the
+    /// Workflow's, as a carried read state is.
+    pub async fn read_range(&self, call: NexusCall) -> NexusStep {
+        let limits = Limits::of(&call);
+        let input: ReadRangeInput = match serde_json::from_slice(&call.input) {
+            Ok(input) => input,
+            Err(error) => return failed(failure::input_mistake(input_error("read_range", error))),
+        };
+        let mut address = match address(&call.namespace, &input.stream) {
+            Ok(address) => address,
+            Err(failure) => return failed(*failure),
+        };
+        // The chain names the run chain, so the ref's run picks nothing here.
+        address.run_id.clear();
+        if !(0..=MAX_RECORDS).contains(&input.stored_records) {
+            return failed(failure::input_mistake(format!(
+                "stored_records is from 0 to {MAX_RECORDS}, not {}",
+                input.stored_records
+            )));
+        }
+        let state = match carried_state(input.state) {
+            Ok(state) => state,
+            Err(failure) => return failed(*failure),
+        };
+        if !input.chain_first_run_id.is_empty()
+            && let Err(error) = self
+                .streams
+                .check_carried_chain(&address, &input.chain_first_run_id)
+                .await
+        {
+            return failed(failure::of_stream(&error));
+        }
+        let request = ReadRangeRequest {
+            stream: Some(address),
+            chain_first_run_id: input.chain_first_run_id,
+            after: input.after_token,
+            to: input.to_token,
+            stored_records: input.stored_records as u32,
+            state,
+            records_digest: input.records_digest.0,
+            floor_holder: input.floor_holder.unwrap_or_default(),
+            // A read that names a floor holder never starts at the end, since only latest_only
+            // does, and it refuses a holder.
+            start_from_end: false,
+        };
+        let mut response = match self.streams.read_range(request).await {
+            Ok(response) => response,
+            Err(error) => return failed(failure::of_stream(&error)),
+        };
+        let (bodies, payloads, bytes) = take_bodies(&mut response.records);
+        let work = Work::ReadRange {
+            response: Box::new(response),
+            limits,
+            bodies,
         };
         if payloads.is_empty() {
             return self.finish(work, Vec::new()).await;
@@ -554,6 +611,11 @@ impl NexusCalls {
                 cut,
                 positions,
             } => finish_read(*read, limits, &bodies, cut, positions, results),
+            Work::ReadRange {
+                response,
+                limits,
+                bodies,
+            } => finish_read_range(*response, limits, &bodies, results),
         }
     }
 
@@ -690,20 +752,10 @@ fn finish_read(
     positions: bool,
     results: Vec<CodecResult>,
 ) -> NexusStep {
-    if results.len() != bodies.len() {
-        return failed(wrong_count(results.len(), bodies.len()));
-    }
-    let mut decoded: HashMap<usize, Result<Payload, String>> = HashMap::new();
-    for (index, result) in bodies.iter().zip(results) {
-        decoded.insert(
-            *index,
-            match result.result {
-                Some(codec_result::Result::Payload(body)) => Ok(body),
-                Some(codec_result::Result::Error(error)) => Err(error),
-                None => Err("the payload codec answered nothing".to_string()),
-            },
-        );
-    }
+    let mut decoded = match decoded(bodies, results) {
+        Ok(decoded) => decoded,
+        Err(failure) => return failed(*failure),
+    };
     let mut budget = Budget::new(limits, &read);
     let CarriedRead {
         response,
@@ -767,6 +819,85 @@ fn finish_read(
         armed,
         replay,
     })
+}
+
+/// A replay's answer. Each record crosses as the read's did, with no budget to cut it.
+fn finish_read_range(
+    response: ReadResponse,
+    limits: Limits,
+    bodies: &[usize],
+    results: Vec<CodecResult>,
+) -> NexusStep {
+    let mut decoded = match decoded(bodies, results) {
+        Ok(decoded) => decoded,
+        Err(failure) => return failed(*failure),
+    };
+    let records = response
+        .records
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, record)| match record.record {
+            Some(read_record::Record::Superseded(superseded)) => {
+                Some(superseded_wire(record.cursor, &superseded))
+            }
+            Some(read_record::Record::Stored(stored)) => Some(record_wire(
+                record.cursor,
+                &stored,
+                decoded.remove(&index),
+                record.stale,
+                limits,
+            )),
+            None => None,
+        })
+        .collect();
+    output(&ReadOutput {
+        records,
+        next_token: response.cursor,
+        done: false,
+        state: None,
+        armed: false,
+        replay: None,
+    })
+}
+
+/// Takes the bodies out of `records` for lang's codec, answering which records had one, the
+/// bodies, and their bytes.
+fn take_bodies(records: &mut [ReadRecord]) -> (Vec<usize>, Vec<Payload>, usize) {
+    let mut bodies = Vec::new();
+    let mut payloads = Vec::new();
+    let mut bytes = 0;
+    for (index, record) in records.iter_mut().enumerate() {
+        if let Some(read_record::Record::Stored(stored)) = &mut record.record
+            && let Some(body) = stored.body.take()
+        {
+            bytes += body.encoded_len();
+            bodies.push(index);
+            payloads.push(body);
+        }
+    }
+    (bodies, payloads, bytes)
+}
+
+/// Lang's codec results by the index of the record each body came from.
+fn decoded(
+    bodies: &[usize],
+    results: Vec<CodecResult>,
+) -> Result<HashMap<usize, Result<Payload, String>>, Box<NexusFailure>> {
+    if results.len() != bodies.len() {
+        return Err(Box::new(wrong_count(results.len(), bodies.len())));
+    }
+    Ok(bodies
+        .iter()
+        .zip(results)
+        .map(|(index, result)| {
+            let body = match result.result {
+                Some(codec_result::Result::Payload(body)) => Ok(body),
+                Some(codec_result::Result::Error(error)) => Err(error),
+                None => Err("the payload codec answered nothing".to_string()),
+            };
+            (*index, body)
+        })
+        .collect())
 }
 
 fn stored_of(record: &ReadRecord) -> Option<&StreamRecord> {
@@ -859,6 +990,24 @@ fn read_failure(error: StreamError, state: Vec<u8>, positions: bool) -> NexusSte
             armed: false,
         }),
         _ => failed(failure::of_stream(&error)),
+    }
+}
+
+/// The state a call carries, decoded. One longer than any state a read answers is refused before
+/// it is decoded.
+fn carried_state(state: Option<String>) -> Result<Vec<u8>, Box<NexusFailure>> {
+    match state {
+        None => Ok(Vec::new()),
+        Some(text) if text.len() > crossing_size(MAX_STATE_BYTES) => {
+            Err(Box::new(failure::of_stream(&StreamError::cursor(format!(
+                "the read state takes {} bytes, above the {} of any state a read answers, so no \
+                 earlier call of this read returned it",
+                text.len(),
+                crossing_size(MAX_STATE_BYTES)
+            )))))
+        }
+        Some(text) => wire::base64_bytes(&text)
+            .ok_or_else(|| Box::new(failure::input_mistake("state must be base64-encoded"))),
     }
 }
 

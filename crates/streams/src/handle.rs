@@ -388,7 +388,7 @@ impl Streams {
     /// Refuses a carried state whose chain is not one of the Workflow's. A caller outside the
     /// process could otherwise point a read at another run's chain by editing its state. Asked
     /// once per chain in a process.
-    async fn check_carried_chain(
+    pub(crate) async fn check_carried_chain(
         &self,
         stream: &StreamAddress,
         first_run_id: &str,

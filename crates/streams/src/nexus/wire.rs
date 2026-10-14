@@ -104,13 +104,6 @@ pub(crate) struct ReadInput {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the contract declares the model before Core serves it"
-    )
-)]
 pub(crate) struct ReadRangeInput {
     pub(crate) stream: StreamRef,
     pub(crate) chain_first_run_id: String,

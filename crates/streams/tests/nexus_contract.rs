@@ -254,6 +254,69 @@ async fn every_declared_input_member_is_accepted_and_nothing_else() {
 }
 
 #[tokio::test]
+async fn every_read_range_member_is_accepted_and_nothing_else() {
+    let contract = contract();
+    let calls = service(memory(), NexusOptions::default());
+    let wf = "contract-read-range";
+    append(
+        &calls,
+        json!({"stream": stream(wf, "out"), "producer_id": "p", "attempt": 1, "sequence": 1,
+               "payloads": [body("a")]}),
+    )
+    .await
+    .unwrap();
+    let first = read(
+        &calls,
+        json!({"stream": stream(wf, "out"), "floor_holder": "ns/run-1/reader"}),
+    )
+    .await
+    .unwrap();
+    append(
+        &calls,
+        json!({"stream": stream(wf, "out"), "producer_id": "p", "attempt": 1, "sequence": 2,
+               "payloads": [body("b")]}),
+    )
+    .await
+    .unwrap();
+    let second = read(
+        &calls,
+        json!({"stream": stream(wf, "out"), "after_token": first["next_token"],
+               "state": first["state"], "floor_holder": "ns/run-1/reader"}),
+    )
+    .await
+    .unwrap();
+    let mut full = replay_input(stream(wf, "out"), &second, first["state"].clone());
+    full["stream"]["chain_run_id"] = Value::Null;
+    full["floor_holder"] = json!("ns/run-1/reader");
+    let mut declared = properties(model(&contract, "ReadRangeInput"));
+    let mut sent: Vec<String> = full.as_object().unwrap().keys().cloned().collect();
+    declared.sort();
+    sent.sort();
+    assert_eq!(
+        sent, declared,
+        "the contract changed ReadRangeInput; teach this test"
+    );
+    let answer = read_range(&calls, full.clone()).await.unwrap();
+    check_output(&contract, "ReadOutput", &answer);
+    assert_eq!(answer["records"], second["records"]);
+    let mut unknown = full.clone();
+    unknown["surprise"] = json!(1);
+    let failure = read_range(&calls, unknown).await.unwrap_err();
+    assert!(is_contract_mistake(&failure), "{}", failure.message);
+    assert_eq!(failure.handler_error_type, "BAD_REQUEST");
+    for member in required(model(&contract, "ReadRangeInput")) {
+        let mut missing = full.clone();
+        missing.as_object_mut().unwrap().remove(&member);
+        let failure = read_range(&calls, missing).await.unwrap_err();
+        assert!(
+            is_contract_mistake(&failure),
+            "{member}: {}",
+            failure.message
+        );
+    }
+}
+
+#[tokio::test]
 async fn every_output_member_is_declared() {
     let contract = contract();
     let store = memory();

@@ -171,6 +171,24 @@ pub(crate) async fn read(calls: &NexusCalls, input: Value) -> Result<Value, Nexu
     drive(calls, calls.read(call(input)).await, Codec::Sealing).await
 }
 
+pub(crate) async fn read_range(calls: &NexusCalls, input: Value) -> Result<Value, NexusFailure> {
+    drive(calls, calls.read_range(call(input)).await, Codec::Sealing).await
+}
+
+/// The `read_range` input that replays `answer`, the answer of a read that sent `state`.
+pub(crate) fn replay_input(stream: Value, answer: &Value, state: Value) -> Value {
+    let replay = &answer["replay"];
+    serde_json::json!({
+        "stream": stream,
+        "chain_first_run_id": replay["chain_first_run_id"],
+        "after_token": replay["after_token"],
+        "to_token": answer["next_token"],
+        "stored_records": replay["stored_records"],
+        "state": state,
+        "records_digest": replay["records_digest"],
+    })
+}
+
 /// A stream reference to `topic` of Workflow `workflow_id`.
 pub(crate) fn stream(workflow_id: &str, topic: &str) -> Value {
     serde_json::json!({"kind": "workflow", "workflow_id": workflow_id, "topic": topic})

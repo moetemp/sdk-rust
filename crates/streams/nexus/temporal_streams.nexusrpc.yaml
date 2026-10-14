@@ -62,7 +62,9 @@ services:
           owner and has no byte budget, since it must answer exactly what the
           read answered. Records with other content are refused as
           StreamReplayMismatchError, and records the store no longer holds as
-          StreamReplayRangeLostError.
+          StreamReplayRangeLostError. The answer holds the records and
+          next_token only, since the caller keeps the read's state, done and
+          replay.
         input: { $ref: "#/$defs/ReadRangeInput" }
         output: { $ref: "#/$defs/ReadOutput" }
 
