@@ -273,6 +273,9 @@ message ReadRangeRequest {
   bytes records_digest = 7;
   // As in `ReadRequest`, so a replay holds the records for its own run.
   string floor_holder = 8;
+  // Set when the read's `after` was `$end`. That read looked up no record at the start it found,
+  // and the replay must not either, or a newer attempt there reads as superseded.
+  bool start_from_end = 9;
 }
 
 message ReleaseFloorRequest {
