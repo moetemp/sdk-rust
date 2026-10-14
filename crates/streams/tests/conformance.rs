@@ -15,8 +15,9 @@ use std::{
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
-    BEGINNING, END, MemoryStore, ReadTarget, StreamResult, StreamStore, mint_cursor, proto::*,
-    read_page, stored_append_record, stream_hash,
+    BEGINNING, END, MemoryStore, Notifier, NotifierClient, NotifyError, NotifyingStore, ReadTarget,
+    StreamNotification, StreamResult, StreamStore, mint_cursor, proto::*, read_page,
+    stored_append_record, stream_hash,
 };
 
 #[async_trait::async_trait]
@@ -71,6 +72,53 @@ impl Case for Memory {
 
 async fn memory() -> Option<Memory> {
     Some(Memory(Arc::new(MemoryStore::new())))
+}
+
+/// Takes every notification and sends nothing.
+struct Quiet;
+
+#[async_trait::async_trait]
+impl NotifierClient for Quiet {
+    async fn notify(&self, _: StreamNotification) -> Result<(), NotifyError> {
+        Ok(())
+    }
+}
+
+/// Another case's store behind `NotifyingStore`, which every process with a client runs, so a
+/// method the wrapper doesn't forward fails the contract.
+struct Notifying<C> {
+    inner: C,
+    store: Arc<dyn StreamStore>,
+}
+
+async fn notifying<C: Case>(
+    inner: impl std::future::Future<Output = Option<C>>,
+) -> Option<Notifying<C>> {
+    let inner = inner.await?;
+    let store = Arc::new(NotifyingStore::new(
+        inner.store(),
+        Arc::new(Notifier::new(Arc::new(Quiet), 10)),
+    ));
+    Some(Notifying { inner, store })
+}
+
+#[async_trait::async_trait]
+impl<C: Case> Case for Notifying<C> {
+    fn store(&self) -> Arc<dyn StreamStore> {
+        self.store.clone()
+    }
+
+    fn chain(&self) -> ChainId {
+        self.inner.chain()
+    }
+
+    async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize) {
+        self.inner.drop_oldest(chain, topic, keep).await;
+    }
+
+    async fn expire_log(&self, chain: &ChainId, topic: &str) {
+        self.inner.expire_log(chain, topic).await;
+    }
 }
 
 #[cfg(feature = "redis")]
@@ -1170,47 +1218,8 @@ macro_rules! conformance {
     };
 }
 
-mod memory {
-    conformance!(super::memory();
-        append_read_roundtrip,
-        a_batch_lands_in_order_and_names_its_last_record,
-        an_empty_append_is_refused,
-        an_append_without_a_digest_is_refused,
-        latest_is_empty_on_an_empty_topic,
-        a_cursor_resumes_strictly_after_its_record,
-        latest_positions_a_reader_at_the_end,
-        end_reads_only_what_arrives_after_the_read_starts,
-        a_read_waits_no_longer_than_asked,
-        dropping_a_waiting_read_releases_it,
-        beginning_starts_at_the_oldest_record_still_held,
-        a_reader_that_falls_behind_retention_is_told,
-        an_empty_read_from_the_beginning_learns_of_a_trim,
-        an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on,
-        rule_11_2_an_empty_read_goes_on_when_a_quiet_log_comes_back,
-        a_retried_append_returns_the_original_positions,
-        a_retry_with_other_ciphertext_still_deduplicates,
-        a_divergent_retry_is_refused,
-        a_sequence_below_the_newest_is_refused,
-        rule_9_1_a_batch_inside_the_held_batch_is_refused,
-        rule_64_1_a_gap_in_the_sequence_is_accepted,
-        producers_and_attempts_dedupe_apart,
-        a_new_attempt_supersedes_the_old_one,
-        a_read_resumed_before_a_new_attempt_reports_it,
-        a_record_that_does_not_parse_fails_with_its_cursor,
-        finish_is_a_record_of_its_own,
-        topics_and_chains_are_apart,
-        a_cursor_from_another_stream_or_store_is_refused,
-        a_closed_chain_refuses_new_batches_but_answers_a_repeat,
-        a_closed_topic_leaves_the_others_open,
-        a_closed_topic_answers_a_repeat_and_ends_reads,
-        a_refused_append_leaves_no_trace_of_its_topic,
-        deleting_an_owner_drops_every_chain_of_it,
-    );
-}
-
 /// Every case but owner deletes, which need a rule of their own under the documented ACL.
-#[cfg(feature = "redis")]
-macro_rules! redis_cases {
+macro_rules! store_cases {
     ($case:expr) => {
         conformance!($case;
             append_read_roundtrip,
@@ -1249,9 +1258,21 @@ macro_rules! redis_cases {
     };
 }
 
+mod memory {
+    store_cases!(super::memory());
+    conformance!(super::memory(); deleting_an_owner_drops_every_chain_of_it);
+}
+
+mod notifying_memory {
+    store_cases!(super::notifying(super::memory()));
+    conformance!(super::notifying(super::memory());
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
 #[cfg(feature = "redis")]
 mod standalone_redis {
-    redis_cases!(super::on_redis::redis("STREAMS_REDIS_URL", false));
+    store_cases!(super::on_redis::redis("STREAMS_REDIS_URL", false));
     conformance!(super::on_redis::redis("STREAMS_REDIS_URL", false);
         deleting_an_owner_drops_every_chain_of_it,
     );
@@ -1259,7 +1280,7 @@ mod standalone_redis {
 
 #[cfg(feature = "redis")]
 mod cluster_redis {
-    redis_cases!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
+    store_cases!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
     // A Workflow id's chains hash to different slots, so the delete reaches every primary.
     conformance!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true);
         deleting_an_owner_drops_every_chain_of_it,
@@ -1267,8 +1288,16 @@ mod cluster_redis {
 }
 
 #[cfg(feature = "redis")]
+mod notifying_redis {
+    store_cases!(super::notifying(super::on_redis::redis(
+        "STREAMS_REDIS_URL",
+        false
+    )));
+}
+
+#[cfg(feature = "redis")]
 mod documented_acl_redis {
-    redis_cases!(super::on_redis::redis_as_documented_user(
+    store_cases!(super::on_redis::redis_as_documented_user(
         "STREAMS_REDIS_URL",
         false,
         &[]
@@ -1282,7 +1311,7 @@ mod documented_acl_redis {
 #[cfg(feature = "redis")]
 mod documented_acl_cluster_redis {
     // A cluster client asks the topology first, so the documented rules must allow it.
-    redis_cases!(super::on_redis::redis_as_documented_user(
+    store_cases!(super::on_redis::redis_as_documented_user(
         "STREAMS_REDIS_CLUSTER_URL",
         true,
         &[]

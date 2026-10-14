@@ -77,6 +77,10 @@ pub trait StreamStore: Send + Sync {
 
     /// Deletes every stream of one owner, across all its chains.
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse>;
+
+    /// Waits until the notifications this store sent are out. A store that sends none returns at
+    /// once.
+    async fn flush_notifications(&self) {}
 }
 
 #[cfg(test)]

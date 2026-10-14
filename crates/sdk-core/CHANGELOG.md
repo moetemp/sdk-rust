@@ -40,6 +40,15 @@ relevant information.
   requests.
 * Experimental: the C bridge has `temporal_core_stream_store_new`, `_call` and `_free` for the
   stream service, built with the Redis store.
+* Experimental: with `StreamStoreConfig.notify_on_append`, Core tells each stream's notifier on
+  the server when the stream moves, after every append. That's how a reader that waits on the
+  notifier wakes. Notifications for one stream fold into one call in flight, a failed last
+  notification is tried twice more, and a notification never fails the write. `max_notifiers`
+  caps how many streams the process keeps a notifier for (1000 when zero).
+* Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
+  notifications still out. A process calls it before it stops.
+* Experimental: a server without the stream notifier answers the first notifier call with
+  `UNIMPLEMENTED`. Core then stops notifier calls in that process and logs it once at debug.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

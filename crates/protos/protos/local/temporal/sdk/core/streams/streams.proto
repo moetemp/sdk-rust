@@ -24,6 +24,9 @@ service StreamService {
   rpc Close(CloseRequest) returns (CloseResponse);
   // Deletes every stream of one owner.
   rpc DeleteOwner(DeleteOwnerRequest) returns (DeleteOwnerResponse);
+  // Waits until the stream notifications this process sent are out, for at most 10 seconds. A
+  // notification goes in the background, so a process calls it before it stops.
+  rpc FlushNotifications(FlushNotificationsRequest) returns (FlushNotificationsResponse);
 }
 
 // Which store holds a process's streams, and how to reach it. Lang builds one store from it and
@@ -33,6 +36,13 @@ message StreamStoreConfig {
     RedisStoreConfig redis = 1;
     MemoryStoreConfig memory = 2;
   }
+  // Tells each stream's notifier on the server when the stream moves, after every append. That's
+  // what wakes a reader that waits on the notifier. Off by default, since most streams have no such
+  // reader and each notification costs a call. A server without the stream notifier costs one
+  // call, and then the process stops notifying.
+  bool notify_on_append = 3;
+  // How many streams to keep a notifier for, dropping the least recently used. Zero uses 1000.
+  uint32 max_notifiers = 4;
 }
 
 // Streams in a Redis or Redis Cluster that Core connects to itself.
@@ -197,6 +207,10 @@ message CloseRequest {
 }
 
 message CloseResponse {}
+
+message FlushNotificationsRequest {}
+
+message FlushNotificationsResponse {}
 
 message DeleteOwnerRequest {
   string namespace = 1;

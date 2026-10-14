@@ -1,10 +1,12 @@
 //! The stream calls lang makes, served in process.
 
 use crate::{
-    OwnerClient, StreamError, StreamResult, StreamStore, Streams, StreamsOptions,
+    DEFAULT_MAX_NOTIFIERS, Notifier, NotifierClient, NotifyingStore, OwnerClient, StreamError,
+    StreamResult, StreamStore, Streams, StreamsOptions,
     proto::{
-        AppendRequest, CloseRequest, DeleteOwnerRequest, LatestRequest, ReadRequest, StreamFailure,
-        StreamStoreConfig, stream_store_config,
+        AppendRequest, CloseRequest, DeleteOwnerRequest, FlushNotificationsRequest,
+        FlushNotificationsResponse, LatestRequest, ReadRequest, StreamFailure, StreamStoreConfig,
+        stream_store_config,
     },
 };
 use prost::Message;
@@ -36,10 +38,21 @@ impl std::fmt::Debug for StreamService {
 }
 
 impl StreamService {
-    /// Connects to the store `config` names, asking `owner` about streams' owners.
+    /// Connects to the store `config` names, asking `owner` about streams' owners. Refuses a
+    /// config that turns notifications on, since there's no client to send them with.
     pub async fn connect(
         config: StreamStoreConfig,
         owner: Arc<dyn OwnerClient>,
+    ) -> StreamResult<Self> {
+        Self::connect_with_notifier(config, owner, None).await
+    }
+
+    /// Like [StreamService::connect], sending stream notifications through `notifier` when the
+    /// config turns them on.
+    pub async fn connect_with_notifier(
+        config: StreamStoreConfig,
+        owner: Arc<dyn OwnerClient>,
+        notifier: Option<Arc<dyn NotifierClient>>,
     ) -> StreamResult<Self> {
         let (store, retention): (Arc<dyn StreamStore>, Duration) = match config.store {
             Some(stream_store_config::Store::Memory(_)) => {
@@ -51,6 +64,21 @@ impl StreamService {
                     "the stream store config names no store",
                 ));
             }
+        };
+        let store: Arc<dyn StreamStore> = if config.notify_on_append {
+            let client = notifier.ok_or_else(|| {
+                StreamError::refused("stream notifications need a client to send them with")
+            })?;
+            let max_notifiers = match config.max_notifiers {
+                0 => DEFAULT_MAX_NOTIFIERS,
+                max => max as usize,
+            };
+            Arc::new(NotifyingStore::new(
+                store,
+                Arc::new(Notifier::new(client, max_notifiers)),
+            ))
+        } else {
+            store
         };
         Ok(Self::new(
             store,
@@ -98,6 +126,14 @@ impl StreamService {
                 .delete_owner(decode::<DeleteOwnerRequest>(rpc, request)?)
                 .await
                 .map(|r| r.encode_to_vec()),
+            "FlushNotifications" => {
+                decode::<FlushNotificationsRequest>(rpc, request)?;
+                // A close retries until the server takes it, so a stopping process waits only
+                // so long for one against a server that's down.
+                let _ = tokio::time::timeout(crate::FLUSH_LIMIT, self.store.flush_notifications())
+                    .await;
+                Ok(FlushNotificationsResponse {}.encode_to_vec())
+            }
             other => Err(StreamError::unsupported(format!(
                 "the stream service has no call {other:?}"
             ))),
@@ -206,6 +242,7 @@ mod tests {
         StreamService::connect(
             StreamStoreConfig {
                 store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+                ..Default::default()
             },
             Arc::new(Running),
         )
@@ -407,7 +444,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_config_that_names_no_store_is_refused() {
-        let error = StreamService::connect(StreamStoreConfig { store: None }, Arc::new(Running))
+        let error = StreamService::connect(StreamStoreConfig::default(), Arc::new(Running))
             .await
             .unwrap_err();
         assert_eq!(error.kind, StreamFailureKind::Refused);
@@ -419,11 +456,167 @@ mod tests {
         let error = StreamService::connect(
             StreamStoreConfig {
                 store: Some(stream_store_config::Store::Redis(Default::default())),
+                ..Default::default()
             },
             Arc::new(Running),
         )
         .await
         .unwrap_err();
         assert_eq!(error.kind, StreamFailureKind::Unsupported);
+    }
+
+    /// Records the notifications it was sent.
+    #[derive(Default)]
+    struct Recorder(std::sync::Mutex<Vec<crate::StreamNotification>>);
+
+    #[async_trait::async_trait]
+    impl NotifierClient for Recorder {
+        async fn notify(
+            &self,
+            notification: crate::StreamNotification,
+        ) -> Result<(), crate::NotifyError> {
+            self.0.lock().unwrap().push(notification);
+            Ok(())
+        }
+    }
+
+    async fn service_notifying(notify_on_append: bool, recorder: Arc<Recorder>) -> StreamService {
+        StreamService::connect_with_notifier(
+            StreamStoreConfig {
+                store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+                notify_on_append,
+                ..Default::default()
+            },
+            Arc::new(Running),
+            Some(recorder),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn flush(service: &StreamService) {
+        let response = service
+            .call(
+                "FlushNotifications",
+                &FlushNotificationsRequest {}.encode_to_vec(),
+            )
+            .await
+            .unwrap();
+        FlushNotificationsResponse::decode(response.as_slice()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_append_notifies_its_streams_notifier_once_notifications_are_on() {
+        let recorder = Arc::new(Recorder::default());
+        let service = service_notifying(true, recorder.clone()).await;
+        let appended = AppendResponse::decode(
+            service
+                .call("Append", &append(1, &["a", "b"]))
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        flush(&service).await;
+        let sent = recorder.0.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            sent[0].chain.first_run_id, "run-1",
+            "the chain the append wrote to"
+        );
+        assert_eq!(sent[0].topic, "out");
+        assert_eq!(sent[0].position, appended.last_cursor);
+        assert_eq!(sent[0].counter, 2);
+    }
+
+    #[tokio::test]
+    async fn notifications_are_off_by_default() {
+        let recorder = Arc::new(Recorder::default());
+        let service = service_notifying(false, recorder.clone()).await;
+        service.call("Append", &append(1, &["a"])).await.unwrap();
+        flush(&service).await;
+        assert!(recorder.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn notifications_without_a_client_are_refused() {
+        let error = StreamService::connect(
+            StreamStoreConfig {
+                store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+                notify_on_append: true,
+                ..Default::default()
+            },
+            Arc::new(Running),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Refused);
+    }
+
+    /// A store whose notifications never go out, as when the server is down and a close retries.
+    struct NeverFlushes(crate::MemoryStore);
+
+    #[async_trait::async_trait]
+    impl StreamStore for NeverFlushes {
+        fn name(&self) -> &str {
+            self.0.name()
+        }
+        async fn append(
+            &self,
+            r: crate::proto::StoreAppendRequest,
+        ) -> StreamResult<crate::proto::StoreAppendResponse> {
+            self.0.append(r).await
+        }
+        async fn read(
+            &self,
+            r: crate::proto::StoreReadRequest,
+        ) -> StreamResult<crate::proto::StoreReadResponse> {
+            self.0.read(r).await
+        }
+        async fn latest(
+            &self,
+            r: crate::proto::StoreLatestRequest,
+        ) -> StreamResult<crate::proto::StoreLatestResponse> {
+            self.0.latest(r).await
+        }
+        async fn record_at(
+            &self,
+            c: &crate::proto::ChainId,
+            t: &str,
+            p: &str,
+        ) -> StreamResult<Option<Vec<u8>>> {
+            self.0.record_at(c, t, p).await
+        }
+        async fn close_chain(&self, c: &crate::proto::ChainId) -> StreamResult<()> {
+            self.0.close_chain(c).await
+        }
+        async fn close_topic(&self, c: &crate::proto::ChainId, t: &str) -> StreamResult<()> {
+            self.0.close_topic(c, t).await
+        }
+        async fn delete_owner(
+            &self,
+            r: DeleteOwnerRequest,
+        ) -> StreamResult<crate::proto::DeleteOwnerResponse> {
+            self.0.delete_owner(r).await
+        }
+        async fn flush_notifications(&self) {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_flush_waits_only_so_long_for_notifications_that_never_go_out() {
+        let service = StreamService::new(
+            Arc::new(NeverFlushes(crate::MemoryStore::new())),
+            Arc::new(Running),
+            StreamsOptions::default(),
+        );
+        let started = tokio::time::Instant::now();
+        flush(&service).await;
+        assert_eq!(
+            started.elapsed(),
+            crate::FLUSH_LIMIT,
+            "a stopping process mustn't hang on a close retrying against a server that's down"
+        );
     }
 }
