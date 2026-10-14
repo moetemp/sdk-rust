@@ -289,10 +289,9 @@ pub(crate) async fn read_with(
                 0 => DEFAULT_MAX_RECORDS,
                 max => max,
             },
-            arm: request.arm,
         })
         .await?;
-    let (closed, armed, close) = (page.closed, page.armed, page.close);
+    let (closed, close) = (page.closed, page.close);
     let mut records = Vec::with_capacity(page.records.len());
     let mut previous = start.clone();
     for stored in page.records {
@@ -337,10 +336,9 @@ pub(crate) async fn read_with(
             cursor: previous,
             state: Vec::new(),
             done: false,
-            armed,
-            // An armed read found nothing after `position`, so a notification counter above that
-            // position's counter can only come from a newer record.
-            wake_after: if armed {
+            // An empty answer found nothing after `position`, so a notification counter above
+            // that position's counter can only come from a newer record.
+            wake_after: if records.is_empty() {
                 progress_counter(&position).unwrap_or(0)
             } else {
                 0
