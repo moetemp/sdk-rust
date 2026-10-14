@@ -3715,6 +3715,10 @@ message AttachStreamCallbackRequest {
     string operation_token = 6;
     // When the handler started the operation. Sent with the token, for the same reason.
     google.protobuf.Timestamp start_time = 7;
+    // A Workflow in this namespace that the notifier wakes, in place of a Nexus callback. The
+    // Workflow gets each change of the stream as a `StreamWake` on its next Workflow Task. Exactly
+    // one of `callback` and `workflow_target` is set.
+    temporal.api.stream.v1.WorkflowWakeTarget workflow_target = 8;
 }
 
 message AttachStreamCallbackResponse {
@@ -3778,4 +3782,34 @@ message DescribeStreamNotifierResponse {
     repeated temporal.api.stream.v1.StreamCallbackInfo callbacks = 4;
     // The failure the stream closed with, when it closed with one.
     temporal.api.failure.v1.Failure close_failure = 5;
+}
+
+message PollStreamNotifierRequest {
+    string namespace = 1;
+    temporal.api.stream.v1.StreamReference stream_ref = 2;
+    // The poll returns when the notifier's counter is above this value, or when the stream is
+    // closed. A reader passes the counter of the position where it armed its read, so a
+    // notification that landed before the poll makes it return at once.
+    //
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "after" names the bound the counter must pass. --)
+    int64 after_counter = 3;
+    // The identity of the client that polls.
+    string identity = 4;
+}
+
+message PollStreamNotifierResponse {
+    // The highest counter the notifier has seen. At or below the request's `after_counter` when
+    // the poll reached its wait limit with no change. Then the client reads the stream again.
+    int64 counter = 1;
+    // The position that came with `counter`.
+    string position = 2;
+    // The metadata that came with `counter`.
+    map<string, string> metadata = 3;
+    // Whether the stream was closed.
+    bool closed = 4;
+    // The result the stream closed with, when `closed` is set. Optional.
+    temporal.api.common.v1.Payload close_result = 5;
+    // The failure the stream closed with, when `closed` is set and it closed with one.
+    temporal.api.failure.v1.Failure close_failure = 6;
 }
