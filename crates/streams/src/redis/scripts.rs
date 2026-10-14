@@ -1,9 +1,9 @@
 //! The Lua scripts, on the stored format the SDKs used before the store moved into Core.
 //!
-//! The append script is D1b's with one more check, the topic's close flag, so a batch can't land
-//! after the topic's close returned (DD-96). It also reports the topic's arm, so a producer
-//! notifies only while a reader sleeps (DD-118), and its trim keeps what positions-only readers
-//! hold (RR-4). `keep.lua` is the prelude of every script that writes a log, and `floor.lua` of
+//! The append script is the one the SDKs sent, with one more check, the topic's close flag, so a
+//! batch can't land after the topic's close returned (DD-16). It also reports the topic's arm, so
+//! a producer notifies only while a reader sleeps (DD-118), and its trim keeps what positions-only
+//! readers hold. `keep.lua` is the prelude of every script that writes a log, and `floor.lua` of
 //! every script that reads or writes the holds.
 
 use redis::Script;
@@ -41,7 +41,7 @@ pub(crate) static RELEASE_SCRIPT: LazyLock<Script> = LazyLock::new(|| {
 mod tests {
     use super::*;
 
-    /// The close check the append script adds to D1b's.
+    /// The close check the append script adds to the SDKs' one.
     const TOPIC_CHECK: &str = " or redis.call('HGET', KEYS[2], 'closed')";
     /// The arm the append script adds to each of its answers.
     const APPEND_ARM: &str = ", redis.call('HGET', KEYS[2], 'arm') or '0'";
