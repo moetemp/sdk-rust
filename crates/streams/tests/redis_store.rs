@@ -1910,6 +1910,7 @@ async fn a_replay_read_on_redis_repeats_the_read_and_survives_retention_under_a_
             state: request.state.clone(),
             records_digest: page.records_digest.clone(),
             floor_holder: "reader-run/1".to_string(),
+            start_from_end: false,
         })
         .await
         .unwrap();

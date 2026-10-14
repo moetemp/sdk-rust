@@ -103,6 +103,7 @@ relevant information.
   against retention, under a lease that each read renews, and the new `ReleaseFloor` call ends
   the hold after a grace. The Redis store keeps holds in a `floors` hash per topic, and its append
   script trims around them. `RedisStoreConfig` gains `floor_lease` and `floor_release_grace`.
+  Lang sets `ReadRangeRequest.start_from_end` when the read asked for `$end`.
 * Experimental: the stream service's `RetireProducer` call drops one producer attempt's dedupe
   state on a stream, which the Redis store keeps as one field of the topic's meta hash until
   retention. A producer that writes once per short-lived attempt calls it after the attempt's

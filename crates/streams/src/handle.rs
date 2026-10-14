@@ -369,9 +369,9 @@ impl Streams {
     }
 
     /// Reads again the exact range of an earlier answer and checks it against that answer's
-    /// digest (RR-2). It runs the read that the answer came from, with the same input state, so
-    /// it gives the same supersessions and stale marks, and it waits for nothing and checks no
-    /// owner. Records with other content fail as a mismatch. Records the store no longer holds
+    /// digest (RR-2). It runs the read that the answer came from, with the same input state and
+    /// the start that read found, so it gives the same supersessions and stale marks, and it waits
+    /// for nothing and checks no owner. Records with other content fail as a mismatch. Records the store no longer holds
     /// fail as lost (REC-01).
     pub async fn read_range(&self, request: ReadRangeRequest) -> StreamResult<ReadResponse> {
         let stream = address(request.stream.as_ref())?;
@@ -388,6 +388,9 @@ impl Streams {
         let mut state = ReadState::decode_from(&request.state)?;
         if state.first_run_id.is_empty() {
             state.first_run_id = request.chain_first_run_id.clone();
+        }
+        if request.start_from_end {
+            state.started = true;
         }
         let target = ReadTarget {
             chain: chain_of(stream, &request.chain_first_run_id),
@@ -1631,6 +1634,7 @@ mod tests {
             state: request.state.clone(),
             records_digest: page.records_digest.clone(),
             floor_holder: String::new(),
+            start_from_end: request.after == crate::END,
         }
     }
 
@@ -1681,6 +1685,24 @@ mod tests {
         assert_eq!(replayed.records, page.records);
         assert_eq!(replayed.cursor, page.cursor);
         assert_eq!(replayed.records_digest, page.records_digest);
+    }
+
+    #[tokio::test]
+    async fn a_replay_read_of_a_read_from_the_end_gives_the_records_the_read_got() {
+        let setup = setup(quick());
+        setup.streams.append(attempt("p", 1, 1, "1")).await.unwrap();
+        let request = read_after(crate::END, &[], Duration::from_secs(5));
+        // The read finds its start at the end, then a newer attempt of the producer there lands.
+        let (page, _) = tokio::join!(setup.streams.read(request.clone()), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            setup.streams.append(attempt("p", 2, 1, "2")).await.unwrap();
+        });
+        let page = page.unwrap();
+        assert_eq!(page.records.len(), 1, "no supersession, {page:?}");
+        let replay = replay_of(&request, &page);
+        assert!(replay.start_from_end);
+        let replayed = setup.streams.read_range(replay).await.unwrap();
+        assert_eq!(replayed.records, page.records);
     }
 
     #[tokio::test]
