@@ -209,6 +209,13 @@ pub trait StreamStore: Send + Sync {
     /// Waits until the notifications this store sent are out. A store that sends none returns at
     /// once.
     async fn flush_notifications(&self) {}
+
+    /// The store's notification log, when each append writes an entry to it in the same step.
+    /// Producers then send no notifications and a driver reads the log. A store without one
+    /// keeps the default, and each producer notifies after its append.
+    fn notification_log(&self) -> Option<std::sync::Arc<dyn crate::NotificationLog>> {
+        None
+    }
 }
 
 #[cfg(test)]

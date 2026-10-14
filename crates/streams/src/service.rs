@@ -60,7 +60,12 @@ impl StreamService {
     ) -> StreamResult<Self> {
         let (store, retention): (Arc<dyn StreamStore>, Duration) = match config.store {
             Some(stream_store_config::Store::Memory(_)) => {
-                (Arc::new(crate::MemoryStore::new()), DEFAULT_RETENTION)
+                let store = if config.notification_log {
+                    crate::MemoryStore::with_notification_log()
+                } else {
+                    crate::MemoryStore::new()
+                };
+                (Arc::new(store), DEFAULT_RETENTION)
             }
             Some(stream_store_config::Store::Redis(redis)) => connect_redis(redis).await?,
             None => {
@@ -69,6 +74,12 @@ impl StreamService {
                 ));
             }
         };
+        if config.notification_log && store.notification_log().is_none() {
+            return Err(StreamError::refused(format!(
+                "the {} store keeps no notification log",
+                store.name()
+            )));
+        }
         if config.notify_on_append && notifier.is_none() {
             return Err(StreamError::refused(
                 "stream notifications need a client to send them with",
@@ -662,6 +673,52 @@ mod tests {
             .map(|n| n.counter)
             .collect();
         assert_eq!(counters.last(), Some(&2), "{counters:?}");
+    }
+
+    #[tokio::test]
+    async fn with_a_notification_log_an_append_writes_an_entry_and_sends_nothing() {
+        let recorder = Arc::new(Recorder::default());
+        let service = StreamService::connect_with_notifier(
+            StreamStoreConfig {
+                store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+                notify_on_append: true,
+                notification_log: true,
+                ..Default::default()
+            },
+            Arc::new(Running),
+            Some(recorder.clone()),
+        )
+        .await
+        .unwrap();
+        service.call("Append", &append(1, &["a"])).await.unwrap();
+        flush(&service).await;
+        assert!(recorder.0.lock().unwrap().is_empty(), "the driver notifies");
+        let log = service.store().notification_log().unwrap();
+        assert_eq!(log.busy().await.unwrap(), [0]);
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn a_store_without_a_notification_log_refuses_one() {
+        let Ok(url) = std::env::var("STREAMS_REDIS_URL") else {
+            return;
+        };
+        let error = StreamService::connect(
+            StreamStoreConfig {
+                store: Some(stream_store_config::Store::Redis(
+                    crate::proto::RedisStoreConfig {
+                        urls: vec![url],
+                        ..Default::default()
+                    },
+                )),
+                notification_log: true,
+                ..Default::default()
+            },
+            Arc::new(Running),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Refused);
     }
 
     #[tokio::test]

@@ -13,6 +13,7 @@ mod error;
 mod handle;
 mod memory;
 mod notify;
+mod notifylog;
 mod owner;
 mod reader;
 mod record;
@@ -33,6 +34,7 @@ pub use notify::{
     NotifierClient, NotifierPoll, NotifyError, NotifyingStore, StreamNotification,
     WorkflowAttachment, progress_counter,
 };
+pub use notifylog::{NotificationEntry, NotificationLog};
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};
 pub use reader::{
     DEFAULT_MAX_RECORDS, MAX_STATE_BYTES, MAX_TRACKED_PRODUCERS, ReadTarget, read_page,

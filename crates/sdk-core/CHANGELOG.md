@@ -46,6 +46,13 @@ relevant information.
   and the reader waits for a counter above it. Notifications for one stream fold into one call in
   flight, a failed last notification is tried twice more, and a notification never fails the
   write. `max_notifiers` caps how many streams the process keeps a notifier for (1000 when zero).
+* Experimental: a stream store can keep a notification log, one entry per append written in the
+  same store step. With `StreamStoreConfig.notification_log`, producers send no notifications and
+  a driver reads the log through `StreamStore::notification_log`, a `NotificationLog` of
+  partitions, doorbells, consumer-group takes, claims after an idle time, acks and a sweep. The
+  memory store keeps one, and a store without one refuses the setting. `NotifierClient` gains
+  `notify_streams`, which Core's client sends as one `NotifyStreams` call per namespace, and the C
+  bridge takes `NotifyStreams` as a raw call.
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with
