@@ -41,10 +41,19 @@ relevant information.
 * Experimental: the C bridge has `temporal_core_stream_store_new`, `_call` and `_free` for the
   stream service, built with the Redis store.
 * Experimental: with `StreamStoreConfig.notify_on_append`, Core tells each stream's notifier on
-  the server when the stream moves, after every append. That's how a reader that waits on the
-  notifier wakes. Notifications for one stream fold into one call in flight, a failed last
-  notification is tried twice more, and a notification never fails the write. `max_notifiers`
-  caps how many streams the process keeps a notifier for (1000 when zero).
+  the server when the stream moves while a reader sleeps on it. That's how a reader that waits on
+  the notifier wakes. A reader arms the stream with a read that sets the new `ReadRequest.arm`
+  and waits its whole wait with no record. The answer says `armed` and carries `wake_after`, the
+  counter of the read's position, and the next append notifies once. Core clears the arm once the
+  notification lands, and a failed one keeps it for the next append. A busy stream, whose readers
+  find records on each read, sends no notification, apart from one refresh a day that keeps its
+  notifier from the idle timeout. `notify_every_append` restores a notification after every
+  append, for readers that can't arm. Notifications for one stream fold into one call in flight,
+  a failed last notification is tried twice more, and a notification never fails the write.
+  `max_notifiers` caps how many streams the process keeps a notifier for (1000 when zero).
+* Experimental: `StreamStore` has `disarm` and `newest_or_arm`, and its read and append messages
+  carry the arm. The Redis store keeps it in each topic's meta as `arm` and `arm_seq`, which
+  changes the append script hash.
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with

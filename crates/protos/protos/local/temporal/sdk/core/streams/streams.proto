@@ -46,6 +46,10 @@ message StreamStoreConfig {
   bool notify_on_append = 3;
   // How many streams to keep a notifier for, dropping the least recently used. Zero uses 1000.
   uint32 max_notifiers = 4;
+  // With `notify_on_append`, notifies after every append, whether or not a reader armed the
+  // stream. For a deployment whose readers can't arm,
+  // such as a hand-written reader over HTTP. Off by default.
+  bool notify_every_append = 5;
 }
 
 // Streams in a Redis or Redis Cluster that Core connects to itself.

@@ -655,6 +655,7 @@ pub struct NotifyingStore {
     inner: Arc<dyn StreamStore>,
     notifier: Arc<Notifier>,
     progress: bool,
+    every_append: bool,
 }
 
 impl NotifyingStore {
@@ -664,6 +665,7 @@ impl NotifyingStore {
             inner,
             notifier,
             progress: true,
+            every_append: false,
         }
     }
 
@@ -671,6 +673,13 @@ impl NotifyingStore {
     /// close outcome completes every attached callback.
     pub fn with_progress(mut self, progress: bool) -> Self {
         self.progress = progress;
+        self
+    }
+
+    /// With progress on, notifies after every write whether or not a reader armed the stream, for
+    /// readers that can't arm.
+    pub fn with_every_append(mut self, every_append: bool) -> Self {
+        self.every_append = every_append;
         self
     }
 
@@ -689,6 +698,9 @@ impl NotifyingStore {
     /// sent, and otherwise the arm to clear once the notification lands. A store that can't tell
     /// reports no arm, and its writes notify without one.
     fn owed(&self, arm: Option<u64>) -> Option<Option<Arm>> {
+        if self.every_append {
+            return Some(None);
+        }
         match arm {
             Some(0) => None,
             Some(generation) => Some(Some(Arm {
