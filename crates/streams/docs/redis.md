@@ -36,6 +36,19 @@ reaches the end sees the outcome without a wake. An append that the close refuse
 beyond the documented ones, since the script uses `HGET`, `HSET` and `PEXPIRE` only. An SDK's
 provider ignores it.
 
+**Floors.** A positions-only Workflow reader records which range it read, not the records, and
+reads the range again on replay. So the store holds those records past retention while the
+reader's run can replay. A hash `<base>:t:<topic>:floors` keeps one field per reader, its run id
+and subscription id, with `<entry id>|<until ms>`: the lowest position the reader read after, and
+the end of its lease. A read or a replay read renews the lease, which lasts the retention by
+default, and extends the log's and the meta's expiry to it. `ReleaseFloor` moves the end to now
+plus a release grace, one day by default. The append script's trim reads the hash first. It drops
+the ended holds, trims to the lower of the retention floor and the lowest held position, and keeps
+the log until the latest lease ends. A hold from the beginning holds `0-1`, so it keeps the whole
+topic. The scripts use `HGET`, `HSET`, `HGETALL`, `HDEL`, `PTTL` and `PEXPIRE`, which the
+documented ACL allows. Without holds the hash doesn't exist and the trim is as before. The append
+script's hash changes again.
+
 **Retired producers.** A field stays until a write's trim finds it older than the retention, so
 a topic written by many short-lived producers holds one field per producer attempt of the last
 retention window, about 235 bytes each. `RetireProducer` deletes one attempt's field with
