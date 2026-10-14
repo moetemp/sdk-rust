@@ -27,7 +27,9 @@ pub use error::{StreamError, StreamResult};
 pub use handle::{OWNER_RECHECK, Streams, StreamsOptions};
 pub use memory::MemoryStore;
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};
-pub use reader::{DEFAULT_MAX_RECORDS, MAX_TRACKED_PRODUCERS, ReadTarget, read_page};
+pub use reader::{
+    DEFAULT_MAX_RECORDS, MAX_STATE_BYTES, MAX_TRACKED_PRODUCERS, ReadTarget, read_page,
+};
 pub use record::{
     WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, stored_append_record,
 };
