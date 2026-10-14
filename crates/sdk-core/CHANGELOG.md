@@ -78,6 +78,21 @@ relevant information.
   retention. A producer that writes once per short-lived attempt calls it after the attempt's
   last append returned, so the meta hash tracks the attempts in flight. Calling it earlier lets a
   retried batch land twice.
+* Experimental: a Workflow publishes stream records with `WorkflowOutputStreamCommit` in its
+  activation completion. The Worker appends them to its `stream_store` before it reports the
+  completion, so readers see them while the Workflow Task runs, and nothing goes to History. The
+  producer is `@<run id>`. The attempt is the last completed task's WorkflowTaskStarted event id
+  shifted left 16 bits, plus 1 and the task's failed or timed-out reruns since. Sequences start at
+  1 per attempt. Replay appends nothing. A store that refuses the append fails the Workflow Task.
+  Once the server accepts a task, Core retires the dedupe sessions of the run's earlier attempts.
+  The C bridge's worker options take the process's stream store as `stream_store`.
+* Experimental: a read reports `SUPERSEDED` for a Workflow producer (`@<run id>`) only when its
+  attempt keeps the high bits (the same task) and raises the low 16 bits (a rerun). A higher
+  prefix is the next task and reads with no supersession.
+* Experimental: a read of a Workflow that Temporal doesn't know yet answers empty for
+  `StreamStoreConfig.owner_start_grace` (60 seconds unless set, counted from the read's first
+  owner check), so a reader can start before its owner. After the grace it fails as `NOT_FOUND`
+  as before. Zero turns the grace off.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

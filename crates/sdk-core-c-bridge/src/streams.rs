@@ -6,7 +6,8 @@ use prost::Message;
 use std::sync::Arc;
 use temporalio_sdk_core::streams::{StreamService, connect_stream_service, proto};
 
-/// One process's stream store, serving the stream calls lang makes.
+/// One process's stream store, serving the stream calls lang makes. Workers take it in their
+/// options, so a Workflow's output and outside producers share it.
 pub struct StreamStore {
     pub(crate) runtime: Runtime,
     pub(crate) service: Arc<StreamService>,
