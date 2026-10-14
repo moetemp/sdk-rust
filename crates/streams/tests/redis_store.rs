@@ -1917,3 +1917,87 @@ async fn a_replay_read_on_redis_repeats_the_read_and_survives_retention_under_a_
     assert_eq!(replayed.records, page.records);
     assert_eq!(replayed.records_digest, page.records_digest);
 }
+
+/// A reader's first range starts at the stream's start, so it has no cursor to find gone. Once
+/// its hold lapsed and retention trimmed the range, later records stand where it began.
+#[tokio::test]
+async fn a_replay_read_from_a_trimmed_start_on_redis_is_rec_01() {
+    use sha2::{Digest, Sha256};
+    use temporalio_common::protos::temporal::api::{
+        common::v1::Payload, enums::v1::WorkflowExecutionStatus,
+    };
+    use temporalio_streams::{
+        Streams, StreamsOptions,
+        proto::{
+            AppendRecord, AppendRequest, NamedProducer, ReadRangeRequest, ReadRequest,
+            StreamAddress, StreamOwnerKind, StreamRecordKind, append_request::Producer,
+        },
+    };
+    let Some(url) = url() else {
+        return;
+    };
+    let mut options = RedisStoreOptions::new(url.clone());
+    options.key_prefix = unique("trimmed-start");
+    options.retention = Duration::from_millis(300);
+    options.floor_lease = Some(Duration::from_millis(100));
+    let streams = Streams::new(
+        Arc::new(RedisStore::connect(options).await.unwrap()),
+        Arc::new(OneOwner {
+            status: std::sync::Mutex::new(WorkflowExecutionStatus::Running),
+        }),
+        StreamsOptions::default(),
+    );
+    let chain = chain();
+    let stream = StreamAddress {
+        namespace: chain.namespace.clone(),
+        owner_kind: StreamOwnerKind::Workflow as i32,
+        workflow_id: chain.workflow_id.clone(),
+        run_id: String::new(),
+        topic: "events".to_string(),
+    };
+    let append = |sequence: i64| AppendRequest {
+        stream: Some(stream.clone()),
+        producer: Some(Producer::Named(NamedProducer {
+            producer_id: "p".to_string(),
+            attempt: 1,
+        })),
+        sequence,
+        records: vec![AppendRecord {
+            kind: StreamRecordKind::Data as i32,
+            body: Some(Payload {
+                data: sequence.to_be_bytes().to_vec(),
+                ..Default::default()
+            }),
+            content_hash: Sha256::digest(sequence.to_be_bytes()).to_vec(),
+        }],
+        digest: Sha256::digest(sequence.to_be_bytes()).to_vec(),
+    };
+    streams.append(append(1)).await.unwrap();
+    streams.append(append(2)).await.unwrap();
+    let request = ReadRequest {
+        stream: Some(stream.clone()),
+        floor_holder: "reader-run/1".to_string(),
+        ..Default::default()
+    };
+    let page = streams.read(request.clone()).await.unwrap();
+    assert_eq!((page.records.len(), page.start_cursor.as_str()), (2, ""));
+    // Past the lease and the retention, the appends' trims drop the range.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    streams.append(append(3)).await.unwrap();
+    streams.append(append(4)).await.unwrap();
+    let error = streams
+        .read_range(ReadRangeRequest {
+            stream: Some(stream.clone()),
+            chain_first_run_id: page.chain_first_run_id.clone(),
+            after: page.start_cursor.clone(),
+            to: page.cursor.clone(),
+            stored_records: 2,
+            state: request.state.clone(),
+            records_digest: page.records_digest.clone(),
+            floor_holder: String::new(),
+            start_from_end: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::ReplayRangeLost, "{error}");
+}
