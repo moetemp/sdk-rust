@@ -40,10 +40,6 @@ relevant information.
   requests.
 * Experimental: the C bridge has `temporal_core_stream_store_new`, `_call` and `_free` for the
   stream service, built with the Redis store.
-* Experimental: `Success.heartbeat_task` on a workflow activation completion asks Core to
-  complete the workflow task now while local activities run, as at a local activity heartbeat.
-  The task carries the commands and markers so far and asks for a new task. Core ignores the
-  flag while replaying, since lang sets it from a count or a clock.
 * Experimental: with `StreamStoreConfig.notify_on_append`, Core tells each stream's notifier on
   the server when the stream moves while a reader sleeps on it. That's how a reader that waits on
   the notifier wakes. A reader arms the stream with a read that sets the new `ReadRequest.arm`
@@ -72,10 +68,11 @@ relevant information.
   outcome to a wrapper that tells the notifier.
 * Experimental: the new `Subscribe` and `Unsubscribe` stream calls attach a Workflow's reader to
   a stream's notifier as a `workflow_target`, and detach it. The attach's request id is
-  `jetty/<run id>/<subscription id>`, so a rerun attaches as the same reader. A process attaches
-  each subscription once and answers a repeat from memory. The attach names the chain that holds
-  the Workflow id now, and on an empty stream it arms the stream, so the first append wakes the
-  Workflow.
+  `jetty/<run id>/<subscription id>`, so a rerun attaches as the same reader. After a wake with
+  `resubscribe`, lang raises `SubscribeRequest.generation`, which makes a new attach. A process
+  attaches each subscription once and answers a repeat from memory. The attach names the chain
+  that holds the Workflow id now, and on an empty stream it arms the stream, so the first append
+  wakes the Workflow.
 * Experimental: the new `WaitForNotification` stream call waits on a stream's notifier with the
   server's `PollStreamNotifier` long poll, for a client reader whose read armed the stream. It
   returns when the notifier's counter passes the read's `wake_after`, when the stream closed, or
@@ -85,11 +82,10 @@ relevant information.
   `stream_wakes` on the task's scheduled events. Replay delivers the same jobs in the same
   activations. A task scheduled with wakes ends a workflow task heartbeat chain, so it keeps an
   activation of its own on replay.
-  `jetty/<run id>/<subscription id>`, so a rerun attaches as the same reader. After a wake with
-  `resubscribe`, lang raises `SubscribeRequest.generation`, which makes a new attach. A process
-  attaches each subscription once and answers a repeat from memory. The attach names the chain
-  that holds the Workflow id now, and on an empty stream it arms the stream, so the first append
-  wakes the Workflow.
+* Experimental: `Success.heartbeat_task` on a workflow activation completion asks Core to
+  complete the workflow task now while local activities run, as at a local activity heartbeat.
+  The task carries the commands and markers so far and asks for a new task. Core ignores the
+  flag while replaying, since lang sets it from a count or a clock.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
