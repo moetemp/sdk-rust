@@ -1,8 +1,8 @@
 //! The Lua scripts, on the stored format the SDKs used before the store moved into Core.
 //!
-//! The append script is D1b's with one more check, the topic's close flag, so a batch can't land
-//! after the topic's close returned (DD-96). `keep.lua` is the prelude of every script that
-//! writes a log.
+//! The append script is the one the SDKs sent, with one more check, the topic's close flag, so a
+//! batch can't land after the topic's close returned (DD-16). `keep.lua` is the prelude of every
+//! script that writes a log.
 
 use redis::Script;
 use std::sync::LazyLock;
@@ -18,7 +18,7 @@ pub(crate) static APPEND_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new
 mod tests {
     use super::*;
 
-    /// The close check the append script adds to D1b's.
+    /// The close check the append script adds to the SDKs' one.
     const TOPIC_CHECK: &str = " or redis.call('HGET', KEYS[2], 'closed')";
 
     #[test]
