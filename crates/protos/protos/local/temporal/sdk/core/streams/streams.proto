@@ -38,10 +38,10 @@ service StreamService {
   rpc Subscribe(SubscribeRequest) returns (SubscribeResponse);
   // Detaches a Workflow's reader that stops before the stream ends.
   rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
-  // Waits on the stream's notifier, for a client reader whose read armed the stream. Returns when
+  // Waits on the stream's notifier, for a client reader whose read came back empty. Returns when
   // the notifier's counter is above `after_counter`, when the stream closed, or at the server's
-  // wait limit (`streamnotifier.pollMaxWait`). The reader then reads again with `arm`. After the
-  // wait limit, that read finds records whose notification was lost, or arms again.
+  // wait limit (`streamnotifier.pollMaxWait`). The reader then reads again. After the wait limit,
+  // that read finds records whose notification was lost, or comes back empty again.
   rpc WaitForNotification(WaitForNotificationRequest) returns (WaitForNotificationResponse);
   // Reads again the exact range an earlier read answered, for a positions-only Workflow reader on
   // replay, and checks it against that read's digest. Waits for nothing and checks no owner.
@@ -58,19 +58,16 @@ message StreamStoreConfig {
     RedisStoreConfig redis = 1;
     MemoryStoreConfig memory = 2;
   }
-  // Tells each stream's notifier on the server when the stream moves while a reader sleeps on
-  // it: after an append, when a reader armed the stream with an empty read. That's what wakes a
-  // reader that waits on the notifier. A busy stream, whose readers find records on each read,
-  // costs no notification. Off by default, since most streams have no such reader. It turns on
-  // progress only. Closes reach the notifier either way. A server without the stream notifier
-  // costs one call, and then the process stops notifying.
+  // Tells each stream's notifier on the server when the stream moves, after every append. That's
+  // what wakes a reader that waits on the notifier. Off by default, since most streams have no
+  // such reader and each notification costs a call. It turns on progress only. Closes reach the
+  // notifier either way. A server without the stream notifier costs one call, and then the
+  // process stops notifying.
   bool notify_on_append = 3;
   // How many streams to keep a notifier for, dropping the least recently used. Zero uses 1000.
   uint32 max_notifiers = 4;
-  // With `notify_on_append`, notifies after every append, whether or not a reader armed the
-  // stream. For a deployment whose readers can't arm,
-  // such as a hand-written reader over HTTP. Off by default.
-  bool notify_every_append = 5;
+  reserved 5;
+  reserved "notify_every_append";
   // How long a read waits for a Workflow that Temporal doesn't know yet, counted from the read's
   // first owner check. Until then the read answers empty, so a reader can start before its
   // owner does. After it the read fails as NOT_FOUND. Unset waits 60 seconds, and zero fails at
@@ -195,10 +192,8 @@ message ReadRequest {
   uint32 max_records = 4;
   // The `state` of the previous answer of the same read. Empty on its first call.
   bytes state = 5;
-  // For a reader that sleeps on the stream's notifier. When the read waits its whole `wait` and
-  // finds nothing, the store arms the stream in the same step, so the next append notifies the
-  // notifier. A reader that doesn't wait on the notifier leaves it unset.
-  bool arm = 6;
+  reserved 6;
+  reserved "arm";
   // For a positions-only Workflow reader: names the reader, as its run id and its subscription
   // id. The store holds the records after this read's start against retention for that holder,
   // until `ReleaseFloor` and its grace, or until the holder's lease passes with no read.
@@ -237,12 +232,12 @@ message ReadResponse {
   // The owner's chain ended and the read delivered every record the stream retains. No later
   // call returns a record.
   bool done = 4;
-  // The read asked to arm, found nothing and armed the stream, so the next append notifies the
-  // stream's notifier. Never set with records or with `done`.
-  bool armed = 5;
-  // Set with `armed`: the notification counter of the read's position, zero for an empty
-  // stream. A notification with a higher counter names a record after the position, so the
-  // reader waits for a counter above this one. One that landed before the wait started counts.
+  reserved 5;
+  reserved "armed";
+  // Set on an answer with no records and not `done`: the notification counter of the read's
+  // position, zero for an empty stream. A notification with a higher counter names a record
+  // after the position, so the reader waits for a counter above this one. One that landed before
+  // the wait started counts.
   int64 wake_after = 6;
   // Set with `done` when the stream's topic was closed with a result. A chain close, when the
   // owner ended with no close, sets none of these three.
@@ -368,7 +363,7 @@ message UnsubscribeResponse {}
 message WaitForNotificationRequest {
   // The stream the reader reads.
   StreamAddress stream = 1;
-  // The `wake_after` of the read that armed the stream.
+  // The `wake_after` of the read that came back empty.
   int64 after_counter = 2;
 }
 
@@ -477,9 +472,8 @@ message StoreAppendRequest {
 message StoreAppendResponse {
   string first_position = 1;
   string last_position = 2;
-  // The topic's arm generation as the append found it, zero when no reader armed the topic.
-  // Unset when the store can't tell, and Core then notifies after the append.
-  optional uint64 arm = 3;
+  reserved 3;
+  reserved "arm";
 }
 
 message StoreReadRequest {
@@ -489,9 +483,8 @@ message StoreReadRequest {
   string after_position = 3;
   google.protobuf.Duration wait = 4;
   uint32 max_records = 5;
-  // When the read ends with no record and the topic is open, arm the topic in the same step that
-  // finds it empty, so the next append reports the arm. A store that can't arm ignores it.
-  bool arm = 6;
+  reserved 6;
+  reserved "arm";
 }
 
 message StoredRecord {
@@ -504,9 +497,8 @@ message StoreReadResponse {
   repeated StoredRecord records = 1;
   // The chain or this topic is marked closed.
   bool closed = 2;
-  // The read asked to arm, found no record and armed the topic. Never set with records or with
-  // `closed`.
-  bool armed = 3;
+  reserved 3;
+  reserved "armed";
   // The topic's first close, when it was closed as a topic. Unset for a chain close.
   StoredClose close = 4;
 }
