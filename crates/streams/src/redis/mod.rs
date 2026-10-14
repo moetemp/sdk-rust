@@ -568,6 +568,23 @@ impl StreamStore for RedisStore {
             .mapped(Call::Write)
     }
 
+    async fn retire_producer(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        producer_id: &str,
+        attempt: i64,
+    ) -> StreamResult<()> {
+        // One field of one key, so a plain `HDEL` is atomic, and it creates nothing when the meta
+        // is gone.
+        redis::cmd("HDEL")
+            .arg(ChainKeys::new(&self.prefix, chain).meta(topic))
+            .arg(session_field(producer_id, attempt))
+            .query_async::<()>(&mut self.shared.clone())
+            .await
+            .mapped(Call::Write)
+    }
+
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
         if request.owner_kind != StreamOwnerKind::Workflow as i32 {
             return Err(StreamError::unsupported(format!(

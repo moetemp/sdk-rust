@@ -40,6 +40,11 @@ relevant information.
   requests.
 * Experimental: the C bridge has `temporal_core_stream_store_new`, `_call` and `_free` for the
   stream service, built with the Redis store.
+* Experimental: the stream service's `RetireProducer` call drops one producer attempt's dedupe
+  state on a stream, which the Redis store keeps as one field of the topic's meta hash until
+  retention. A producer that writes once per short-lived attempt calls it after the attempt's
+  last append returned, so the meta hash tracks the attempts in flight. Calling it earlier lets a
+  retried batch land twice.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

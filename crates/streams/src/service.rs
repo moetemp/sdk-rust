@@ -3,8 +3,8 @@
 use crate::{
     OwnerClient, StreamError, StreamResult, StreamStore, Streams, StreamsOptions,
     proto::{
-        AppendRequest, CloseRequest, DeleteOwnerRequest, LatestRequest, ReadRequest, StreamFailure,
-        StreamStoreConfig, stream_store_config,
+        AppendRequest, CloseRequest, DeleteOwnerRequest, LatestRequest, ReadRequest,
+        RetireProducerRequest, StreamFailure, StreamStoreConfig, stream_store_config,
     },
 };
 use prost::Message;
@@ -96,6 +96,11 @@ impl StreamService {
             "DeleteOwner" => self
                 .streams
                 .delete_owner(decode::<DeleteOwnerRequest>(rpc, request)?)
+                .await
+                .map(|r| r.encode_to_vec()),
+            "RetireProducer" => self
+                .streams
+                .retire_producer(decode::<RetireProducerRequest>(rpc, request)?)
                 .await
                 .map(|r| r.encode_to_vec()),
             other => Err(StreamError::unsupported(format!(
@@ -378,6 +383,42 @@ mod tests {
         let garbled = service.call("Append", &[0xff, 0xff]).await.unwrap_err();
         assert_eq!(garbled.kind(), StreamFailureKind::InvalidArgument);
         assert!(garbled.message.contains("did not decode"));
+    }
+
+    #[tokio::test]
+    async fn a_retired_producer_writes_its_batch_again() {
+        let service = service().await;
+        let first = AppendResponse::decode(
+            service
+                .call("Append", &append(1, &["a"]))
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let retire = crate::proto::RetireProducerRequest {
+            stream: Some(address()),
+            producer: Some(crate::proto::retire_producer_request::Producer::Named(
+                NamedProducer {
+                    producer_id: "p".to_string(),
+                    attempt: 1,
+                },
+            )),
+        };
+        let answer = service
+            .call("RetireProducer", &retire.encode_to_vec())
+            .await
+            .unwrap();
+        assert!(answer.is_empty());
+        let again = AppendResponse::decode(
+            service
+                .call("Append", &append(1, &["a"]))
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert_ne!(again.first_cursor, first.first_cursor);
     }
 
     #[tokio::test]

@@ -12,6 +12,14 @@ count, its first and last entry ids, and lang's digest of it in hex. The script 
 new batch once the chain or the topic is closed, in the same step as the write, so no batch
 lands after a close returned. Only that topic check differs from the SDKs' script.
 
+**Retired producers.** A field stays until a write's trim finds it older than the retention, so
+a topic written by many short-lived producers holds one field per producer attempt of the last
+retention window, about 235 bytes each. `RetireProducer` deletes one attempt's field with
+`HDEL` and touches nothing else. A missing field or meta is no failure. Call it only once the
+attempt's last append returned: a retry of an earlier batch would find no field to compare with
+and land a second time. Readers lose nothing, since a store compares a batch with its own
+attempt's field only and readers find a newer attempt from the records.
+
 **Retention.** Every script that writes a log trims it with `XTRIM MINID` to the retention and
 slides the expiry of the log and its meta, so a stream dies a retention after its last write
 and nobody cleans up when the Workflow closes. The meta outlives its log by a 30-day grace, as
