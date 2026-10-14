@@ -5,8 +5,9 @@ use crate::{
     StreamResult, StreamStore, Streams, StreamsOptions,
     proto::{
         AppendRequest, CloseRequest, DeleteOwnerRequest, FlushNotificationsRequest,
-        FlushNotificationsResponse, LatestRequest, ReadRequest, StreamFailure, StreamStoreConfig,
-        SubscribeRequest, UnsubscribeRequest, WaitForNotificationRequest, stream_store_config,
+        FlushNotificationsResponse, LatestRequest, ReadRequest, RetireProducerRequest,
+        StreamFailure, StreamStoreConfig, SubscribeRequest, UnsubscribeRequest,
+        WaitForNotificationRequest, stream_store_config,
     },
     subscribe::Subscriptions,
 };
@@ -141,6 +142,11 @@ impl StreamService {
             "DeleteOwner" => self
                 .streams
                 .delete_owner(decode::<DeleteOwnerRequest>(rpc, request)?)
+                .await
+                .map(|r| r.encode_to_vec()),
+            "RetireProducer" => self
+                .streams
+                .retire_producer(decode::<RetireProducerRequest>(rpc, request)?)
                 .await
                 .map(|r| r.encode_to_vec()),
             "FlushNotifications" => {
@@ -454,6 +460,42 @@ mod tests {
         let garbled = service.call("Append", &[0xff, 0xff]).await.unwrap_err();
         assert_eq!(garbled.kind(), StreamFailureKind::InvalidArgument);
         assert!(garbled.message.contains("did not decode"));
+    }
+
+    #[tokio::test]
+    async fn a_retired_producer_writes_its_batch_again() {
+        let service = service().await;
+        let first = AppendResponse::decode(
+            service
+                .call("Append", &append(1, &["a"]))
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let retire = crate::proto::RetireProducerRequest {
+            stream: Some(address()),
+            producer: Some(crate::proto::retire_producer_request::Producer::Named(
+                NamedProducer {
+                    producer_id: "p".to_string(),
+                    attempt: 1,
+                },
+            )),
+        };
+        let answer = service
+            .call("RetireProducer", &retire.encode_to_vec())
+            .await
+            .unwrap();
+        assert!(answer.is_empty());
+        let again = AppendResponse::decode(
+            service
+                .call("Append", &append(1, &["a"]))
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert_ne!(again.first_cursor, first.first_cursor);
     }
 
     #[tokio::test]
@@ -918,6 +960,15 @@ mod tests {
         }
         async fn close_topic(&self, c: &crate::proto::ChainId, t: &str) -> StreamResult<()> {
             self.0.close_topic(c, t).await
+        }
+        async fn retire_producer(
+            &self,
+            c: &crate::proto::ChainId,
+            t: &str,
+            p: &str,
+            a: i64,
+        ) -> StreamResult<()> {
+            self.0.retire_producer(c, t, p, a).await
         }
         async fn delete_owner(
             &self,

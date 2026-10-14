@@ -86,6 +86,11 @@ relevant information.
   complete the workflow task now while local activities run, as at a local activity heartbeat.
   The task carries the commands and markers so far and asks for a new task. Core ignores the
   flag while replaying, since lang sets it from a count or a clock.
+* Experimental: the stream service's `RetireProducer` call drops one producer attempt's dedupe
+  state on a stream, which the Redis store keeps as one field of the topic's meta hash until
+  retention. A producer that writes once per short-lived attempt calls it after the attempt's
+  last append returned, so the meta hash tracks the attempts in flight. Calling it earlier lets a
+  retried batch land twice.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
