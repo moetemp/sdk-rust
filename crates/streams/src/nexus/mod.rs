@@ -22,7 +22,7 @@ use crate::{
         StreamAddress, StreamOwnerKind, StreamRecord, StreamRecordKind, append_request::Producer,
         codec_result, nexus_step, read_record,
     },
-    reader::ReadState,
+    reader::{ReadState, records_digest},
 };
 use prost::Message;
 use sha2::{Digest, Sha256};
@@ -37,13 +37,14 @@ use std::{
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use tokio::time::Instant;
 use wire::{
-    AppendInput, AppendOutput, Base64, ReadInput, ReadOutput, RecordWire, StreamRef, Supersession,
-    crossing_size, json_size,
+    AppendInput, AppendOutput, Base64, ReadInput, ReadOutput, RecordWire, ReplayRange, StreamRef,
+    Supersession, crossing_size, json_size,
 };
 
 /// The most bytes one read answer takes as JSON past its first record, with its tokens and state.
-/// A read answer is a sync Nexus result recorded in the caller's History, so it stays well below
-/// the server's blob size limit (2 MiB by default).
+/// A Workflow caller records a read answer in its History, unless its read names a floor holder
+/// and it keeps only the range. So an answer stays well below the server's blob size limit
+/// (2 MiB by default).
 pub const DEFAULT_MAX_ANSWER_BYTES: u64 = 1 << 20;
 /// The most bytes one record may take in an answer. One record must fit an answer on its own, so
 /// a larger one can never be read through the service.
@@ -141,6 +142,8 @@ enum Work {
         bodies: Vec<usize>,
         /// The answer's byte budget left out records of the page before the codec step.
         cut: bool,
+        /// The call named a floor holder, so the answer carries its replay range.
+        positions: bool,
     },
 }
 
@@ -269,7 +272,8 @@ impl NexusCalls {
     /// The answer carries the read's state as it stood after the last record kept, also when the
     /// byte budget cut it short, so a reader's marks stay exact across calls and Workers. A record
     /// the store's reader can't parse crosses as an error at its cursor, which the reader goes on
-    /// past.
+    /// past. A call with a floor holder holds the records after its start for that holder, and its
+    /// answer carries the range of the records that crossed, so replay can read them again.
     pub async fn read(&self, call: NexusCall) -> NexusStep {
         let limits = Limits::of(&call);
         let input: ReadInput = match serde_json::from_slice(&call.input) {
@@ -293,10 +297,17 @@ impl NexusCalls {
             )));
         }
         let after = input.after_token.unwrap_or_default();
+        let floor_holder = input.floor_holder.unwrap_or_default();
         if input.latest_only.unwrap_or(false) {
             if !after.is_empty() {
                 return failed(failure::input_mistake(
                     "latest_only starts a read at the newest record; it takes no after_token",
+                ));
+            }
+            if !floor_holder.is_empty() {
+                return failed(failure::input_mistake(
+                    "latest_only answers no records, so it holds no floor; start the read that \
+                     holds one at the cursor latest_only answers",
                 ));
             }
             return match self
@@ -353,8 +364,9 @@ impl NexusCalls {
             max_records: max_records as u32,
             state: state.clone(),
             arm: input.arm.unwrap_or(false),
-            floor_holder: String::new(),
+            floor_holder: floor_holder.clone(),
         };
+        let positions = !floor_holder.is_empty();
         let mut read = match self.streams.read_carried(request).await {
             Ok(read) => read,
             Err(error) => {
@@ -363,7 +375,7 @@ impl NexusCalls {
                 } else {
                     state
                 };
-                return read_failure(error, state);
+                return read_failure(error, state, positions);
             }
         };
         // Cut by the stored bodies first, so the codec decodes only what can cross. A codec that
@@ -411,6 +423,7 @@ impl NexusCalls {
             limits,
             bodies,
             cut,
+            positions,
         };
         if payloads.is_empty() {
             return self.finish(work, Vec::new()).await;
@@ -539,7 +552,8 @@ impl NexusCalls {
                 limits,
                 bodies,
                 cut,
-            } => finish_read(*read, limits, &bodies, cut, results),
+                positions,
+            } => finish_read(*read, limits, &bodies, cut, positions, results),
         }
     }
 
@@ -673,6 +687,7 @@ fn finish_read(
     limits: Limits,
     bodies: &[usize],
     cut: bool,
+    positions: bool,
     results: Vec<CodecResult>,
 ) -> NexusStep {
     if results.len() != bodies.len() {
@@ -697,29 +712,28 @@ fn finish_read(
     } = read;
     let mut cut = cut;
     let mut wires: Vec<RecordWire> = Vec::with_capacity(response.records.len());
-    let mut kept: Vec<StreamRecord> = Vec::new();
+    // The records that crossed, without their bodies, for the state at a cut and the digest.
+    let mut kept: Vec<ReadRecord> = Vec::with_capacity(response.records.len());
     for (index, record) in response.records.into_iter().enumerate() {
-        let ReadRecord {
-            cursor,
-            record,
-            stale,
-        } = record;
-        let (wire, stored) = match record {
+        let wire = match &record.record {
             Some(read_record::Record::Superseded(superseded)) => {
-                (superseded_wire(cursor, &superseded), None)
+                superseded_wire(record.cursor.clone(), superseded)
             }
-            Some(read_record::Record::Stored(stored)) => {
-                let wire = record_wire(cursor, &stored, decoded.remove(&index), stale, limits);
-                (wire, Some(stored))
-            }
+            Some(read_record::Record::Stored(stored)) => record_wire(
+                record.cursor.clone(),
+                stored,
+                decoded.remove(&index),
+                record.stale,
+                limits,
+            ),
             None => continue,
         };
-        if !budget.admits(json_size(&wire), stored.is_some()) {
+        if !budget.admits(json_size(&wire), wire.superseded.is_none()) {
             cut = true;
             break;
         }
         wires.push(wire);
-        kept.extend(stored);
+        kept.push(record);
     }
     // An answer the budget cut holds records, so only a whole empty answer stays armed.
     let armed = response.armed && !cut && wires.is_empty();
@@ -727,8 +741,9 @@ fn finish_read(
         // A supersession belongs to the record after it, so it goes into the next answer too.
         if wires.last().is_some_and(|wire| wire.superseded.is_some()) {
             wires.pop();
+            kept.pop();
         }
-        state = state.at_cut(&before, &kept);
+        state = state.at_cut(&before, kept.iter().filter_map(stored_of));
         let last = wires
             .last()
             .map(|wire| wire.token.clone())
@@ -738,14 +753,27 @@ fn finish_read(
         (response.cursor, response.done)
     };
     state.fit_within(MAX_STATE_BYTES);
+    let replay = positions.then(|| ReplayRange {
+        chain_first_run_id: response.chain_first_run_id,
+        after_token: response.start_cursor,
+        stored_records: kept.iter().filter_map(stored_of).count() as i64,
+        records_digest: Base64(records_digest(&kept)),
+    });
     output(&ReadOutput {
         records: wires,
         next_token,
         done,
         state: Some(Base64(state.encode_to_vec())),
         armed,
-        replay: None,
+        replay,
     })
+}
+
+fn stored_of(record: &ReadRecord) -> Option<&StreamRecord> {
+    match &record.record {
+        Some(read_record::Record::Stored(stored)) => Some(stored),
+        _ => None,
+    }
 }
 
 fn superseded_wire(token: String, superseded: &crate::proto::Supersession) -> RecordWire {
@@ -807,19 +835,28 @@ fn record_wire(
 }
 
 /// How a read's failure crosses. A record the store's reader can't parse ends no read: it
-/// crosses as an error at its cursor, and the reader goes on past it with the state it had.
-fn read_failure(error: StreamError, state: Vec<u8>) -> NexusStep {
+/// crosses as an error at its cursor, and the reader goes on past it with the state it had. With
+/// `positions` the answer's range is empty at that cursor, since a replay can't read the record
+/// either, and the reader keeps the error itself.
+fn read_failure(error: StreamError, state: Vec<u8>, positions: bool) -> NexusStep {
     match (error.kind, error.cursor.clone()) {
         (crate::proto::StreamFailureKind::Record, Some(cursor)) => output(&ReadOutput {
             records: vec![RecordWire {
                 error: Some(failure::capped(&error.message)),
                 ..stored_wire(cursor.clone(), Base64::default(), false)
             }],
-            next_token: cursor,
+            next_token: cursor.clone(),
             done: false,
+            replay: positions.then(|| ReplayRange {
+                chain_first_run_id: ReadState::decode_from(&state)
+                    .map(|state| state.first_run_id)
+                    .unwrap_or_default(),
+                after_token: cursor,
+                stored_records: 0,
+                records_digest: Base64(records_digest(&[])),
+            }),
             state: (!state.is_empty()).then_some(Base64(state)),
             armed: false,
-            replay: None,
         }),
         _ => failed(failure::of_stream(&error)),
     }

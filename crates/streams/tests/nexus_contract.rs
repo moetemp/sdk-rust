@@ -327,6 +327,11 @@ async fn every_output_member_is_declared() {
             "no answer carried {member}"
         );
     }
+    let mut holding = json!({"stream": stream(wf, "out")});
+    holding["floor_holder"] = json!("ns/run-1/reader");
+    let held = read(&calls, holding).await.unwrap();
+    check_output(&contract, "ReadOutput", &held);
+    check_output(&contract, "ReplayRange", &held["replay"]);
     let latest = read(
         &calls,
         json!({"stream": stream(wf, "out"), "latest_only": true}),

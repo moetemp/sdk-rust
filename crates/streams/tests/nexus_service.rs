@@ -22,7 +22,10 @@ use temporalio_common::protos::temporal::api::{
 use temporalio_streams::{
     MemoryStore, OwnerClient, OwnerDescription, OwnerError, StreamStore, Streams, StreamsOptions,
     nexus::{NexusCalls, NexusOptions},
-    proto::{ChainId, NexusFailure, StoreAppendRequest, StreamRecord, StreamRecordKind},
+    proto::{
+        ChainId, NexusFailure, ReadRangeRequest, ReadRequest, StoreAppendRequest, StreamAddress,
+        StreamOwnerKind, StreamRecord, StreamRecordKind,
+    },
 };
 
 static IDS: AtomicUsize = AtomicUsize::new(0);
@@ -885,4 +888,262 @@ async fn an_expired_cursor_is_told_apart() {
         kind_of(&refused),
         ("BAD_REQUEST", false, "StreamExpiredError")
     );
+}
+
+const HOLDER: &str = "ns/reader-run/1";
+
+fn holding(wf: &str, after: &str) -> Value {
+    let mut input = read_input(wf, after);
+    input["floor_holder"] = json!(HOLDER);
+    input
+}
+
+fn chain_of(wf: &str) -> ChainId {
+    ChainId {
+        namespace: NAMESPACE.to_string(),
+        workflow_id: wf.to_string(),
+        first_run_id: "run-1".to_string(),
+    }
+}
+
+/// The Nexus calls over `store`, and the stream layer they share.
+fn layered(store: Arc<dyn StreamStore>) -> (Arc<Streams>, NexusCalls) {
+    let streams = Arc::new(Streams::new(
+        store,
+        Arc::new(Running),
+        StreamsOptions::default(),
+    ));
+    let calls = NexusCalls::new(streams.clone(), NexusOptions::default());
+    (streams, calls)
+}
+
+/// Core's replay read of the range `answer` carries, for the read that sent `state`.
+fn replay_of(wf: &str, answer: &Value, state: &[u8]) -> ReadRangeRequest {
+    use base64::Engine;
+    let replay = &answer["replay"];
+    ReadRangeRequest {
+        stream: Some(StreamAddress {
+            namespace: NAMESPACE.to_string(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: wf.to_string(),
+            run_id: String::new(),
+            topic: TOPIC.to_string(),
+        }),
+        chain_first_run_id: replay["chain_first_run_id"].as_str().unwrap().to_string(),
+        after: replay["after_token"].as_str().unwrap().to_string(),
+        to: token(answer).to_string(),
+        stored_records: replay["stored_records"].as_u64().unwrap() as u32,
+        state: state.to_vec(),
+        records_digest: base64::engine::general_purpose::STANDARD
+            .decode(replay["records_digest"].as_str().unwrap())
+            .unwrap(),
+        floor_holder: String::new(),
+        start_from_end: false,
+    }
+}
+
+#[tokio::test]
+async fn a_read_without_a_floor_holder_answers_no_range() {
+    let calls = service(memory(), NexusOptions::default());
+    let wf = workflow();
+    write(&calls, &wf, 1, &["one"]).await;
+    let answer = read_after(&calls, &wf, "").await;
+    assert!(answer.get("replay").is_none(), "{answer}");
+}
+
+#[tokio::test]
+async fn a_read_with_a_floor_holder_holds_what_it_read_against_retention() {
+    let memory = Arc::new(MemoryStore::new());
+    let calls = service(memory.clone(), NexusOptions::default());
+    let held = workflow();
+    let free = workflow();
+    let mut starts = Vec::new();
+    for wf in [&held, &free] {
+        let first = write(&calls, wf, 1, &["one"]).await;
+        write(&calls, wf, 2, &["two", "three"]).await;
+        starts.push(first);
+    }
+    let answer = read(&calls, holding(&held, &starts[0])).await.unwrap();
+    assert_eq!(texts(&answer), ["two", "three"]);
+    let replay = &answer["replay"];
+    assert_eq!(replay["chain_first_run_id"], "run-1");
+    assert_eq!(replay["after_token"], starts[0].as_str());
+    assert_eq!(replay["stored_records"], 2);
+    read_after(&calls, &free, &starts[1]).await;
+    for wf in [&held, &free] {
+        memory.truncate(&chain_of(wf), TOPIC, 0);
+    }
+    assert_eq!(
+        texts(&read_after(&calls, &held, &starts[0]).await),
+        ["two", "three"],
+        "the floor kept the records after the read's start"
+    );
+    let refused = read(&calls, read_input(&free, &starts[1]))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        kind_of(&refused),
+        ("BAD_REQUEST", false, "StreamExpiredError")
+    );
+}
+
+#[cfg(feature = "redis")]
+#[tokio::test]
+async fn a_read_with_a_floor_holder_holds_what_it_read_on_redis() {
+    let Ok(url) = std::env::var("STREAMS_REDIS_URL") else {
+        eprintln!("set STREAMS_REDIS_URL to run the Redis cases");
+        return;
+    };
+    let mut options = temporalio_streams::RedisStoreOptions::new(url);
+    options.key_prefix = workflow();
+    options.retention = Duration::from_millis(200);
+    options.floor_lease = Some(Duration::from_secs(60));
+    let store = Arc::new(
+        temporalio_streams::RedisStore::connect(options)
+            .await
+            .unwrap(),
+    );
+    let calls = service(store, NexusOptions::default());
+    let wf = workflow();
+    let first = write(&calls, &wf, 1, &["one"]).await;
+    write(&calls, &wf, 2, &["two", "three"]).await;
+    let answer = read(&calls, holding(&wf, &first)).await.unwrap();
+    assert_eq!(answer["replay"]["stored_records"], 2);
+    // Past the retention, an append's trim would drop the records without the floor.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    write(&calls, &wf, 4, &["four"]).await;
+    assert_eq!(
+        texts(&read_after(&calls, &wf, &first).await),
+        ["two", "three", "four"]
+    );
+}
+
+#[tokio::test]
+async fn a_cut_answer_ranges_over_the_records_that_crossed() {
+    let (streams, calls) = layered(memory());
+    let wf = workflow();
+    let big = "x".repeat(300 * 1024);
+    write(&calls, &wf, 1, &[&format!("1{big}"), &format!("2{big}")]).await;
+    // The newer attempt's supersession fits the budget, but its record doesn't, so the cut
+    // leaves the supersession for the next answer.
+    append(&calls, append_input(&wf, "p", 2, 1, &[&format!("3{big}")]))
+        .await
+        .unwrap();
+    let answer = read(&calls, holding(&wf, "")).await.unwrap();
+    assert_eq!(records(&answer).len(), 2, "the budget cut the answer");
+    assert!(
+        records(&answer)
+            .iter()
+            .all(|r| r.get("superseded").is_none())
+    );
+    let replay = &answer["replay"];
+    assert_eq!(replay["after_token"], "");
+    assert_eq!(replay["stored_records"], 2);
+    let replayed = streams
+        .read_range(replay_of(&wf, &answer, &[]))
+        .await
+        .unwrap();
+    assert_eq!(replayed.records.len(), 2);
+    assert_eq!(replayed.cursor, token(&answer));
+    // Core's page went on past the cut, so its digest is not the answer's.
+    let page = streams
+        .read(ReadRequest {
+            stream: replay_of(&wf, &answer, &[]).stream,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(page.records.len(), 4);
+    assert_ne!(
+        json!(base64_of(&page.records_digest)),
+        replay["records_digest"]
+    );
+}
+
+fn base64_of(bytes: &[u8]) -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(bytes)
+}
+
+#[tokio::test]
+async fn a_range_replays_with_the_state_the_read_sent() {
+    let (streams, calls) = layered(memory());
+    let wf = workflow();
+    write(&calls, &wf, 1, &["one"]).await;
+    let first = read(&calls, holding(&wf, "")).await.unwrap();
+    append(&calls, append_input(&wf, "p", 2, 1, &["two"]))
+        .await
+        .unwrap();
+    let mut input = holding(&wf, token(&first));
+    input["state"] = first["state"].clone();
+    let second = read(&calls, input).await.unwrap();
+    assert_eq!(values(&second), ["SUPERSEDED p 1->2", "p@2 two"]);
+    let state = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD
+            .decode(first["state"].as_str().unwrap())
+            .unwrap()
+    };
+    let replayed = streams
+        .read_range(replay_of(&wf, &second, &state))
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed.records.len(),
+        2,
+        "the supersession comes out again"
+    );
+}
+
+#[tokio::test]
+async fn a_record_the_reader_cannot_parse_has_an_empty_range_at_its_cursor() {
+    let memory = Arc::new(MemoryStore::new());
+    let (streams, calls) = layered(memory.clone());
+    let wf = workflow();
+    memory
+        .append(StoreAppendRequest {
+            chain: Some(chain_of(&wf)),
+            topic: TOPIC.to_string(),
+            producer_id: "raw".to_string(),
+            attempt: 1,
+            sequence: 1,
+            digest: vec![1; 32],
+            records: vec![b"\xff".to_vec()],
+        })
+        .await
+        .unwrap();
+    let answer = read(&calls, holding(&wf, "")).await.unwrap();
+    let [wire] = records(&answer).as_slice() else {
+        panic!("expected one record, got {answer}");
+    };
+    assert!(wire.get("error").is_some(), "{answer}");
+    let replay = &answer["replay"];
+    assert_eq!(replay["after_token"], token(&answer));
+    assert_eq!(replay["stored_records"], 0);
+    assert_eq!(replay["chain_first_run_id"], "run-1");
+    let replayed = streams
+        .read_range(replay_of(&wf, &answer, &[]))
+        .await
+        .unwrap();
+    assert!(replayed.records.is_empty());
+}
+
+#[tokio::test]
+async fn a_floor_holder_is_at_most_512_bytes_and_never_beside_latest_only() {
+    let calls = service(memory(), NexusOptions::default());
+    let wf = workflow();
+    write(&calls, &wf, 1, &["one"]).await;
+    let mut input = read_input(&wf, "");
+    input["floor_holder"] = json!("h".repeat(512));
+    read(&calls, input.clone()).await.unwrap();
+    input["floor_holder"] = json!("h".repeat(513));
+    let refused = read(&calls, input).await.unwrap_err();
+    assert_eq!(kind_of(&refused), ("BAD_REQUEST", false, "ValueError"));
+    assert!(refused.message.contains("512"), "{}", refused.message);
+    let mut latest = holding(&wf, "");
+    latest.as_object_mut().unwrap().remove("after_token");
+    latest["latest_only"] = json!(true);
+    let refused = read(&calls, latest).await.unwrap_err();
+    assert_eq!(kind_of(&refused), ("BAD_REQUEST", false, "ValueError"));
+    assert!(refused.message.contains("floor"), "{}", refused.message);
 }
