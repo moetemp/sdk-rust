@@ -40,6 +40,10 @@ relevant information.
   requests.
 * Experimental: the C bridge has `temporal_core_stream_store_new`, `_call` and `_free` for the
   stream service, built with the Redis store.
+* Experimental: `Success.heartbeat_task` on a workflow activation completion asks Core to
+  complete the workflow task now while local activities run, as at a local activity heartbeat.
+  The task carries the commands and markers so far and asks for a new task. Core ignores the
+  flag while replaying, since lang sets it from a count or a clock.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

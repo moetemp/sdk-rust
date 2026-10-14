@@ -1444,6 +1444,7 @@ fn validate_completion(
                 commands,
                 used_flags: success.used_internal_flags,
                 versioning_behavior: success.versioning_behavior.try_into().unwrap_or_default(),
+                heartbeat_task: success.heartbeat_task,
             })
         }
         Some(workflow_activation_completion::Status::Failed(failure)) => {
@@ -1468,6 +1469,7 @@ enum ValidatedCompletion {
         commands: Vec<WFCommand>,
         used_flags: Vec<u32>,
         versioning_behavior: VersioningBehavior,
+        heartbeat_task: bool,
     },
     Fail {
         run_id: String,
