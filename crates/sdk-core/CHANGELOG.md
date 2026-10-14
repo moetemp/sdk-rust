@@ -76,6 +76,11 @@ relevant information.
   server's `PollStreamNotifier` long poll, for a client reader whose read armed the stream. It
   returns when the notifier's counter passes the read's `wake_after`, when the stream closed, or
   with `timed_out` at the server's wait limit. The reader then reads again with `arm`.
+* Experimental: a stream wake for one of a Workflow's readers reaches lang as a
+  `ResolveStreamWake` job, at most one per subscription per workflow task, folded from the
+  `stream_wakes` on the task's scheduled events. Replay delivers the same jobs in the same
+  activations. A task scheduled with wakes ends a workflow task heartbeat chain, so it keeps an
+  activation of its own on replay.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

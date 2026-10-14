@@ -2,6 +2,7 @@ mod activity_tasks;
 mod event_groups;
 mod queries;
 mod replay_flag;
+mod stream_wakes;
 mod updates;
 mod workers;
 mod workflow_cancels;

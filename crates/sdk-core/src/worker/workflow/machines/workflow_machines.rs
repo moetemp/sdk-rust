@@ -59,7 +59,8 @@ use temporalio_common::{
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
             workflow_activation::{
-                self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
+                self, NotifyHasPatch, ResolveStreamWake, UpdateRandomSeed, WorkflowActivation,
+                workflow_activation_job,
             },
             workflow_commands::ContinueAsNewWorkflowExecution,
         },
@@ -70,6 +71,7 @@ use temporalio_common::{
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
+            stream::v1::StreamWake,
         },
     },
     worker::WorkerDeploymentVersion,
@@ -88,6 +90,10 @@ pub(crate) struct WorkflowMachines {
     last_history_from_server: HistoryUpdate,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
+    /// Stream wakes read from the scheduled events of the task being applied, one per
+    /// subscription. A failed task's scheduled event and its retry's are applied together, and
+    /// the server clears what it put on the first, so both count.
+    pending_stream_wakes: Vec<StreamWake>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
     /// The event id of the next workflow task started event that the machines need to process.
@@ -272,6 +278,7 @@ impl WorkflowMachines {
         Self {
             last_history_from_server: basics.history,
             protocol_msgs: vec![],
+            pending_stream_wakes: vec![],
             workflow_id: basics.workflow_id,
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
@@ -483,6 +490,27 @@ impl WorkflowMachines {
                 .to_owned(),
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
+        }
+    }
+
+    /// Hands lang one job per subscription for the wakes folded from this task's scheduled
+    /// events. The wakes come from History, so replay hands lang the same jobs at the same point.
+    fn deliver_stream_wakes(&mut self) {
+        for wake in std::mem::take(&mut self.pending_stream_wakes) {
+            self.drive_me.send_job(
+                workflow_activation_job::Variant::ResolveStreamWake(ResolveStreamWake {
+                    subscription_id: wake.subscription_id,
+                    position: wake.position,
+                    counter: wake.counter,
+                    metadata: wake.metadata,
+                    recheck: wake.recheck,
+                    closed: wake.closed,
+                    close_result: wake.close_result,
+                    close_failure: wake.close_failure,
+                    resubscribe: wake.resubscribe,
+                })
+                .into(),
+            );
         }
     }
 
@@ -759,6 +787,7 @@ impl WorkflowMachines {
             }
             self.last_processed_event = eid;
         }
+        self.deliver_stream_wakes();
 
         // Needed to delay mutation of self until after we've iterated over peeked events.
         #[allow(clippy::large_enum_variant)]
@@ -1035,6 +1064,14 @@ impl WorkflowMachines {
                 }
             }
             Ok(EventType::WorkflowTaskScheduled) => {
+                if let Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(
+                    ref attrs,
+                )) = event_dat.event.attributes
+                {
+                    for wake in &attrs.stream_wakes {
+                        fold_stream_wake(&mut self.pending_stream_wakes, wake);
+                    }
+                }
                 let wf_task_sm = WorkflowTaskMachine::new(self.next_started_event_id);
                 let key = self.all_machines.insert(wf_task_sm.into());
                 self.submachine_handle_event(key, event_dat)?;
@@ -1860,4 +1897,94 @@ enum CommandIdKind {
     CoreInternal,
     /// A command which is fire-and-forget (ex: Upsert search attribs)
     NeverResolves,
+}
+
+/// Keeps one wake per subscription, in order of first appearance. The highest counter keeps its
+/// position and metadata. A recheck, a close or a resubscribe on any of the folded wakes stays,
+/// since each one asks the reader to act whatever the counter.
+fn fold_stream_wake(folded: &mut Vec<StreamWake>, wake: &StreamWake) {
+    let Some(held) = folded
+        .iter_mut()
+        .find(|held| held.subscription_id == wake.subscription_id)
+    else {
+        folded.push(wake.clone());
+        return;
+    };
+    if wake.counter > held.counter {
+        held.counter = wake.counter;
+        held.position = wake.position.clone();
+        held.metadata = wake.metadata.clone();
+    }
+    held.recheck |= wake.recheck;
+    held.resubscribe |= wake.resubscribe;
+    if wake.closed && !held.closed {
+        held.closed = true;
+        held.close_result = wake.close_result.clone();
+        held.close_failure = wake.close_failure.clone();
+    }
+}
+
+#[cfg(test)]
+mod stream_wake_tests {
+    use super::fold_stream_wake;
+    use temporalio_common::protos::temporal::api::{common::v1::Payload, stream::v1::StreamWake};
+
+    fn wake(subscription_id: &str, counter: i64, position: &str) -> StreamWake {
+        StreamWake {
+            subscription_id: subscription_id.to_string(),
+            position: position.to_string(),
+            counter,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_highest_counter_per_subscription_is_kept_in_first_seen_order() {
+        let mut folded = vec![];
+        for w in [
+            wake("b", 2, "a"),
+            wake("a", 1, "b"),
+            wake("b", 4, "c"),
+            wake("b", 3, "d"),
+            wake("a", 1, "e"),
+        ] {
+            fold_stream_wake(&mut folded, &w);
+        }
+        assert_eq!(folded, vec![wake("b", 4, "c"), wake("a", 1, "b")]);
+    }
+
+    #[test]
+    fn a_recheck_a_close_or_a_resubscribe_survives_a_higher_counter() {
+        let result = Payload {
+            data: b"done".to_vec(),
+            ..Default::default()
+        };
+        let mut folded = vec![];
+        fold_stream_wake(
+            &mut folded,
+            &StreamWake {
+                recheck: true,
+                closed: true,
+                close_result: Some(result.clone()),
+                ..wake("a", 5, "closed")
+            },
+        );
+        fold_stream_wake(
+            &mut folded,
+            &StreamWake {
+                resubscribe: true,
+                ..wake("a", 7, "later")
+            },
+        );
+        assert_eq!(
+            folded,
+            vec![StreamWake {
+                recheck: true,
+                closed: true,
+                close_result: Some(result),
+                resubscribe: true,
+                ..wake("a", 7, "later")
+            }]
+        );
+    }
 }

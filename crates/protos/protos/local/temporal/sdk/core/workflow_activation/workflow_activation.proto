@@ -140,6 +140,9 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // A stream that one of the Workflow's readers subscribed to moved or closed. Numbers 17
+        // and 18 are left to the external stream replay job and to Nexus operation progress.
+        ResolveStreamWake resolve_stream_wake = 19;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
@@ -382,6 +385,34 @@ message ResolveNexusOperation {
     // Sequence number as provided by lang in the corresponding ScheduleNexusOperation command
     uint32 seq = 1;
     nexus.NexusOperationResult result = 2;
+}
+
+// A wake for one of the Workflow's stream readers, as the server folded it onto this Workflow
+// Task's scheduled event.
+//
+// Core issues at most one per subscription per Workflow Task, in the task's first activation. It
+// comes from History, so replay issues the same job at the same point. A wake says that the
+// stream moved, not what it holds, so the reader reads the stream itself.
+message ResolveStreamWake {
+    // The subscription id the reader subscribed with.
+    string subscription_id = 1;
+    // The position that came with `counter`, in the producer's terms.
+    string position = 2;
+    // The highest counter the stream's notifier has seen. The reader reads when it is above the
+    // `wake_after` of the read that armed the stream.
+    int64 counter = 3;
+    // The metadata that came with `counter`.
+    map<string, string> metadata = 4;
+    // The notifier asks the reader to read again whatever the counter, after a quiet period.
+    bool recheck = 5;
+    // The stream closed. The reader reads to its end, then sees the outcome.
+    bool closed = 6;
+    // The result the stream closed with, when it gave one.
+    temporal.api.common.v1.Payload close_result = 7;
+    // The failure the stream closed with, when it closed with one.
+    temporal.api.failure.v1.Failure close_failure = 8;
+    // The notifier dropped the subscription. The reader subscribes again.
+    bool resubscribe = 9;
 }
 
 message RemoveFromCache {

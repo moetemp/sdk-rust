@@ -1254,6 +1254,9 @@ pub mod coresdk {
                         workflow_activation_job::Variant::ResolveNexusOperation(_) => {
                             write!(f, "ResolveNexusOperation")
                         }
+                        workflow_activation_job::Variant::ResolveStreamWake(w) => {
+                            write!(f, "ResolveStreamWake({}, {})", w.subscription_id, w.counter)
+                        }
                     }
                 }
             }
