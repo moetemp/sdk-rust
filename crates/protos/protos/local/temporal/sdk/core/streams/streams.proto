@@ -255,6 +255,10 @@ message SubscribeRequest {
   // Names the reader in its run. Lang derives it from the reader's call number, so replay gives
   // the same one. At most 256 bytes.
   string subscription_id = 4;
+  // Counts the times the reader subscribed again after a wake with `resubscribe`. Each value is a
+  // new attach, since the server answers a repeat of a dropped attach as done. Lang counts it from
+  // the wakes, so replay gives the same one.
+  uint32 generation = 5;
 }
 
 message SubscribeResponse {
@@ -265,10 +269,12 @@ message SubscribeResponse {
 }
 
 message UnsubscribeRequest {
-  // The stream, the reader's run and the subscription, as the Subscribe named them.
+  // The stream, the reader's run, the subscription and its generation, as the last Subscribe
+  // named them.
   StreamAddress stream = 1;
   string run_id = 2;
   string subscription_id = 3;
+  uint32 generation = 4;
 }
 
 message UnsubscribeResponse {}
