@@ -142,16 +142,16 @@ pub trait StreamStore: Send + Sync {
 
     /// Like [StreamStore::close_topic], with the close's outcome and who closed it. A store that
     /// keeps the outcome keeps the topic's first close only, and a read of the closed topic
-    /// answers it. A store that keeps none keeps the default, but a wrapper that tells the
-    /// stream's notifier still needs the outcome.
+    /// answers it. Answers the close the store keeps, so a wrapper tells the stream's notifier the
+    /// same close a reader sees. A store that keeps none answers `close`.
     async fn close_topic_with(
         &self,
         chain: &ChainId,
         topic: &str,
         close: StoredClose,
-    ) -> StreamResult<()> {
-        let _ = close;
-        self.close_topic(chain, topic).await
+    ) -> StreamResult<StoredClose> {
+        self.close_topic(chain, topic).await?;
+        Ok(close)
     }
 
     /// Drops the newest-batch record [StreamStore::append] keeps for one producer attempt on a
@@ -181,7 +181,7 @@ pub trait StreamStore: Send + Sync {
         topic: &str,
         close: StoredClose,
     ) -> StreamResult<()> {
-        self.close_topic_with(chain, topic, close).await
+        self.close_topic_with(chain, topic, close).await.map(drop)
     }
 
     /// Waits until the notifications this store sent are out. A store that sends none returns at

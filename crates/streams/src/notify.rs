@@ -887,6 +887,7 @@ impl StreamStore for NotifyingStore {
     async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()> {
         self.close_topic_with(chain, topic, StoredClose::default())
             .await
+            .map(drop)
     }
 
     async fn close_topic_with(
@@ -894,11 +895,10 @@ impl StreamStore for NotifyingStore {
         chain: &ChainId,
         topic: &str,
         close: StoredClose,
-    ) -> StreamResult<()> {
-        let outcome = CloseOutcome::of(&close);
-        self.inner.close_topic_with(chain, topic, close).await?;
-        self.close_notifier_in_background(chain, topic, outcome);
-        Ok(())
+    ) -> StreamResult<StoredClose> {
+        let stored = self.inner.close_topic_with(chain, topic, close).await?;
+        self.close_notifier_in_background(chain, topic, CloseOutcome::of(&stored));
+        Ok(stored)
     }
 
     async fn retire_producer(
@@ -923,8 +923,10 @@ impl StreamStore for NotifyingStore {
         topic: &str,
         close: StoredClose,
     ) -> StreamResult<()> {
-        let outcome = CloseOutcome::of(&close);
-        self.inner.close_topic_with(chain, topic, close).await?;
+        // A later close, such as a rerun's, tells the notifier the first close, as a reader
+        // that ends from the store sees it.
+        let stored = self.inner.close_topic_with(chain, topic, close).await?;
+        let outcome = CloseOutcome::of(&stored);
         let closed = match close_position(self.inner.as_ref(), chain, topic).await {
             Ok((cursor, counter)) => {
                 self.notifier
@@ -1500,6 +1502,32 @@ mod tests {
             "the store refused appends before the notifier heard the close"
         );
         assert!(store.notifier().slots.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_second_close_tells_the_notifier_the_first() {
+        // A rerun that closes again must not give waiters another outcome than readers get.
+        let (client, store) = sees_the_store(None);
+        let run = chain("run-1");
+        store
+            .close_stream(&run, "t", CloseOutcome::Result(summary()).into())
+            .await
+            .unwrap();
+        store
+            .close_stream(&run, "t", CloseOutcome::Failure(gave_up()).into())
+            .await
+            .unwrap();
+        store
+            .close_topic_with(&run, "t", CloseOutcome::Failure(gave_up()).into())
+            .await
+            .unwrap();
+        store.flush_notifications().await;
+        let sent = client.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 3);
+        assert!(
+            sent.iter()
+                .all(|close| close.close_result() == Some(summary()))
+        );
     }
 
     #[tokio::test]

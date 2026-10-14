@@ -91,8 +91,10 @@ relevant information.
   `close_result`, `close_failure` and `closed_by`, so a reader that reaches the end before a
   close wake still sees the outcome. A chain close, when the owner ended, keeps none. A CLOSED
   append refusal names the close's `closed_by` in `StreamFailure.closed_by`. The Redis store
-  keeps it in the topic's meta as `close`, set only once by the close script.
-  `StreamStore::close_topic_with` and `close_stream` take a `StoredClose`.
+  keeps it in the topic's meta as `close`, set only once by the close script. A later close
+  tells the stream's notifier that first close too, not its own.
+  `StreamStore::close_topic_with` and `close_stream` take a `StoredClose`, and
+  `close_topic_with` answers the close the store keeps.
 * Experimental: the stream service's `RetireProducer` call drops one producer attempt's dedupe
   state on a stream, which the Redis store keeps as one field of the topic's meta hash until
   retention. A producer that writes once per short-lived attempt calls it after the attempt's
