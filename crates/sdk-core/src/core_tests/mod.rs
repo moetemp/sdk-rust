@@ -1,5 +1,7 @@
 mod activity_tasks;
 mod event_groups;
+#[cfg(feature = "streams")]
+mod external_streams;
 mod nexus_progress;
 mod queries;
 mod replay_flag;
