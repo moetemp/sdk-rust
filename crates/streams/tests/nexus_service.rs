@@ -1264,3 +1264,42 @@ async fn a_range_names_a_chain_of_the_workflow_and_a_count_a_read_can_answer() {
         assert_eq!(kind_of(&refused), ("BAD_REQUEST", false, "ValueError"));
     }
 }
+
+/// A reader's first range starts at the stream's start, so it has no cursor to find gone. Once
+/// its hold lapsed and retention trimmed the range, later records stand where it began.
+#[cfg(feature = "redis")]
+#[tokio::test]
+async fn a_range_from_a_trimmed_start_is_lost_on_redis() {
+    let Ok(url) = std::env::var("STREAMS_REDIS_URL") else {
+        eprintln!("set STREAMS_REDIS_URL to run the Redis cases");
+        return;
+    };
+    let mut options = temporalio_streams::RedisStoreOptions::new(url);
+    options.key_prefix = workflow();
+    options.retention = Duration::from_millis(300);
+    options.floor_lease = Some(Duration::from_millis(100));
+    let store = Arc::new(
+        temporalio_streams::RedisStore::connect(options)
+            .await
+            .unwrap(),
+    );
+    let calls = service(store, NexusOptions::default());
+    let wf = workflow();
+    let answer = held_read(&calls, &wf).await;
+    assert_eq!(answer["replay"]["after_token"], "");
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    write(&calls, &wf, 3, &["three"]).await;
+    write(&calls, &wf, 4, &["four"]).await;
+    let refused = read_range(
+        &calls,
+        replay_input(stream(&wf, TOPIC), &answer, Value::Null),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        kind_of(&refused),
+        ("BAD_REQUEST", false, "StreamReplayRangeLostError"),
+        "{}",
+        refused.message
+    );
+}
