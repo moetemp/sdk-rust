@@ -17979,6 +17979,33 @@
       "default": "NEXUS_OPERATION_ID_REUSE_POLICY_UNSPECIFIED",
       "description": "Defines whether to allow re-using an operation ID from a previously *closed* Nexus operation.\nIf the request is denied, the server returns a `NexusOperationAlreadyStarted` error.\n\nSee `NexusOperationIdConflictPolicy` for handling ID duplication with a *running* operation.\n\n - NEXUS_OPERATION_ID_REUSE_POLICY_ALLOW_DUPLICATE: Always allow starting an operation using the same operation ID.\n - NEXUS_OPERATION_ID_REUSE_POLICY_ALLOW_DUPLICATE_FAILED_ONLY: Allow starting an operation using the same ID only when the last operation's final state is one\nof {failed, canceled, terminated, timed out}.\n - NEXUS_OPERATION_ID_REUSE_POLICY_REJECT_DUPLICATE: Do not permit re-use of the ID for this operation. Future start requests could potentially change the policy,\nallowing re-use of the ID."
     },
+    "v1NexusOperationProgress": {
+      "type": "object",
+      "properties": {
+        "scheduledEventId": {
+          "type": "string",
+          "format": "int64",
+          "description": "The event ID of the `NEXUS_OPERATION_SCHEDULED` event of the caller Workflow's operation."
+        },
+        "position": {
+          "type": "string",
+          "description": "Where the operation's output stands after the change this progress reports, in the\nhandler's terms, such as a stream cursor. Opaque to the server, which rejects a position\nlonger than 1 KiB of UTF-8."
+        },
+        "counter": {
+          "type": "string",
+          "format": "int64",
+          "description": "Orders the progress of one operation. Among progress folded together, the highest counter\nis kept. Must be positive."
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Small details for the caller. The server rejects progress whose metadata keys and values\nexceed 2 KiB in total, counted as UTF-8 bytes."
+        }
+      },
+      "description": "Non-terminal progress of an asynchronous Nexus operation, delivered to the operation's callback\nwith the `running` state before its completion.\n\nProgress says that the operation's output moved, not what the output is: the receiver reads the\noutput itself, starting from `position`. Deliveries may arrive out of order or be dropped, so a\nreceiver keeps the one with the highest `counter` and drops any lower one."
+    },
     "v1NexusOperationScheduledEventAttributes": {
       "type": "object",
       "properties": {
@@ -22666,6 +22693,14 @@
           "type": "integer",
           "format": "int32",
           "title": "Starting at 1, how many attempts there have been to complete this task"
+        },
+        "nexusOperationProgress": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1NexusOperationProgress"
+          },
+          "description": "Progress of the Workflow's Nexus operations that arrived since the previous Workflow Task was\nscheduled, at most one entry per operation: the one with the highest counter. Recorded here\nrather than as events of its own, so a burst of progress costs one task and replay sees the\nsame progress the Workflow saw. Its size is bounded by the Workflow's pending Nexus operation\nlimit times the per-entry bounds on `position` and `metadata`, about 3 KiB per operation, and\nit counts toward the History size limit."
         },
         "streamWakes": {
           "type": "array",

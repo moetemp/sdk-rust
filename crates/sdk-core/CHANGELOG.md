@@ -98,6 +98,12 @@ relevant information.
   retention. A producer that writes once per short-lived attempt calls it after the attempt's
   last append returned, so the meta hash tracks the attempts in flight. Calling it earlier lets a
   retried batch land twice.
+* Experimental: progress of a started Nexus operation reaches lang as a
+  `ResolveNexusOperationProgress` job, at most one per operation per workflow task, with the
+  highest counter the server folded onto the task's scheduled event. Replay delivers the same jobs
+  in the same activations. Progress for an operation that is unknown, not started, already
+  resolved, or below a counter already delivered is dropped. A task scheduled with progress ends
+  a workflow task heartbeat chain, as one with stream wakes does.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

@@ -111,6 +111,28 @@ impl TestHistoryBuilder {
         self.workflow_task_scheduled_event_id = self.add_by_type(EventType::WorkflowTaskScheduled);
     }
 
+    /// Add a workflow task scheduled event with the given attributes, such as both Nexus operation
+    /// progress and stream wakes.
+    pub fn add_workflow_task_scheduled_with(
+        &mut self,
+        attributes: WorkflowTaskScheduledEventAttributes,
+    ) {
+        self.workflow_task_scheduled_event_id = self.add(attributes);
+    }
+
+    /// Add a workflow task scheduled event carrying folded Nexus operation progress.
+    pub fn add_workflow_task_scheduled_with_nexus_progress(
+        &mut self,
+        nexus_operation_progress: Vec<
+            temporalio_common::protos::temporal::api::nexus::v1::NexusOperationProgress,
+        >,
+    ) {
+        self.workflow_task_scheduled_event_id = self.add(WorkflowTaskScheduledEventAttributes {
+            nexus_operation_progress,
+            ..Default::default()
+        });
+    }
+
     /// Add a workflow task scheduled event carrying folded stream wakes.
     pub fn add_workflow_task_scheduled_with_stream_wakes(
         &mut self,

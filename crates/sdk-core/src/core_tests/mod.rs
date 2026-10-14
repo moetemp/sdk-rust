@@ -1,5 +1,6 @@
 mod activity_tasks;
 mod event_groups;
+mod nexus_progress;
 mod queries;
 mod replay_flag;
 mod stream_wakes;

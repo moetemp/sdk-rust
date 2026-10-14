@@ -48,6 +48,32 @@ message Link {
     string type = 2;
 }
 
+// Non-terminal progress of an asynchronous Nexus operation, delivered to the operation's callback
+// with the `running` state before its completion.
+//
+// Progress says that the operation's output moved, not what the output is: the receiver reads the
+// output itself, starting from `position`. Deliveries may arrive out of order or be dropped, so a
+// receiver keeps the one with the highest `counter` and drops any lower one.
+message NexusOperationProgress {
+    // The operation this progress belongs to. A handler leaves it unset, since the callback already
+    // identifies the operation. The server sets it when it hands progress to a caller. A oneof, so
+    // a later case can name an operation that no Workflow schedules, such as a standalone one.
+    oneof operation {
+        // The event ID of the `NEXUS_OPERATION_SCHEDULED` event of the caller Workflow's operation.
+        int64 scheduled_event_id = 1;
+    }
+    // Where the operation's output stands after the change this progress reports, in the
+    // handler's terms, such as a stream cursor. Opaque to the server, which rejects a position
+    // longer than 1 KiB of UTF-8.
+    string position = 2;
+    // Orders the progress of one operation. Among progress folded together, the highest counter
+    // is kept. Must be positive.
+    int64 counter = 3;
+    // Small details for the caller. The server rejects progress whose metadata keys and values
+    // exceed 2 KiB in total, counted as UTF-8 bytes.
+    map<string, string> metadata = 4;
+}
+
 // A request to start an operation.
 message StartOperationRequest {
     // Name of service to start the operation in.

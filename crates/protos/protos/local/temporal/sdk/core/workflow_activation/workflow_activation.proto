@@ -140,8 +140,10 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
-        // A stream that one of the Workflow's readers subscribed to moved or closed. Numbers 17
-        // and 18 are left to the external stream replay job and to Nexus operation progress.
+        // A started nexus operation reported progress. Number 17 is left to the external stream
+        // replay job.
+        ResolveNexusOperationProgress resolve_nexus_operation_progress = 18;
+        // A stream that one of the Workflow's readers subscribed to moved or closed.
         ResolveStreamWake resolve_stream_wake = 19;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
@@ -385,6 +387,24 @@ message ResolveNexusOperation {
     // Sequence number as provided by lang in the corresponding ScheduleNexusOperation command
     uint32 seq = 1;
     nexus.NexusOperationResult result = 2;
+}
+
+// The latest progress of a started Nexus operation, as the server folded it onto this Workflow
+// Task's scheduled event.
+//
+// Core issues at most one per operation per Workflow Task, in the task's first activation, with
+// the highest counter recorded since the previous task. It comes from History, so replay issues
+// the same job at the same point. Progress for an operation that is not started, or that has
+// already resolved, is dropped. A counter only grows across the jobs for one operation.
+message ResolveNexusOperationProgress {
+    // Sequence number as provided by lang in the corresponding ScheduleNexusOperation command
+    uint32 seq = 1;
+    // Where the operation's output stands, in the handler's terms, such as a stream cursor.
+    string position = 2;
+    // Orders the progress of one operation.
+    int64 counter = 3;
+    // Small details from the handler.
+    map<string, string> metadata = 4;
 }
 
 // A wake for one of the Workflow's stream readers, as the server folded it onto this Workflow

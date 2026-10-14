@@ -134,6 +134,8 @@ pub(super) struct SharedState {
     cancel_type: NexusOperationCancellationType,
     operation_token: Option<String>,
     annotations: CommandAnnotations,
+    /// The highest progress counter handed to lang, so a later task never moves it backwards.
+    delivered_progress_counter: i64,
 }
 
 impl NexusOperationMachine {
@@ -156,6 +158,7 @@ impl NexusOperationMachine {
                 cancel_type: attribs.cancellation_type(),
                 operation_token: None,
                 annotations,
+                delivered_progress_counter: 0,
             },
         );
         NewMachineWithCommand {
@@ -181,6 +184,18 @@ impl NexusOperationMachine {
 
     pub(super) fn was_cancelled_before_sent_to_server(&self) -> bool {
         self.shared_state.cancelled_before_sent
+    }
+
+    /// Accepts progress for lang if the operation is started and still unresolved, and the
+    /// counter is higher than any delivered before. Returns lang's sequence number for the job.
+    pub(super) fn accept_progress(&mut self, counter: i64) -> Option<u32> {
+        if !matches!(self.state(), NexusOperationMachineState::Started(_))
+            || counter <= self.shared_state.delivered_progress_counter
+        {
+            return None;
+        }
+        self.shared_state.delivered_progress_counter = counter;
+        Some(self.shared_state.lang_seq_num)
     }
 }
 

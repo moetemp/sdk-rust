@@ -337,6 +337,11 @@ impl WorkflowFuture {
                         .context("Nexus operation must have result")?;
                     push_polled_context!(ActivationJobContext::Passive);
                 }
+                // This SDK has no API for operation progress yet. Progress carries no records,
+                // only a hint to read the operation's output, so dropping it loses nothing.
+                Variant::ResolveNexusOperationProgress(_) => {
+                    push_polled_context!(ActivationJobContext::Passive);
+                }
                 // This SDK has no stream reader yet. A wake carries no records, only a hint to
                 // read the stream, so dropping it loses nothing.
                 Variant::ResolveStreamWake(_) => {

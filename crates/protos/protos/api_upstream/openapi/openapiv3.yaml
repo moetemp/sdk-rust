@@ -14131,6 +14131,37 @@ components:
           type: string
           description: Operation token - may be empty if the operation completed synchronously.
       description: Representation of the Temporal SDK NexusOperationError object that is returned to workflow callers.
+    NexusOperationProgress:
+      type: object
+      properties:
+        scheduledEventId:
+          type: string
+          description: The event ID of the `NEXUS_OPERATION_SCHEDULED` event of the caller Workflow's operation.
+        position:
+          type: string
+          description: |-
+            Where the operation's output stands after the change this progress reports, in the
+             handler's terms, such as a stream cursor. Opaque to the server, which rejects a position
+             longer than 1 KiB of UTF-8.
+        counter:
+          type: string
+          description: |-
+            Orders the progress of one operation. Among progress folded together, the highest counter
+             is kept. Must be positive.
+        metadata:
+          type: object
+          additionalProperties:
+            type: string
+          description: |-
+            Small details for the caller. The server rejects progress whose metadata keys and values
+             exceed 2 KiB in total, counted as UTF-8 bytes.
+      description: |-
+        Non-terminal progress of an asynchronous Nexus operation, delivered to the operation's callback
+         with the `running` state before its completion.
+
+         Progress says that the operation's output moved, not what the output is: the receiver reads the
+         output itself, starting from `position`. Deliveries may arrive out of order or be dropped, so a
+         receiver keeps the one with the highest `counter` and drops any lower one.
     NexusOperationScheduledEventAttributes:
       type: object
       properties:
@@ -21303,6 +21334,17 @@ components:
           type: integer
           description: Starting at 1, how many attempts there have been to complete this task
           format: int32
+        nexusOperationProgress:
+          type: array
+          items:
+            $ref: '#/components/schemas/NexusOperationProgress'
+          description: |-
+            Progress of the Workflow's Nexus operations that arrived since the previous Workflow Task was
+             scheduled, at most one entry per operation: the one with the highest counter. Recorded here
+             rather than as events of its own, so a burst of progress costs one task and replay sees the
+             same progress the Workflow saw. Its size is bounded by the Workflow's pending Nexus operation
+             limit times the per-entry bounds on `position` and `metadata`, about 3 KiB per operation, and
+             it counts toward the History size limit.
         streamWakes:
           type: array
           items:
