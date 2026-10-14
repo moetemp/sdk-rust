@@ -189,7 +189,7 @@ async fn a_batch_is_one_script_and_keeps_one_high_water_field() {
 
 #[tokio::test]
 async fn appends_answer_as_the_python_sdk_recorded() {
-    // The outcomes D1b's script gave the Python provider, run again through the Core store.
+    // The outcomes the Python provider's script gave, run again through the Core store.
     let Some(mut setup) = setup().await else {
         return;
     };
