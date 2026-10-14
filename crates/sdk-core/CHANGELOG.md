@@ -53,6 +53,9 @@ relevant information.
   1 per attempt. Replay appends nothing. A store that refuses the append fails the Workflow Task.
   Once the server accepts a task, Core retires the dedupe sessions of the run's earlier attempts.
   The C bridge's worker options take the process's stream store as `stream_store`.
+* Experimental: a read reports `SUPERSEDED` for a Workflow producer (`@<run id>`) only when its
+  attempt keeps the high bits (the same task) and raises the low 16 bits (a rerun). A higher
+  prefix is the next task and reads with no supersession.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

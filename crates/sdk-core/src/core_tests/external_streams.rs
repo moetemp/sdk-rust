@@ -658,6 +658,11 @@ async fn the_next_task_moves_the_prefix_and_starts_the_sequence_again() {
         [(TOPIC.to_string(), producer, 1)],
         "the second task's completion retires the first task's session, and keeps its own"
     );
+    assert_eq!(
+        store.read(TOPIC).await,
+        ["encrypted a", "encrypted b", "encrypted c"],
+        "a later task goes on with no supersession, and a heartbeat task is a task like any"
+    );
 }
 
 /// Replays the first task of `history`, then commits `["c"]` live in the task after it, and
