@@ -43,6 +43,12 @@ service StreamService {
   // wait limit (`streamnotifier.pollMaxWait`). The reader then reads again with `arm`. After the
   // wait limit, that read finds records whose notification was lost, or arms again.
   rpc WaitForNotification(WaitForNotificationRequest) returns (WaitForNotificationResponse);
+  // Reads again the exact range an earlier read answered, for a positions-only Workflow reader on
+  // replay, and checks it against that read's digest. Waits for nothing and checks no owner.
+  rpc ReadRange(ReadRangeRequest) returns (ReadResponse);
+  // Ends a positions-only reader's hold on a stream's records after a grace, so retention takes
+  // them again.
+  rpc ReleaseFloor(ReleaseFloorRequest) returns (ReleaseFloorResponse);
 }
 
 // Which store holds a process's streams, and how to reach it. Lang builds one store from it and
@@ -83,6 +89,11 @@ message RedisStoreConfig {
   uint32 blocking_reads_per_node = 5;
   // How long a short call waits for its reply. Unset uses the default.
   google.protobuf.Duration response_timeout = 6;
+  // How long a positions-only reader holds a stream's records after its last read. Unset uses
+  // `retention`.
+  google.protobuf.Duration floor_lease = 7;
+  // How long a hold lasts after its reader released it. Unset keeps one day.
+  google.protobuf.Duration floor_release_grace = 8;
 }
 
 // Streams in this process's memory, for tests and local development. Nothing survives the
@@ -183,6 +194,10 @@ message ReadRequest {
   // finds nothing, the store arms the stream in the same step, so the next append notifies the
   // notifier. A reader that doesn't wait on the notifier leaves it unset.
   bool arm = 6;
+  // For a positions-only Workflow reader: names the reader, as its run id and its subscription
+  // id. The store holds the records after this read's start against retention for that holder,
+  // until `ReleaseFloor` and its grace, or until the holder's lease passes with no read.
+  string floor_holder = 7;
 }
 
 // A later attempt of a producer started writing. Readers synthesize it, and no store holds it.
@@ -231,7 +246,42 @@ message ReadResponse {
   temporal.api.failure.v1.Failure close_failure = 8;
   // Set with `done` to the `closed_by` of the topic's first close.
   string closed_by = 9;
+  // SHA-256 over the answer's records, as `ReadRange` checks it: per record its cursor, its stale
+  // flag, and for a stored record its kind, producer, attempt, sequence and plaintext content
+  // hash, or for a supersession its producer and both attempts. It leaves out the encoded body.
+  bytes records_digest = 10;
+  // The first run of the chain the read read. `ReadRange` takes it, so replay needs no describe.
+  string chain_first_run_id = 11;
+  // The cursor this answer reads strictly after, with `$end` resolved. With `cursor`, it is the
+  // range `ReadRange` reads again.
+  string start_cursor = 12;
 }
+
+message ReadRangeRequest {
+  // The stream, as the read named it.
+  StreamAddress stream = 1;
+  // The read's `chain_first_run_id`.
+  string chain_first_run_id = 2;
+  // The read's `start_cursor` and its answer's `cursor`.
+  string after = 3;
+  string to = 4;
+  // How many stored records the answer held, not counting supersessions.
+  uint32 stored_records = 5;
+  // The read's input `state`.
+  bytes state = 6;
+  // The answer's `records_digest`.
+  bytes records_digest = 7;
+  // As in `ReadRequest`, so a replay holds the records for its own run.
+  string floor_holder = 8;
+}
+
+message ReleaseFloorRequest {
+  StreamAddress stream = 1;
+  string chain_first_run_id = 2;
+  string floor_holder = 3;
+}
+
+message ReleaseFloorResponse {}
 
 message LatestRequest {
   StreamAddress stream = 1;
@@ -383,6 +433,12 @@ enum StreamFailureKind {
   // the same call fails the same way. The Nexus calls answer it, as BAD_REQUEST. A lang built
   // before this kind maps it, as any kind it doesn't know, to a storage failure.
   STREAM_FAILURE_KIND_INVALID_ARGUMENT = 12;
+  // A replay read found other records than the read it repeats: other content, another count
+  // or another end. Lang reports it as nondeterminism.
+  STREAM_FAILURE_KIND_REPLAY_MISMATCH = 13;
+  // A replay read found that the store no longer holds the range the read it repeats got
+  // (REC-01), such as records that retention trimmed or a deleted log.
+  STREAM_FAILURE_KIND_REPLAY_RANGE_LOST = 14;
 }
 
 message StreamFailure {

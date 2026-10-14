@@ -1679,3 +1679,236 @@ async fn the_arm_lives_in_the_topics_meta() {
     assert!(!fields.contains_key("arm"), "{fields:?}");
     assert_eq!(fields.get("arm_seq").map(String::as_str), Some("1"));
 }
+
+async fn floored(lease: Duration, release_grace: Duration) -> Option<Setup> {
+    let url = url()?;
+    Some(
+        setup_with(&url, &url, &unique("floor"), |options| {
+            options.retention = Duration::from_millis(200);
+            options.floor_lease = Some(lease);
+            options.floor_release_grace = release_grace;
+        })
+        .await,
+    )
+}
+
+async fn sequences(setup: &mut Setup, chain: &ChainId) -> Vec<i64> {
+    let log = log_key(&setup.prefix, chain, "events");
+    let entries: Vec<(String, HashMap<String, Vec<u8>>)> =
+        setup.raw.xrange_all(&log).await.unwrap();
+    entries
+        .iter()
+        .map(|(_, fields)| StreamRecord::decode(&*fields["r"]).unwrap().sequence)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_floor_keeps_records_past_retention_until_its_release_grace_ends() {
+    let Some(mut setup) = floored(Duration::from_secs(60), Duration::from_millis(300)).await else {
+        return;
+    };
+    let chain = chain();
+    let first = setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    setup
+        .store
+        .append(append(&chain, "p", 2, 1, b"\x02"))
+        .await
+        .unwrap();
+    setup
+        .store
+        .hold_floor(&chain, "events", "reader-run/1", &first.first_position)
+        .await
+        .unwrap();
+    let log = log_key(&setup.prefix, &chain, "events");
+    let ttl: i64 = setup.raw.pttl(&log).await.unwrap();
+    assert!(ttl > 50_000, "the hold keeps the log for its lease: {ttl}");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    setup
+        .store
+        .append(append(&chain, "p", 3, 1, b"\x03"))
+        .await
+        .unwrap();
+    assert_eq!(
+        sequences(&mut setup, &chain).await,
+        [1, 2, 3],
+        "the floor holds the records retention would have trimmed"
+    );
+    let ttl: i64 = setup.raw.pttl(&log).await.unwrap();
+    assert!(
+        ttl > 50_000,
+        "an append keeps the log for the lease too: {ttl}"
+    );
+    setup
+        .store
+        .release_floor(&chain, "events", "reader-run/1")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    setup
+        .store
+        .append(append(&chain, "p", 4, 1, b"\x04"))
+        .await
+        .unwrap();
+    assert_eq!(
+        sequences(&mut setup, &chain).await,
+        [4],
+        "once the release grace ended, retention trims again"
+    );
+    let floors = format!("{log}:floors");
+    let left: HashMap<String, String> = setup.raw.hgetall(&floors).await.unwrap();
+    assert!(
+        left.is_empty(),
+        "the append dropped the ended hold: {left:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_hold_keeps_the_lowest_position_and_a_lapsed_lease_lets_retention_trim() {
+    let Some(mut setup) = floored(Duration::from_millis(300), Duration::from_secs(60)).await else {
+        return;
+    };
+    let chain = chain();
+    let first = setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let second = setup
+        .store
+        .append(append(&chain, "p", 2, 1, b"\x02"))
+        .await
+        .unwrap();
+    for position in [&first.first_position, &second.first_position] {
+        setup
+            .store
+            .hold_floor(&chain, "events", "reader-run/1", position)
+            .await
+            .unwrap();
+    }
+    let floors = format!("{}:floors", log_key(&setup.prefix, &chain, "events"));
+    let held: HashMap<String, String> = setup.raw.hgetall(&floors).await.unwrap();
+    assert!(
+        held["reader-run/1"].starts_with(&format!("{}|", first.first_position)),
+        "{held:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    setup
+        .store
+        .append(append(&chain, "p", 3, 1, b"\x03"))
+        .await
+        .unwrap();
+    assert_eq!(sequences(&mut setup, &chain).await, [3]);
+}
+
+#[tokio::test]
+async fn a_hold_from_the_beginning_keeps_the_whole_topic() {
+    let Some(mut setup) = floored(Duration::from_secs(60), Duration::from_secs(60)).await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    setup
+        .store
+        .hold_floor(&chain, "events", "reader-run/1", "")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    setup
+        .store
+        .append(append(&chain, "p", 2, 1, b"\x02"))
+        .await
+        .unwrap();
+    assert_eq!(sequences(&mut setup, &chain).await, [1, 2]);
+}
+
+#[tokio::test]
+async fn a_replay_read_on_redis_repeats_the_read_and_survives_retention_under_a_floor() {
+    use sha2::{Digest, Sha256};
+    use temporalio_common::protos::temporal::api::{
+        common::v1::Payload, enums::v1::WorkflowExecutionStatus,
+    };
+    use temporalio_streams::{
+        Streams, StreamsOptions,
+        proto::{
+            AppendRecord, AppendRequest, NamedProducer, ReadRangeRequest, ReadRequest,
+            StreamAddress, StreamOwnerKind, StreamRecordKind, append_request::Producer,
+        },
+    };
+    let Some(url) = url() else {
+        return;
+    };
+    let prefix = unique("replay");
+    let mut options = RedisStoreOptions::new(url.clone());
+    options.key_prefix = prefix.clone();
+    options.retention = Duration::from_millis(200);
+    options.floor_lease = Some(Duration::from_secs(60));
+    let streams = Streams::new(
+        Arc::new(RedisStore::connect(options).await.unwrap()),
+        Arc::new(OneOwner {
+            status: std::sync::Mutex::new(WorkflowExecutionStatus::Running),
+        }),
+        StreamsOptions::default(),
+    );
+    let chain = chain();
+    let stream = StreamAddress {
+        namespace: chain.namespace.clone(),
+        owner_kind: StreamOwnerKind::Workflow as i32,
+        workflow_id: chain.workflow_id.clone(),
+        run_id: String::new(),
+        topic: "events".to_string(),
+    };
+    let append = |attempt: i64, sequence: i64, value: &str| AppendRequest {
+        stream: Some(stream.clone()),
+        producer: Some(Producer::Named(NamedProducer {
+            producer_id: "p".to_string(),
+            attempt,
+        })),
+        sequence,
+        records: vec![AppendRecord {
+            kind: StreamRecordKind::Data as i32,
+            body: Some(Payload {
+                data: value.as_bytes().to_vec(),
+                ..Default::default()
+            }),
+            content_hash: Sha256::digest(value.as_bytes()).to_vec(),
+        }],
+        digest: Sha256::digest(value.as_bytes()).to_vec(),
+    };
+    let first = streams.append(append(1, 1, "1")).await.unwrap();
+    streams.append(append(1, 2, "2")).await.unwrap();
+    streams.append(append(2, 1, "3")).await.unwrap();
+    let request = ReadRequest {
+        stream: Some(stream.clone()),
+        after: first.last_cursor.clone(),
+        floor_holder: "reader-run/1".to_string(),
+        ..Default::default()
+    };
+    let page = streams.read(request.clone()).await.unwrap();
+    assert_eq!(page.records.len(), 3, "two records and a supersession");
+    // Past the retention, an append's trim would drop the range without the floor.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    streams.append(append(2, 2, "4")).await.unwrap();
+    let replayed = streams
+        .read_range(ReadRangeRequest {
+            stream: Some(stream.clone()),
+            chain_first_run_id: page.chain_first_run_id.clone(),
+            after: page.start_cursor.clone(),
+            to: page.cursor.clone(),
+            stored_records: 2,
+            state: request.state.clone(),
+            records_digest: page.records_digest.clone(),
+            floor_holder: "reader-run/1".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(replayed.records, page.records);
+    assert_eq!(replayed.records_digest, page.records_digest);
+}
