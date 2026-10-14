@@ -37,7 +37,7 @@ pub use record::{
     WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, stored_append_record,
 };
 pub use service::StreamService;
-pub use store::{CloseOutcome, StreamStore, empty_close_result};
+pub use store::{CloseOutcome, NewestOrArm, StreamStore, empty_close_result};
 
 /// The protos stores and lang exchange.
 pub mod proto {

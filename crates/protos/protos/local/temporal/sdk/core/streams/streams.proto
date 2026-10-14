@@ -292,6 +292,9 @@ message StoreAppendRequest {
 message StoreAppendResponse {
   string first_position = 1;
   string last_position = 2;
+  // The topic's arm generation as the append found it, zero when no reader armed the topic.
+  // Unset when the store can't tell, and Core then notifies after the append.
+  optional uint64 arm = 3;
 }
 
 message StoreReadRequest {
@@ -301,6 +304,9 @@ message StoreReadRequest {
   string after_position = 3;
   google.protobuf.Duration wait = 4;
   uint32 max_records = 5;
+  // When the read ends with no record and the topic is open, arm the topic in the same step that
+  // finds it empty, so the next append reports the arm. A store that can't arm ignores it.
+  bool arm = 6;
 }
 
 message StoredRecord {
@@ -313,6 +319,9 @@ message StoreReadResponse {
   repeated StoredRecord records = 1;
   // The chain or this topic is marked closed.
   bool closed = 2;
+  // The read asked to arm, found no record and armed the topic. Never set with records or with
+  // `closed`.
+  bool armed = 3;
 }
 
 message StoreLatestRequest {
