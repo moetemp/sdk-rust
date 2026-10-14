@@ -4,7 +4,7 @@
 //! hint that there is something new to read. The records stay on the read path.
 
 use crate::{
-    CloseOutcome, NewestOrArm, StreamResult, StreamStore, WORKFLOW_OWNER_KIND, mint_cursor,
+    CloseOutcome, StreamResult, StreamStore, WORKFLOW_OWNER_KIND, mint_cursor,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
@@ -27,10 +27,6 @@ pub const DEFAULT_MAX_NOTIFIERS: usize = 1000;
 
 /// How long a stopping process waits for the notifications still out.
 pub const FLUSH_LIMIT: Duration = Duration::from_secs(10);
-
-/// How long a stream's slot may send nothing before an append sends its last counter again, so
-/// the notifier of a busy stream that never arms sees activity before its idle timeout.
-pub const NOTIFIER_REFRESH: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The wait before a failed notifier close is tried again. It doubles up to [CLOSE_RETRY_CAP].
 pub const CLOSE_RETRY_FIRST: Duration = Duration::from_secs(1);
@@ -240,37 +236,10 @@ impl StreamKey {
     }
 }
 
-/// An arm a notification answers. The slot clears it in the store once the notification lands,
-/// so a send that fails for good leaves the arm for the next append to report.
-#[derive(Clone)]
-pub struct Arm {
-    /// The generation the store reported.
-    pub generation: u64,
-    /// The store that holds the arm.
-    pub store: Arc<dyn StreamStore>,
-}
-
-impl std::fmt::Debug for Arm {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Arm")
-            .field("generation", &self.generation)
-            .finish_non_exhaustive()
-    }
-}
-
-/// The newer of two arms, which a disarm of the older would leave set.
-fn newer(a: Option<Arm>, b: Option<Arm>) -> Option<Arm> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(if b.generation > a.generation { b } else { a }),
-        (a, b) => a.or(b),
-    }
-}
-
 #[derive(Debug)]
 struct Pending {
     position: String,
     counter: i64,
-    arm: Option<Arm>,
 }
 
 #[derive(Debug, Default)]
@@ -278,10 +247,6 @@ struct SlotState {
     pending: Option<Pending>,
     sending: bool,
     closed: bool,
-    /// The last notification that landed, which a refresh sends again.
-    last_sent: Option<(String, i64)>,
-    /// When the slot last sent or scheduled a send, or was made.
-    active_at: Option<tokio::time::Instant>,
 }
 
 /// One stream's notifications: folded, with one call in flight per slot.
@@ -296,42 +261,16 @@ impl Slot {
     fn new(key: StreamKey) -> Arc<Self> {
         Arc::new(Self {
             key,
-            state: Mutex::new(SlotState {
-                active_at: Some(tokio::time::Instant::now()),
-                ..SlotState::default()
-            }),
+            state: Mutex::default(),
             idle: watch::Sender::new(true),
         })
     }
 
-    /// Whether the slot sent nothing for [NOTIFIER_REFRESH], answering the last notification
-    /// that landed, if any. Counts as activity, so the writes that follow don't refresh again.
-    fn refresh_due(&self) -> Option<Option<(String, i64)>> {
-        let mut state = self.state.lock().unwrap();
-        let now = tokio::time::Instant::now();
-        if state.closed
-            || state.pending.is_some()
-            || state
-                .active_at
-                .is_some_and(|at| now.duration_since(at) < NOTIFIER_REFRESH)
-        {
-            return None;
-        }
-        state.active_at = Some(now);
-        Some(state.last_sent.clone())
-    }
-
     /// Records the newest position and returns at once. While a call is out, later
     /// notifications fold into the one that goes next, so a burst costs at most two calls.
-    fn notify(
-        self: &Arc<Self>,
-        client: &Arc<dyn NotifierClient>,
-        position: String,
-        counter: i64,
-        arm: Option<Arm>,
-    ) {
+    fn notify(self: &Arc<Self>, client: &Arc<dyn NotifierClient>, position: String, counter: i64) {
         let mut state = self.state.lock().unwrap();
-        self.hold(&mut state, client, position, counter, arm);
+        self.hold(&mut state, client, position, counter);
     }
 
     fn hold(
@@ -340,27 +279,16 @@ impl Slot {
         client: &Arc<dyn NotifierClient>,
         position: String,
         counter: i64,
-        arm: Option<Arm>,
     ) {
         if state.closed {
             return;
         }
-        state.active_at = Some(tokio::time::Instant::now());
-        match &mut state.pending {
-            Some(held) => {
-                if counter >= held.counter {
-                    held.position = position;
-                    held.counter = counter;
-                }
-                held.arm = newer(held.arm.take(), arm);
-            }
-            None => {
-                state.pending = Some(Pending {
-                    position,
-                    counter,
-                    arm,
-                })
-            }
+        if state
+            .pending
+            .as_ref()
+            .is_none_or(|held| counter >= held.counter)
+        {
+            state.pending = Some(Pending { position, counter });
         }
         if !state.sending {
             state.sending = true;
@@ -377,11 +305,7 @@ impl Slot {
 
     async fn send_pending(self: Arc<Self>, client: Arc<dyn NotifierClient>) {
         loop {
-            let Pending {
-                position,
-                counter,
-                arm,
-            } = {
+            let Pending { position, counter } = {
                 let mut state = self.state.lock().unwrap();
                 match state.pending.take() {
                     Some(next) => next,
@@ -399,31 +323,7 @@ impl Slot {
                 counter,
                 close: None,
             };
-            if self.send(&client, notification).await {
-                self.state.lock().unwrap().last_sent = Some((position, counter));
-                if let Some(arm) = arm {
-                    self.disarm(arm).await;
-                }
-            } else if let Some(held) = self.state.lock().unwrap().pending.as_mut() {
-                // The newer notification answers this one's arm too.
-                held.arm = newer(held.arm.take(), arm);
-            }
-        }
-    }
-
-    /// Clears the arm a landed notification answered, unless a reader armed again since.
-    async fn disarm(&self, arm: Arm) {
-        if let Err(error) = arm
-            .store
-            .disarm(&self.key.chain(), &self.key.topic, arm.generation)
-            .await
-        {
-            tracing::warn!(
-                workflow_id = %self.key.workflow_id,
-                topic = %self.key.topic,
-                %error,
-                "Could not clear a stream's arm, so the next write notifies again"
-            );
+            self.send(&client, notification).await;
         }
     }
 
@@ -572,29 +472,8 @@ impl Notifier {
     /// Tells the notifier of `chain`'s stream on `topic` that it moved to `position`. Never
     /// waits, and never fails: a notification that can't go is logged and dropped.
     pub fn notify(&self, chain: &ChainId, topic: &str, position: String, counter: i64) {
-        self.notify_armed(chain, topic, position, counter, None);
-    }
-
-    /// Like [Notifier::notify], for a write that found `arm` set. Once the notification lands,
-    /// the arm is cleared, unless a reader armed again since.
-    pub fn notify_armed(
-        &self,
-        chain: &ChainId,
-        topic: &str,
-        position: String,
-        counter: i64,
-        arm: Option<Arm>,
-    ) {
         self.slot(StreamKey::new(chain, topic))
-            .notify(&self.client, position, counter, arm);
-    }
-
-    /// For a write that owes no notification: once the stream's slot sent nothing for
-    /// [NOTIFIER_REFRESH], answers what keeps the notifier active. That is the last counter that
-    /// landed, which the notifier takes as activity and delivers to no one, or `None` when the
-    /// slot never sent, for the caller to send the newest record.
-    pub fn refresh_due(&self, chain: &ChainId, topic: &str) -> Option<Option<(String, i64)>> {
-        self.slot(StreamKey::new(chain, topic)).refresh_due()
+            .notify(&self.client, position, counter);
     }
 
     /// Closes the stream on the server with `outcome`, after the notification in flight, and
@@ -741,8 +620,7 @@ impl NotifierClient for UnlessUnsupported {
 }
 
 /// A store that closes each stream's notifier after the store closes the stream, and with
-/// progress on, notifies it after an append lands, when the store reports that a reader armed
-/// the stream or can't tell. A landed notification clears the arm it answered.
+/// progress on, notifies it after every append that lands.
 ///
 /// Wraps the store a process hands to its stream calls, so every write path notifies without
 /// knowing about notifiers. It forwards every trait method by name, since a
@@ -751,7 +629,6 @@ pub struct NotifyingStore {
     inner: Arc<dyn StreamStore>,
     notifier: Arc<Notifier>,
     progress: bool,
-    every_append: bool,
 }
 
 impl NotifyingStore {
@@ -761,7 +638,6 @@ impl NotifyingStore {
             inner,
             notifier,
             progress: true,
-            every_append: false,
         }
     }
 
@@ -769,13 +645,6 @@ impl NotifyingStore {
     /// close outcome completes every attached callback.
     pub fn with_progress(mut self, progress: bool) -> Self {
         self.progress = progress;
-        self
-    }
-
-    /// With progress on, notifies after every write whether or not a reader armed the stream, for
-    /// readers that can't arm.
-    pub fn with_every_append(mut self, every_append: bool) -> Self {
-        self.every_append = every_append;
         self
     }
 
@@ -790,29 +659,11 @@ impl NotifyingStore {
         close_notifier_in_background(&self.inner, &self.notifier, chain, topic, outcome);
     }
 
-    /// What a write that found `arm` owes: `None` when no reader armed the topic, so nothing is
-    /// sent, and otherwise the arm to clear once the notification lands. A store that can't tell
-    /// reports no arm, and its writes notify without one.
-    fn owed(&self, arm: Option<u64>) -> Option<Option<Arm>> {
-        if self.every_append {
-            return Some(None);
-        }
-        match arm {
-            Some(0) => None,
-            Some(generation) => Some(Some(Arm {
-                generation,
-                store: self.inner.clone(),
-            })),
-            None => Some(None),
-        }
-    }
-
-    fn notify_at(&self, chain: &ChainId, topic: &str, position: &str, arm: Option<Arm>) {
+    fn notify_at(&self, chain: &ChainId, topic: &str, position: &str) {
         if let Some((cursor, counter)) =
             notification_at(self.inner.as_ref(), chain, topic, position)
         {
-            self.notifier
-                .notify_armed(chain, topic, cursor, counter, arm);
+            self.notifier.notify(chain, topic, cursor, counter);
         }
     }
 }
@@ -861,16 +712,7 @@ impl StreamStore for NotifyingStore {
         if self.progress
             && let Some(chain) = &chain
         {
-            match self.owed(landed.arm) {
-                Some(arm) => self.notify_at(chain, &topic, &landed.last_position, arm),
-                None => match self.notifier.refresh_due(chain, &topic) {
-                    Some(Some((cursor, counter))) => {
-                        self.notifier.notify(chain, &topic, cursor, counter)
-                    }
-                    Some(None) => self.notify_at(chain, &topic, &landed.last_position, None),
-                    None => {}
-                },
-            }
+            self.notify_at(chain, &topic, &landed.last_position);
         }
         Ok(landed)
     }
@@ -990,14 +832,6 @@ impl StreamStore for NotifyingStore {
 
     async fn flush_notifications(&self) {
         self.notifier.flush().await;
-    }
-
-    async fn disarm(&self, chain: &ChainId, topic: &str, generation: u64) -> StreamResult<()> {
-        self.inner.disarm(chain, topic, generation).await
-    }
-
-    async fn newest_or_arm(&self, chain: &ChainId, topic: &str) -> StreamResult<NewestOrArm> {
-        self.inner.newest_or_arm(chain, topic).await
     }
 }
 
@@ -1239,7 +1073,7 @@ mod tests {
         notifier.notify(&chain("run-1"), "t", "c1".to_string(), 1);
         let slot = notifier.slot(StreamKey::new(&chain("run-1"), "t"));
         slot.close().await;
-        slot.notify(&notifier.client, "c2".to_string(), 2, None);
+        slot.notify(&notifier.client, "c2".to_string(), 2);
         notifier.flush().await;
         assert_eq!(recorder.sent(), vec![("c1".to_string(), 1)]);
     }
@@ -1318,8 +1152,7 @@ mod tests {
     #[tokio::test]
     async fn an_append_notifies_the_chain_it_wrote_to() {
         let recorder = Arc::new(Recorder::default());
-        let (inner, store) = notifying_store(&recorder);
-        arm(inner.as_ref(), &chain("run-1"), "t").await;
+        let (_, store) = notifying_store(&recorder);
         let landed = store
             .append(append_request(&chain("run-1"), "t", 1))
             .await
@@ -1357,7 +1190,6 @@ mod tests {
             Ok(StoreAppendResponse {
                 first_position: "odd".to_string(),
                 last_position: "odd".to_string(),
-                arm: None,
             })
         }
         async fn read(&self, r: StoreReadRequest) -> StreamResult<StoreReadResponse> {
@@ -1399,10 +1231,8 @@ mod tests {
     #[tokio::test]
     async fn a_closed_streams_notifier_is_dropped() {
         let recorder = Arc::new(Recorder::default());
-        let (inner, store) = notifying_store(&recorder);
+        let (_, store) = notifying_store(&recorder);
         let run = chain("run-1");
-        arm(inner.as_ref(), &run, "a").await;
-        arm(inner.as_ref(), &run, "b").await;
         store.append(append_request(&run, "a", 1)).await.unwrap();
         store.append(append_request(&run, "b", 1)).await.unwrap();
         store.close_topic(&run, "a").await.unwrap();
@@ -1734,106 +1564,11 @@ mod tests {
         assert_eq!(client.at.lock().unwrap().len(), 2, "the retry lands");
     }
 
-    /// Arms `topic` as a reader that found nothing after the newest record does.
-    async fn arm(store: &dyn StreamStore, chain: &ChainId, topic: &str) {
-        let after = store
-            .latest(StoreLatestRequest {
-                chain: Some(chain.clone()),
-                topic: topic.to_string(),
-            })
-            .await
-            .unwrap()
-            .position;
-        let read = store
-            .read(StoreReadRequest {
-                chain: Some(chain.clone()),
-                topic: topic.to_string(),
-                after_position: after,
-                arm: true,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(read.armed);
-    }
-
-    /// The arm an append straight to `store` reports, which sends no notification.
-    async fn arm_now(store: &MemoryStore, chain: &ChainId, topic: &str, sequence: i64) -> u64 {
-        let mut request = append_request(chain, topic, sequence);
-        request.producer_id = "probe".to_string();
-        store.append(request).await.unwrap().arm.unwrap()
-    }
-
     #[tokio::test]
-    async fn an_append_with_nothing_armed_sends_nothing() {
+    async fn every_append_notifies_whether_or_not_a_reader_waits() {
         let recorder = Arc::new(Recorder::default());
         let (_, store) = notifying_store(&recorder);
-        store
-            .append(append_request(&chain("run-1"), "t", 1))
-            .await
-            .unwrap();
-        store.flush_notifications().await;
-        assert!(recorder.sent().is_empty(), "no reader sleeps on the stream");
-    }
-
-    #[tokio::test]
-    async fn a_send_disarms_only_after_it_lands() {
-        let recorder = Recorder::holding();
-        let (inner, store) = notifying_store(&recorder);
         let run = chain("run-1");
-        arm(inner.as_ref(), &run, "t").await;
-        store.append(append_request(&run, "t", 1)).await.unwrap();
-        settle().await;
-        assert_eq!(recorder.sent().len(), 1, "the notification is in flight");
-        let armed = arm_now(&inner, &run, "t", 1).await;
-        assert!(armed > 0, "the arm stays while the notification is out");
-        recorder.release(1);
-        store.flush_notifications().await;
-        assert_eq!(
-            arm_now(&inner, &run, "t", 2).await,
-            0,
-            "cleared once it landed"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_disarm_keeps_an_arm_a_reader_set_while_the_send_was_out() {
-        let recorder = Recorder::holding();
-        let (inner, store) = notifying_store(&recorder);
-        let run = chain("run-1");
-        arm(inner.as_ref(), &run, "t").await;
-        store.append(append_request(&run, "t", 1)).await.unwrap();
-        settle().await;
-        // The reader woke from another notification, read everything and armed again.
-        arm(inner.as_ref(), &run, "t").await;
-        recorder.release(1);
-        store.flush_notifications().await;
-        assert!(arm_now(&inner, &run, "t", 1).await > 0);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_failed_send_keeps_the_arm_for_the_next_append() {
-        let recorder = Arc::new(Recorder::default());
-        recorder.fail.store(true, Ordering::SeqCst);
-        let (inner, store) = notifying_store(&recorder);
-        let run = chain("run-1");
-        arm(inner.as_ref(), &run, "t").await;
-        store.append(append_request(&run, "t", 1)).await.unwrap();
-        store.flush_notifications().await;
-        assert_eq!(recorder.sent().len(), 3, "three tries, then it's dropped");
-        recorder.fail.store(false, Ordering::SeqCst);
-        store.append(append_request(&run, "t", 2)).await.unwrap();
-        store.flush_notifications().await;
-        assert_eq!(recorder.sent().len(), 4, "the next append notifies again");
-        assert_eq!(arm_now(&inner, &run, "t", 1).await, 0);
-    }
-
-    #[tokio::test]
-    async fn a_local_activitys_appends_notify_only_armed_topics() {
-        let recorder = Arc::new(Recorder::default());
-        let (inner, store) = notifying_store(&recorder);
-        let run = chain("run-1");
-        arm(inner.as_ref(), &run, "a").await;
         for topic in ["a", "b"] {
             store
                 .append(StoreAppendRequest {
@@ -1844,64 +1579,6 @@ mod tests {
                 .unwrap();
         }
         store.flush_notifications().await;
-        let topics: Vec<String> = recorder
-            .sent
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|n| n.topic.clone())
-            .collect();
-        assert_eq!(topics, ["a"]);
-        assert_eq!(arm_now(&inner, &run, "a", 1).await, 0);
-    }
-
-    /// A memory store that reports no arm, as a store that can't arm does.
-    struct CantTell(MemoryStore);
-
-    #[async_trait::async_trait]
-    impl StreamStore for CantTell {
-        fn name(&self) -> &str {
-            self.0.name()
-        }
-        async fn append(&self, r: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
-            let landed = self.0.append(r).await?;
-            Ok(StoreAppendResponse {
-                arm: None,
-                ..landed
-            })
-        }
-        async fn read(&self, r: StoreReadRequest) -> StreamResult<StoreReadResponse> {
-            self.0.read(r).await
-        }
-        async fn latest(&self, r: StoreLatestRequest) -> StreamResult<StoreLatestResponse> {
-            self.0.latest(r).await
-        }
-        async fn record_at(&self, c: &ChainId, t: &str, p: &str) -> StreamResult<Option<Vec<u8>>> {
-            self.0.record_at(c, t, p).await
-        }
-        async fn close_chain(&self, c: &ChainId) -> StreamResult<()> {
-            self.0.close_chain(c).await
-        }
-        async fn close_topic(&self, c: &ChainId, t: &str) -> StreamResult<()> {
-            self.0.close_topic(c, t).await
-        }
-        async fn retire_producer(&self, c: &ChainId, t: &str, p: &str, a: i64) -> StreamResult<()> {
-            self.0.retire_producer(c, t, p, a).await
-        }
-        async fn delete_owner(&self, r: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
-            self.0.delete_owner(r).await
-        }
-    }
-
-    #[tokio::test]
-    async fn a_store_that_cant_tell_still_notifies() {
-        let recorder = Arc::new(Recorder::default());
-        let notifier = Arc::new(Notifier::new(recorder.clone(), 10));
-        let store = NotifyingStore::new(Arc::new(CantTell(MemoryStore::new())), notifier);
-        let run = chain("run-1");
-        store.append(append_request(&run, "t", 1)).await.unwrap();
-        store.append(append_request(&run, "b", 1)).await.unwrap();
-        store.flush_notifications().await;
         let mut topics: Vec<String> = recorder
             .sent
             .lock()
@@ -1910,44 +1587,6 @@ mod tests {
             .map(|n| n.topic.clone())
             .collect();
         topics.sort();
-        assert_eq!(topics, ["b", "t"]);
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn a_busy_stream_that_never_arms_refreshes_its_notifier_once_a_day() {
-        // Its readers always find records, so without a refresh the notifier would see no
-        // activity and fail its callers at its idle timeout.
-        let recorder = Arc::new(Recorder::default());
-        let (_, store) = notifying_store(&recorder);
-        let run = chain("run-1");
-        let mut sequence = 0;
-        let mut append_after = async |wait: Duration| {
-            tokio::time::sleep(wait).await;
-            sequence += 1;
-            let landed = store
-                .append(append_request(&run, "t", sequence))
-                .await
-                .unwrap();
-            store.flush_notifications().await;
-            landed
-        };
-        append_after(Duration::ZERO).await;
-        append_after(NOTIFIER_REFRESH - Duration::from_secs(60)).await;
-        assert!(recorder.sent().is_empty(), "a day has not passed");
-        let landed = append_after(Duration::from_secs(60)).await;
-        let first = progress_counter(&landed.last_position).unwrap();
-        assert_eq!(
-            recorder.sent().iter().map(|(_, c)| *c).collect::<Vec<_>>(),
-            [first],
-            "a slot that never sent sends the newest record's counter"
-        );
-        append_after(Duration::from_secs(60)).await;
-        assert_eq!(recorder.sent().len(), 1, "once a day");
-        append_after(NOTIFIER_REFRESH).await;
-        assert_eq!(
-            recorder.sent().iter().map(|(_, c)| *c).collect::<Vec<_>>(),
-            [first, first],
-            "the last counter it sent again, which the notifier takes as activity only"
-        );
+        assert_eq!(topics, ["a", "b"]);
     }
 }
