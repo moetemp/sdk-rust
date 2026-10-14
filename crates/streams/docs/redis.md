@@ -47,7 +47,13 @@ the ended holds, trims to the lower of the retention floor and the lowest held p
 the log until the latest lease ends. A hold from the beginning holds `0-1`, so it keeps the whole
 topic. The scripts use `HGET`, `HSET`, `HGETALL`, `HDEL`, `PTTL` and `PEXPIRE`, which the
 documented ACL allows. Without holds the hash doesn't exist and the trim is as before. The append
-script's hash changes again.
+script's hash changes again. A stream close releases no hold, since the readers of a closed
+stream still replay. Only the reader's `ReleaseFloor` and its grace, or a lapsed lease, end one.
+
+**Mixed providers and floors.** An SDK's own Redis provider trims with its own append script and
+doesn't read the floors hash, so its appends can trim records that a positions-only reader holds.
+A topic that a positions-only reader reads must take its appends only through Core's store. Other
+providers on such a topic are unsupported.
 
 **Retired producers.** A field stays until a write's trim finds it older than the retention, so
 a topic written by many short-lived producers holds one field per producer attempt of the last
