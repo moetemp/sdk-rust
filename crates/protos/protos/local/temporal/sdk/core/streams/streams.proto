@@ -48,6 +48,11 @@ message StreamStoreConfig {
   bool notify_on_append = 3;
   // How many streams to keep a notifier for, dropping the least recently used. Zero uses 1000.
   uint32 max_notifiers = 4;
+  // How long a read waits for a Workflow that Temporal doesn't know yet, counted from the read's
+  // first owner check. Until then the read answers empty, so a reader can start before its
+  // owner does. After it the read fails as NOT_FOUND. Unset waits 60 seconds, and zero fails at
+  // once.
+  google.protobuf.Duration owner_start_grace = 6;
 }
 
 // Streams in a Redis or Redis Cluster that Core connects to itself.
