@@ -7,8 +7,9 @@ use crate::{
     proto::{
         AppendRequest, AttachCallerRequest, CloseRequest, DeleteOwnerRequest, DetachCallerRequest,
         FlushNotificationsRequest, FlushNotificationsResponse, LatestRequest, NexusCall,
-        NexusResumeRequest, ReadRequest, RetireProducerRequest, StreamFailure, StreamStoreConfig,
-        SubscribeRequest, UnsubscribeRequest, WaitForNotificationRequest, stream_store_config,
+        NexusResumeRequest, ReadRangeRequest, ReadRequest, ReleaseFloorRequest,
+        RetireProducerRequest, StreamFailure, StreamStoreConfig, SubscribeRequest,
+        UnsubscribeRequest, WaitForNotificationRequest, stream_store_config,
     },
     subscribe::Subscriptions,
 };
@@ -159,6 +160,16 @@ impl StreamService {
                 .delete_owner(decode::<DeleteOwnerRequest>(rpc, request)?)
                 .await
                 .map(|r| r.encode_to_vec()),
+            "ReadRange" => self
+                .streams
+                .read_range(decode::<ReadRangeRequest>(rpc, request)?)
+                .await
+                .map(|r| r.encode_to_vec()),
+            "ReleaseFloor" => self
+                .streams
+                .release_floor(decode::<ReleaseFloorRequest>(rpc, request)?)
+                .await
+                .map(|r| r.encode_to_vec()),
             "RetireProducer" => self
                 .streams
                 .retire_producer(decode::<RetireProducerRequest>(rpc, request)?)
@@ -270,6 +281,12 @@ async fn connect_redis(
     }
     if let Some(timeout) = config.response_timeout {
         options.response_timeout = duration(timeout.seconds, timeout.nanos, "response timeout")?;
+    }
+    if let Some(lease) = config.floor_lease {
+        options.floor_lease = Some(duration(lease.seconds, lease.nanos, "floor lease")?);
+    }
+    if let Some(grace) = config.floor_release_grace {
+        options.floor_release_grace = duration(grace.seconds, grace.nanos, "floor release grace")?;
     }
     let retention = options.retention;
     let store = crate::RedisStore::connect(options).await?;
@@ -903,6 +920,64 @@ mod tests {
                 .all(|n| n.close_result().is_none()),
             "an empty close would beat the outcome the notifier's owner check finds"
         );
+    }
+
+    #[tokio::test]
+    async fn a_replay_read_and_a_release_go_through_the_one_call_entry() {
+        use crate::proto::{ReadRangeRequest, ReleaseFloorRequest, ReleaseFloorResponse};
+        let service = service().await;
+        service
+            .call("Append", &append(1, &["a", "b"]))
+            .await
+            .unwrap();
+        let request = ReadRequest {
+            stream: Some(address()),
+            floor_holder: "reader-run/1".to_string(),
+            ..Default::default()
+        };
+        let page = ReadResponse::decode(
+            service
+                .call("Read", &request.encode_to_vec())
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let replayed = ReadResponse::decode(
+            service
+                .call(
+                    "ReadRange",
+                    &ReadRangeRequest {
+                        stream: Some(address()),
+                        chain_first_run_id: page.chain_first_run_id.clone(),
+                        after: page.start_cursor.clone(),
+                        to: page.cursor.clone(),
+                        stored_records: 2,
+                        state: Vec::new(),
+                        records_digest: page.records_digest.clone(),
+                        floor_holder: "reader-run/1".to_string(),
+                    }
+                    .encode_to_vec(),
+                )
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert_eq!(replayed.records, page.records);
+        let released = service
+            .call(
+                "ReleaseFloor",
+                &ReleaseFloorRequest {
+                    stream: Some(address()),
+                    chain_first_run_id: page.chain_first_run_id,
+                    floor_holder: "reader-run/1".to_string(),
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap();
+        ReleaseFloorResponse::decode(released.as_slice()).unwrap();
     }
 
     #[tokio::test]

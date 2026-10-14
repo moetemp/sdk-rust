@@ -34,5 +34,5 @@ for i = 6, #ARGV do
 end
 redis.call('HSET', KEYS[2], field,
   ARGV[4] .. '|' .. (#ARGV - 5) .. '|' .. first .. '|' .. last .. '|' .. digest_arg)
-keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace)
+keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace, KEYS[4])
 return {first, last, redis.call('HGET', KEYS[2], 'arm') or '0'}
