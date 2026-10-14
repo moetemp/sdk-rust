@@ -1914,6 +1914,16 @@ proxier! {
             r.extensions_mut().insert(labels);
         }
     );
+    (
+        poll_stream_notifier,
+        PollStreamNotifierRequest,
+        PollStreamNotifierResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+            r.extensions_mut().insert(IsUserLongPoll);
+        }
+    );
 }
 
 proxier! {

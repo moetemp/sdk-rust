@@ -20049,6 +20049,52 @@
         }
       }
     },
+    "v1StreamWake": {
+      "type": "object",
+      "properties": {
+        "subscriptionId": {
+          "type": "string",
+          "description": "The `subscription_id` of the `WorkflowWakeTarget` this wake is for."
+        },
+        "position": {
+          "type": "string",
+          "description": "The position that came with `counter`, in the producer's terms."
+        },
+        "counter": {
+          "type": "string",
+          "format": "int64",
+          "description": "The highest counter the notifier has seen. A reader that armed its read at a counter wakes\nwhen this value is above it. Zero when the notifier has seen no notification."
+        },
+        "metadata": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The metadata that came with `counter`."
+        },
+        "recheck": {
+          "type": "boolean",
+          "description": "Set when the notifier asks the reader to read again with no new counter. The notifier sends\nit after a quiet period, so a reader also finds records whose notification was lost."
+        },
+        "closed": {
+          "type": "boolean",
+          "description": "Set when the stream closed. The reader reads to the end of the stream, then sees the\noutcome."
+        },
+        "closeResult": {
+          "$ref": "#/definitions/v1Payload",
+          "description": "The result the stream closed with, when `closed` is set. Optional."
+        },
+        "closeFailure": {
+          "$ref": "#/definitions/v1Failure",
+          "description": "The failure the stream closed with, when `closed` is set and it closed with one."
+        },
+        "resubscribe": {
+          "type": "boolean",
+          "description": "Set when the notifier dropped this reader, for example at the notifier's idle timeout. The\nreader attaches again under a new request ID."
+        }
+      },
+      "description": "A wake for one reader of a stream in a Workflow. The server records it on the next Workflow\nTask scheduled event, so it adds no event of its own.\n\nA wake says that the stream moved, not what it holds. The reader reads the stream itself. Wakes\nof one reader are folded, so the reader sees the latest one, with the highest `counter`."
+    },
     "v1StructuredCalendarSpec": {
       "type": "object",
       "properties": {
@@ -22620,6 +22666,14 @@
           "type": "integer",
           "format": "int32",
           "title": "Starting at 1, how many attempts there have been to complete this task"
+        },
+        "streamWakes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/v1StreamWake"
+          },
+          "description": "Wakes for the Workflow's stream readers that arrived since the previous Workflow Task was\nscheduled, at most one entry per reader: the latest one. Recorded here rather than as\nevents of their own, so a burst of wakes costs one task and replay sees the same wakes the\nWorkflow saw. Bounded by `history.maximumStreamWakeSources` readers per execution, and it\ncounts toward the History size limit."
         }
       }
     },
