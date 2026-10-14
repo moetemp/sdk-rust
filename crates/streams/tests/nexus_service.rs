@@ -22,7 +22,7 @@ use temporalio_common::protos::temporal::api::{
 use temporalio_streams::{
     MemoryStore, OwnerClient, OwnerDescription, OwnerError, StreamStore, Streams, StreamsOptions,
     nexus::{NexusCalls, NexusOptions},
-    proto::{ChainId, NexusFailure, StreamRecord, StreamRecordKind},
+    proto::{ChainId, NexusFailure, StoreAppendRequest, StreamRecord, StreamRecordKind},
 };
 
 static IDS: AtomicUsize = AtomicUsize::new(0);
@@ -633,6 +633,108 @@ mod cases {
         assert!(small.get("error").is_none());
         assert_eq!(texts(&answer), ["small"]);
     }
+    fn arming(wf: &str, after: &str) -> Value {
+        let mut input = read_input(wf, after);
+        input["arm"] = json!(true);
+        input
+    }
+
+    /// Appends one record to the stream through the store, answering the arm it reported.
+    async fn arm_reported(store: &Arc<dyn StreamStore>, wf: &str, sequence: i64) -> Option<u64> {
+        store
+            .append(StoreAppendRequest {
+                chain: Some(ChainId {
+                    namespace: NAMESPACE.to_string(),
+                    workflow_id: wf.to_string(),
+                    first_run_id: "run-1".to_string(),
+                }),
+                topic: TOPIC.to_string(),
+                producer_id: "store".to_string(),
+                attempt: 1,
+                sequence,
+                digest: vec![sequence as u8],
+                records: vec![
+                    StreamRecord {
+                        topic: TOPIC.to_string(),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ],
+            })
+            .await
+            .unwrap()
+            .arm
+    }
+
+    pub(crate) async fn an_empty_read_that_asks_to_arm_answers_armed(store: Arc<dyn StreamStore>) {
+        let calls = service(store.clone(), NexusOptions::default());
+        let wf = workflow();
+        let answer = read(&calls, arming(&wf, "")).await.unwrap();
+        assert!(records(&answer).is_empty());
+        assert_eq!(answer["armed"], true, "{answer}");
+        assert_eq!(answer["done"], false);
+        assert!(
+            arm_reported(&store, &wf, 1)
+                .await
+                .is_some_and(|arm| arm > 0)
+        );
+    }
+
+    pub(crate) async fn an_answer_with_records_never_says_armed(store: Arc<dyn StreamStore>) {
+        let calls = service(store.clone(), NexusOptions::default());
+        let wf = workflow();
+        write(&calls, &wf, 1, &["one"]).await;
+        let answer = read(&calls, arming(&wf, "")).await.unwrap();
+        assert_eq!(texts(&answer), ["one"]);
+        assert!(
+            answer.get("armed").is_none_or(|armed| armed == false),
+            "{answer}"
+        );
+        assert_eq!(arm_reported(&store, &wf, 1).await, Some(0));
+    }
+
+    pub(crate) async fn a_done_answer_never_arms(store: Arc<dyn StreamStore>) {
+        let wf = workflow();
+        write(
+            &service(store.clone(), NexusOptions::default()),
+            &wf,
+            1,
+            &["one"],
+        )
+        .await;
+        let ended = NexusCalls::new(
+            Arc::new(Streams::new(
+                store,
+                Arc::new(Ended),
+                StreamsOptions::default(),
+            )),
+            NexusOptions::default(),
+        );
+        let mut after = String::new();
+        for _ in 0..10 {
+            let mut input = arming(&wf, &after);
+            input["wait_ms"] = json!(5000);
+            let answer = read(&ended, input).await.unwrap();
+            if answer["done"] == true {
+                assert!(
+                    answer.get("armed").is_none_or(|armed| armed == false),
+                    "{answer}"
+                );
+                return;
+            }
+            after = token(&answer).to_string();
+        }
+        panic!("the read never said done");
+    }
+
+    pub(crate) async fn a_read_without_arm_never_arms(store: Arc<dyn StreamStore>) {
+        let calls = service(store.clone(), NexusOptions::default());
+        let wf = workflow();
+        let answer = read_after(&calls, &wf, "").await;
+        assert!(records(&answer).is_empty());
+        assert!(answer.get("armed").is_none(), "{answer}");
+        assert_eq!(arm_reported(&store, &wf, 1).await, Some(0));
+    }
 }
 
 macro_rules! lanes {
@@ -671,6 +773,10 @@ macro_rules! all_cases {
             a_record_above_the_budget_still_crosses_alone,
             an_append_above_the_record_limit_is_refused,
             a_stored_record_above_the_limit_crosses_as_an_error,
+            an_empty_read_that_asks_to_arm_answers_armed,
+            an_answer_with_records_never_says_armed,
+            a_done_answer_never_arms,
+            a_read_without_arm_never_arms,
         );
     };
 }

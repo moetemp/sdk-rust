@@ -58,6 +58,8 @@ fn full_input(contract: &Value, name: &str, workflow_id: &str) -> Value {
             ("ReadInput", "wait_ms") => json!(0),
             ("ReadInput", "latest_only") => json!(false),
             ("ReadInput", "state") => Value::Null,
+            // So the answer carries `armed`, which the output check holds to the contract.
+            ("ReadInput", "arm") => json!(true),
             (model, member) => panic!("the contract added {model}.{member}; teach this test"),
         };
         out.insert(member, value);

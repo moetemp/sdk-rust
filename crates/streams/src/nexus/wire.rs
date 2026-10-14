@@ -96,6 +96,8 @@ pub(crate) struct ReadInput {
     /// Left as base64, so an oversized state is refused before it is decoded.
     #[serde(default)]
     pub(crate) state: Option<String>,
+    #[serde(default)]
+    pub(crate) arm: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -105,6 +107,8 @@ pub(crate) struct ReadOutput {
     pub(crate) done: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) state: Option<Base64>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) armed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
