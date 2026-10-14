@@ -28,7 +28,7 @@ pub use error::{StreamError, StreamResult};
 pub use handle::{OWNER_RECHECK, Streams, StreamsOptions};
 pub use memory::MemoryStore;
 pub use notify::{
-    CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT, Notifier,
+    Arm, CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT, Notifier,
     NotifierClient, NotifyError, NotifyingStore, StreamNotification, progress_counter,
 };
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};

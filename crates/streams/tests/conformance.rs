@@ -94,11 +94,26 @@ struct Notifying<C> {
 async fn notifying<C: Case>(
     inner: impl std::future::Future<Output = Option<C>>,
 ) -> Option<Notifying<C>> {
+    notifying_with(inner, true).await
+}
+
+/// [notifying] with progress off, for the arm cases, since with progress on a landed
+/// notification clears the arm the case checks.
+async fn notifying_quietly<C: Case>(
+    inner: impl std::future::Future<Output = Option<C>>,
+) -> Option<Notifying<C>> {
+    notifying_with(inner, false).await
+}
+
+async fn notifying_with<C: Case>(
+    inner: impl std::future::Future<Output = Option<C>>,
+    progress: bool,
+) -> Option<Notifying<C>> {
     let inner = inner.await?;
-    let store = Arc::new(NotifyingStore::new(
-        inner.store(),
-        Arc::new(Notifier::new(Arc::new(Quiet), 10)),
-    ));
+    let store = Arc::new(
+        NotifyingStore::new(inner.store(), Arc::new(Notifier::new(Arc::new(Quiet), 10)))
+            .with_progress(progress),
+    );
     Some(Notifying { inner, store })
 }
 
@@ -1404,7 +1419,7 @@ mod memory {
 
 mod notifying_memory {
     store_cases!(super::notifying(super::memory()));
-    arm_cases!(super::notifying(super::memory()));
+    arm_cases!(super::notifying_quietly(super::memory()));
     conformance!(super::notifying(super::memory());
         deleting_an_owner_drops_every_chain_of_it,
     );
@@ -1435,7 +1450,7 @@ mod notifying_redis {
         "STREAMS_REDIS_URL",
         false
     )));
-    arm_cases!(super::notifying(super::on_redis::redis(
+    arm_cases!(super::notifying_quietly(super::on_redis::redis(
         "STREAMS_REDIS_URL",
         false
     )));
