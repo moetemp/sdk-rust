@@ -358,7 +358,6 @@ impl NexusCalls {
             wait: wait.try_into().ok(),
             max_records: max_records as u32,
             state: state.clone(),
-            arm: input.arm.unwrap_or(false),
             floor_holder: floor_holder.clone(),
         };
         let positions = !floor_holder.is_empty();
@@ -787,8 +786,8 @@ fn finish_read(
         wires.push(wire);
         kept.push(record);
     }
-    // An answer the budget cut holds records, so only a whole empty answer stays armed.
-    let armed = response.armed && !cut && wires.is_empty();
+    // Core's read no longer arms, so the contract's `armed` stays false until it leaves the IDL.
+    let armed = false;
     let (next_token, done) = if cut {
         // A supersession belongs to the record after it, so it goes into the next answer too.
         if wires.last().is_some_and(|wire| wire.superseded.is_some()) {

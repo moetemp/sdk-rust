@@ -41,19 +41,11 @@ relevant information.
 * Experimental: the C bridge has `temporal_core_stream_store_new`, `_call` and `_free` for the
   stream service, built with the Redis store.
 * Experimental: with `StreamStoreConfig.notify_on_append`, Core tells each stream's notifier on
-  the server when the stream moves while a reader sleeps on it. That's how a reader that waits on
-  the notifier wakes. A reader arms the stream with a read that sets the new `ReadRequest.arm`
-  and waits its whole wait with no record. The answer says `armed` and carries `wake_after`, the
-  counter of the read's position, and the next append notifies once. Core clears the arm once the
-  notification lands, and a failed one keeps it for the next append. A busy stream, whose readers
-  find records on each read, sends no notification, apart from one refresh a day that keeps its
-  notifier from the idle timeout. `notify_every_append` restores a notification after every
-  append, for readers that can't arm. Notifications for one stream fold into one call in flight,
-  a failed last notification is tried twice more, and a notification never fails the write.
-  `max_notifiers` caps how many streams the process keeps a notifier for (1000 when zero).
-* Experimental: `StreamStore` has `disarm` and `newest_or_arm`, and its read and append messages
-  carry the arm. The Redis store keeps it in each topic's meta as `arm` and `arm_seq`, which
-  changes the append script hash.
+  the server when the stream moves, after every append. That's how a reader that waits on the
+  notifier wakes. An empty read answer carries `wake_after`, the counter of the read's position,
+  and the reader waits for a counter above it. Notifications for one stream fold into one call in
+  flight, a failed last notification is tried twice more, and a notification never fails the
+  write. `max_notifiers` caps how many streams the process keeps a notifier for (1000 when zero).
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with
@@ -71,12 +63,12 @@ relevant information.
   `jetty/<run id>/<subscription id>`, so a rerun attaches as the same reader. After a wake with
   `resubscribe`, lang raises `SubscribeRequest.generation`, which makes a new attach. A process
   attaches each subscription once and answers a repeat from memory. The attach names the chain
-  that holds the Workflow id now, and on an empty stream it arms the stream, so the first append
+  that holds the Workflow id now. The attach only announces the reader, and the first append
   wakes the Workflow.
 * Experimental: the new `WaitForNotification` stream call waits on a stream's notifier with the
-  server's `PollStreamNotifier` long poll, for a client reader whose read armed the stream. It
+  server's `PollStreamNotifier` long poll, for a client reader whose read came back empty. It
   returns when the notifier's counter passes the read's `wake_after`, when the stream closed, or
-  with `timed_out` at the server's wait limit. The reader then reads again with `arm`.
+  with `timed_out` at the server's wait limit. The reader then reads again.
 * Experimental: a stream wake for one of a Workflow's readers reaches lang as a
   `ResolveStreamWake` job, at most one per subscription per workflow task, folded from the
   `stream_wakes` on the task's scheduled events. Replay delivers the same jobs in the same
