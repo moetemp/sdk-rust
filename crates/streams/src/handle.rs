@@ -80,31 +80,35 @@ struct ProducerKey {
 }
 
 #[derive(Debug, Clone)]
-struct Checked {
-    first_run_id: String,
+pub(crate) struct Checked {
+    pub(crate) first_run_id: String,
     at: Instant,
 }
 
 /// Remembers when each key was last checked, forgetting the oldest when full.
 #[derive(Debug)]
-struct Remembered<K> {
+pub(crate) struct Remembered<K> {
     entries: Mutex<HashMap<K, Checked>>,
     limit: usize,
 }
 
 impl<K: std::hash::Hash + Eq + Clone> Remembered<K> {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
             entries: Mutex::default(),
             limit: limit.max(1),
         }
     }
 
-    fn get(&self, key: &K) -> Option<Checked> {
+    pub(crate) fn get(&self, key: &K) -> Option<Checked> {
         self.entries.lock().unwrap().get(key).cloned()
     }
 
-    fn put(&self, key: K, first_run_id: &str, fresh_for: Duration) {
+    pub(crate) fn forget(&self, key: &K) {
+        self.entries.lock().unwrap().remove(key);
+    }
+
+    pub(crate) fn put(&self, key: K, first_run_id: &str, fresh_for: Duration) {
         let mut entries = self.entries.lock().unwrap();
         if entries.len() >= self.limit && !entries.contains_key(&key) {
             entries.retain(|_, checked| checked.at.elapsed() < fresh_for);
