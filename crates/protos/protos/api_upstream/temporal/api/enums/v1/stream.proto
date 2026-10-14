@@ -12,9 +12,8 @@ option csharp_namespace = "Temporalio.Api.Enums.V1";
 // What owns a stream. The owner decides when the stream closes.
 enum StreamOwnerKind {
     STREAM_OWNER_KIND_UNSPECIFIED = 0;
-    // A Workflow owns the stream. Readers see it end when the Workflow's run chain closes. If the
-    // Workflow did not close the stream itself and callbacks are attached, the stream notifier
-    // closes it with a failure within `streamnotifier.ownerCheckInterval`, which completes the
-    // operations that handed it out.
+    // A Workflow owns the stream. The Workflow closes the stream itself, with a result or a
+    // failure. If the Workflow's run chain ends with no close and callbacks are attached, the
+    // stream notifier closes the stream with a failure within `streamnotifier.ownerCheckInterval`.
     STREAM_OWNER_KIND_WORKFLOW = 1;
 }
