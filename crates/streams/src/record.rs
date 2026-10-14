@@ -22,6 +22,40 @@ pub fn activity_producer_id(activity: &ActivityProducer) -> String {
     format!("{}@{}", activity.activity_id, activity.run_id)
 }
 
+/// The producer id a Workflow run writes its own records as.
+///
+/// It is an Activity's id form with no Activity id. An Activity id is never empty, so no Activity
+/// writes as a run. Each run of a chain is a producer of its own, so Continue-as-New and a reset
+/// start a new producer rather than superseding the earlier run.
+pub fn workflow_producer_id(run_id: &str) -> String {
+    format!("@{run_id}")
+}
+
+/// The digest of a batch of a Workflow's records on `topic`, from each record's kind and content
+/// hash, so it never depends on the codec. A Workflow's records reach Core after the codec, and a
+/// task that runs again must repeat the digest of the same records.
+///
+/// It is the SHA-256 over each record as its length in 8 bytes big-endian, then the record as its
+/// topic's length in 8 bytes big-endian, the topic's UTF-8 bytes, its kind in 4 bytes big-endian,
+/// its content hash's length in 8 bytes big-endian and the content hash.
+pub fn workflow_batch_digest<'a>(
+    topic: &str,
+    records: impl IntoIterator<Item = (i32, &'a [u8])>,
+) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for (kind, content_hash) in records {
+        let length = 8 + topic.len() + 4 + 8 + content_hash.len();
+        digest.update((length as u64).to_be_bytes());
+        digest.update((topic.len() as u64).to_be_bytes());
+        digest.update(topic.as_bytes());
+        digest.update(kind.to_be_bytes());
+        digest.update((content_hash.len() as u64).to_be_bytes());
+        digest.update(content_hash);
+    }
+    digest.finalize().to_vec()
+}
+
 /// Refuses an append batch digest that isn't the 32-byte SHA-256 lang takes before the codec.
 ///
 /// Stores compare it unchanged when a producer repeats its newest batch, so a digest Core made
@@ -156,6 +190,41 @@ mod tests {
             attempt: 3,
         };
         assert_eq!(activity_producer_id(&activity), "fetch@run-1");
+    }
+
+    #[test]
+    fn a_workflow_run_writes_as_no_activity_can() {
+        let activity = ActivityProducer {
+            activity_id: "x".to_string(),
+            run_id: "run-1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(workflow_producer_id("run-1"), "@run-1");
+        assert_ne!(
+            workflow_producer_id("run-1"),
+            activity_producer_id(&activity)
+        );
+    }
+
+    #[test]
+    fn a_workflow_batch_digest_sees_order_kind_and_hash() {
+        let data = StreamRecordKind::Data as i32;
+        let finish = StreamRecordKind::Finish as i32;
+        let base = workflow_batch_digest("t", [(data, &[1u8; 32][..]), (finish, &[][..])]);
+        assert_eq!(base.len(), HASH_LENGTH);
+        assert_eq!(check_append_digest(&base), Ok(()));
+        for other in [
+            workflow_batch_digest("t", [(finish, &[][..]), (data, &[1u8; 32][..])]),
+            workflow_batch_digest("t", [(data, &[2u8; 32][..]), (finish, &[][..])]),
+            workflow_batch_digest("u", [(data, &[1u8; 32][..]), (finish, &[][..])]),
+            workflow_batch_digest("t", [(data, &[1u8; 32][..])]),
+        ] {
+            assert_ne!(other, base);
+        }
+        assert_eq!(
+            workflow_batch_digest("t", [(data, &[1u8; 32][..]), (finish, &[][..])]),
+            base
+        );
     }
 
     #[test]

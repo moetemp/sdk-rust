@@ -16,6 +16,18 @@ use crate::{
 use prost::Message;
 use std::collections::HashMap;
 
+/// The low bits of a Workflow producer's attempt, which count the reruns of one task. The high
+/// bits name the last task that completed before it.
+const WORKFLOW_RETRY_BITS: u32 = 16;
+
+/// Whether a producer's `attempt` withdraws what its `previous` attempt wrote. A Workflow
+/// producer (`@<run id>`) moves to a higher attempt with each completed task, and only a rerun
+/// of the same task withdraws. Any other producer's higher attempt is a retry.
+fn supersedes(producer_id: &str, previous: i64, attempt: i64) -> bool {
+    !producer_id.starts_with('@')
+        || previous >> WORKFLOW_RETRY_BITS == attempt >> WORKFLOW_RETRY_BITS
+}
+
 /// How many producers a read remembers the newest attempt of.
 pub const MAX_TRACKED_PRODUCERS: usize = 1_000;
 
@@ -67,6 +79,10 @@ pub(crate) struct ReadState {
     watermark_known: bool,
     #[prost(uint64, tag = "10")]
     clock: u64,
+    /// When the read first found no owner, in milliseconds since the Unix epoch, or 0 once it
+    /// found one. The owner start grace counts from it.
+    #[prost(uint64, tag = "11")]
+    pub(crate) owner_missing_since_ms: u64,
 }
 
 /// What a read knows of one producer.
@@ -236,7 +252,8 @@ impl ReadState {
         }
         tracked.attempt = record.attempt;
         self.forget_beyond(MAX_TRACKED_PRODUCERS);
-        Observed::Newer((seen > 0).then(|| Supersession {
+        let superseded = seen > 0 && supersedes(&record.producer_id, seen, record.attempt);
+        Observed::Newer(superseded.then(|| Supersession {
             topic: record.topic.clone(),
             producer_id: record.producer_id.clone(),
             previous_attempt: seen,
@@ -249,7 +266,8 @@ impl ReadState {
 ///
 /// The read turns stored records into what lang delivers. A producer's newer attempt gets a
 /// `SUPERSEDED` record before it, at the cursor of the record delivered before it, so a read that
-/// resumes there reports the supersession again. A record from an attempt below the newest the
+/// resumes there reports the supersession again. A Workflow producer's attempt for a later task
+/// gets none, since only a rerun of the same task withdraws records. A record from an attempt below the newest the
 /// read delivered is still delivered, marked `stale`. The attempts seen ride in `state`, so this
 /// holds across calls. A read that starts from a cursor without state looks up the record at the
 /// cursor first, since that record was delivered before. Only that record's producer is known
@@ -784,6 +802,45 @@ mod tests {
         }
         let error = ReadState::decode_from(&state.encode_to_vec()).unwrap_err();
         assert_eq!(error.kind, StreamFailureKind::Cursor);
+    }
+
+    #[test]
+    fn a_workflow_producer_supersedes_only_within_one_task() {
+        let task = |prefix: i64, retry: i64| (prefix << 16) | retry;
+        let mut state = ReadState::default();
+        assert_eq!(
+            observe(&mut state, "@run", task(0, 1)),
+            Observed::Newer(None)
+        );
+        // A completed task moves the prefix, so the next task goes on with no supersession.
+        assert_eq!(
+            observe(&mut state, "@run", task(3, 1)),
+            Observed::Newer(None)
+        );
+        assert_eq!(
+            observe(&mut state, "@run", task(3, 2)),
+            Observed::Newer(Some(Supersession {
+                topic: "out".to_string(),
+                producer_id: "@run".to_string(),
+                previous_attempt: task(3, 1),
+                attempt: task(3, 2),
+            }))
+        );
+        assert_eq!(
+            observe(&mut state, "@run", task(9, 1)),
+            Observed::Newer(None)
+        );
+        // An earlier task's record after a later one is still behind.
+        assert_eq!(
+            observe(&mut state, "@run", task(3, 2)),
+            Observed::Behind { newest: task(9, 1) }
+        );
+        // Any other producer's higher attempt is a retry, whatever its bits hold.
+        observe(&mut state, "model", task(0, 1));
+        assert!(matches!(
+            observe(&mut state, "model", task(3, 1)),
+            Observed::Newer(Some(_))
+        ));
     }
 
     #[test]

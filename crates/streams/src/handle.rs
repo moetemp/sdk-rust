@@ -4,8 +4,8 @@
 //! where the contract says so, and mints and checks cursors. Stores only move records.
 
 use crate::{
-    END, MAX_CLOSE_BYTES, ReadTarget, StreamError, StreamResult, StreamStore, WORKFLOW_OWNER_KIND,
-    activity_producer_id, check_append_digest, cursor_position, mint_cursor,
+    BEGINNING, END, MAX_CLOSE_BYTES, ReadTarget, StreamError, StreamResult, StreamStore,
+    WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, cursor_position, mint_cursor,
     owner::{OwnerClient, OwnerDescription, OwnerError},
     proto::{
         ActivityProducer, AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse,
@@ -36,6 +36,9 @@ const MAX_CLOSED_BY_BYTES: usize = 256;
 /// The longest a producer writes without asking whether its owner's chain ended.
 pub const OWNER_RECHECK: Duration = Duration::from_secs(60);
 
+/// How long a read waits by default for an owner that Temporal doesn't know yet.
+pub const OWNER_START_GRACE: Duration = Duration::from_secs(60);
+
 /// How the stream layer behaves.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamsOptions {
@@ -48,6 +51,9 @@ pub struct StreamsOptions {
     pub owner_check_min: Duration,
     /// The longest an idle read waits between two such questions.
     pub owner_check_max: Duration,
+    /// How long after its first owner check a read takes a Workflow that Temporal doesn't know
+    /// as one that has not started yet, and answers empty. Zero fails the read at once.
+    pub owner_start_grace: Duration,
 }
 
 impl Default for StreamsOptions {
@@ -57,6 +63,7 @@ impl Default for StreamsOptions {
             remembered: 10_000,
             owner_check_min: Duration::from_millis(500),
             owner_check_max: Duration::from_secs(5),
+            owner_start_grace: OWNER_START_GRACE,
         }
     }
 }
@@ -263,7 +270,8 @@ impl Streams {
     /// the owner ended, or the store marked the stream closed, the read delivers what is left
     /// and answers `done`. A read pinned to a run ends when that run closes, even if the chain
     /// continued as new. A read with `arm` that waits its whole `wait` and finds nothing arms the
-    /// stream and answers `armed`.
+    /// stream and answers `armed`. A read whose owner Temporal doesn't know yet answers empty
+    /// within [StreamsOptions::owner_start_grace], so it can start before its owner does.
     pub async fn read(&self, request: ReadRequest) -> StreamResult<ReadResponse> {
         let read = self.read_carried(request).await?;
         Ok(ReadResponse {
@@ -278,8 +286,29 @@ impl Streams {
     pub(crate) async fn read_carried(&self, request: ReadRequest) -> StreamResult<CarriedRead> {
         let stream = address(request.stream.as_ref())?;
         let mut state = ReadState::decode_from(&request.state)?;
+        let wait = request
+            .wait
+            .and_then(|wait| Duration::try_from(wait).ok())
+            .unwrap_or_default();
+        let deadline = Instant::now() + wait;
         if state.first_run_id.is_empty() {
-            state.first_run_id = self.chain(stream).await?.first_run_id;
+            let Some(chain) = self.started_chain(stream, &mut state, deadline).await? else {
+                // The owner has not started, so its stream holds nothing and its end is its start.
+                let cursor = if request.after == END {
+                    BEGINNING.to_string()
+                } else {
+                    request.after.clone()
+                };
+                return Ok(CarriedRead {
+                    response: ReadResponse {
+                        cursor,
+                        ..Default::default()
+                    },
+                    before: state.attempts(),
+                    state,
+                });
+            };
+            state.first_run_id = chain.first_run_id;
             // Resolved here, so it is the Workflow's own, and the state it rides in back needs
             // no check.
             let key = OwnerKey {
@@ -301,11 +330,6 @@ impl Streams {
             self.hold_floor(&target, &request.after, &request.floor_holder)
                 .await?;
         }
-        let wait = request
-            .wait
-            .and_then(|wait| Duration::try_from(wait).ok())
-            .unwrap_or_default();
-        let deadline = Instant::now() + wait;
         let minimum = self.options.owner_check_min;
         let mut page_request = request.clone();
         let mut topic_close = None;
@@ -575,6 +599,42 @@ impl Streams {
             )
             .await?;
         Ok(ReleaseFloorResponse {})
+    }
+
+    /// The chain a read follows, or `None` when Temporal doesn't know its owner yet, within
+    /// [StreamsOptions::owner_start_grace] of the read's first owner check. It asks again as
+    /// an idle read does until `deadline`. After the grace the read fails as not found.
+    async fn started_chain(
+        &self,
+        stream: &StreamAddress,
+        state: &mut ReadState,
+        deadline: Instant,
+    ) -> StreamResult<Option<ChainId>> {
+        let mut interval = self.options.owner_check_min;
+        loop {
+            let error = match self.chain(stream).await {
+                Ok(chain) => {
+                    state.owner_missing_since_ms = 0;
+                    return Ok(Some(chain));
+                }
+                Err(error) if error.kind == StreamFailureKind::NotFound => error,
+                Err(error) => return Err(error),
+            };
+            let now = unix_ms();
+            if state.owner_missing_since_ms == 0 {
+                state.owner_missing_since_ms = now;
+            }
+            let missing_for = now.saturating_sub(state.owner_missing_since_ms);
+            if missing_for >= millis(self.options.owner_start_grace) {
+                return Err(error);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(None);
+            }
+            tokio::time::sleep(interval.min(remaining)).await;
+            interval = (interval * 2).min(self.options.owner_check_max);
+        }
     }
 
     /// Whether the owner a read follows ended. Following the chain, a run that continued as
@@ -1600,6 +1660,100 @@ mod tests {
             wait: Some(wait.try_into().unwrap()),
             ..Default::default()
         }
+    }
+
+    /// A setup whose Workflow `wf` has not started yet, with an owner start grace of `grace`.
+    fn before_owner_starts(grace: Duration) -> Setup {
+        let store = Arc::new(MemoryStore::new());
+        let owners = Arc::new(Owners::default());
+        let options = StreamsOptions {
+            owner_start_grace: grace,
+            ..quick()
+        };
+        let streams = Streams::new(store.clone(), owners.clone(), options);
+        Setup {
+            store,
+            owners,
+            streams,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_before_its_owner_starts_answers_empty_until_the_owner_writes() {
+        let setup = before_owner_starts(Duration::from_secs(60));
+        let empty = setup
+            .streams
+            .read(read_after(END, &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert!(empty.records.is_empty() && !empty.done);
+        assert_eq!(
+            empty.cursor, BEGINNING,
+            "the end of a stream that holds nothing is its start"
+        );
+        setup.owners.run("wf", "run-1", "run-1");
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        let read = setup
+            .streams
+            .read(read_after(&empty.cursor, &empty.state, Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(read.records.len(), 1, "the first record is not missed");
+    }
+
+    #[tokio::test]
+    async fn a_waiting_read_gets_the_first_record_of_an_owner_that_starts_later() {
+        let setup = before_owner_starts(Duration::from_secs(60));
+        let owners = setup.owners.clone();
+        let streams = Arc::new(setup.streams);
+        let writer = streams.clone();
+        let late_start = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            owners.run("wf", "run-1", "run-1");
+            writer.append(append("p", 1, "1")).await.unwrap();
+        });
+        let read = streams
+            .read(read_after("", &[], Duration::from_secs(5)))
+            .await
+            .unwrap();
+        late_start.await.unwrap();
+        assert_eq!(read.records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_read_of_an_owner_that_never_starts_is_not_found_after_the_grace() {
+        let setup = before_owner_starts(Duration::from_millis(200));
+        let empty = setup
+            .streams
+            .read(read_after("", &[], Duration::from_millis(50)))
+            .await
+            .unwrap();
+        assert!(empty.records.is_empty());
+        let error = setup
+            .streams
+            .read(read_after("", &empty.state, Duration::from_secs(5)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::NotFound);
+        // The grace counts from the read's first owner check, so a new read waits again.
+        assert!(
+            setup
+                .streams
+                .read(read_after("", &[], Duration::ZERO))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn no_grace_fails_a_read_of_a_missing_owner_at_once() {
+        let setup = before_owner_starts(Duration::ZERO);
+        let error = setup
+            .streams
+            .read(read_after("", &[], Duration::from_secs(5)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::NotFound);
     }
 
     /// Reads until the read says it is done, or fails after `limit` calls.
