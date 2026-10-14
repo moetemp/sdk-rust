@@ -50,7 +50,7 @@ pub const DEFAULT_MAX_ANSWER_BYTES: u64 = 1 << 20;
 pub const DEFAULT_MAX_RECORD_BYTES: u64 = 3 << 19;
 /// The most bytes the state a reader carries may take. It rides in the caller's History on each
 /// call of a read.
-pub const MAX_STATE_BYTES: usize = 64 << 10;
+pub const MAX_STATE_BYTES: usize = crate::MAX_STATE_BYTES;
 
 /// What a stored record holds beside its body, topic and producer id: the kind, attempt and
 /// sequence, the field tags, and the content hash metadata.

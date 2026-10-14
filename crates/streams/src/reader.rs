@@ -19,6 +19,10 @@ use std::collections::HashMap;
 /// How many producers a read remembers the newest attempt of.
 pub const MAX_TRACKED_PRODUCERS: usize = 1_000;
 
+/// The most bytes the state a read carries takes. It crosses to lang on every call, and a
+/// Workflow reader may keep it in History.
+pub const MAX_STATE_BYTES: usize = 16 << 10;
+
 /// How many records one call returns when the request leaves it to Core.
 pub const DEFAULT_MAX_RECORDS: u32 = 100;
 
@@ -36,12 +40,13 @@ pub struct ReadTarget {
 /// What a read carries from one call to the next. Lang passes it back as opaque bytes.
 #[derive(Clone, PartialEq, Message)]
 pub(crate) struct ReadState {
-    /// The newest attempt this read delivered, per producer id.
-    #[prost(map = "string, int64", tag = "1")]
-    attempts: HashMap<String, i64>,
+    /// What the read knows of each producer, by producer id. One entry holds the attempt and the
+    /// last sight, so a long producer id is stored once.
+    #[prost(map = "string, message", tag = "1")]
+    producers: HashMap<String, Tracked>,
     /// Set by the first call, so later calls don't look up the resume record again.
     #[prost(bool, tag = "2")]
-    started: bool,
+    pub(crate) started: bool,
     /// The first run of the chain the read follows, so later calls don't resolve it again.
     #[prost(string, tag = "3")]
     pub(crate) first_run_id: String,
@@ -60,20 +65,27 @@ pub(crate) struct ReadState {
     watermark: String,
     #[prost(bool, tag = "8")]
     watermark_known: bool,
-    /// When this read last saw each producer in `attempts`, on the read's own clock, so the
-    /// least recently seen one is forgotten first.
-    #[prost(map = "string, uint64", tag = "9")]
-    last_seen: HashMap<String, u64>,
     #[prost(uint64, tag = "10")]
     clock: u64,
+}
+
+/// What a read knows of one producer.
+#[derive(Clone, PartialEq, Message)]
+struct Tracked {
+    /// The newest attempt this read delivered.
+    #[prost(int64, tag = "1")]
+    attempt: i64,
+    /// When this read last saw the producer, on the read's own clock, so the least recently
+    /// seen one is forgotten first.
+    #[prost(uint64, tag = "2")]
+    seen: u64,
 }
 
 /// The producer attempts a read knows at one point of a page, so an answer cut short can hand back
 /// the state as it stood after the records it kept.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Attempts {
-    attempts: HashMap<String, i64>,
-    last_seen: HashMap<String, u64>,
+    producers: HashMap<String, Tracked>,
     clock: u64,
 }
 
@@ -115,7 +127,7 @@ impl ReadState {
             ))
         };
         let state = Self::decode(state).map_err(|error| not_returned(error.to_string()))?;
-        let producers = state.attempts.len().max(state.last_seen.len());
+        let producers = state.producers.len();
         if producers > MAX_TRACKED_PRODUCERS {
             return Err(not_returned(format!(
                 "it names {producers} producers, above the {MAX_TRACKED_PRODUCERS} a read remembers"
@@ -135,9 +147,9 @@ impl ReadState {
     /// The producers, least recently seen first.
     fn by_last_seen(&self) -> Vec<String> {
         let mut producers: Vec<(u64, &String)> = self
-            .attempts
-            .keys()
-            .map(|producer| (self.last_seen.get(producer).copied().unwrap_or(0), producer))
+            .producers
+            .iter()
+            .map(|(producer, tracked)| (tracked.seen, producer))
             .collect();
         producers.sort_unstable();
         producers
@@ -146,28 +158,20 @@ impl ReadState {
             .collect()
     }
 
-    fn forget(&mut self, producer: &str) {
-        self.attempts.remove(producer);
-        self.last_seen.remove(producer);
-    }
-
     /// Keeps the state small however many producers a long chain had, since it crosses to lang
     /// on every call.
     fn forget_beyond(&mut self, limit: usize) {
-        if self.attempts.len() > limit {
-            let excess = self.attempts.len() - limit;
+        if self.producers.len() > limit {
+            let excess = self.producers.len() - limit;
             for producer in self.by_last_seen().into_iter().take(excess) {
-                self.forget(&producer);
+                self.producers.remove(&producer);
             }
         }
-        self.last_seen
-            .retain(|producer, _| self.attempts.contains_key(producer));
     }
 
     pub(crate) fn attempts(&self) -> Attempts {
         Attempts {
-            attempts: self.attempts.clone(),
-            last_seen: self.last_seen.clone(),
+            producers: self.producers.clone(),
             clock: self.clock,
         }
     }
@@ -180,8 +184,7 @@ impl ReadState {
         kept: impl IntoIterator<Item = &'a StreamRecord>,
     ) -> ReadState {
         let mut state = ReadState {
-            attempts: before.attempts.clone(),
-            last_seen: before.last_seen.clone(),
+            producers: before.producers.clone(),
             clock: before.clock,
             ..self.clone()
         };
@@ -194,7 +197,6 @@ impl ReadState {
     /// Forgets the least recently seen producers until the encoded state takes at most `bytes`.
     /// A forgotten producer's next attempt reads without `SUPERSEDED`, as past the producer cap.
     pub(crate) fn fit_within(&mut self, bytes: usize) {
-        self.forget_beyond(self.attempts.len());
         let mut size = self.encoded_len();
         if size <= bytes {
             return;
@@ -202,17 +204,12 @@ impl ReadState {
         for producer in self.by_last_seen() {
             // Map entries encode as repeated fields, so one producer's bytes are those of a
             // state that holds only that producer.
-            let alone = ReadState {
-                attempts: HashMap::from([(producer.clone(), self.attempts[&producer])]),
-                last_seen: self
-                    .last_seen
-                    .get(&producer)
-                    .map(|seen| HashMap::from([(producer.clone(), *seen)]))
-                    .unwrap_or_default(),
+            let tracked = self.producers.remove(&producer).unwrap_or_default();
+            size -= ReadState {
+                producers: HashMap::from([(producer, tracked)]),
                 ..ReadState::default()
-            };
-            size -= alone.encoded_len();
-            self.forget(&producer);
+            }
+            .encoded_len();
             if size <= bytes {
                 break;
             }
@@ -225,17 +222,19 @@ impl ReadState {
             return Observed::Known;
         }
         self.clock += 1;
-        self.last_seen
-            .insert(record.producer_id.clone(), self.clock);
-        let seen = self.attempts.get(&record.producer_id).copied().unwrap_or(0);
+        let tracked = self
+            .producers
+            .entry(record.producer_id.clone())
+            .or_default();
+        tracked.seen = self.clock;
+        let seen = tracked.attempt;
         if record.attempt < seen {
             return Observed::Behind { newest: seen };
         }
         if record.attempt == seen {
             return Observed::Known;
         }
-        self.attempts
-            .insert(record.producer_id.clone(), record.attempt);
+        tracked.attempt = record.attempt;
         self.forget_beyond(MAX_TRACKED_PRODUCERS);
         Observed::Newer((seen > 0).then(|| Supersession {
             topic: record.topic.clone(),
@@ -255,8 +254,8 @@ impl ReadState {
 /// holds across calls. A read that starts from a cursor without state looks up the record at the
 /// cursor first, since that record was delivered before. Only that record's producer is known
 /// then, and another producer's earlier attempts are not. A read remembers at most
-/// [MAX_TRACKED_PRODUCERS] producers, and the next attempt of one it forgot reads without
-/// `SUPERSEDED`.
+/// [MAX_TRACKED_PRODUCERS] producers in at most [MAX_STATE_BYTES], and the next attempt of one it
+/// forgot reads without `SUPERSEDED`.
 ///
 /// A record that does not parse fails the call as `RECORD` with its cursor, so the caller resumes
 /// past it on purpose. Skipping it would lose data no one hears of. The records before it in the
@@ -381,6 +380,7 @@ pub(crate) async fn read_with(
         });
         previous = cursor;
     }
+    state.fit_within(MAX_STATE_BYTES);
     Ok(Page {
         response: ReadResponse {
             cursor: previous,
@@ -672,7 +672,8 @@ mod tests {
         // Without an id or an attempt there is no generation to compare.
         assert_eq!(observe(&mut state, "", 5), Observed::Known);
         assert_eq!(observe(&mut state, "other", 0), Observed::Known);
-        assert_eq!(state.attempts, [("model".to_string(), 2)].into());
+        assert_eq!(state.producers.len(), 1);
+        assert_eq!(state.producers["model"].attempt, 2);
     }
 
     #[test]
@@ -700,9 +701,9 @@ mod tests {
         // Seen again, so `p0` is now the most recent and `p1` the least.
         observe(&mut state, "p0", 1);
         observe(&mut state, "new", 1);
-        assert_eq!(state.attempts.len(), MAX_TRACKED_PRODUCERS);
-        assert!(state.attempts.contains_key("p0"));
-        assert!(!state.attempts.contains_key("p1"));
+        assert_eq!(state.producers.len(), MAX_TRACKED_PRODUCERS);
+        assert!(state.producers.contains_key("p0"));
+        assert!(!state.producers.contains_key("p1"));
         // A forgotten producer's next attempt reads as its first, without `SUPERSEDED`.
         assert_eq!(observe(&mut state, "p1", 2), Observed::Newer(None));
         assert!(matches!(
@@ -711,7 +712,21 @@ mod tests {
         ));
         // The bound holds across calls, since it rides in the state.
         let state = ReadState::decode_from(&state.encode_to_vec()).unwrap();
-        assert_eq!(state.attempts.len(), MAX_TRACKED_PRODUCERS);
+        assert_eq!(state.producers.len(), MAX_TRACKED_PRODUCERS);
+    }
+
+    /// A producer id as a Workflow's per-call Local Activity writes as.
+    fn local_call(number: usize) -> String {
+        format!("__temporal_local_{number}@0b0e5bd5-1c4b-4f4e-9d1e-6f3b7a8c9d0e")
+    }
+
+    #[test]
+    fn a_producer_costs_its_id_once() {
+        let mut state = ReadState::default();
+        observe(&mut state, &local_call(0), 1_234_567_890_123);
+        let one = state.encoded_len();
+        // The id, the attempt and the last sight, with a few bytes of framing.
+        assert!(one <= local_call(0).len() + 24, "{one}");
     }
 
     #[test]
@@ -721,27 +736,51 @@ mod tests {
             observe(&mut state, &format!("{producer:0200}"), 1);
         }
         let started = std::time::Instant::now();
-        state.fit_within(64 << 10);
+        state.fit_within(MAX_STATE_BYTES);
         assert!(started.elapsed() < std::time::Duration::from_secs(1));
         let size = state.encoded_len();
-        assert!(size <= 64 << 10, "{size}");
+        assert!(size <= MAX_STATE_BYTES, "{size}");
         // It forgot no more than it had to.
-        let one = size / state.attempts.len();
-        assert!(size + one > 64 << 10, "{size}");
-        let oldest_kept = MAX_TRACKED_PRODUCERS - state.attempts.len();
-        assert!(state.attempts.contains_key(&format!("{oldest_kept:0200}")));
+        let one = size / state.producers.len();
+        assert!(size + one > MAX_STATE_BYTES, "{size}");
+        let oldest_kept = MAX_TRACKED_PRODUCERS - state.producers.len();
+        assert!(state.producers.contains_key(&format!("{oldest_kept:0200}")));
         assert!(
             !state
-                .attempts
+                .producers
                 .contains_key(&format!("{:0200}", oldest_kept - 1))
         );
+    }
+
+    #[tokio::test]
+    async fn a_read_hands_back_a_state_within_its_budget() {
+        let log = Log::default();
+        let mut state = Vec::new();
+        let mut after = BEGINNING.to_string();
+        // A Workflow that flushes as a new Local Activity call each time.
+        for call in 0..MAX_TRACKED_PRODUCERS {
+            log.write(&local_call(call), 1_234_567_890_123, b"x");
+            if call % 100 == 99 {
+                let page = read(&log, &after, &state).await.unwrap();
+                assert!(page.state.len() <= MAX_STATE_BYTES, "{}", page.state.len());
+                (after, state) = (page.cursor, page.state);
+            }
+        }
+        let kept = ReadState::decode_from(&state).unwrap();
+        assert!(
+            kept.producers
+                .contains_key(&local_call(MAX_TRACKED_PRODUCERS - 1))
+        );
+        assert!(!kept.producers.contains_key(&local_call(0)));
     }
 
     #[test]
     fn a_state_with_more_producers_than_a_read_remembers_is_refused() {
         let mut state = ReadState::default();
         for producer in 0..=MAX_TRACKED_PRODUCERS {
-            state.attempts.insert(format!("p{producer}"), 1);
+            state
+                .producers
+                .insert(format!("p{producer}"), Tracked::default());
         }
         let error = ReadState::decode_from(&state.encode_to_vec()).unwrap_err();
         assert_eq!(error.kind, StreamFailureKind::Cursor);
