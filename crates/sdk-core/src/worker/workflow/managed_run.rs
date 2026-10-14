@@ -7,8 +7,8 @@ use crate::{
         LEGACY_QUERY_ID, LocalActRequest, WorkflowErrorType,
         workflow::{
             ActivationAction, ActivationCompleteOutcome, ActivationCompleteResult,
-            ActivationOrAuto, BufferedTasks, DrivenWorkflow, EvictionRequestResult,
-            FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
+            ActivationOrAuto, ActivationOutput, BufferedTasks, DrivenWorkflow,
+            EvictionRequestResult, FailedActivationWFTReport, HeartbeatTimeoutMsg, HistoryUpdate,
             LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
             OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
             ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
@@ -16,12 +16,13 @@ use crate::{
             WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
+            stream_output::{OutputBatch, RetiredSessions, output_by_topic},
         },
     },
 };
 use futures_util::future::AbortHandle;
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     mem,
     ops::{Add, Sub},
     rc::Rc,
@@ -36,7 +37,7 @@ use temporalio_common::protos::{
             RemoveFromCache, WorkflowActivation, query_to_job, remove_from_cache::EvictionReason,
             workflow_activation_job,
         },
-        workflow_commands::{FailWorkflowExecution, QueryResult},
+        workflow_commands::{FailWorkflowExecution, QueryResult, WorkflowOutputStreamCommit},
         workflow_completion,
     },
     temporal::api::{
@@ -96,6 +97,14 @@ pub(super) struct ManagedRun {
     /// duplicating field values. Remove this once https://github.com/tokio-rs/tracing/issues/2334
     /// is fixed.
     recorded_span_ids: HashSet<tracing::Id>,
+    /// The producer attempt `committed_by_topic` counts for.
+    stream_attempt: i64,
+    /// How many stream records the run appended to each topic under `stream_attempt`, which is
+    /// where its next commit's sequences start.
+    committed_by_topic: HashMap<String, i64>,
+    /// The attempts the run appended stream records under, with their topics, whose store
+    /// sessions are not retired yet.
+    stream_sessions: BTreeMap<i64, BTreeSet<String>>,
     metrics: MetricsContext,
     /// We store the paginator used for our own run's history fetching
     paginator: Option<HistoryPaginator>,
@@ -121,6 +130,9 @@ impl ManagedRun {
             task_buffer: Default::default(),
             trying_to_evict: None,
             recorded_span_ids: Default::default(),
+            stream_attempt: 0,
+            committed_by_topic: Default::default(),
+            stream_sessions: Default::default(),
             metrics,
             paginator: None,
             completion_waiting_on_page_fetch: None,
@@ -780,10 +792,28 @@ impl ManagedRun {
             )));
         }
 
+        let mut lang_commands = completion.commands;
+        let output = match self.commit_stream_output(&mut lang_commands) {
+            Ok(output) => output.map(|batch| {
+                Box::new(ActivationOutput {
+                    batch,
+                    task_token: data.task_token.clone(),
+                    attempt: self.wft.as_ref().map(|t| t.info.attempt).unwrap_or(1),
+                    metrics: self.metrics.clone(),
+                })
+            }),
+            Err(source) => {
+                return Err(RunUpdateErr {
+                    source,
+                    complete_resp_chan: completion.resp_chan,
+                });
+            }
+        };
+
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
             // another activation and mark it if so
-            self.wfm.push_commands_and_iterate(completion.commands)?;
+            self.wfm.push_commands_and_iterate(lang_commands)?;
             if let Some(update) = update_from_new_page {
                 self.wfm.feed_history_from_new_page(update)?;
             }
@@ -813,7 +843,7 @@ impl ManagedRun {
             }
         })();
 
-        match outcome {
+        let completed = match outcome {
             Ok(None) => {
                 if let Some(waiting) = self.waiting_on_la.take() {
                     waiting.hb_timeout_handle.abort();
@@ -866,6 +896,8 @@ impl ManagedRun {
                         result: ActivationCompleteResult {
                             outcome: ActivationCompleteOutcome::DoNothing,
                             replaying: self.wfm.machines.replaying,
+                            output: None,
+                            retired: None,
                         },
                         resp_chan: completion.resp_chan,
                     }))
@@ -875,7 +907,90 @@ impl ManagedRun {
                 source: e,
                 complete_resp_chan: completion.resp_chan,
             }),
+        };
+        // Only a completion the run took has output to append.
+        completed.map(|done| {
+            done.map(|mut done| {
+                done.result.output = output;
+                done
+            })
+        })
+    }
+
+    /// Takes the stream records lang committed, if any, out of `commands`.
+    ///
+    /// Returns the records to append when the commit is live. A commit while replaying is
+    /// dropped, since its records are in the store already.
+    fn commit_stream_output(
+        &mut self,
+        commands: &mut Vec<WFCommand>,
+    ) -> Result<Option<OutputBatch>> {
+        let Some(commit) = take_output_stream_commit(commands)? else {
+            return Ok(None);
+        };
+        if self.wfm.machines.replaying || commit.records.is_empty() {
+            return Ok(None);
         }
+        if !self.has_stream_store() {
+            return Err(WFMachinesError::Fatal(
+                "Refusing a stream output commit, since this Worker has no stream store"
+                    .to_string(),
+            ));
+        }
+        let machines = &self.wfm.machines;
+        if machines.first_execution_run_id.is_empty() {
+            return Err(WFMachinesError::Fatal(
+                "Refusing a stream output commit, since the run has no start event to name the \
+                 chain its streams are keyed by"
+                    .to_string(),
+            ));
+        }
+        let attempt = machines.stream_producer_attempt();
+        if attempt != self.stream_attempt {
+            self.stream_attempt = attempt;
+            self.committed_by_topic.clear();
+        }
+        let topics = output_by_topic(commit.records, &mut self.committed_by_topic)?;
+        self.stream_sessions
+            .entry(attempt)
+            .or_default()
+            .extend(topics.iter().map(|t| t.topic.clone()));
+        Ok(Some(OutputBatch {
+            workflow_id: machines.workflow_id.clone(),
+            run_id: machines.run_id.clone(),
+            first_run_id: machines.first_execution_run_id.clone(),
+            attempt,
+            topics,
+        }))
+    }
+
+    fn has_stream_store(&self) -> bool {
+        #[cfg(feature = "streams")]
+        {
+            self.config.stream_store.is_some()
+        }
+        #[cfg(not(feature = "streams"))]
+        {
+            false
+        }
+    }
+
+    /// The store sessions of attempts below the current one. Once the server accepts the
+    /// current task, no earlier attempt of the run writes again.
+    fn sessions_to_retire(&mut self) -> Option<Box<RetiredSessions>> {
+        let current = self.wfm.machines.stream_producer_attempt();
+        let kept = self.stream_sessions.split_off(&current);
+        let sessions = mem::replace(&mut self.stream_sessions, kept);
+        if sessions.is_empty() {
+            return None;
+        }
+        let machines = &self.wfm.machines;
+        Some(Box::new(RetiredSessions {
+            workflow_id: machines.workflow_id.clone(),
+            run_id: machines.run_id.clone(),
+            first_run_id: machines.first_execution_run_id.clone(),
+            sessions,
+        }))
     }
 
     fn _local_resolution(
@@ -1269,11 +1384,18 @@ impl ManagedRun {
             ActivationCompleteOutcome::DoNothing
         };
         let replaying = machines_wft_response.replaying;
+        let mut retired = None;
         if matches!(outcome, ActivationCompleteOutcome::ReportWFTSuccess(_)) {
             self.wfm.wft_completion_reported();
+            retired = self.sessions_to_retire();
         }
         FulfillableActivationComplete {
-            result: ActivationCompleteResult { outcome, replaying },
+            result: ActivationCompleteResult {
+                outcome,
+                replaying,
+                output: None,
+                retired,
+            },
             resp_chan,
         }
     }
@@ -1307,6 +1429,8 @@ impl ManagedRun {
                 .send(ActivationCompleteResult {
                     outcome,
                     replaying: self.wfm.machines.replaying,
+                    output: None,
+                    retired: None,
                 })
                 .is_err()
         {
@@ -1348,6 +1472,27 @@ impl ManagedRun {
     fn run_id(&self) -> &str {
         &self.wfm.machines.run_id
     }
+}
+
+/// Removes lang's stream output commit from `commands`, if it sent one.
+fn take_output_stream_commit(
+    commands: &mut Vec<WFCommand>,
+) -> Result<Option<WorkflowOutputStreamCommit>> {
+    let mut commit = None;
+    let mut repeated = false;
+    commands.retain_mut(|command| {
+        let WFCommandVariant::OutputStreamCommit(taken) = &mut command.variant else {
+            return true;
+        };
+        repeated |= commit.replace(mem::take(taken)).is_some();
+        false
+    });
+    if repeated {
+        return Err(WFMachinesError::Fatal(
+            "Lang sent more than one WorkflowOutputStreamCommit in one completion".to_string(),
+        ));
+    }
+    Ok(commit)
 }
 
 // Construct a new command sequence with query responses removed, and any
