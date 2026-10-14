@@ -7,27 +7,31 @@
 //! the notifier with a long poll.
 
 use crate::{
-    NotifierClient, NotifyError, StreamError, StreamResult, StreamStore, Streams,
-    WorkflowAttachment,
-    handle::address,
+    NotifierClient, NotifyError, OWNER_RECHECK, StreamError, StreamResult, StreamStore, Streams,
+    StreamsOptions, WorkflowAttachment,
+    handle::{Remembered, address},
     proto::{
         StreamAddress, SubscribeRequest, SubscribeResponse, UnsubscribeRequest,
         UnsubscribeResponse, WaitForNotificationRequest, WaitForNotificationResponse,
     },
 };
-use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
-};
+use std::sync::Arc;
 
 /// The longest subscription id the server takes.
 const MAX_SUBSCRIPTION_ID_BYTES: usize = 256;
 
-/// The subscriptions this process attached, so a reader's later reads send no attach.
-#[derive(Default)]
+/// The subscriptions this process attached, so a reader's later reads send no attach. A reader
+/// that ends or a run that closes never detaches, so the oldest are forgotten. A reader this
+/// process forgot attaches again, and the server dedupes that attach.
 pub(crate) struct Subscriptions {
     client: Option<Arc<dyn NotifierClient>>,
-    attached: Mutex<HashMap<SubscriptionKey, String>>,
+    attached: Remembered<SubscriptionKey>,
+}
+
+impl Default for Subscriptions {
+    fn default() -> Self {
+        Self::new(None)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -88,7 +92,7 @@ impl Subscriptions {
     pub(crate) fn new(client: Option<Arc<dyn NotifierClient>>) -> Self {
         Self {
             client,
-            attached: Mutex::default(),
+            attached: Remembered::new(StreamsOptions::default().remembered),
         }
     }
 
@@ -119,9 +123,9 @@ impl Subscriptions {
             request.generation,
         );
         let key = SubscriptionKey::new(stream, &request_id);
-        if let Some(first_run_id) = self.attached.lock().unwrap().get(&key) {
+        if let Some(attached) = self.attached.get(&key) {
             return Ok(SubscribeResponse {
-                chain_first_run_id: first_run_id.clone(),
+                chain_first_run_id: attached.first_run_id,
                 attached: false,
             });
         }
@@ -149,10 +153,7 @@ impl Subscriptions {
                 "Could not arm the stream a Workflow reader subscribed to"
             );
         }
-        self.attached
-            .lock()
-            .unwrap()
-            .insert(key, chain.first_run_id.clone());
+        self.attached.put(key, &chain.first_run_id, OWNER_RECHECK);
         Ok(SubscribeResponse {
             chain_first_run_id: chain.first_run_id,
             attached: true,
@@ -175,12 +176,11 @@ impl Subscriptions {
         );
         let client = self.client()?;
         let key = SubscriptionKey::new(stream, &request_id);
-        let known = self.attached.lock().unwrap().get(&key).cloned();
-        let chain = match known {
-            Some(first_run_id) => crate::proto::ChainId {
+        let chain = match self.attached.get(&key) {
+            Some(attached) => crate::proto::ChainId {
                 namespace: stream.namespace.clone(),
                 workflow_id: stream.workflow_id.clone(),
-                first_run_id,
+                first_run_id: attached.first_run_id,
             },
             None => streams.chain_now(stream).await?,
         };
@@ -188,7 +188,7 @@ impl Subscriptions {
             .detach(chain, stream.topic.clone(), request_id)
             .await
             .map_err(subscribe_error)?;
-        self.attached.lock().unwrap().remove(&key);
+        self.attached.forget(&key);
         Ok(UnsubscribeResponse {})
     }
 
@@ -233,6 +233,7 @@ mod tests {
         proto::{ChainId, StoreAppendRequest, StreamFailureKind, StreamOwnerKind},
     };
     use prost::Message;
+    use std::sync::Mutex;
     use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
 
     /// The owner's chain is `first_run_id`, which a test moves to a new chain.
@@ -384,6 +385,32 @@ mod tests {
             .await
             .unwrap()
             .arm
+    }
+
+    #[tokio::test]
+    async fn a_full_process_forgets_its_subscriptions_and_attaches_again() {
+        let setup = setup();
+        let subscriptions = Subscriptions {
+            client: Some(setup.server.clone()),
+            attached: Remembered::new(2),
+        };
+        let streams = Streams::new(
+            setup.store.clone(),
+            setup.owner.clone(),
+            StreamsOptions::default(),
+        );
+        let subscribe = |id: &str| {
+            subscriptions.subscribe(&streams, setup.store.as_ref(), subscribe_request(id))
+        };
+        for id in ["1", "2", "3"] {
+            assert!(subscribe(id).await.unwrap().attached);
+        }
+        assert!(!subscribe("3").await.unwrap().attached);
+        assert!(
+            subscribe("1").await.unwrap().attached,
+            "the oldest was forgotten"
+        );
+        assert_eq!(setup.server.attached.lock().unwrap().len(), 4);
     }
 
     #[tokio::test]

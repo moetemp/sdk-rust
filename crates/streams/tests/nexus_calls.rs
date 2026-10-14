@@ -785,10 +785,16 @@ fn decode_state(state: &Value) -> Vec<u8> {
 /// The fields of a read state that grow with its producers, as its proto declares them.
 #[derive(Clone, PartialEq, prost::Message)]
 struct Producers {
-    #[prost(map = "string, int64", tag = "1")]
-    attempts: std::collections::HashMap<String, i64>,
-    #[prost(map = "string, uint64", tag = "9")]
-    last_seen: std::collections::HashMap<String, u64>,
+    #[prost(map = "string, message", tag = "1")]
+    producers: std::collections::HashMap<String, Tracked>,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+struct Tracked {
+    #[prost(int64, tag = "1")]
+    attempt: i64,
+    #[prost(uint64, tag = "2")]
+    seen: u64,
 }
 
 /// `real` with `count` more producers of `id_bytes`-byte ids, as a caller could forge it.
@@ -797,8 +803,13 @@ fn forged_state(real: &[u8], count: usize, id_bytes: usize) -> Value {
     let mut producers = Producers::default();
     for index in 0..count {
         let id = format!("{index:0id_bytes$}");
-        producers.attempts.insert(id.clone(), 1);
-        producers.last_seen.insert(id, index as u64 + 1);
+        producers.producers.insert(
+            id,
+            Tracked {
+                attempt: 1,
+                seen: index as u64 + 1,
+            },
+        );
     }
     let mut forged = real.to_vec();
     forged.extend(producers.encode_to_vec());
