@@ -29,6 +29,7 @@ use temporalio_common::protos::{
         command::v1::command::Attributes,
         enums::v1::{CommandType, EventType},
         history::v1::{MarkerRecordedEventAttributes, history_event},
+        stream::v1::StreamWake,
         workflowservice::v1::RespondWorkflowTaskCompletedResponse,
     },
 };
@@ -123,10 +124,24 @@ fn cut_history_up_to_second_task() -> TestHistoryBuilder {
 
 /// The history the server writes for `completions`, one workflow task each.
 fn history_of(completions: &[WorkflowTaskCompletion]) -> TestHistoryBuilder {
+    history_with_wakes(completions, &[])
+}
+
+/// Like [history_of], with `wakes[i]` on the scheduled event of task `i`.
+fn history_with_wakes(
+    completions: &[WorkflowTaskCompletion],
+    wakes: &[Vec<StreamWake>],
+) -> TestHistoryBuilder {
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(WFT_TIMEOUT);
-    for completion in completions {
-        t.add_workflow_task_scheduled_and_started();
+    for (task, completion) in completions.iter().enumerate() {
+        match wakes.get(task) {
+            Some(wakes) if !wakes.is_empty() => {
+                t.add_workflow_task_scheduled_with_stream_wakes(wakes.clone());
+                t.add_workflow_task_started();
+            }
+            _ => t.add_workflow_task_scheduled_and_started(),
+        }
         t.add_workflow_task_completed();
         let completed_id = t.current_event_id();
         if let Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(attrs)) =
@@ -367,4 +382,105 @@ async fn a_cut_history_has_the_events_the_server_writes() {
             EventType::WorkflowExecutionCompleted,
         ]
     );
+}
+
+fn wake() -> StreamWake {
+    StreamWake {
+        subscription_id: "1".to_string(),
+        position: "position-42".to_string(),
+        counter: 42,
+        ..Default::default()
+    }
+}
+
+fn wakes_reader_1(activation: &WorkflowActivation) -> bool {
+    matches!(
+        activation.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveStreamWake(wake)),
+        }] if wake.subscription_id == "1" && wake.counter == 42
+    )
+}
+
+/// A wake that lands while the cut task is open comes on the task the cut asked for, with the
+/// local activity still running, and the activity resolves in a later activation of that task.
+async fn run_cut_then_wake_live() -> Vec<WorkflowTaskCompletion> {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(WFT_TIMEOUT);
+    t.add_full_wf_task();
+    t.add_timer_started("1".to_string());
+    t.add_workflow_task_scheduled_with_stream_wakes(vec![wake()]);
+    t.add_workflow_task_started();
+    let (core, reported) = recording_worker(
+        t,
+        [ResponseType::ToTaskNum(1), ResponseType::ToTaskNum(2)],
+        2,
+    );
+    let activation = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(completion(&activation.run_id, first_commands(), true))
+        .await
+        .unwrap();
+    let task = core.poll_activity_task().await.unwrap();
+    let woken = core.poll_workflow_activation().await.unwrap();
+    assert!(wakes_reader_1(&woken), "{woken:?}");
+    core.complete_workflow_activation(completion(&woken.run_id, vec![], false))
+        .await
+        .unwrap();
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: task.task_token,
+        result: Some(ActivityExecutionResult::ok(b"done".to_vec().into())),
+    })
+    .await
+    .unwrap();
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert!(resolves_la_1(&activation), "{activation:?}");
+    core.complete_execution(&activation.run_id).await;
+    drain_pollers_and_shutdown(&core).await;
+    let reported = reported.lock().unwrap().clone();
+    let [cut, last] = reported.as_slice() else {
+        panic!("expected two completions, got {reported:?}");
+    };
+    assert!(cut.force_create_new_workflow_task);
+    assert!(!last.force_create_new_workflow_task);
+    reported
+}
+
+#[tokio::test]
+async fn a_wake_on_the_task_after_a_cut_reaches_lang_while_the_local_activity_runs() {
+    run_cut_then_wake_live().await;
+}
+
+#[rstest::rstest]
+#[case::with_the_cut(true)]
+#[case::without_the_cut(false)]
+#[tokio::test]
+async fn a_cut_then_a_wake_replays_in_the_live_order(#[case] heartbeat_task: bool) {
+    let live = run_cut_then_wake_live().await;
+    let history = history_with_wakes(&live, &[vec![], vec![wake()]]);
+    let (core, reported) = recording_worker(history, [ResponseType::AllHistory], 0);
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert!(is_init(&activation), "{activation:?}");
+    core.complete_workflow_activation(completion(
+        &activation.run_id,
+        first_commands(),
+        heartbeat_task,
+    ))
+    .await
+    .unwrap();
+    let woken = core.poll_workflow_activation().await.unwrap();
+    assert!(
+        wakes_reader_1(&woken),
+        "the wake comes first, as live: {woken:?}"
+    );
+    core.complete_workflow_activation(completion(&woken.run_id, vec![], false))
+        .await
+        .unwrap();
+    let activation = tokio::time::timeout(Duration::from_secs(10), core.poll_workflow_activation())
+        .await
+        .expect("replay resolves the local activity from its marker")
+        .unwrap();
+    assert!(resolves_la_1(&activation), "{activation:?}");
+    core.complete_execution(&activation.run_id).await;
+    drain_pollers_and_shutdown(&core).await;
+    assert!(reported.lock().unwrap().is_empty());
 }
