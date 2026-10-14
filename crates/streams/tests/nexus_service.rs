@@ -691,19 +691,13 @@ mod cases {
         assert!(small.get("error").is_none());
         assert_eq!(texts(&answer), ["small"]);
     }
-    fn arming(wf: &str, after: &str) -> Value {
-        let mut input = read_input(wf, after);
-        input["arm"] = json!(true);
-        input
-    }
-
-    pub(crate) async fn a_read_that_asks_to_arm_is_never_armed(store: Arc<dyn StreamStore>) {
+    pub(crate) async fn a_read_that_asks_to_arm_is_refused(store: Arc<dyn StreamStore>) {
+        // The contract has no arm, and a read refuses members it doesn't know.
         let calls = service(store, NexusOptions::default());
-        let wf = workflow();
-        let answer = read(&calls, arming(&wf, "")).await.unwrap();
-        assert!(records(&answer).is_empty());
-        assert!(answer.get("armed").is_none(), "{answer}");
-        assert_eq!(answer["done"], false);
+        let mut input = read_input(&workflow(), "");
+        input["arm"] = json!(true);
+        let refused = read(&calls, input).await.unwrap_err();
+        assert_eq!(kind_of(&refused).0, "BAD_REQUEST");
     }
 }
 
@@ -744,7 +738,7 @@ macro_rules! all_cases {
             a_record_above_the_budget_still_crosses_alone,
             an_append_above_the_record_limit_is_refused,
             a_stored_record_above_the_limit_crosses_as_an_error,
-            a_read_that_asks_to_arm_is_never_armed,
+            a_read_that_asks_to_arm_is_refused,
         );
     };
 }

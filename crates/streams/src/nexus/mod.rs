@@ -328,7 +328,6 @@ impl NexusCalls {
                     next_token: latest.cursor,
                     done: false,
                     state: None,
-                    armed: false,
                     replay: None,
                 }),
                 Err(error) => failed(failure::of_stream(&error)),
@@ -720,7 +719,6 @@ impl Budget {
             next_token: read.response.cursor.clone(),
             done: false,
             state: Some(Base64::default()),
-            armed: false,
             replay: None,
         });
         let state = crossing_size(read.state.encoded_len().min(MAX_STATE_BYTES));
@@ -786,8 +784,6 @@ fn finish_read(
         wires.push(wire);
         kept.push(record);
     }
-    // Core's read no longer arms, so the contract's `armed` stays false until it leaves the IDL.
-    let armed = false;
     let (next_token, done) = if cut {
         // A supersession belongs to the record after it, so it goes into the next answer too.
         if wires.last().is_some_and(|wire| wire.superseded.is_some()) {
@@ -815,7 +811,6 @@ fn finish_read(
         next_token,
         done,
         state: Some(Base64(state.encode_to_vec())),
-        armed,
         replay,
     })
 }
@@ -854,7 +849,6 @@ fn finish_read_range(
         next_token: response.cursor,
         done: false,
         state: None,
-        armed: false,
         replay: None,
     })
 }
@@ -986,7 +980,6 @@ fn read_failure(error: StreamError, state: Vec<u8>, positions: bool) -> NexusSte
                 records_digest: Base64(records_digest(&[])),
             }),
             state: (!state.is_empty()).then_some(Base64(state)),
-            armed: false,
         }),
         _ => failed(failure::of_stream(&error)),
     }

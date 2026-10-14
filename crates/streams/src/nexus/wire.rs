@@ -97,8 +97,6 @@ pub(crate) struct ReadInput {
     #[serde(default)]
     pub(crate) state: Option<String>,
     #[serde(default)]
-    pub(crate) arm: Option<bool>,
-    #[serde(default)]
     pub(crate) floor_holder: Option<String>,
 }
 
@@ -126,8 +124,6 @@ pub(crate) struct ReadOutput {
     pub(crate) done: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) state: Option<Base64>,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) armed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) replay: Option<ReplayRange>,
 }
@@ -276,7 +272,6 @@ mod tests {
             next_token: "c".to_string(),
             done: false,
             state: None,
-            armed: false,
             replay: Some(ReplayRange {
                 chain_first_run_id: "run-1".to_string(),
                 after_token: String::new(),

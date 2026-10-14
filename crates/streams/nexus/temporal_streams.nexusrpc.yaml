@@ -205,13 +205,6 @@ $defs:
           producer attempts the reader already saw, so its superseded and
           stale marks are exact across calls and across handler Workers. A
           state that doesn't parse is refused as a cursor mistake.
-      arm:
-        type: boolean
-        description: >-
-          For a reader that sleeps until its caller hears of progress. When
-          the call waits its whole wait_ms and collects nothing, the endpoint
-          arms the stream, so the next append notifies the stream's callers.
-          A reader with no callback leaves it out.
       floor_holder:
         type: string
         description: >-
@@ -354,12 +347,6 @@ $defs:
           also when the answer was cut short by its byte budget. It holds at
           most 16 KiB, which is about 22 KiB as base64, so it can ride in a
           Workflow's History. A longer state is refused.
-      armed:
-        type: boolean
-        description: >-
-          The call asked to arm, collected nothing and armed the stream, so
-          the caller waits for progress. Never true with records or with done.
-          An empty answer without it falls back to waiting for progress too.
       replay:
         $ref: "#/$defs/ReplayRange"
         description: >-
