@@ -909,6 +909,7 @@ mod tests {
                         state: Vec::new(),
                         records_digest: page.records_digest.clone(),
                         floor_holder: "reader-run/1".to_string(),
+                        start_from_end: false,
                     }
                     .encode_to_vec(),
                 )

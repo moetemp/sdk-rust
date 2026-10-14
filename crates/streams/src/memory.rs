@@ -463,6 +463,7 @@ impl StreamStore for MemoryStore {
     async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()> {
         self.close_topic_with(chain, topic, StoredClose::default())
             .await
+            .map(drop)
     }
 
     async fn close_topic_with(
@@ -470,8 +471,8 @@ impl StreamStore for MemoryStore {
         chain: &ChainId,
         topic: &str,
         close: StoredClose,
-    ) -> StreamResult<()> {
-        {
+    ) -> StreamResult<StoredClose> {
+        let stored = {
             let mut chains = self.chains.lock().unwrap();
             let topic = chains
                 .entry(chain_key(chain))
@@ -480,10 +481,10 @@ impl StreamStore for MemoryStore {
                 .entry(topic.to_string())
                 .or_default();
             topic.closed = true;
-            topic.close.get_or_insert(close);
-        }
+            topic.close.get_or_insert(close).clone()
+        };
         self.wrote();
-        Ok(())
+        Ok(stored)
     }
 
     async fn retire_producer(
