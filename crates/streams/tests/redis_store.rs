@@ -229,7 +229,7 @@ async fn retiring_a_producer_deletes_its_session_field_only() {
 
 #[tokio::test]
 async fn appends_answer_as_the_python_sdk_recorded() {
-    // The outcomes D1b's script gave the Python provider, run again through the Core store.
+    // The outcomes the Python provider's script gave, run again through the Core store.
     let Some(mut setup) = setup().await else {
         return;
     };
