@@ -518,7 +518,8 @@ fn test_stream_store_appends_and_reads_through_the_c_bridge() {
     use temporalio_common::protos::temporal::api::common::v1::Payload;
     use temporalio_sdk_core::streams::proto::{
         AppendRecord, AppendRequest, AppendResponse, NamedProducer, ReadRequest, ReadResponse,
-        StreamAddress, StreamOwnerKind, StreamRecordKind, append_request, read_record,
+        RetireProducerRequest, StreamAddress, StreamOwnerKind, StreamRecordKind, append_request,
+        read_record, retire_producer_request,
     };
     Context::with(|context| {
         context.runtime_new().unwrap();
@@ -570,7 +571,7 @@ fn test_stream_store_appends_and_reads_through_the_c_bridge() {
                 &store,
                 "Read",
                 ReadRequest {
-                    stream: Some(address),
+                    stream: Some(address.clone()),
                     ..Default::default()
                 }
                 .encode_to_vec(),
@@ -586,6 +587,24 @@ fn test_stream_store_appends_and_reads_through_the_c_bridge() {
             panic!("expected a stored record, got {record:?}");
         };
         assert_eq!(stored.body.as_ref().unwrap().data, b"encrypted");
+
+        // The producer's last append returned, so its dedupe state may go.
+        let retired = context
+            .stream_store_call(
+                &store,
+                "RetireProducer",
+                RetireProducerRequest {
+                    stream: Some(address),
+                    producer: Some(retire_producer_request::Producer::Named(NamedProducer {
+                        producer_id: "p".to_string(),
+                        attempt: 1,
+                    })),
+                }
+                .encode_to_vec(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(retired.is_empty());
     });
 }
 

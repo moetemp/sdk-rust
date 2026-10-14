@@ -77,6 +77,11 @@ relevant information.
   server's `PollStreamNotifier` long poll, for a client reader whose read armed the stream. It
   returns when the notifier's counter passes the read's `wake_after`, when the stream closed, or
   with `timed_out` at the server's wait limit. The reader then reads again with `arm`.
+* Experimental: the stream service's `RetireProducer` call drops one producer attempt's dedupe
+  state on a stream, which the Redis store keeps as one field of the topic's meta hash until
+  retention. A producer that writes once per short-lived attempt calls it after the attempt's
+  last append returned, so the meta hash tracks the attempts in flight. Calling it earlier lets a
+  retried batch land twice.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
