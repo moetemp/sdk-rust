@@ -20063,7 +20063,7 @@
         "counter": {
           "type": "string",
           "format": "int64",
-          "description": "The highest counter the notifier has seen. A reader that armed its read at a counter wakes\nwhen this value is above it. Zero when the notifier has seen no notification."
+          "description": "The highest counter the notifier has seen. A reader that subscribed after a counter wakes\nwhen this value is above it. Zero when the notifier has seen no notification."
         },
         "metadata": {
           "type": "object",
