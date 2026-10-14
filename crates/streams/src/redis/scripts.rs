@@ -71,7 +71,7 @@ mod tests {
     ];
 
     #[test]
-    fn the_append_script_is_d1bs_with_the_topic_check_the_arm_and_the_floor_only() {
+    fn the_append_script_matches_the_sdks_with_the_topic_check_the_arm_and_the_floor_only() {
         assert_eq!(
             APPEND_SCRIPT.get_hash(),
             "57d10e1ab0e8c139a18014504b4058dd1179ab1f"
@@ -90,11 +90,11 @@ mod tests {
         );
         assert_eq!(before_floor.matches(TOPIC_CHECK).count(), 1);
         assert_eq!(before_floor.matches(APPEND_ARM).count(), 2);
-        let d1b = before_floor
+        let sdk_script = before_floor
             .replacen(TOPIC_CHECK, "", 1)
             .replace(APPEND_ARM, "");
         assert_eq!(
-            Script::new(&d1b).get_hash(),
+            Script::new(&sdk_script).get_hash(),
             "7944489663d477b49e3f4f947933e15de3269718"
         );
     }
