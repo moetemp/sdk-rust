@@ -847,6 +847,9 @@ async fn call_workflow_service(
         "PollNexusTaskQueue" => {
             rpc_call_on_trait!(client, call, WorkflowService, poll_nexus_task_queue)
         }
+        "PollStreamNotifier" => {
+            rpc_call_on_trait!(client, call, WorkflowService, poll_stream_notifier)
+        }
         "PollWorkflowExecutionUpdate" => rpc_call_on_trait!(
             client,
             call,
