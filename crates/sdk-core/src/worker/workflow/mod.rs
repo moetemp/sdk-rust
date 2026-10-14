@@ -7,6 +7,7 @@ mod history_update;
 mod machines;
 mod managed_run;
 mod run_cache;
+pub(crate) mod stream_output;
 mod wft_extraction;
 pub(crate) mod wft_poller;
 mod workflow_stream;
@@ -147,6 +148,9 @@ pub(crate) struct Workflows {
     default_versioning_behavior: Option<VersioningBehavior>,
     namespace_capabilities: Arc<NamespaceCapabilities>,
     shutdown_token: CancellationToken,
+    /// Appends Workflow stream output, when the Worker has a stream store.
+    #[cfg(feature = "streams")]
+    output_store: Option<stream_output::OutputStore>,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -196,6 +200,10 @@ impl Workflows {
         let default_versioning_behavior = basics.default_versioning_behavior;
         let namespace_capabilities = basics.namespace_capabilities.clone();
         let shutdown_token = basics.shutdown_token.clone();
+        #[cfg(feature = "streams")]
+        let output_store = basics.worker_config.stream_store.clone().map(|store| {
+            stream_output::OutputStore::new(store, basics.worker_config.namespace.clone())
+        });
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
             basics.worker_config.fetching_concurrency,
@@ -293,6 +301,8 @@ impl Workflows {
             default_versioning_behavior,
             namespace_capabilities,
             shutdown_token,
+            #[cfg(feature = "streams")]
+            output_store,
         }
     }
 
@@ -369,6 +379,7 @@ impl Workflows {
         wft_from_complete: &mut Option<ValidPollWFTQResponse>,
         completion_time: Instant,
         report: ServerCommandsWithWorkflowInfo,
+        retired: Option<Box<stream_output::RetiredSessions>>,
     ) -> WFTReportStatus {
         match report {
             ServerCommandsWithWorkflowInfo {
@@ -440,6 +451,9 @@ impl Workflows {
                         Ok(response) => {
                             if let Some(record) = maybe_record_terminal_metric.take() {
                                 record(&run_metrics);
+                            }
+                            if let Some(retired) = retired {
+                                self.retire_stream_sessions(&retired).await;
                             }
                             if response.reset_history_event_id > 0 {
                                 reset_last_started_to = Some(response.reset_history_event_id);
@@ -582,6 +596,7 @@ impl Workflows {
                     wft_from_complete,
                     completion_time,
                     report,
+                    completion_outcome.retired,
                 )
                 .await
             }
@@ -639,6 +654,7 @@ impl Workflows {
             );
             return Ok(());
         };
+        let completion_outcome = self.append_output(&run_id, completion_outcome).await;
         let replaying = completion_outcome.replaying;
 
         let mut wft_from_complete = None;
@@ -678,6 +694,65 @@ impl Workflows {
         });
 
         Ok(())
+    }
+
+    /// Appends the stream output `result` carries, if any, before anything else happens with the
+    /// completion.
+    ///
+    /// The run has one outstanding activation until [Self::post_activation], so its appends never
+    /// overlap and land in commit order. When the append fails, the Workflow Task fails instead of
+    /// whatever the completion would have done, and the run is evicted, since its records may be
+    /// in the store in part.
+    async fn append_output(
+        &self,
+        run_id: &str,
+        mut result: ActivationCompleteResult,
+    ) -> ActivationCompleteResult {
+        let Some(output) = result.output.take() else {
+            return result;
+        };
+        let Err(failure) = self.append_to_store(&output.batch).await else {
+            return result;
+        };
+        self.request_eviction(
+            run_id,
+            "The Workflow Task's stream output could not be appended",
+            EvictionReason::Fatal,
+        );
+        result.retired = None;
+        result.outcome =
+            ActivationCompleteOutcome::ReportWFTFail(Box::new(FailedActivationWFTReport::new(
+                output.task_token,
+                output.attempt,
+                WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+                failure,
+                WftFailureKind::Task,
+                &output.metrics,
+            )));
+        result
+    }
+
+    async fn append_to_store(&self, batch: &stream_output::OutputBatch) -> Result<(), Failure> {
+        #[cfg(feature = "streams")]
+        if let Some(store) = &self.output_store {
+            return store.append(batch).await.map_err(|e| {
+                make_stream_output_failure(&format!(
+                    "Could not append the Workflow Task's stream output ({e})"
+                ))
+            });
+        }
+        let _ = batch;
+        Err(make_stream_output_failure(
+            "This Worker has no stream store to append the Workflow Task's stream output to",
+        ))
+    }
+
+    async fn retire_stream_sessions(&self, retired: &stream_output::RetiredSessions) {
+        #[cfg(feature = "streams")]
+        if let Some(store) = &self.output_store {
+            store.retire(retired).await;
+        }
+        let _ = retired;
     }
 
     /// Tell workflow that a local activity has finished with the provided result
@@ -1307,6 +1382,27 @@ struct GetStateInfoMsg {
 struct ActivationCompleteResult {
     replaying: bool,
     outcome: ActivationCompleteOutcome,
+    /// The stream output this activation committed, to append before anything else is done.
+    output: Option<Box<ActivationOutput>>,
+    /// The store sessions to retire once the server accepts the reported task.
+    retired: Option<Box<stream_output::RetiredSessions>>,
+}
+
+/// One activation's stream output, and what failing its Workflow Task takes.
+struct ActivationOutput {
+    batch: stream_output::OutputBatch,
+    task_token: TaskToken,
+    attempt: u32,
+    metrics: MetricsContext,
+}
+impl Debug for ActivationOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivationOutput")
+            .field("batch", &self.batch)
+            .field("task_token", &self.task_token)
+            .field("attempt", &self.attempt)
+            .finish()
+    }
 }
 
 /// What needs to be done after calling [Workflows::activation_completed]
@@ -1593,6 +1689,8 @@ enum WFCommandVariant {
     UpdateResponse(UpdateResponse),
     ScheduleNexusOperation(ScheduleNexusOperation),
     RequestCancelNexusOperation(RequestCancelNexusOperation),
+    /// The stream records lang published in this activation.
+    OutputStreamCommit(WorkflowOutputStreamCommit),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1653,6 +1751,9 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             }
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
+            }
+            workflow_command::Variant::WorkflowOutputStreamCommit(commit) => {
+                WFCommandVariant::OutputStreamCommit(commit)
             }
         };
         Ok(Self {
@@ -1951,6 +2052,25 @@ fn make_grpc_message_too_large_failure() -> Failure {
             },
         ),
         force_cause: WorkflowTaskFailedCause::GrpcMessageTooLarge as i32,
+    }
+}
+
+fn make_stream_output_failure(message: &str) -> Failure {
+    Failure {
+        failure: Some(
+            temporalio_common::protos::temporal::api::failure::v1::Failure {
+                message: message.to_string(),
+                failure_info: Some(FailureInfo::ApplicationFailureInfo(
+                    ApplicationFailureInfo {
+                        r#type: "StreamOutputNotAppended".to_string(),
+                        non_retryable: false,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
+        ),
+        force_cause: WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure as i32,
     }
 }
 

@@ -20,6 +20,7 @@ import "temporal/api/workflow/v1/message.proto";
 import "temporal/sdk/core/child_workflow/child_workflow.proto";
 import "temporal/sdk/core/nexus/nexus.proto";
 import "temporal/sdk/core/common/common.proto";
+import "temporal/sdk/streams/v1/message.proto";
 
 message WorkflowCommand {
     // User metadata that may or may not be persisted into history depending on the command type.
@@ -55,7 +56,31 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        WorkflowOutputStreamCommit workflow_output_stream_commit = 23;
     }
+}
+
+// The stream records one activation published, sent with its completion.
+//
+// Core appends them to the Worker's stream store before it reports the completion to the
+// server, so readers see them before the Workflow Task completes. Nothing about them goes to
+// History. Lang sends no commit while it replays, and Core drops one it gets then, since the
+// records are in the store already. Core takes at most one commit per completion.
+message WorkflowOutputStreamCommit {
+    repeated OutputRecord records = 1;
+}
+
+// One record a Workflow published, in publish order across topics.
+message OutputRecord {
+    string topic = 1;
+    // DATA or FINISH.
+    temporal.sdk.streams.v1.StreamRecordKind kind = 2;
+    // The value on DATA, after lang's payload codec. Absent on FINISH.
+    temporal.api.common.v1.Payload body = 3;
+    // The SHA-256 of the body as the payload converter made it, before the codec. Set on DATA.
+    // Core builds each topic's batch digest from these, so a repeat of a batch matches whatever
+    // the codec made of the bodies.
+    bytes content_hash = 4;
 }
 
 message StartTimer {
