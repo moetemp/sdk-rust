@@ -104,6 +104,15 @@ relevant information.
   in the same activations. Progress for an operation that is unknown, not started, already
   resolved, or below a counter already delivered is dropped. A task scheduled with progress ends
   a workflow task heartbeat chain, as one with stream wakes does.
+* Experimental: the stream calls `AttachCaller` and `DetachCaller` serve a stream-returning Nexus
+  operation. `AttachCaller` resolves the stream's run chain, mints the operation token and
+  attaches the start's callback to the stream's notifier with the token and start time.
+  `DetachCaller` decodes the token and detaches from the chain the start attached to. The token
+  format is in `crates/streams/nexus/operation_token_vectors.json`, which every SDK's encoder and
+  decoder check. Both answer a failure in the response as a `NexusFailure`, from the same table as
+  the Nexus calls, so lang's handler raises it as it is. A mistake in the stream, an empty callback
+  URL or request id, and a token that names no stream are `BAD_REQUEST`. An attach for the latest
+  run describes the Workflow fresh, so it never lands on a chain that already ended.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

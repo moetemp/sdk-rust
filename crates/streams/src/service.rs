@@ -5,10 +5,10 @@ use crate::{
     StreamResult, StreamStore, Streams, StreamsOptions,
     nexus::{NexusCalls, NexusOptions},
     proto::{
-        AppendRequest, CloseRequest, DeleteOwnerRequest, FlushNotificationsRequest,
-        FlushNotificationsResponse, LatestRequest, NexusCall, NexusResumeRequest, ReadRequest,
-        RetireProducerRequest, StreamFailure, StreamStoreConfig, SubscribeRequest,
-        UnsubscribeRequest, WaitForNotificationRequest, stream_store_config,
+        AppendRequest, AttachCallerRequest, CloseRequest, DeleteOwnerRequest, DetachCallerRequest,
+        FlushNotificationsRequest, FlushNotificationsResponse, LatestRequest, NexusCall,
+        NexusResumeRequest, ReadRequest, RetireProducerRequest, StreamFailure, StreamStoreConfig,
+        SubscribeRequest, UnsubscribeRequest, WaitForNotificationRequest, stream_store_config,
     },
     subscribe::Subscriptions,
 };
@@ -32,6 +32,7 @@ pub struct StreamService {
     streams: Arc<Streams>,
     subscriptions: Subscriptions,
     nexus: NexusCalls,
+    callers: Option<Arc<dyn NotifierClient>>,
 }
 
 impl std::fmt::Debug for StreamService {
@@ -54,7 +55,8 @@ impl StreamService {
 
     /// Like [StreamService::connect], closing each stream's notifier through `notifier` after
     /// the store closes the stream, sending progress too when the config turns it on, attaching
-    /// and detaching Workflow readers through it, and waiting on it for client readers.
+    /// and detaching Workflow readers and stream operation callers through it, and waiting on it
+    /// for client readers.
     pub async fn connect_with_notifier(
         config: StreamStoreConfig,
         owner: Arc<dyn OwnerClient>,
@@ -92,7 +94,9 @@ impl StreamService {
         };
         let service = Self::new(store, owner, StreamsOptions::for_retention(retention));
         Ok(match notifier {
-            Some(client) => service.with_subscriptions(client),
+            Some(client) => service
+                .with_subscriptions(client.clone())
+                .with_callers(client),
             None => service,
         })
     }
@@ -110,12 +114,19 @@ impl StreamService {
             streams,
             subscriptions: Subscriptions::default(),
             nexus,
+            callers: None,
         }
     }
 
     /// Attaches and detaches Workflow readers, and waits for client readers, through `client`.
     pub fn with_subscriptions(mut self, client: Arc<dyn NotifierClient>) -> Self {
         self.subscriptions = Subscriptions::new(Some(client));
+        self
+    }
+
+    /// Attaches and detaches stream operation callers through `client`.
+    pub fn with_callers(mut self, client: Arc<dyn NotifierClient>) -> Self {
+        self.callers = Some(client);
         self
     }
 
@@ -200,6 +211,20 @@ impl StreamService {
                 .resume(decode::<NexusResumeRequest>(rpc, request)?)
                 .await
                 .encode_to_vec()),
+            // Like the Nexus calls, a caller call answers its failure in the response.
+            "AttachCaller" => Ok(crate::nexus::attach_caller(
+                &self.streams,
+                self.callers.as_ref(),
+                decode::<AttachCallerRequest>(rpc, request)?,
+            )
+            .await
+            .encode_to_vec()),
+            "DetachCaller" => Ok(crate::nexus::detach_caller(
+                self.callers.as_ref(),
+                decode::<DetachCallerRequest>(rpc, request)?,
+            )
+            .await
+            .encode_to_vec()),
             other => Err(StreamError::unsupported(format!(
                 "the stream service has no call {other:?}"
             ))),

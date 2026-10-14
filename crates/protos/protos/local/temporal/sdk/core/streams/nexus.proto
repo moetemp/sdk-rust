@@ -6,6 +6,7 @@ option ruby_package = "Temporalio::Internal::Bridge::Api::Streams";
 import "google/protobuf/timestamp.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
+import "temporal/sdk/core/streams/streams.proto";
 
 // The stream service's Nexus operations, served by Core. Lang forwards each call's input in the
 // N0a contract's JSON transfer form, runs its payload codec when Core asks for it, and hands the
@@ -20,6 +21,12 @@ service StreamNexusService {
   rpc NexusRead(NexusCall) returns (NexusStep);
   // Goes on with a call that asked for codec work.
   rpc NexusResume(NexusResumeRequest) returns (NexusStep);
+  // Attaches the caller of a stream-returning Nexus operation's start to the stream's notifier,
+  // and answers with the operation token, or the failure the start answers with. The server then delivers the stream's progress and its
+  // close result to the caller's callback. Idempotent by the start's request id.
+  rpc AttachCaller(AttachCallerRequest) returns (AttachCallerResponse);
+  // Detaches the caller a token's start attached, from the chain it attached to.
+  rpc DetachCaller(DetachCallerRequest) returns (DetachCallerResponse);
 }
 
 // One Nexus operation call.
@@ -90,4 +97,35 @@ message NexusFailure {
   // The failure that crosses to the caller, with the stream condition's class as its cause's
   // application error type.
   temporal.api.failure.v1.Failure failure = 4;
+}
+
+message AttachCallerRequest {
+  // The stream the operation's start names. An empty run id attaches to the chain that holds the
+  // Workflow id now.
+  StreamAddress stream = 1;
+  // The start's request id. A retried start attaches once.
+  string request_id = 2;
+  // The start's callback URL and headers. An empty URL is refused, since the caller could never
+  // hear about the stream.
+  string callback_url = 3;
+  map<string, string> callback_headers = 4;
+}
+
+message AttachCallerResponse {
+  // The token the start answers with. It names the stream, the attach and the chain.
+  string operation_token = 1;
+  // Set when the attach failed, as the Nexus calls answer a failure, so lang hands it to its
+  // Nexus handler as it is. The token is then empty.
+  NexusFailure failure = 2;
+}
+
+message DetachCallerRequest {
+  string namespace = 1;
+  // The token the start answered with.
+  string operation_token = 2;
+}
+
+message DetachCallerResponse {
+  // Set when the detach failed, as the Nexus calls answer a failure.
+  NexusFailure failure = 1;
 }
