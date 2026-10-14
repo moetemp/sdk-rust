@@ -5,6 +5,7 @@ option ruby_package = "Temporalio::Internal::Bridge::Api::Streams";
 
 import "google/protobuf/duration.proto";
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/failure/v1/message.proto";
 import "temporal/sdk/streams/v1/message.proto";
 
 // The stream calls lang makes, served in process by Core against the configured store.
@@ -38,8 +39,9 @@ message StreamStoreConfig {
   }
   // Tells each stream's notifier on the server when the stream moves, after every append. That's
   // what wakes a reader that waits on the notifier. Off by default, since most streams have no such
-  // reader and each notification costs a call. A server without the stream notifier costs one
-  // call, and then the process stops notifying.
+  // reader and each notification costs a call. It turns on progress only. Closes reach the
+  // notifier either way. A server without the stream notifier costs one call, and then the process
+  // stops notifying.
   bool notify_on_append = 3;
   // How many streams to keep a notifier for, dropping the least recently used. Zero uses 1000.
   uint32 max_notifiers = 4;
@@ -204,6 +206,15 @@ message LatestResponse {
 
 message CloseRequest {
   StreamAddress stream = 1;
+  // What every callback attached to the stream's notifier completes with, after lang's payload
+  // codec. The stream's notifier on the server closes once the store has. When set, a notifier
+  // that doesn't take the close fails the call, and Core keeps trying in the background too. Unset, the callbacks complete with a `binary/null` result, and the notifier
+  // close is retried in the background.
+  temporal.api.common.v1.Payload result = 2;
+  // Closes the stream with a failure instead of `result`, after lang's failure converter and
+  // codec. The callbacks complete as failed, or as canceled for a failure with canceled info.
+  // A close carries a result or a failure, never both.
+  temporal.api.failure.v1.Failure failure = 3;
 }
 
 message CloseResponse {}

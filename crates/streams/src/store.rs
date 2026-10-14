@@ -6,6 +6,37 @@ use crate::{
     },
 };
 
+/// The result a stream closes with when its owner gave none: a `binary/null` payload, which every
+/// SDK's converter reads as no value. A payload with no encoding fails a caller that expects a
+/// typed result.
+pub fn empty_close_result() -> crate::proto::Payload {
+    crate::proto::Payload {
+        metadata: [("encoding".to_string(), b"binary/null".to_vec())].into(),
+        ..Default::default()
+    }
+}
+
+/// What a closed stream's waiters see: the readers and callbacks its notifier holds.
+// One is built per close, so the size of a failure doesn't matter.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum CloseOutcome {
+    /// The stream ended with this payload, after lang's codec.
+    Result(crate::proto::Payload),
+    /// The stream ended with this failure, or as canceled when it has canceled info.
+    Failure(temporalio_common::protos::temporal::api::failure::v1::Failure),
+}
+
+impl CloseOutcome {
+    /// The result, or `None` for a failure.
+    pub fn result(&self) -> Option<crate::proto::Payload> {
+        match self {
+            CloseOutcome::Result(result) => Some(result.clone()),
+            CloseOutcome::Failure(_) => None,
+        }
+    }
+}
+
 /// A store that holds streams, keyed by their owner's run chain.
 ///
 /// A store moves serialized `temporal.sdk.streams.v1.StreamRecord`s with encoded bodies and deals
@@ -75,8 +106,34 @@ pub trait StreamStore: Send + Sync {
     /// Marks one topic of a chain closed, like [StreamStore::close_chain] for that topic alone.
     async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()>;
 
+    /// Like [StreamStore::close_topic], with the outcome the stream's waiters get. A store keeps
+    /// no outcome, but a wrapper that tells the stream's notifier needs it.
+    async fn close_topic_with(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        outcome: CloseOutcome,
+    ) -> StreamResult<()> {
+        let _ = outcome;
+        self.close_topic(chain, topic).await
+    }
+
     /// Deletes every stream of one owner, across all its chains.
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse>;
+
+    /// Closes one topic of a chain in the store, then tells the topic's notifier on the server,
+    /// which completes every attached callback with `outcome`. The store closes first, so a
+    /// reader the completion reaches always finds the stream's end. A store that sends no
+    /// notifications only closes the topic. Fails as refused when the server will never take the
+    /// close, and with another kind when trying again may help.
+    async fn close_stream(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        outcome: CloseOutcome,
+    ) -> StreamResult<()> {
+        self.close_topic_with(chain, topic, outcome).await
+    }
 
     /// Waits until the notifications this store sent are out. A store that sends none returns at
     /// once.

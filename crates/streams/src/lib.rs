@@ -28,8 +28,8 @@ pub use error::{StreamError, StreamResult};
 pub use handle::{OWNER_RECHECK, Streams, StreamsOptions};
 pub use memory::MemoryStore;
 pub use notify::{
-    DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT, Notifier, NotifierClient, NotifyError, NotifyingStore,
-    StreamNotification, progress_counter,
+    CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT, Notifier,
+    NotifierClient, NotifyError, NotifyingStore, StreamNotification, progress_counter,
 };
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};
 pub use reader::{DEFAULT_MAX_RECORDS, MAX_TRACKED_PRODUCERS, ReadTarget, read_page};
@@ -37,12 +37,13 @@ pub use record::{
     WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, stored_append_record,
 };
 pub use service::StreamService;
-pub use store::StreamStore;
+pub use store::{CloseOutcome, StreamStore, empty_close_result};
 
 /// The protos stores and lang exchange.
 pub mod proto {
     pub use temporalio_common::protos::{
         coresdk::streams::*,
+        temporal::api::common::v1::Payload,
         temporal::sdk::streams::v1::{StreamRecord, StreamRecordKind},
     };
 }

@@ -49,6 +49,14 @@ relevant information.
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with
   `UNIMPLEMENTED`. Core then stops notifier calls in that process and logs it once at debug.
+* Experimental: Core closes a stream's notifier after the store closes the stream, whether or
+  not `notify_on_append` is on, so attached callbacks complete with the close outcome. A
+  `CloseRequest` carries it in the new `result` or `failure` field. With one of them, the call
+  fails when the server doesn't take the close, and Core keeps trying in the background too.
+  Without them, the notifier closes in the background with a `binary/null` result. A reader that
+  finds the owner ended closes only the store. The notifier's owner check closes the notifier.
+* Experimental: `StreamStore` has `close_topic_with` and `close_stream`, which carry the close
+  outcome to a wrapper that tells the notifier.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
