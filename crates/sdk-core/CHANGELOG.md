@@ -49,6 +49,11 @@ relevant information.
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with
   `UNIMPLEMENTED`. Core then stops notifier calls in that process and logs it once at debug.
+* Experimental: the stream service's `RetireProducer` call drops one producer attempt's dedupe
+  state on a stream, which the Redis store keeps as one field of the topic's meta hash until
+  retention. A producer that writes once per short-lived attempt calls it after the attempt's
+  last append returned, so the meta hash tracks the attempts in flight. Calling it earlier lets a
+  retried batch land twice.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

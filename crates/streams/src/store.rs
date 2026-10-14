@@ -75,6 +75,19 @@ pub trait StreamStore: Send + Sync {
     /// Marks one topic of a chain closed, like [StreamStore::close_chain] for that topic alone.
     async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()>;
 
+    /// Drops the newest-batch record [StreamStore::append] keeps for one producer attempt on a
+    /// topic, and nothing else. A missing attempt or topic is no failure.
+    ///
+    /// Call it only once the attempt's last append returned. A retry of an earlier batch would
+    /// then find no record to compare with and land a second time.
+    async fn retire_producer(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        producer_id: &str,
+        attempt: i64,
+    ) -> StreamResult<()>;
+
     /// Deletes every stream of one owner, across all its chains.
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse>;
 

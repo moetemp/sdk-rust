@@ -1170,6 +1170,45 @@ mod cases {
         }
     }
 
+    pub(crate) async fn retiring_a_producer_drops_only_its_dedupe_state(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        let first = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        let kept = Producer::new(case, &chain, OUT, "q", 1)
+            .append(&["2"])
+            .await;
+        store.retire_producer(&chain, OUT, "p", 1).await.unwrap();
+        // A repeat, an attempt that never wrote, a topic and a chain that hold nothing.
+        store.retire_producer(&chain, OUT, "p", 1).await.unwrap();
+        store.retire_producer(&chain, OUT, "p", 2).await.unwrap();
+        store.retire_producer(&chain, OTHER, "p", 1).await.unwrap();
+        store
+            .retire_producer(&case.chain(), OUT, "p", 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
+            ["1", "2"]
+        );
+        // The other producer still dedupes.
+        let repeat = Producer::new(case, &chain, OUT, "q", 1)
+            .append(&["2"])
+            .await;
+        assert_eq!(repeat, kept);
+        // The retired attempt no longer does, which is why only an attempt whose last append
+        // returned may be retired.
+        let again = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        assert_ne!(again.first_position, first.first_position);
+        assert_eq!(
+            values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
+            ["1", "2", "1"]
+        );
+    }
+
     pub(crate) async fn deleting_an_owner_drops_every_chain_of_it(case: &dyn Case) {
         let store = case.store();
         let chain = case.chain();
@@ -1254,6 +1293,7 @@ macro_rules! store_cases {
             a_closed_chain_refuses_new_batches_but_answers_a_repeat,
             a_closed_topic_leaves_the_others_open,
             a_closed_topic_answers_a_repeat_and_ends_reads,
+            retiring_a_producer_drops_only_its_dedupe_state,
         );
     };
 }

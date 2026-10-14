@@ -24,6 +24,9 @@ service StreamService {
   rpc Close(CloseRequest) returns (CloseResponse);
   // Deletes every stream of one owner.
   rpc DeleteOwner(DeleteOwnerRequest) returns (DeleteOwnerResponse);
+  // Drops the dedupe state of one producer attempt on one stream. Safe only once the attempt's
+  // last append returned, since a retry of that append would then land twice.
+  rpc RetireProducer(RetireProducerRequest) returns (RetireProducerResponse);
   // Waits until the stream notifications this process sent are out, for at most 10 seconds. A
   // notification goes in the background, so a process calls it before it stops.
   rpc FlushNotifications(FlushNotificationsRequest) returns (FlushNotificationsResponse);
@@ -223,6 +226,18 @@ message DeleteOwnerResponse {
   // means the same on every store: nothing was left to delete.
   uint64 deleted = 1;
 }
+
+message RetireProducerRequest {
+  StreamAddress stream = 1;
+  // The producer attempt whose dedupe state goes. Nothing it wrote is touched.
+  oneof producer {
+    NamedProducer named = 2;
+    ActivityProducer activity = 3;
+  }
+}
+
+// A producer attempt with no dedupe state left, or a stream that holds nothing, answers the same.
+message RetireProducerResponse {}
 
 // One class per way a stream call can fail, so every lang maps the same failure to the same
 // error.

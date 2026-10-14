@@ -8,10 +8,11 @@ use crate::{
     check_append_digest, mint_cursor,
     owner::{OwnerClient, OwnerDescription, OwnerError},
     proto::{
-        AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse, DeleteOwnerRequest,
-        DeleteOwnerResponse, LatestRequest, LatestResponse, ReadRequest, ReadResponse,
-        StoreAppendRequest, StoreLatestRequest, StreamAddress, StreamOwnerKind,
-        append_request::Producer,
+        ActivityProducer, AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse,
+        DeleteOwnerRequest, DeleteOwnerResponse, LatestRequest, LatestResponse, NamedProducer,
+        ReadRequest, ReadResponse, RetireProducerRequest, RetireProducerResponse,
+        StoreAppendRequest, StoreLatestRequest, StreamAddress, StreamOwnerKind, append_request,
+        retire_producer_request,
     },
     reader::{ReadState, read_with},
     stored_append_record, stream_hash,
@@ -164,26 +165,14 @@ impl Streams {
     pub async fn append(&self, request: AppendRequest) -> StreamResult<AppendResponse> {
         let stream = address(request.stream.as_ref())?;
         let (producer_id, attempt) = match &request.producer {
-            Some(Producer::Named(named)) => {
-                if named.producer_id.is_empty() {
-                    return Err(StreamError::invalid_argument("a producer needs an id"));
-                }
-                (named.producer_id.clone(), named.attempt)
-            }
-            Some(Producer::Activity(activity)) => {
-                (activity_producer_id(activity), i64::from(activity.attempt))
-            }
+            Some(append_request::Producer::Named(named)) => producer(Some(named), None)?,
+            Some(append_request::Producer::Activity(activity)) => producer(None, Some(activity))?,
             None => {
                 return Err(StreamError::invalid_argument(
                     "an append needs its producer",
                 ));
             }
         };
-        if attempt < 1 {
-            return Err(StreamError::invalid_argument(format!(
-                "a producer's attempt starts at one, not {attempt}"
-            )));
-        }
         if request.sequence < 1 {
             return Err(StreamError::invalid_argument(format!(
                 "a producer's sequence starts at one, not {}",
@@ -372,6 +361,44 @@ impl Streams {
         Ok(CloseResponse {})
     }
 
+    /// Drops one producer attempt's dedupe state on a stream, on the chain that attempt wrote
+    /// on. It refuses nothing on a closed stream, and a stream or attempt with no state answers
+    /// the same.
+    ///
+    /// Only safe once the attempt's last append returned: a retry of an earlier batch would land
+    /// a second time. Nothing else is lost. A store compares a batch with its own attempt's
+    /// state only, and readers find a newer attempt from the records.
+    pub async fn retire_producer(
+        &self,
+        request: RetireProducerRequest,
+    ) -> StreamResult<RetireProducerResponse> {
+        let stream = address(request.stream.as_ref())?;
+        let (producer_id, attempt) = match &request.producer {
+            Some(retire_producer_request::Producer::Named(named)) => producer(Some(named), None)?,
+            Some(retire_producer_request::Producer::Activity(activity)) => {
+                producer(None, Some(activity))?
+            }
+            None => {
+                return Err(StreamError::invalid_argument("a retire needs its producer"));
+            }
+        };
+        let key = ProducerKey {
+            owner: owner_key(stream),
+            producer_id,
+            attempt,
+        };
+        // The chain the attempt's appends resolved, even when a newer chain took the Workflow
+        // id since, so the state goes from where it was written.
+        let chain = match self.producers.get(&key) {
+            Some(checked) => chain_of_key(&key.owner, &checked.first_run_id),
+            None => self.chain(stream).await?,
+        };
+        self.store
+            .retire_producer(&chain, &stream.topic, &key.producer_id, attempt)
+            .await?;
+        Ok(RetireProducerResponse {})
+    }
+
     /// Deletes every stream of one owner, across all its chains. It asks Temporal nothing, so it
     /// works after the owner is gone. Delete only after the chain closed and its producers
     /// stopped, since a late append writes a fresh stream with no dedupe state and no close mark.
@@ -520,6 +547,29 @@ fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
 }
 
 /// Refuses a topic no store keys reliably, by the rules Core's Workflow path also applies.
+/// The producer id and attempt a named producer or an Activity attempt writes as.
+fn producer(
+    named: Option<&NamedProducer>,
+    activity: Option<&ActivityProducer>,
+) -> StreamResult<(String, i64)> {
+    let (producer_id, attempt) = match (named, activity) {
+        (Some(named), _) => {
+            if named.producer_id.is_empty() {
+                return Err(StreamError::invalid_argument("a producer needs an id"));
+            }
+            (named.producer_id.clone(), named.attempt)
+        }
+        (None, Some(activity)) => (activity_producer_id(activity), i64::from(activity.attempt)),
+        (None, None) => return Err(StreamError::invalid_argument("a call needs its producer")),
+    };
+    if attempt < 1 {
+        return Err(StreamError::invalid_argument(format!(
+            "a producer's attempt starts at one, not {attempt}"
+        )));
+    }
+    Ok((producer_id, attempt))
+}
+
 fn check_topic(topic: &str) -> StreamResult<()> {
     temporalio_common::streams::check_topic(topic).map_err(StreamError::invalid_argument)
 }
@@ -593,7 +643,7 @@ mod tests {
         MemoryStore,
         proto::{
             ActivityProducer, AppendRecord, NamedProducer, StoreReadRequest, StreamFailureKind,
-            StreamRecordKind,
+            StreamRecordKind, append_request::Producer,
         },
     };
     use sha2::{Digest, Sha256};
@@ -1117,6 +1167,51 @@ mod tests {
         let mut other = append("p", 1, "1");
         other.stream.as_mut().unwrap().topic = "other".to_string();
         setup.streams.append(other).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_retire_drops_the_attempts_state_on_the_chain_it_wrote() {
+        let setup = setup(StreamsOptions::default());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup
+            .streams
+            .close(CloseRequest {
+                stream: Some(stream("out")),
+            })
+            .await
+            .unwrap();
+        let before = setup.owners.describes();
+        let retire = |producer: Option<retire_producer_request::Producer>| RetireProducerRequest {
+            stream: Some(stream("out")),
+            producer,
+        };
+        let named = |attempt| {
+            Some(retire_producer_request::Producer::Named(NamedProducer {
+                producer_id: "p".to_string(),
+                attempt,
+            }))
+        };
+        // A closed stream refuses no retire, and a repeat answers the same.
+        for _ in 0..2 {
+            setup
+                .streams
+                .retire_producer(retire(named(1)))
+                .await
+                .unwrap();
+        }
+        // The append resolved the chain, so the retire asks Temporal nothing.
+        assert_eq!(setup.owners.describes(), before);
+        // With the state gone, the repeat is a new batch, which the closed stream refuses.
+        assert_eq!(
+            kind(setup.streams.append(append("p", 1, "1")).await),
+            StreamFailureKind::Closed
+        );
+        for bad in [retire(None), retire(named(0))] {
+            assert_eq!(
+                kind(setup.streams.retire_producer(bad).await),
+                StreamFailureKind::InvalidArgument
+            );
+        }
     }
 
     fn quick() -> StreamsOptions {
