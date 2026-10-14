@@ -231,7 +231,7 @@ pub(crate) async fn read_with(
         .await?;
     let (closed, armed, close) = (page.closed, page.armed, page.close);
     let mut records = Vec::with_capacity(page.records.len());
-    let mut previous = start;
+    let mut previous = start.clone();
     for stored in page.records {
         let cursor = mint_cursor(store.name(), &target.stream_hash, &stored.position);
         let record = match parse(&stored.record) {
@@ -270,7 +270,6 @@ pub(crate) async fn read_with(
     }
     Ok((
         ReadResponse {
-            records,
             cursor: previous,
             state: Vec::new(),
             done: false,
@@ -282,11 +281,54 @@ pub(crate) async fn read_with(
             } else {
                 0
             },
+            records_digest: records_digest(&records),
+            records,
+            chain_first_run_id: target.chain.first_run_id.clone(),
+            start_cursor: start.clone(),
             ..Default::default()
         },
         closed,
         close,
     ))
+}
+
+/// The digest of a read's answer that a replay read checks (RR-1). It covers what a reader acts
+/// on and leaves out the encoded body, so a codec change keeps it. Each field has a length
+/// prefix, so two answers can't give the same bytes.
+pub(crate) fn records_digest(records: &[ReadRecord]) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    let mut field = |bytes: &[u8]| {
+        digest.update((bytes.len() as u64).to_be_bytes());
+        digest.update(bytes);
+    };
+    for record in records {
+        field(record.cursor.as_bytes());
+        field(&[u8::from(record.stale)]);
+        match &record.record {
+            Some(read_record::Record::Stored(stored)) => {
+                field(b"stored");
+                field(&stored.kind.to_be_bytes());
+                field(stored.producer_id.as_bytes());
+                field(&stored.attempt.to_be_bytes());
+                field(&stored.sequence.to_be_bytes());
+                field(
+                    stored
+                        .metadata
+                        .get(temporalio_common::streams::CONTENT_HASH_KEY)
+                        .map_or(&[][..], |hash| hash.data.as_slice()),
+                );
+            }
+            Some(read_record::Record::Superseded(superseded)) => {
+                field(b"superseded");
+                field(superseded.producer_id.as_bytes());
+                field(&superseded.previous_attempt.to_be_bytes());
+                field(&superseded.attempt.to_be_bytes());
+            }
+            None => field(b"none"),
+        }
+    }
+    digest.finalize().to_vec()
 }
 
 /// A stored record as a reader delivers it. Fails on bytes that are no record, and on a kind no

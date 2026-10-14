@@ -77,6 +77,9 @@ struct Chain {
     /// Kept apart from the topics, so an arm on a topic with no records leaves it unknown to
     /// reads and to the topic list.
     arms: HashMap<String, Arm>,
+    /// Per topic, the position each positions-only reader holds the records after. `None` holds
+    /// the whole topic.
+    floors: HashMap<String, HashMap<String, Option<u64>>>,
 }
 
 /// A topic's arm: the generation a reader set, zero once cleared, and the last one handed out.
@@ -126,15 +129,23 @@ impl MemoryStore {
     }
 
     /// Drops all but the newest `keep` records of a topic, standing in for a store's retention.
+    /// It keeps the records a positions-only reader holds, from the position it holds on.
     pub fn truncate(&self, chain: &ChainId, topic: &str, keep: usize) {
         let mut chains = self.chains.lock().unwrap();
-        let Some(topic) = chains
-            .get_mut(&chain_key(chain))
-            .and_then(|chain| chain.topics.get_mut(topic))
-        else {
+        let Some(chain) = chains.get_mut(&chain_key(chain)) else {
             return;
         };
-        let drop = topic.records.len().saturating_sub(keep);
+        let held = chain
+            .floors
+            .get(topic)
+            .and_then(|holders| holders.values().map(|position| position.unwrap_or(0)).min());
+        let Some(topic) = chain.topics.get_mut(topic) else {
+            return;
+        };
+        let mut drop = topic.records.len().saturating_sub(keep);
+        if let Some(held) = held {
+            drop = drop.min(held.saturating_sub(topic.base) as usize);
+        }
         topic.records.drain(..drop);
         topic.base += drop as u64;
     }
@@ -398,6 +409,44 @@ impl StreamStore for MemoryStore {
             .and_then(|topic| topic.base.checked_sub(1))
             .filter(|dropped| mark.is_none_or(|mark| *dropped > mark))
             .map(|offset| offset.to_string()))
+    }
+
+    async fn hold_floor(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        holder: &str,
+        position: &str,
+    ) -> StreamResult<()> {
+        let position = parse_position(position)?;
+        let mut chains = self.chains.lock().unwrap();
+        let held = chains
+            .entry(chain_key(chain))
+            .or_default()
+            .floors
+            .entry(topic.to_string())
+            .or_default()
+            .entry(holder.to_string())
+            .or_insert(position);
+        *held = match (*held, position) {
+            (Some(held), Some(position)) => Some(held.min(position)),
+            _ => None,
+        };
+        Ok(())
+    }
+
+    /// The memory store has no clock for retention, so a release ends the hold at once.
+    async fn release_floor(&self, chain: &ChainId, topic: &str, holder: &str) -> StreamResult<()> {
+        if let Some(holders) = self
+            .chains
+            .lock()
+            .unwrap()
+            .get_mut(&chain_key(chain))
+            .and_then(|chain| chain.floors.get_mut(topic))
+        {
+            holders.remove(holder);
+        }
+        Ok(())
     }
 
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {

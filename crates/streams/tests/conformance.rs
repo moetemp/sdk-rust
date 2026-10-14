@@ -1291,6 +1291,46 @@ mod cases {
         assert_eq!(refused.closed_by, None);
     }
 
+    pub(crate) async fn a_floor_holds_and_releases_for_any_reader(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        let landed = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1", "2"])
+            .await;
+        store
+            .hold_floor(&chain, OUT, "a/1", &landed.first_position)
+            .await
+            .unwrap();
+        // A lower hold, a hold from the beginning, another reader and a topic with no records.
+        store
+            .hold_floor(&chain, OUT, "a/1", &landed.last_position)
+            .await
+            .unwrap();
+        store.hold_floor(&chain, OUT, "b/1", "").await.unwrap();
+        store.hold_floor(&chain, OTHER, "a/1", "").await.unwrap();
+        // A held topic still takes appends and reads.
+        Producer::new(case, &chain, OUT, "q", 1)
+            .append(&["3"])
+            .await;
+        let read = store
+            .read(StoreReadRequest {
+                chain: Some(chain.clone()),
+                topic: OUT.to_string(),
+                max_records: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(read.records.len(), 3);
+        for holder in ["a/1", "b/1", "never-held"] {
+            store.release_floor(&chain, OUT, holder).await.unwrap();
+        }
+        store
+            .release_floor(&case.chain(), OUT, "a/1")
+            .await
+            .unwrap();
+    }
+
     pub(crate) async fn retiring_a_producer_drops_only_its_dedupe_state(case: &dyn Case) {
         let store = case.store();
         let chain = case.chain();
@@ -1539,6 +1579,7 @@ macro_rules! store_cases {
             a_closed_topic_answers_a_repeat_and_ends_reads,
             retiring_a_producer_drops_only_its_dedupe_state,
             a_topic_keeps_its_first_close,
+            a_floor_holds_and_releases_for_any_reader,
             a_close_with_no_outcome_is_the_first_close_too,
             a_chain_close_keeps_no_outcome,
         );
