@@ -51,7 +51,7 @@ services:
           state-field: state
         input: { $ref: "#/$defs/ReadInput" }
         output: { $ref: "#/$defs/ReadOutput" }
-      read_range:
+      readRange:
         fqn: read_range
         description: >-
           Answer again the records of an earlier read that named a

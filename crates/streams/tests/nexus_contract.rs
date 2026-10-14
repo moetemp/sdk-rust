@@ -102,14 +102,26 @@ fn the_contract_names_the_operations_core_serves() {
     );
     assert_eq!(operations["read"]["input"]["$ref"], "#/$defs/ReadInput");
     assert_eq!(operations["read"]["output"]["$ref"], "#/$defs/ReadOutput");
+    assert_eq!(operations["readRange"]["fqn"], "read_range");
     assert_eq!(
-        operations["read_range"]["input"]["$ref"],
+        operations["readRange"]["input"]["$ref"],
         "#/$defs/ReadRangeInput"
     );
     assert_eq!(
-        operations["read_range"]["output"]["$ref"],
+        operations["readRange"]["output"]["$ref"],
         "#/$defs/ReadOutput"
     );
+    // nexgen takes an operation key only as a lowercase letter and then letters or digits. The
+    // wire name comes from `fqn`.
+    for key in operations.as_object().unwrap().keys() {
+        let mut chars = key.chars();
+        assert!(
+            chars.next().is_some_and(|c| c.is_ascii_lowercase())
+                && key.len() > 1
+                && chars.all(|c| c.is_ascii_alphanumeric()),
+            "nexgen refuses operation key {key}"
+        );
+    }
     for input in ["StreamRef", "AppendInput", "ReadInput", "ReadRangeInput"] {
         assert_eq!(
             model(&contract, input)["additionalProperties"],
