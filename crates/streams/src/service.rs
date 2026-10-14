@@ -22,8 +22,8 @@ const MAX_READ_WAIT: Duration = Duration::from_secs(60);
 
 /// One process's stream store and the calls lang makes on it.
 ///
-/// Lang builds one from a [StreamStoreConfig] and sends its stream calls to
-/// [StreamService::call] as serialized `coresdk.streams` requests.
+/// Lang builds one from a [StreamStoreConfig], hands [StreamService::store] to its Workers, and
+/// sends its stream calls to [StreamService::call] as serialized `coresdk.streams` requests.
 pub struct StreamService {
     store: Arc<dyn StreamStore>,
     streams: Streams,
@@ -84,11 +84,13 @@ impl StreamService {
             }
             None => store,
         };
-        Ok(Self::new(
-            store,
-            owner,
-            StreamsOptions::for_retention(retention),
-        ))
+        let mut options = StreamsOptions::for_retention(retention);
+        if let Some(grace) = config.owner_start_grace {
+            options.owner_start_grace = Duration::try_from(grace).map_err(|_| {
+                StreamError::refused("the stream store's owner start grace must not be negative")
+            })?;
+        }
+        Ok(Self::new(store, owner, options))
     }
 
     /// Serves calls on `store`.
@@ -99,6 +101,11 @@ impl StreamService {
     ) -> Self {
         let streams = Streams::new(store.clone(), owner, options);
         Self { store, streams }
+    }
+
+    /// The store, for the Workers that append Workflow output to it.
+    pub fn store(&self) -> Arc<dyn StreamStore> {
+        self.store.clone()
     }
 
     /// Serves one call: `rpc` is a `StreamService` method name and `request` its serialized
@@ -493,6 +500,21 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind, StreamFailureKind::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_negative_owner_start_grace_is_refused() {
+        let mut config = StreamStoreConfig {
+            store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+            owner_start_grace: Some(Default::default()),
+            ..Default::default()
+        };
+        config.owner_start_grace.as_mut().unwrap().seconds = -1;
+        let error = StreamService::connect(config, Arc::new(Running))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Refused);
+        assert!(error.message.contains("owner start grace"), "{error}");
     }
 
     #[cfg(not(feature = "redis"))]
