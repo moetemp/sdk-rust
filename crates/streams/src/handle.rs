@@ -35,7 +35,7 @@ pub struct StreamsOptions {
     /// How long a producer writes before it asks again whether its owner's chain ended. Nothing
     /// else ends the writes of a Workflow that never published itself.
     pub owner_recheck: Duration,
-    /// How many producer attempts and chains to remember the last owner check of.
+    /// How many owners, producer attempts and chains to remember the last owner check of.
     pub remembered: usize,
     /// How long an idle read waits before it first asks whether its owner ended.
     pub owner_check_min: Duration,
@@ -127,6 +127,9 @@ pub struct Streams {
     store: Arc<dyn StreamStore>,
     owner: Arc<dyn OwnerClient>,
     options: StreamsOptions,
+    /// The last owner check per owner, which all its producers share.
+    owners: Remembered<OwnerKey>,
+    /// The chain each producer attempt began on.
     producers: Remembered<ProducerKey>,
     chains: Remembered<OwnerKey>,
 }
@@ -150,6 +153,7 @@ impl Streams {
         Self {
             store,
             owner,
+            owners: Remembered::new(options.remembered),
             producers: Remembered::new(options.remembered),
             chains: Remembered::new(options.remembered),
             options,
@@ -158,8 +162,8 @@ impl Streams {
 
     /// Appends one batch for one producer attempt.
     ///
-    /// A producer's first batch, and its first batch after [StreamsOptions::owner_recheck],
-    /// asks whether the owner's chain ended. If it did, or Temporal no longer holds the owner,
+    /// The first batch for an owner, and the first after [StreamsOptions::owner_recheck], asks
+    /// whether the owner's chain ended. All producers of the owner share that check. If it did, or Temporal no longer holds the owner,
     /// or a new chain took the Workflow id, the chain is marked closed and the batch is refused
     /// as closed.
     pub async fn append(&self, request: AppendRequest) -> StreamResult<AppendResponse> {
@@ -445,40 +449,63 @@ impl Streams {
         self.store.delete_owner(request).await
     }
 
-    /// The chain a producer writes on, asking about the owner when the producer is new or its
-    /// last check is older than the recheck interval.
+    /// The chain a producer writes on. A producer attempt stays on the chain it began on, and
+    /// is refused once a new chain took the Workflow id.
     async fn producer_chain(&self, key: ProducerKey) -> StreamResult<ChainId> {
+        let chain = self.owner_chain(&key.owner).await?;
+        if let Some(began) = self.producers.get(&key)
+            && began.first_run_id != chain.first_run_id
+        {
+            let began = chain_of_key(&key.owner, &began.first_run_id);
+            return Err(self.closed(&began, "has closed").await);
+        }
+        self.producers
+            .put(key, &chain.first_run_id, self.options.owner_recheck);
+        Ok(chain)
+    }
+
+    /// The chain an owner writes on now, asking about the owner when no producer of it asked
+    /// within the recheck interval.
+    async fn owner_chain(&self, owner: &OwnerKey) -> StreamResult<ChainId> {
         let recheck = self.options.owner_recheck;
-        let stream = &key.owner;
-        let chain = match self.producers.get(&key) {
-            Some(checked) if checked.at.elapsed() < recheck => {
-                return Ok(chain_of_key(stream, &checked.first_run_id));
+        let known = self.owners.get(owner);
+        if let Some(checked) = &known
+            && checked.at.elapsed() < recheck
+        {
+            return Ok(chain_of_key(owner, &checked.first_run_id));
+        }
+        let chain = if owner.run_id.is_empty() {
+            // The latest run names the chain and tells whether it ended, in one call.
+            let latest = self.describe(owner, "").await;
+            if let (Err(OwnerError::NotFound(_)), Some(checked)) = (&latest, &known) {
+                // The chain came from this Workflow, so History has since dropped it.
+                let gone = chain_of_key(owner, &checked.first_run_id);
+                return Err(self.closed(&gone, "is gone from History").await);
             }
-            Some(checked) => {
-                let chain = chain_of_key(stream, &checked.first_run_id);
+            let latest = latest.map_err(not_found)?;
+            let chain = chain_of_key(owner, &first_run_id(owner, &latest)?);
+            if latest.chain_ended() {
+                return Err(self.closed(&chain, "has closed").await);
+            }
+            chain
+        } else if let Some(checked) = known {
+            // A pinned run's chain never changes, so only its end is left to check.
+            let chain = chain_of_key(owner, &checked.first_run_id);
+            self.refuse_if_ended(&chain).await?;
+            chain
+        } else {
+            let pinned = self
+                .describe(owner, &owner.run_id)
+                .await
+                .map_err(not_found)?;
+            let chain = chain_of_key(owner, &first_run_id(owner, &pinned)?);
+            // A running run is its chain's latest, so it answers the end check too.
+            if pinned.status != WorkflowExecutionStatus::Running {
                 self.refuse_if_ended(&chain).await?;
-                chain
             }
-            None if stream.run_id.is_empty() => {
-                // The latest run names the chain and tells whether it ended, in one call.
-                let latest = self.describe(stream, "").await.map_err(not_found)?;
-                let chain = chain_of_key(stream, &first_run_id(stream, &latest)?);
-                if latest.chain_ended() {
-                    return Err(self.closed(&chain, "has closed").await);
-                }
-                chain
-            }
-            None => {
-                let pinned = self
-                    .describe(stream, &stream.run_id)
-                    .await
-                    .map_err(not_found)?;
-                let chain = chain_of_key(stream, &first_run_id(stream, &pinned)?);
-                self.refuse_if_ended(&chain).await?;
-                chain
-            }
+            chain
         };
-        self.producers.put(key, &chain.first_run_id, recheck);
+        self.owners.put(owner.clone(), &chain.first_run_id, recheck);
         Ok(chain)
     }
 
@@ -1048,17 +1075,41 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_new_producer_closes_an_ended_chain_the_worker_missed() {
         let setup = setup(StreamsOptions::default());
         setup.streams.append(append("p", 1, "1")).await.unwrap();
         setup.owners.end("wf", WorkflowExecutionStatus::Terminated);
+        tokio::time::advance(OWNER_RECHECK + Duration::from_secs(1)).await;
         assert!(!chain_closed(&setup.store, "run-1").await);
         assert_eq!(
             kind(setup.streams.append(append("q", 1, "2")).await),
             StreamFailureKind::Closed
         );
         assert!(chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test]
+    async fn the_producers_of_one_owner_share_its_check() {
+        // A Workflow that writes each flush as a new producer asks about its owner once.
+        let setup = setup(StreamsOptions::default());
+        for producer in 0..50 {
+            let request = append(&format!("__temporal_local_{producer}@run-1"), 1, "x");
+            setup.streams.append(request).await.unwrap();
+        }
+        assert_eq!(setup.owners.describes(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_producer_pinned_to_a_running_run_asks_once() {
+        let setup = setup(StreamsOptions::default());
+        setup.owners.run("wf", "run-2", "run-1");
+        for producer in ["p", "q"] {
+            let mut request = append(producer, 1, "1");
+            request.stream.as_mut().unwrap().run_id = "run-2".to_string();
+            setup.streams.append(request).await.unwrap();
+        }
+        assert_eq!(setup.owners.describes(), 1);
     }
 
     #[tokio::test(start_paused = true)]
