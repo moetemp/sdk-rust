@@ -1593,6 +1593,8 @@ enum WFCommandVariant {
     UpdateResponse(UpdateResponse),
     ScheduleNexusOperation(ScheduleNexusOperation),
     RequestCancelNexusOperation(RequestCancelNexusOperation),
+    /// The stream records lang published in this activation.
+    OutputStreamCommit(WorkflowOutputStreamCommit),
 }
 
 impl TryFrom<WorkflowCommand> for WFCommand {
@@ -1653,6 +1655,9 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             }
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
+            }
+            workflow_command::Variant::WorkflowOutputStreamCommit(commit) => {
+                WFCommandVariant::OutputStreamCommit(commit)
             }
         };
         Ok(Self {
