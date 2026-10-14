@@ -1624,6 +1624,16 @@ pub mod coresdk {
                 }
             }
 
+            impl Display for WorkflowOutputStreamCommit {
+                fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                    write!(
+                        f,
+                        "WorkflowOutputStreamCommit({} record(s))",
+                        self.records.len()
+                    )
+                }
+            }
+
             impl QueryResult {
                 /// Helper to construct the Temporal API query result types.
                 pub fn into_components(

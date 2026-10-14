@@ -67,7 +67,7 @@ use temporalio_common::{
         temporal::api::{
             command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
             common::v1::SearchAttributes,
-            enums::v1::EventType,
+            enums::v1::{EventType, TimeoutType},
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
@@ -78,6 +78,28 @@ use temporalio_common::{
 };
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
+
+/// The Workflow Task attempts that `event` shows ran and did not complete.
+///
+/// The server writes a failed or timed-out event only for a first attempt, and for every attempt
+/// on a sticky queue. Each later attempt that fails adds one to the attempt of the next
+/// WorkflowTaskScheduled event, so attempt `a` at 2 or above follows one written failure and
+/// `a - 2` unwritten ones. A schedule-to-start timeout means no Worker ran the task.
+fn workflow_task_reruns_in(event: &HistoryEvent) -> i64 {
+    match &event.attributes {
+        Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(attrs)) => {
+            i64::from(attrs.attempt.saturating_sub(2).max(0))
+        }
+        Some(history_event::Attributes::WorkflowTaskFailedEventAttributes(_)) => 1,
+        Some(history_event::Attributes::WorkflowTaskTimedOutEventAttributes(attrs)) => {
+            i64::from(attrs.timeout_type() != TimeoutType::ScheduleToStart)
+        }
+        _ => 0,
+    }
+}
+
+/// The bits of a Workflow producer's attempt that hold the reruns since the last completed task.
+const STREAM_RETRY_BITS: u32 = 16;
 
 slotmap::new_key_type! { struct MachineKey; }
 /// Handles all the logic for driving a workflow. It orchestrates many state machines that together
@@ -96,6 +118,15 @@ pub(crate) struct WorkflowMachines {
     pending_stream_wakes: Vec<StreamWake>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
+    /// The WorkflowTaskStarted event id of the last task History shows completed, 0 before one
+    /// did. A task's stream records are written under an attempt that starts with it, so each
+    /// completed task moves the Workflow producer on with no supersession.
+    stream_prefix: i64,
+    /// The Workflow Task attempts since `stream_prefix` that ran and did not complete. Each could
+    /// have written stream records that its rerun withdraws.
+    stream_reruns: i64,
+    /// The id of the last WorkflowTaskStarted event applied.
+    stream_last_started: i64,
     /// The event id of the next workflow task started event that the machines need to process.
     /// Eventually, this number should reach the started id in the latest history update, but
     /// we must incrementally apply the history while communicating with lang.
@@ -112,6 +143,9 @@ pub(crate) struct WorkflowMachines {
     pub(crate) workflow_type: String,
     /// Identifies the current run
     pub(crate) run_id: String,
+    /// The first run of the run chain this run belongs to, which keys its streams. Empty until
+    /// the start event is applied.
+    pub(crate) first_execution_run_id: String,
     /// Is set to true once we've seen the final event in workflow history, to avoid accidentally
     /// re-applying the final workflow task.
     pub(crate) have_seen_terminal_event: bool,
@@ -282,11 +316,15 @@ impl WorkflowMachines {
             workflow_id: basics.workflow_id,
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
+            first_execution_run_id: String::new(),
             drive_me: driven_wf,
             replaying,
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
             current_started_event_id: 0,
+            stream_prefix: 0,
+            stream_reruns: 0,
+            stream_last_started: 0,
             next_started_event_id: 0,
             last_processed_event: 0,
             workflow_start_time: None,
@@ -415,6 +453,14 @@ impl WorkflowMachines {
 
     pub(crate) fn history_size_bytes(&self) -> u64 {
         self.history_size_bytes
+    }
+
+    /// The attempt the run writes the current Workflow Task's stream records under: the last
+    /// completed task's WorkflowTaskStarted event id in the high bits, then 1 plus the reruns
+    /// since it. History alone gives it, so a Worker restart or a cache miss gets the same one.
+    pub(crate) fn stream_producer_attempt(&self) -> i64 {
+        let retry = (1 + self.stream_reruns).min((1 << STREAM_RETRY_BITS) - 1);
+        (self.stream_prefix << STREAM_RETRY_BITS) | retry
     }
 
     pub(crate) fn prepare_for_wft_response(&mut self) -> MachinesWFTResponseContent<'_> {
@@ -702,6 +748,15 @@ impl WorkflowMachines {
                     self.last_processed_event,
                     eid
                 ));
+            }
+            match event.event_type() {
+                EventType::WorkflowTaskStarted => self.stream_last_started = eid,
+                // The started event right before it is the completed task's own.
+                EventType::WorkflowTaskCompleted => {
+                    self.stream_prefix = self.stream_last_started;
+                    self.stream_reruns = 0;
+                }
+                _ => self.stream_reruns += workflow_task_reruns_in(&event),
             }
             let next_event = history.peek();
 
@@ -1050,6 +1105,12 @@ impl WorkflowMachines {
                         // workflow time set.
                         self.set_current_time(as_systime);
                     }
+                    // A first run may leave its own id out.
+                    self.first_execution_run_id = if attrs.first_execution_run_id.is_empty() {
+                        self.run_id.clone()
+                    } else {
+                        attrs.first_execution_run_id.clone()
+                    };
                     // Notify the lang sdk that it's time to kick off a workflow
                     self.drive_me.start(
                         self.workflow_id.clone(),
@@ -1622,6 +1683,12 @@ impl WorkflowMachines {
                         cancel,
                         annotations
                     );
+                }
+                WFCommandVariant::OutputStreamCommit(_) => {
+                    return Err(fatal!(
+                        "WorkflowOutputStreamCommit reached the state machines. The run takes it \
+                         out when it processes the completion"
+                    ));
                 }
                 WFCommandVariant::NoCommandsFromLang => (),
             }
