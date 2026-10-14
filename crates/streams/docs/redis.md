@@ -89,8 +89,8 @@ so on a cluster the user must exist on every node. Deleting an owner's streams a
 `+scan`. With the notification log on, an application also needs `~temporal-streams:{*}:n
 %W~temporal-streams:{*}:bell`, since its appends write the slot streams. Those entries name
 other namespaces' streams and positions, never records. A driver needs those keys with read and
-write, and `+xreadgroup +xautoclaim +xack +xdel +xgroup|create +xlen +xadd +cluster|slots`. `+config|get` only reads
-`maxmemory-policy`, and the store goes on when a server refuses it.
+write, and `+xreadgroup +xautoclaim +xack +xdel +xgroup|create +xlen +xadd +cluster|slots`.
+`+config|get` only reads `maxmemory-policy`, and the store goes on when a server refuses it.
 
 **Tests.** The Redis tests run when `STREAMS_REDIS_URL` names a standalone server and
 `STREAMS_REDIS_CLUSTER_URL` a cluster seed. `scripts/redis-test-servers.sh` starts both. The
