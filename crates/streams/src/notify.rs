@@ -828,7 +828,7 @@ fn cursor_of(store: &dyn StreamStore, chain: &ChainId, topic: &str, position: &s
 }
 
 /// The cursor and counter that tell a reader about the record at `position`.
-fn notification_at(
+pub(crate) fn notification_at(
     store: &dyn StreamStore,
     chain: &ChainId,
     topic: &str,

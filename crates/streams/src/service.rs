@@ -33,6 +33,7 @@ pub struct StreamService {
     subscriptions: Subscriptions,
     nexus: NexusCalls,
     callers: Option<Arc<dyn NotifierClient>>,
+    attach_progress: Option<Arc<Notifier>>,
 }
 
 impl std::fmt::Debug for StreamService {
@@ -78,25 +79,27 @@ impl StreamService {
                 "stream notifications need a client to send them with",
             ));
         }
-        let store: Arc<dyn StreamStore> = match notifier.clone() {
-            Some(client) => {
-                let max_notifiers = match config.max_notifiers {
-                    0 => DEFAULT_MAX_NOTIFIERS,
-                    max => max as usize,
-                };
-                Arc::new(
-                    NotifyingStore::new(store, Arc::new(Notifier::new(client, max_notifiers)))
-                        .with_progress(config.notify_on_append)
-                        .with_every_append(config.notify_every_append),
-                )
-            }
+        let folding = notifier.as_ref().map(|client| {
+            let max_notifiers = match config.max_notifiers {
+                0 => DEFAULT_MAX_NOTIFIERS,
+                max => max as usize,
+            };
+            Arc::new(Notifier::new(client.clone(), max_notifiers))
+        });
+        let store: Arc<dyn StreamStore> = match &folding {
+            Some(folding) => Arc::new(
+                NotifyingStore::new(store, folding.clone())
+                    .with_progress(config.notify_on_append)
+                    .with_every_append(config.notify_every_append),
+            ),
             None => store,
         };
         let service = Self::new(store, owner, StreamsOptions::for_retention(retention));
         Ok(match notifier {
             Some(client) => service
                 .with_subscriptions(client.clone())
-                .with_callers(client),
+                .with_callers(client)
+                .with_attach_progress(folding.filter(|_| config.notify_on_append)),
             None => service,
         })
     }
@@ -115,6 +118,7 @@ impl StreamService {
             subscriptions: Subscriptions::default(),
             nexus,
             callers: None,
+            attach_progress: None,
         }
     }
 
@@ -128,6 +132,23 @@ impl StreamService {
     pub fn with_callers(mut self, client: Arc<dyn NotifierClient>) -> Self {
         self.callers = Some(client);
         self
+    }
+
+    /// After a caller's attach, notifies the stream's newest record, so the new caller hears of
+    /// the records already there. A caller that only waits for progress would otherwise hear
+    /// nothing until the next append. It goes through `notifier`, the one that sends the appends'
+    /// notifications, so it is retried and flushed as they are. On an empty stream the attach
+    /// arms the stream instead, so the first append notifies. `None` turns both off, as the
+    /// config's progress setting does.
+    pub fn with_attach_progress(mut self, notifier: Option<Arc<Notifier>>) -> Self {
+        self.attach_progress = notifier;
+        self
+    }
+
+    /// The store, for tests that append past the stream layer.
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> Arc<dyn StreamStore> {
+        self.store.clone()
     }
 
     /// Serves one call: `rpc` is a `StreamService` method name and `request` its serialized
@@ -215,6 +236,7 @@ impl StreamService {
             "AttachCaller" => Ok(crate::nexus::attach_caller(
                 &self.streams,
                 self.callers.as_ref(),
+                self.attach_progress.as_ref(),
                 decode::<AttachCallerRequest>(rpc, request)?,
             )
             .await

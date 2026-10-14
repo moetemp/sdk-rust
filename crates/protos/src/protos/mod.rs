@@ -3061,6 +3061,22 @@ mod sdk_helpers {
         };
         use anyhow::anyhow;
 
+        mod nexus_handler_callback {
+            use crate::protos::temporal::api::common::v1::callback::NexusHandler;
+            use prost::Message;
+
+            // The server reads the progress operation by its field number, so a renumbered field
+            // would send progress to an operation the Worker never named.
+            #[test]
+            fn the_progress_operation_keeps_its_field_number() {
+                let handler = NexusHandler {
+                    progress_operation: "p".to_string(),
+                    ..Default::default()
+                };
+                assert_eq!(handler.encode_to_vec(), vec![0x2a, 0x01, b'p']);
+            }
+        }
+
         mod stream_record_envelope {
             use crate::protos::temporal::{
                 api::common::v1::Payload,

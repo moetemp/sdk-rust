@@ -21,9 +21,10 @@ use std::{io, sync::Arc, time::SystemTime};
 pub(crate) async fn attach_caller(
     streams: &Streams,
     client: Option<&Arc<dyn NotifierClient>>,
+    announce: Option<&Arc<crate::Notifier>>,
     request: AttachCallerRequest,
 ) -> AttachCallerResponse {
-    match attach(streams, client, request).await {
+    match attach(streams, client, announce, request).await {
         Ok(operation_token) => AttachCallerResponse {
             operation_token,
             failure: None,
@@ -51,6 +52,7 @@ pub(crate) async fn detach_caller(
 async fn attach(
     streams: &Streams,
     client: Option<&Arc<dyn NotifierClient>>,
+    announce: Option<&Arc<crate::Notifier>>,
     request: AttachCallerRequest,
 ) -> StreamResult<String> {
     if request.callback_url.is_empty() {
@@ -78,7 +80,7 @@ async fn attach(
     // completion that beats the start's response still names the operation.
     client
         .attach_caller(CallerAttachment {
-            chain,
+            chain: chain.clone(),
             topic: stream.topic.clone(),
             request_id: request.request_id,
             callback_url: request.callback_url,
@@ -88,7 +90,44 @@ async fn attach(
         })
         .await
         .map_err(caller_error)?;
+    if let Some(notifier) = announce {
+        announce_newest(streams, notifier, chain, &stream.topic).await;
+    }
     Ok(operation_token)
+}
+
+/// Notifies the newest record on `topic`, so a caller that just attached hears of the records
+/// already there. The server keeps a notifier only once a caller attached, so the notifications
+/// sent before were dropped. It goes through the notifier the appends use, so a failed send is
+/// tried again and a flush waits for it. A notification the retries can't send is lost as an
+/// append's is, and the caller still hears of every record from the next append or the close.
+///
+/// On an empty stream it arms the stream instead, in the same store step that finds it empty,
+/// since a caller that waits only for progress must hear of the first append.
+async fn announce_newest(
+    streams: &Streams,
+    notifier: &crate::Notifier,
+    chain: ChainId,
+    topic: &str,
+) {
+    let position = match streams.store().newest_or_arm(&chain, topic).await {
+        Ok(crate::NewestOrArm::Newest(position)) => position,
+        Ok(crate::NewestOrArm::Armed(_) | crate::NewestOrArm::Unarmed) => return,
+        Err(error) => {
+            tracing::warn!(
+                workflow_id = %chain.workflow_id,
+                topic,
+                %error,
+                "Could not find the newest record to tell a new caller about"
+            );
+            return;
+        }
+    };
+    if let Some((cursor, counter)) =
+        crate::notify::notification_at(streams.store(), &chain, topic, &position)
+    {
+        notifier.notify(&chain, topic, cursor, counter);
+    }
 }
 
 async fn detach(
@@ -331,12 +370,23 @@ mod tests {
     struct Notifier {
         attached: Mutex<Vec<CallerAttachment>>,
         detached: Mutex<Vec<(ChainId, String, String)>>,
+        notified: Mutex<Vec<StreamNotification>>,
+        notify_failures: std::sync::atomic::AtomicUsize,
         answer: Mutex<Option<NotifyError>>,
     }
 
     #[async_trait::async_trait]
     impl NotifierClient for Notifier {
-        async fn notify(&self, _: StreamNotification) -> Result<(), NotifyError> {
+        async fn notify(&self, notification: StreamNotification) -> Result<(), NotifyError> {
+            use std::sync::atomic::Ordering;
+            if self
+                .notify_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                return Err(NotifyError::Failed("the server is down".to_string()));
+            }
+            self.notified.lock().unwrap().push(notification);
             Ok(())
         }
 
@@ -463,6 +513,182 @@ mod tests {
         response
             .failure
             .map_or(Ok(()), |failure| Err(raised(failure)))
+    }
+
+    fn append(values: &[&str]) -> Vec<u8> {
+        use crate::proto::{AppendRecord, AppendRequest, NamedProducer, append_request};
+        use temporalio_common::protos::temporal::{
+            api::common::v1::Payload, sdk::streams::v1::StreamRecordKind,
+        };
+        AppendRequest {
+            stream: Some(stream("")),
+            producer: Some(append_request::Producer::Named(NamedProducer {
+                producer_id: "p".to_string(),
+                attempt: 1,
+            })),
+            sequence: 1,
+            digest: vec![1; 32],
+            records: values
+                .iter()
+                .map(|value| AppendRecord {
+                    kind: StreamRecordKind::Data as i32,
+                    body: Some(Payload {
+                        data: value.as_bytes().to_vec(),
+                        ..Default::default()
+                    }),
+                    content_hash: vec![value.as_bytes()[0]; 32],
+                })
+                .collect(),
+        }
+        .encode_to_vec()
+    }
+
+    /// `setup()` with the announcement on, sent through Core's folding notifier.
+    fn announcing() -> Setup {
+        let mut setup = setup();
+        let folding = Arc::new(crate::Notifier::new(setup.notifier.clone(), 16));
+        setup.service = setup.service.with_attach_progress(Some(folding));
+        setup
+    }
+
+    /// Waits for the background sends of the folding notifier.
+    async fn notified(notifier: &Notifier, count: usize) -> Vec<StreamNotification> {
+        for _ in 0..50 {
+            if notifier.notified.lock().unwrap().len() >= count {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        notifier.notified.lock().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn an_attach_announces_the_records_already_there_when_progress_is_on() {
+        let setup = announcing();
+        setup
+            .service
+            .call("Append", &append(&["a", "b"]))
+            .await
+            .unwrap();
+        attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        let notified = notified(&setup.notifier, 1).await;
+        let [notification] = notified.as_slice() else {
+            panic!("one notification after the attach, not {notified:?}");
+        };
+        assert_eq!(
+            notification.chain,
+            setup.notifier.attached.lock().unwrap()[0].chain
+        );
+        assert_eq!(notification.topic, "tokens");
+        // The memory store's second record is at offset 1, so its counter is 2.
+        assert_eq!(notification.counter, 2);
+        assert!(
+            notification.position.ends_with(":1"),
+            "{}",
+            notification.position
+        );
+        assert!(notification.close.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_announcement_is_sent_again_as_an_append_notification_is() {
+        // A quiet stream gets no other notification, so a lost announcement would leave a
+        // caller that only waits for progress with nothing until the close.
+        let setup = announcing();
+        setup.service.call("Append", &append(&["a"])).await.unwrap();
+        setup
+            .notifier
+            .notify_failures
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        let notified = notified(&setup.notifier, 1).await;
+        assert_eq!(notified.len(), 1, "the retry went out: {notified:?}");
+        assert_eq!(notified[0].counter, 1);
+    }
+
+    /// Appends one record to the stream through the store, answering the arm it reported.
+    async fn arm_reported(service: &StreamService) -> Option<u64> {
+        service
+            .store()
+            .append(crate::proto::StoreAppendRequest {
+                chain: Some(ChainId {
+                    namespace: "default".to_string(),
+                    workflow_id: "owner-1".to_string(),
+                    first_run_id: "chain-1".to_string(),
+                }),
+                topic: "tokens".to_string(),
+                producer_id: "p".to_string(),
+                attempt: 1,
+                sequence: 1,
+                digest: vec![1],
+                records: vec![b"record".to_vec()],
+            })
+            .await
+            .unwrap()
+            .arm
+    }
+
+    #[tokio::test]
+    async fn an_attach_to_an_empty_stream_arms_it_for_the_first_append() {
+        // A follower waits only for progress, so the first append must notify it.
+        let setup = announcing();
+        attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        assert!(
+            arm_reported(&setup.service)
+                .await
+                .is_some_and(|arm| arm > 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attach_to_a_stream_with_records_announces_without_arming() {
+        let setup = announcing();
+        setup.service.call("Append", &append(&["a"])).await.unwrap();
+        attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        assert_eq!(notified(&setup.notifier, 1).await.len(), 1);
+        let landed = setup
+            .service
+            .store()
+            .append(crate::proto::StoreAppendRequest {
+                chain: Some(ChainId {
+                    namespace: "default".to_string(),
+                    workflow_id: "owner-1".to_string(),
+                    first_run_id: "chain-1".to_string(),
+                }),
+                topic: "tokens".to_string(),
+                producer_id: "other".to_string(),
+                attempt: 1,
+                sequence: 1,
+                digest: vec![1],
+                records: vec![b"record".to_vec()],
+            })
+            .await
+            .unwrap();
+        assert_eq!(landed.arm, Some(0));
+    }
+
+    #[tokio::test]
+    async fn an_attach_announces_nothing_on_an_empty_stream_or_with_progress_off() {
+        let setup = announcing();
+        attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        assert!(notified(&setup.notifier, 1).await.is_empty());
+
+        let setup = self::setup();
+        setup.service.call("Append", &append(&["a"])).await.unwrap();
+        attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        assert!(notified(&setup.notifier, 1).await.is_empty());
     }
 
     #[tokio::test]
