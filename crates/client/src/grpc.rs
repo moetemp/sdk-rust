@@ -1878,6 +1878,42 @@ proxier! {
             r.extensions_mut().insert(labels);
         }
     );
+    (
+        attach_stream_callback,
+        AttachStreamCallbackRequest,
+        AttachStreamCallbackResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        detach_stream_callback,
+        DetachStreamCallbackRequest,
+        DetachStreamCallbackResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        notify_stream,
+        NotifyStreamRequest,
+        NotifyStreamResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
+        describe_stream_notifier,
+        DescribeStreamNotifierRequest,
+        DescribeStreamNotifierResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
 }
 
 proxier! {

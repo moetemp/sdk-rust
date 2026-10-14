@@ -2039,4 +2039,42 @@ service WorkflowService {
             value: "workflow:{workflow_execution.workflow_id}"
         };
     }
+
+    // AttachStreamCallback attaches a callback to the notifier of a stream. The callback receives the
+    // stream's progress while it is open and one completion when it closes. A Nexus handler whose
+    // operation returns a stream calls it with the caller's callback when the operation starts.
+    //
+    // (-- api-linter: core::0127::http-annotation=disabled
+    //     aip.dev/not-precedent: SDKs reach the stream notifier through System Nexus or gRPC. --)
+    rpc AttachStreamCallback (AttachStreamCallbackRequest) returns (AttachStreamCallbackResponse) {
+        option (nexusannotations.v1.operation).tags = "exposed";
+    }
+
+    // DetachStreamCallback removes a callback from the notifier of a stream. The notifier completes
+    // the callback's operation as canceled and sends it no more progress. A Nexus handler calls it
+    // when the caller cancels the operation.
+    //
+    // (-- api-linter: core::0127::http-annotation=disabled
+    //     aip.dev/not-precedent: SDKs reach the stream notifier through System Nexus or gRPC. --)
+    rpc DetachStreamCallback (DetachStreamCallbackRequest) returns (DetachStreamCallbackResponse) {
+        option (nexusannotations.v1.operation).tags = "exposed";
+    }
+
+    // NotifyStream tells the notifier of a stream that the stream moved, or that it closed. The
+    // notifier passes the latest notification on to every attached callback as progress, and on close
+    // completes them. Producers fold their notifications and keep at most one call in flight.
+    //
+    // (-- api-linter: core::0127::http-annotation=disabled
+    //     aip.dev/not-precedent: SDKs reach the stream notifier through System Nexus or gRPC. --)
+    rpc NotifyStream (NotifyStreamRequest) returns (NotifyStreamResponse) {
+        option (nexusannotations.v1.operation).tags = "exposed";
+    }
+
+    // DescribeStreamNotifier returns the state of the notifier of a stream and its callbacks. It is
+    // for operators and tools, so it is not exposed through System Nexus.
+    //
+    // (-- api-linter: core::0127::http-annotation=disabled
+    //     aip.dev/not-precedent: SDKs reach the stream notifier through System Nexus or gRPC. --)
+    rpc DescribeStreamNotifier (DescribeStreamNotifierRequest) returns (DescribeStreamNotifierResponse) {
+    }
 }

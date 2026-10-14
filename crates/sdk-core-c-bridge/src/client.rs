@@ -600,6 +600,9 @@ async fn call_workflow_service(
     let rpc = call.rpc.to_str();
     let mut client = client.clone();
     match rpc {
+        "AttachStreamCallback" => {
+            rpc_call_on_trait!(client, call, WorkflowService, attach_stream_callback)
+        }
         "CountActivityExecutions" => {
             rpc_call_on_trait!(client, call, WorkflowService, count_activity_executions)
         }
@@ -684,6 +687,9 @@ async fn call_workflow_service(
             )
         }
         "DescribeSchedule" => rpc_call_on_trait!(client, call, WorkflowService, describe_schedule),
+        "DescribeStreamNotifier" => {
+            rpc_call_on_trait!(client, call, WorkflowService, describe_stream_notifier)
+        }
         "DescribeTaskQueue" => {
             rpc_call_on_trait!(client, call, WorkflowService, describe_task_queue)
         }
@@ -706,6 +712,9 @@ async fn call_workflow_service(
         }
         "DescribeWorkflowRule" => {
             rpc_call_on_trait!(client, call, WorkflowService, describe_workflow_rule)
+        }
+        "DetachStreamCallback" => {
+            rpc_call_on_trait!(client, call, WorkflowService, detach_stream_callback)
         }
         "ExecuteMultiOperation" => {
             rpc_call_on_trait!(client, call, WorkflowService, execute_multi_operation)
@@ -801,6 +810,9 @@ async fn call_workflow_service(
         }
         "ListWorkflowRules" => {
             rpc_call_on_trait!(client, call, WorkflowService, list_workflow_rules)
+        }
+        "NotifyStream" => {
+            rpc_call_on_trait!(client, call, WorkflowService, notify_stream)
         }
         "PatchSchedule" => rpc_call_on_trait!(client, call, WorkflowService, patch_schedule),
         "PauseActivity" => rpc_call_on_trait!(client, call, WorkflowService, pause_activity),
