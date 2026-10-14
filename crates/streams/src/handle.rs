@@ -4,8 +4,8 @@
 //! where the contract says so, and mints and checks cursors. Stores only move records.
 
 use crate::{
-    ReadTarget, StreamError, StreamResult, StreamStore, WORKFLOW_OWNER_KIND, activity_producer_id,
-    check_append_digest, mint_cursor,
+    CloseOutcome, ReadTarget, StreamError, StreamResult, StreamStore, WORKFLOW_OWNER_KIND,
+    activity_producer_id, check_append_digest, mint_cursor,
     owner::{OwnerClient, OwnerDescription, OwnerError},
     proto::{
         AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse, DeleteOwnerRequest,
@@ -246,7 +246,8 @@ impl Streams {
     /// the interval over. So many readers parked on a quiet stream don't load the server. Once
     /// the owner ended, or the store marked the stream closed, the read delivers what is left
     /// and answers `done`. A read pinned to a run ends when that run closes, even if the chain
-    /// continued as new.
+    /// continued as new. A read with `arm` that waits its whole `wait` and finds nothing arms the
+    /// stream and answers `armed`.
     pub async fn read(&self, request: ReadRequest) -> StreamResult<ReadResponse> {
         let stream = address(request.stream.as_ref())?;
         let mut state = ReadState::decode_from(&request.state)?;
@@ -279,6 +280,9 @@ impl Streams {
                 remaining.min(until_check)
             };
             page_request.wait = wait.try_into().ok();
+            // Only the pass that waits out the read's own wait arms, so a shorter pass before an
+            // owner check doesn't wake the caller for a gap shorter than the reader chose.
+            page_request.arm = request.arm && !state.owner_ended && remaining <= until_check;
             let (mut page, closed) =
                 read_with(&*self.store, &target, &page_request, &mut state).await?;
             page_request.after = page.cursor.clone();
@@ -294,6 +298,8 @@ impl Streams {
             }
             if state.owner_ended {
                 page.done = true;
+                page.armed = false;
+                page.wake_after = 0;
                 break page;
             }
             if unix_ms() >= state.next_check_ms {
@@ -364,11 +370,30 @@ impl Streams {
         })
     }
 
-    /// Closes one stream, so producers' new batches are refused and reads end.
+    /// Closes one stream, so producers' new batches are refused and reads end. With a result or a
+    /// failure, the stream's notifier closes too, and fails the call when the server doesn't take
+    /// it, since the close completes every callback attached there.
     pub async fn close(&self, request: CloseRequest) -> StreamResult<CloseResponse> {
         let stream = address(request.stream.as_ref())?;
         let chain = self.chain(stream).await?;
-        self.store.close_topic(&chain, &stream.topic).await?;
+        let outcome = match (request.result, request.failure) {
+            (Some(_), Some(_)) => {
+                return Err(StreamError::invalid_argument(
+                    "a close carries a result or a failure, not both",
+                ));
+            }
+            (Some(result), None) => Some(CloseOutcome::Result(result)),
+            (None, Some(failure)) => Some(CloseOutcome::Failure(failure)),
+            (None, None) => None,
+        };
+        match outcome {
+            Some(outcome) => {
+                self.store
+                    .close_stream(&chain, &stream.topic, outcome)
+                    .await?
+            }
+            None => self.store.close_topic(&chain, &stream.topic).await?,
+        }
         Ok(CloseResponse {})
     }
 
@@ -459,8 +484,23 @@ impl Streams {
         ))
     }
 
+    /// The run chain a checked stream address names now. A pinned run's chain comes from the
+    /// owner cache, since it never changes. The latest run's chain comes from a fresh describe,
+    /// for a caller that must not land on a chain that already ended.
+    pub(crate) async fn chain_now(&self, stream: &StreamAddress) -> StreamResult<ChainId> {
+        let key = owner_key(stream);
+        if !key.run_id.is_empty() {
+            return self.chain(stream).await;
+        }
+        let described = self.describe(&key, "").await.map_err(not_found)?;
+        let first_run_id = first_run_id(&key, &described)?;
+        self.chains
+            .put(key, &first_run_id, self.options.owner_recheck);
+        Ok(chain_of(stream, &first_run_id))
+    }
+
     /// The chain a stream address names now.
-    async fn chain(&self, stream: &StreamAddress) -> StreamResult<ChainId> {
+    pub(crate) async fn chain(&self, stream: &StreamAddress) -> StreamResult<ChainId> {
         let key = owner_key(stream);
         // A pinned run's chain never changes. The latest run's chain changes when a new chain
         // takes the Workflow id.
@@ -501,7 +541,7 @@ impl Streams {
 }
 
 /// The address of a stream this release keeps, checked.
-fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
+pub(crate) fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
     let stream =
         stream.ok_or_else(|| StreamError::invalid_argument("a stream call needs its stream"))?;
     if stream.owner_kind != StreamOwnerKind::Workflow as i32 {
@@ -1103,6 +1143,8 @@ mod tests {
             .streams
             .close(CloseRequest {
                 stream: Some(stream("out")),
+                result: None,
+                failure: None,
             })
             .await
             .unwrap();
@@ -1150,6 +1192,83 @@ mod tests {
             last = read_after(&page.cursor, &page.state, wait);
         }
         panic!("the read never ended");
+    }
+
+    #[tokio::test]
+    async fn only_the_pass_that_waits_out_the_read_arms() {
+        // Owner checks every 20 ms cut the wait into passes. One arm for the whole wait keeps a
+        // gap shorter than the reader's wait from costing a notification.
+        let setup = setup(quick());
+        let page = setup
+            .streams
+            .read(ReadRequest {
+                arm: true,
+                ..read_after("", &[], Duration::from_millis(300))
+            })
+            .await
+            .unwrap();
+        assert!(page.armed && page.records.is_empty() && !page.done);
+        assert_eq!(page.wake_after, 0, "an empty stream wakes on any counter");
+        assert_eq!(
+            setup
+                .store
+                .newest_or_arm(&chain("run-1"), "out")
+                .await
+                .unwrap(),
+            crate::NewestOrArm::Armed(2),
+            "the read armed once"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_armed_read_waits_for_a_counter_above_its_position() {
+        let setup = setup(StreamsOptions::default());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        let landed = setup.streams.append(append("p", 2, "2")).await.unwrap();
+        let page = setup
+            .streams
+            .read(ReadRequest {
+                arm: true,
+                ..read_after(&landed.last_cursor, &[], Duration::from_millis(20))
+            })
+            .await
+            .unwrap();
+        assert!(page.armed);
+        let at = |cursor: &str| {
+            crate::cursor_position(
+                cursor,
+                setup.store.name(),
+                &setup.streams.hash(&stream("out")),
+            )
+            .unwrap()
+            .unwrap()
+            .to_string()
+        };
+        assert_eq!(
+            Some(page.wake_after),
+            crate::progress_counter(&at(&landed.last_cursor))
+        );
+        let next = setup.streams.append(append("p", 3, "3")).await.unwrap();
+        assert!(
+            crate::progress_counter(&at(&next.last_cursor)).unwrap() > page.wake_after,
+            "the next record's notification wakes the reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_that_finds_its_owner_ended_answers_done_unarmed() {
+        let setup = setup(quick());
+        setup.owners.end("wf", WorkflowExecutionStatus::Completed);
+        let page = setup
+            .streams
+            .read(ReadRequest {
+                arm: true,
+                ..read_after("", &[], Duration::from_secs(5))
+            })
+            .await
+            .unwrap();
+        assert!(page.done);
+        assert!(!page.armed);
     }
 
     #[tokio::test]
@@ -1342,6 +1461,8 @@ mod tests {
             .streams
             .close(CloseRequest {
                 stream: Some(stream("out")),
+                result: None,
+                failure: None,
             })
             .await
             .unwrap();

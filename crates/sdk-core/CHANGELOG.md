@@ -44,6 +44,47 @@ relevant information.
   complete the workflow task now while local activities run, as at a local activity heartbeat.
   The task carries the commands and markers so far and asks for a new task. Core ignores the
   flag while replaying, since lang sets it from a count or a clock.
+* Experimental: with `StreamStoreConfig.notify_on_append`, Core tells each stream's notifier on
+  the server when the stream moves while a reader sleeps on it. That's how a reader that waits on
+  the notifier wakes. A reader arms the stream with a read that sets the new `ReadRequest.arm`
+  and waits its whole wait with no record. The answer says `armed` and carries `wake_after`, the
+  counter of the read's position, and the next append notifies once. Core clears the arm once the
+  notification lands, and a failed one keeps it for the next append. A busy stream, whose readers
+  find records on each read, sends no notification, apart from one refresh a day that keeps its
+  notifier from the idle timeout. `notify_every_append` restores a notification after every
+  append, for readers that can't arm. Notifications for one stream fold into one call in flight,
+  a failed last notification is tried twice more, and a notification never fails the write.
+  `max_notifiers` caps how many streams the process keeps a notifier for (1000 when zero).
+* Experimental: `StreamStore` has `disarm` and `newest_or_arm`, and its read and append messages
+  carry the arm. The Redis store keeps it in each topic's meta as `arm` and `arm_seq`, which
+  changes the append script hash.
+* Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
+  notifications still out. A process calls it before it stops.
+* Experimental: a server without the stream notifier answers the first notifier call with
+  `UNIMPLEMENTED`. Core then stops notifier calls in that process and logs it once at debug.
+* Experimental: Core closes a stream's notifier after the store closes the stream, whether or
+  not `notify_on_append` is on, so attached callbacks complete with the close outcome. A
+  `CloseRequest` carries it in the new `result` or `failure` field. With one of them, the call
+  fails when the server doesn't take the close, and Core keeps trying in the background too.
+  Without them, the notifier closes in the background with a `binary/null` result. A reader that
+  finds the owner ended closes only the store. The notifier's owner check closes the notifier.
+* Experimental: `StreamStore` has `close_topic_with` and `close_stream`, which carry the close
+  outcome to a wrapper that tells the notifier.
+* Experimental: the new `Subscribe` and `Unsubscribe` stream calls attach a Workflow's reader to
+  a stream's notifier as a `workflow_target`, and detach it. The attach's request id is
+  `jetty/<run id>/<subscription id>`, so a rerun attaches as the same reader. A process attaches
+  each subscription once and answers a repeat from memory. The attach names the chain that holds
+  the Workflow id now, and on an empty stream it arms the stream, so the first append wakes the
+  Workflow.
+* Experimental: the new `WaitForNotification` stream call waits on a stream's notifier with the
+  server's `PollStreamNotifier` long poll, for a client reader whose read armed the stream. It
+  returns when the notifier's counter passes the read's `wake_after`, when the stream closed, or
+  with `timed_out` at the server's wait limit. The reader then reads again with `arm`.
+* Experimental: a stream wake for one of a Workflow's readers reaches lang as a
+  `ResolveStreamWake` job, at most one per subscription per workflow task, folded from the
+  `stream_wakes` on the task's scheduled events. Replay delivers the same jobs in the same
+  activations. A task scheduled with wakes ends a workflow task heartbeat chain, so it keeps an
+  activation of its own on replay.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

@@ -6,6 +6,37 @@ use crate::{
     },
 };
 
+/// The result a stream closes with when its owner gave none: a `binary/null` payload, which every
+/// SDK's converter reads as no value. A payload with no encoding fails a caller that expects a
+/// typed result.
+pub fn empty_close_result() -> crate::proto::Payload {
+    crate::proto::Payload {
+        metadata: [("encoding".to_string(), b"binary/null".to_vec())].into(),
+        ..Default::default()
+    }
+}
+
+/// What a closed stream's waiters see: the readers and callbacks its notifier holds.
+// One is built per close, so the size of a failure doesn't matter.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum CloseOutcome {
+    /// The stream ended with this payload, after lang's codec.
+    Result(crate::proto::Payload),
+    /// The stream ended with this failure, or as canceled when it has canceled info.
+    Failure(temporalio_common::protos::temporal::api::failure::v1::Failure),
+}
+
+impl CloseOutcome {
+    /// The result, or `None` for a failure.
+    pub fn result(&self) -> Option<crate::proto::Payload> {
+        match self {
+            CloseOutcome::Result(result) => Some(result.clone()),
+            CloseOutcome::Failure(_) => None,
+        }
+    }
+}
+
 /// A store that holds streams, keyed by their owner's run chain.
 ///
 /// A store moves serialized `temporal.sdk.streams.v1.StreamRecord`s with encoded bodies and deals
@@ -27,6 +58,7 @@ pub trait StreamStore: Send + Sync {
     /// positions and writes nothing. The same first sequence with another digest fails as
     /// producer divergent, and a first sequence below the end of the newest batch as producer
     /// stale. A closed chain or topic refuses a new batch as closed, but still answers a repeat.
+    /// The answer, a repeat's too, reports the topic's arm, so a lost notification goes again.
     async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse>;
 
     /// Reads the records of a topic after a position, waiting up to the request's `wait` for one
@@ -35,6 +67,10 @@ pub trait StreamStore: Send + Sync {
     /// Fails as expired when the position names a record retention dropped, or when retention
     /// dropped records the read had not delivered yet. Fails as not found when nothing is known
     /// about the topic and the position is not empty.
+    ///
+    /// A read that asks to arm and ends with no record on an open topic arms the topic in the
+    /// same step that finds it empty. The next append then reports the arm, and the producer
+    /// notifies the topic's callers.
     async fn read(&self, request: StoreReadRequest) -> StreamResult<StoreReadResponse>;
 
     /// The position of the newest record of a topic, or empty when it holds none.
@@ -75,8 +111,75 @@ pub trait StreamStore: Send + Sync {
     /// Marks one topic of a chain closed, like [StreamStore::close_chain] for that topic alone.
     async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()>;
 
+    /// Like [StreamStore::close_topic], with the outcome the stream's waiters get. A store keeps
+    /// no outcome, but a wrapper that tells the stream's notifier needs it.
+    async fn close_topic_with(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        outcome: CloseOutcome,
+    ) -> StreamResult<()> {
+        let _ = outcome;
+        self.close_topic(chain, topic).await
+    }
+
     /// Deletes every stream of one owner, across all its chains.
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse>;
+
+    /// Closes one topic of a chain in the store, then tells the topic's notifier on the server,
+    /// which completes every attached callback with `outcome`. The store closes first, so a
+    /// reader the completion reaches always finds the stream's end. A store that sends no
+    /// notifications only closes the topic. Fails as refused when the server will never take the
+    /// close, and with another kind when trying again may help.
+    async fn close_stream(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        outcome: CloseOutcome,
+    ) -> StreamResult<()> {
+        self.close_topic_with(chain, topic, outcome).await
+    }
+
+    /// Waits until the notifications this store sent are out. A store that sends none returns at
+    /// once.
+    async fn flush_notifications(&self) {}
+
+    /// Clears the arm of a topic when it still holds `generation`, once the notification that
+    /// generation asked for landed. A reader that armed again since holds a higher generation,
+    /// and its arm stays for the next append. A store that can't arm keeps the default.
+    async fn disarm(&self, chain: &ChainId, topic: &str, generation: u64) -> StreamResult<()> {
+        let _ = (chain, topic, generation);
+        Ok(())
+    }
+
+    /// The position of the newest record of a topic, or, when it holds none, an arm set in the
+    /// same step that finds it empty, so the first append reports the arm. A store that can't
+    /// arm keeps the default, which answers [NewestOrArm::Unarmed] for an empty topic.
+    async fn newest_or_arm(&self, chain: &ChainId, topic: &str) -> StreamResult<NewestOrArm> {
+        let position = self
+            .latest(StoreLatestRequest {
+                chain: Some(chain.clone()),
+                topic: topic.to_string(),
+            })
+            .await?
+            .position;
+        Ok(if position.is_empty() {
+            NewestOrArm::Unarmed
+        } else {
+            NewestOrArm::Newest(position)
+        })
+    }
+}
+
+/// What [StreamStore::newest_or_arm] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NewestOrArm {
+    /// The position of the topic's newest record.
+    Newest(String),
+    /// The topic held no record, and the store armed it with this generation.
+    Armed(u64),
+    /// The topic held no record, and the store can't arm.
+    Unarmed,
 }
 
 #[cfg(test)]

@@ -15,8 +15,9 @@ use std::{
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
-    BEGINNING, END, MemoryStore, ReadTarget, StreamResult, StreamStore, mint_cursor, proto::*,
-    read_page, stored_append_record, stream_hash,
+    BEGINNING, END, MemoryStore, NewestOrArm, Notifier, NotifierClient, NotifyError,
+    NotifyingStore, ReadTarget, StreamNotification, StreamResult, StreamStore, mint_cursor,
+    proto::*, read_page, stored_append_record, stream_hash,
 };
 
 #[async_trait::async_trait]
@@ -71,6 +72,68 @@ impl Case for Memory {
 
 async fn memory() -> Option<Memory> {
     Some(Memory(Arc::new(MemoryStore::new())))
+}
+
+/// Takes every notification and sends nothing.
+struct Quiet;
+
+#[async_trait::async_trait]
+impl NotifierClient for Quiet {
+    async fn notify(&self, _: StreamNotification) -> Result<(), NotifyError> {
+        Ok(())
+    }
+}
+
+/// Another case's store behind `NotifyingStore`, which every process with a client runs, so a
+/// method the wrapper doesn't forward fails the contract.
+struct Notifying<C> {
+    inner: C,
+    store: Arc<dyn StreamStore>,
+}
+
+async fn notifying<C: Case>(
+    inner: impl std::future::Future<Output = Option<C>>,
+) -> Option<Notifying<C>> {
+    notifying_with(inner, true).await
+}
+
+/// [notifying] with progress off, for the arm cases, since with progress on a landed
+/// notification clears the arm the case checks.
+async fn notifying_quietly<C: Case>(
+    inner: impl std::future::Future<Output = Option<C>>,
+) -> Option<Notifying<C>> {
+    notifying_with(inner, false).await
+}
+
+async fn notifying_with<C: Case>(
+    inner: impl std::future::Future<Output = Option<C>>,
+    progress: bool,
+) -> Option<Notifying<C>> {
+    let inner = inner.await?;
+    let store = Arc::new(
+        NotifyingStore::new(inner.store(), Arc::new(Notifier::new(Arc::new(Quiet), 10)))
+            .with_progress(progress),
+    );
+    Some(Notifying { inner, store })
+}
+
+#[async_trait::async_trait]
+impl<C: Case> Case for Notifying<C> {
+    fn store(&self) -> Arc<dyn StreamStore> {
+        self.store.clone()
+    }
+
+    fn chain(&self) -> ChainId {
+        self.inner.chain()
+    }
+
+    async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize) {
+        self.inner.drop_oldest(chain, topic, keep).await;
+    }
+
+    async fn expire_log(&self, chain: &ChainId, topic: &str) {
+        self.inner.expire_log(chain, topic).await;
+    }
 }
 
 #[cfg(feature = "redis")]
@@ -1156,6 +1219,129 @@ mod cases {
             ["1"]
         );
     }
+    /// A store read that asks to arm when it finds nothing, as a reader that sleeps on progress
+    /// makes it.
+    async fn arming_read(
+        case: &dyn Case,
+        chain: &ChainId,
+        topic: &str,
+        after: &str,
+    ) -> StoreReadResponse {
+        case.store()
+            .read(StoreReadRequest {
+                chain: Some(chain.clone()),
+                topic: topic.to_string(),
+                after_position: after.to_string(),
+                max_records: 10,
+                arm: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+    }
+
+    pub(crate) async fn an_empty_read_that_asks_arms_and_the_next_append_reports_it(
+        case: &dyn Case,
+    ) {
+        let chain = case.chain();
+        let read = arming_read(case, &chain, OUT, "").await;
+        assert!(read.records.is_empty());
+        assert!(read.armed, "an empty read that asks arms");
+        let landed = Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        assert!(landed.arm.is_some_and(|arm| arm > 0), "{landed:?}");
+    }
+
+    pub(crate) async fn an_append_with_nothing_armed_reports_zero(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        assert_eq!(producer.append(&["1"]).await.arm, Some(0));
+        // A read that doesn't ask never arms.
+        let read = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        let after = &read.records[0].cursor;
+        let empty = read_with(case, &chain, OUT, after, Duration::ZERO, &read.state)
+            .await
+            .unwrap();
+        assert!(empty.records.is_empty());
+        assert_eq!(producer.append(&["2"]).await.arm, Some(0));
+    }
+
+    pub(crate) async fn an_arm_that_finds_a_newer_record_stays_unarmed(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let first = producer.append(&["1"]).await;
+        producer.append(&["2"]).await;
+        let read = arming_read(case, &chain, OUT, &first.last_position).await;
+        assert_eq!(read.records.len(), 1);
+        assert!(!read.armed, "an answer with records never arms");
+        assert_eq!(producer.append(&["3"]).await.arm, Some(0));
+    }
+
+    pub(crate) async fn a_disarm_of_an_older_generation_keeps_the_newer_arm(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        assert!(arming_read(case, &chain, OUT, "").await.armed);
+        let landed = producer.append(&["1"]).await;
+        let older = landed.arm.unwrap();
+        assert!(
+            arming_read(case, &chain, OUT, &landed.last_position)
+                .await
+                .armed
+        );
+        let landed = producer.append(&["2"]).await;
+        let newer = landed.arm.unwrap();
+        assert!(newer > older, "a new arm gets a higher generation");
+        store.disarm(&chain, OUT, older).await.unwrap();
+        assert_eq!(producer.append(&["3"]).await.arm, Some(newer));
+        store.disarm(&chain, OUT, newer).await.unwrap();
+        assert_eq!(producer.append(&["4"]).await.arm, Some(0));
+        // A disarm of a topic that holds no arm changes nothing.
+        store.disarm(&chain, OTHER, newer).await.unwrap();
+    }
+
+    pub(crate) async fn a_local_activity_append_reports_each_topics_arm(case: &dyn Case) {
+        // A Workflow appends through a Local Activity as its own producer, so it reports the arm
+        // the same way.
+        let chain = case.chain();
+        assert!(arming_read(case, &chain, OUT, "").await.armed);
+        let producer = format!("__temporal_local_1@{}", chain.first_run_id);
+        let armed = Producer::new(case, &chain, OUT, &producer, 1)
+            .append(&["1"])
+            .await;
+        assert!(armed.arm.unwrap() > 0, "{armed:?}");
+        let unarmed = Producer::new(case, &chain, OTHER, &producer, 1)
+            .append(&["2"])
+            .await;
+        assert_eq!(unarmed.arm, Some(0), "{unarmed:?}");
+    }
+
+    pub(crate) async fn newest_or_arm_arms_only_an_empty_topic(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        let NewestOrArm::Armed(generation) = store.newest_or_arm(&chain, OUT).await.unwrap() else {
+            panic!("an empty topic arms");
+        };
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let landed = producer.append(&["1"]).await;
+        assert_eq!(landed.arm, Some(generation));
+        store.disarm(&chain, OUT, generation).await.unwrap();
+        assert_eq!(
+            store.newest_or_arm(&chain, OUT).await.unwrap(),
+            NewestOrArm::Newest(landed.last_position)
+        );
+        assert_eq!(producer.append(&["2"]).await.arm, Some(0));
+    }
+
+    pub(crate) async fn a_closed_topic_never_arms(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        store.close_topic(&chain, OUT).await.unwrap();
+        let read = arming_read(case, &chain, OUT, "").await;
+        assert!(read.closed);
+        assert!(!read.armed, "a closed answer never arms");
+    }
 }
 
 macro_rules! conformance {
@@ -1170,47 +1356,8 @@ macro_rules! conformance {
     };
 }
 
-mod memory {
-    conformance!(super::memory();
-        append_read_roundtrip,
-        a_batch_lands_in_order_and_names_its_last_record,
-        an_empty_append_is_refused,
-        an_append_without_a_digest_is_refused,
-        latest_is_empty_on_an_empty_topic,
-        a_cursor_resumes_strictly_after_its_record,
-        latest_positions_a_reader_at_the_end,
-        end_reads_only_what_arrives_after_the_read_starts,
-        a_read_waits_no_longer_than_asked,
-        dropping_a_waiting_read_releases_it,
-        beginning_starts_at_the_oldest_record_still_held,
-        a_reader_that_falls_behind_retention_is_told,
-        an_empty_read_from_the_beginning_learns_of_a_trim,
-        an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on,
-        rule_11_2_an_empty_read_goes_on_when_a_quiet_log_comes_back,
-        a_retried_append_returns_the_original_positions,
-        a_retry_with_other_ciphertext_still_deduplicates,
-        a_divergent_retry_is_refused,
-        a_sequence_below_the_newest_is_refused,
-        rule_9_1_a_batch_inside_the_held_batch_is_refused,
-        rule_64_1_a_gap_in_the_sequence_is_accepted,
-        producers_and_attempts_dedupe_apart,
-        a_new_attempt_supersedes_the_old_one,
-        a_read_resumed_before_a_new_attempt_reports_it,
-        a_record_that_does_not_parse_fails_with_its_cursor,
-        finish_is_a_record_of_its_own,
-        topics_and_chains_are_apart,
-        a_cursor_from_another_stream_or_store_is_refused,
-        a_closed_chain_refuses_new_batches_but_answers_a_repeat,
-        a_closed_topic_leaves_the_others_open,
-        a_closed_topic_answers_a_repeat_and_ends_reads,
-        a_refused_append_leaves_no_trace_of_its_topic,
-        deleting_an_owner_drops_every_chain_of_it,
-    );
-}
-
 /// Every case but owner deletes, which need a rule of their own under the documented ACL.
-#[cfg(feature = "redis")]
-macro_rules! redis_cases {
+macro_rules! store_cases {
     ($case:expr) => {
         conformance!($case;
             append_read_roundtrip,
@@ -1249,9 +1396,39 @@ macro_rules! redis_cases {
     };
 }
 
+/// The arm a reader sets for the append notifications, for a store that arms.
+macro_rules! arm_cases {
+    ($case:expr) => {
+        conformance!($case;
+            an_empty_read_that_asks_arms_and_the_next_append_reports_it,
+            an_append_with_nothing_armed_reports_zero,
+            an_arm_that_finds_a_newer_record_stays_unarmed,
+            a_disarm_of_an_older_generation_keeps_the_newer_arm,
+            a_local_activity_append_reports_each_topics_arm,
+            newest_or_arm_arms_only_an_empty_topic,
+            a_closed_topic_never_arms,
+        );
+    };
+}
+
+mod memory {
+    store_cases!(super::memory());
+    arm_cases!(super::memory());
+    conformance!(super::memory(); deleting_an_owner_drops_every_chain_of_it);
+}
+
+mod notifying_memory {
+    store_cases!(super::notifying(super::memory()));
+    arm_cases!(super::notifying_quietly(super::memory()));
+    conformance!(super::notifying(super::memory());
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
 #[cfg(feature = "redis")]
 mod standalone_redis {
-    redis_cases!(super::on_redis::redis("STREAMS_REDIS_URL", false));
+    store_cases!(super::on_redis::redis("STREAMS_REDIS_URL", false));
+    arm_cases!(super::on_redis::redis("STREAMS_REDIS_URL", false));
     conformance!(super::on_redis::redis("STREAMS_REDIS_URL", false);
         deleting_an_owner_drops_every_chain_of_it,
     );
@@ -1259,7 +1436,8 @@ mod standalone_redis {
 
 #[cfg(feature = "redis")]
 mod cluster_redis {
-    redis_cases!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
+    store_cases!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
+    arm_cases!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
     // A Workflow id's chains hash to different slots, so the delete reaches every primary.
     conformance!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true);
         deleting_an_owner_drops_every_chain_of_it,
@@ -1267,8 +1445,25 @@ mod cluster_redis {
 }
 
 #[cfg(feature = "redis")]
+mod notifying_redis {
+    store_cases!(super::notifying(super::on_redis::redis(
+        "STREAMS_REDIS_URL",
+        false
+    )));
+    arm_cases!(super::notifying_quietly(super::on_redis::redis(
+        "STREAMS_REDIS_URL",
+        false
+    )));
+}
+
+#[cfg(feature = "redis")]
 mod documented_acl_redis {
-    redis_cases!(super::on_redis::redis_as_documented_user(
+    store_cases!(super::on_redis::redis_as_documented_user(
+        "STREAMS_REDIS_URL",
+        false,
+        &[]
+    ));
+    arm_cases!(super::on_redis::redis_as_documented_user(
         "STREAMS_REDIS_URL",
         false,
         &[]
@@ -1282,7 +1477,12 @@ mod documented_acl_redis {
 #[cfg(feature = "redis")]
 mod documented_acl_cluster_redis {
     // A cluster client asks the topology first, so the documented rules must allow it.
-    redis_cases!(super::on_redis::redis_as_documented_user(
+    store_cases!(super::on_redis::redis_as_documented_user(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true,
+        &[]
+    ));
+    arm_cases!(super::on_redis::redis_as_documented_user(
         "STREAMS_REDIS_CLUSTER_URL",
         true,
         &[]

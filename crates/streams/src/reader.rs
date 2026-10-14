@@ -7,6 +7,7 @@
 
 use crate::{
     BEGINNING, END, StreamError, StreamResult, StreamStore, cursor_position, mint_cursor,
+    progress_counter,
     proto::{
         ChainId, ReadRecord, ReadRequest, ReadResponse, StoreLatestRequest, StoreReadRequest,
         StreamRecord, StreamRecordKind, Supersession, read_record,
@@ -218,15 +219,16 @@ pub(crate) async fn read_with(
         .read(StoreReadRequest {
             chain: Some(target.chain.clone()),
             topic: target.topic.clone(),
-            after_position: position,
+            after_position: position.clone(),
             wait: request.wait,
             max_records: match request.max_records {
                 0 => DEFAULT_MAX_RECORDS,
                 max => max,
             },
+            arm: request.arm,
         })
         .await?;
-    let closed = page.closed;
+    let (closed, armed) = (page.closed, page.armed);
     let mut records = Vec::with_capacity(page.records.len());
     let mut previous = start;
     for stored in page.records {
@@ -271,6 +273,14 @@ pub(crate) async fn read_with(
             cursor: previous,
             state: Vec::new(),
             done: false,
+            armed,
+            // An armed read found nothing after `position`, so a notification counter above that
+            // position's counter can only come from a newer record.
+            wake_after: if armed {
+                progress_counter(&position).unwrap_or(0)
+            } else {
+                0
+            },
         },
         closed,
     ))
@@ -381,7 +391,7 @@ mod tests {
                 .collect();
             Ok(StoreReadResponse {
                 records,
-                closed: false,
+                ..Default::default()
             })
         }
 

@@ -111,6 +111,17 @@ impl TestHistoryBuilder {
         self.workflow_task_scheduled_event_id = self.add_by_type(EventType::WorkflowTaskScheduled);
     }
 
+    /// Add a workflow task scheduled event carrying folded stream wakes.
+    pub fn add_workflow_task_scheduled_with_stream_wakes(
+        &mut self,
+        stream_wakes: Vec<temporalio_common::protos::temporal::api::stream::v1::StreamWake>,
+    ) {
+        self.workflow_task_scheduled_event_id = self.add(WorkflowTaskScheduledEventAttributes {
+            stream_wakes,
+            ..Default::default()
+        });
+    }
+
     /// Add a workflow task started event.
     pub fn add_workflow_task_started(&mut self) {
         self.final_workflow_task_started_event_id = self.add(WorkflowTaskStartedEventAttributes {

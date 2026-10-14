@@ -1439,3 +1439,203 @@ async fn a_delete_reaches_every_primary_of_a_cluster() {
         assert!(keys.is_empty(), "{keys:?}");
     }
 }
+
+/// Records the stream notifications it was sent.
+#[derive(Default)]
+struct Recorder(std::sync::Mutex<Vec<temporalio_streams::StreamNotification>>);
+
+#[async_trait::async_trait]
+impl temporalio_streams::NotifierClient for Recorder {
+    async fn notify(
+        &self,
+        notification: temporalio_streams::StreamNotification,
+    ) -> Result<(), temporalio_streams::NotifyError> {
+        self.0.lock().unwrap().push(notification);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn notification_counters_come_from_redis_entry_ids_and_grow_with_the_stream() {
+    let Some(setup) = setup().await else { return };
+    let recorder = Arc::new(Recorder::default());
+    let store = temporalio_streams::NotifyingStore::new(
+        Arc::new(setup.store),
+        Arc::new(temporalio_streams::Notifier::new(recorder.clone(), 10)),
+    );
+    let chain = chain();
+    let mut positions: Vec<String> = vec![];
+    // A reader sleeps before each write, and each landed notification clears its arm.
+    let rearm = async |after: &str| {
+        let read = store.read(arming_read(&chain, after)).await.unwrap();
+        assert!(read.armed);
+    };
+    for sequence in [1, 3] {
+        rearm(positions.last().map_or("", String::as_str)).await;
+        let digest = [sequence as u8];
+        let landed = store
+            .append(append(&chain, "p", sequence, 2, &digest))
+            .await
+            .unwrap();
+        positions.push(landed.last_position);
+        store.flush_notifications().await;
+    }
+    rearm(&positions[1]).await;
+    // A Workflow appends through a Local Activity as its own producer, so it notifies the same way.
+    let landed = store
+        .append(append(&chain, "__temporal_local_1@run-1", 1, 1, &[9]))
+        .await
+        .unwrap();
+    positions.push(landed.last_position);
+    store.flush_notifications().await;
+
+    let counters: Vec<i64> = recorder
+        .0
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|n| n.counter)
+        .collect();
+    let expected: Vec<i64> = positions
+        .iter()
+        .map(|position| {
+            let (milliseconds, sequence) = position.split_once('-').expect("an entry id");
+            (milliseconds.parse::<i64>().unwrap() << 20) | sequence.parse::<i64>().unwrap()
+        })
+        .collect();
+    assert_eq!(counters, expected);
+    assert!(
+        counters.windows(2).all(|pair| pair[0] < pair[1]),
+        "{counters:?}"
+    );
+}
+
+fn arming_read(chain: &ChainId, position: &str) -> StoreReadRequest {
+    StoreReadRequest {
+        arm: true,
+        ..read_after(chain, position, 10)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_arm_and_an_append_on_two_connections_never_lose_a_wake() {
+    // The reader and the producer are two processes. Whichever lands first, a reader that
+    // sleeps must hear of the record: the arm finds it, or the append reports the arm.
+    let Some(url) = url() else {
+        return;
+    };
+    let prefix = unique("arm-race");
+    let reader = Arc::new(setup_with(&url, &url, &prefix, |_| {}).await.store);
+    let producer = Arc::new(setup_with(&url, &url, &prefix, |_| {}).await.store);
+    let chain = chain();
+    let mut position = String::new();
+    let (mut found, mut armed) = (0, 0);
+    for round in 1..=1000 {
+        let read = {
+            let (reader, chain, position) = (reader.clone(), chain.clone(), position.clone());
+            tokio::spawn(async move { reader.read(arming_read(&chain, &position)).await })
+        };
+        let appended = {
+            let (producer, chain) = (producer.clone(), chain.clone());
+            // A spread of head starts, so both orders happen.
+            let head_start = Duration::from_micros((round as u64 * 37) % 1500);
+            tokio::spawn(async move {
+                tokio::time::sleep(head_start).await;
+                producer
+                    .append(append(&chain, "p", round, 1, &round.to_be_bytes()))
+                    .await
+            })
+        };
+        let read = read.await.unwrap().unwrap();
+        let landed = appended.await.unwrap().unwrap();
+        let arm = landed.arm.unwrap();
+        if read.records.is_empty() {
+            assert!(read.armed, "round {round}: an empty answer that asks arms");
+            assert!(
+                arm > 0,
+                "round {round}: the reader armed and the append missed it"
+            );
+            armed += 1;
+        } else {
+            assert!(!read.armed, "round {round}");
+            found += 1;
+        }
+        if arm > 0 {
+            reader.disarm(&chain, "events", arm).await.unwrap();
+        }
+        position = landed.last_position;
+    }
+    eprintln!("{found} reads found the record, {armed} armed first");
+    assert!(found > 0 && armed > 0, "only one order happened");
+}
+
+#[tokio::test]
+async fn an_arm_on_a_topic_with_no_meta_sets_its_expiry() {
+    let Some(mut setup) = retained_for(Duration::from_millis(200)).await else {
+        return;
+    };
+    let chain = chain();
+    let read = setup.store.read(arming_read(&chain, "")).await.unwrap();
+    assert!(read.armed);
+    let meta = format!("{}:meta", log_key(&setup.prefix, &chain, "events"));
+    let ttl: i64 = setup.raw.pttl(&meta).await.unwrap();
+    assert!(
+        ttl > GRACE_MS - 60_000 && ttl <= GRACE_MS + 200,
+        "an arm must not leave a key that outlives the retention: {ttl}"
+    );
+    // An arm on a topic with a meta leaves the expiry its last write set.
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let _: () = setup.raw.pexpire(&meta, 60_000).await.unwrap();
+    let landed = setup.store.latest(StoreLatestRequest {
+        chain: Some(chain.clone()),
+        topic: "events".to_string(),
+    });
+    let position = landed.await.unwrap().position;
+    assert!(
+        setup
+            .store
+            .read(arming_read(&chain, &position))
+            .await
+            .unwrap()
+            .armed
+    );
+    let ttl: i64 = setup.raw.pttl(&meta).await.unwrap();
+    assert!(0 < ttl && ttl <= 60_000, "{ttl}");
+}
+
+#[tokio::test]
+async fn the_arm_lives_in_the_topics_meta() {
+    // Documented in docs/redis.md, so an operator can read and clear it.
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    assert!(
+        setup
+            .store
+            .read(arming_read(&chain, ""))
+            .await
+            .unwrap()
+            .armed
+    );
+    let meta = format!("{}:meta", log_key(&setup.prefix, &chain, "events"));
+    let fields: HashMap<String, String> = setup.raw.hgetall(&meta).await.unwrap();
+    assert_eq!(
+        fields.get("arm").map(String::as_str),
+        Some("1"),
+        "{fields:?}"
+    );
+    assert_eq!(
+        fields.get("arm_seq").map(String::as_str),
+        Some("1"),
+        "{fields:?}"
+    );
+    setup.store.disarm(&chain, "events", 1).await.unwrap();
+    let fields: HashMap<String, String> = setup.raw.hgetall(&meta).await.unwrap();
+    assert!(!fields.contains_key("arm"), "{fields:?}");
+    assert_eq!(fields.get("arm_seq").map(String::as_str), Some("1"));
+}

@@ -4,13 +4,27 @@ The store on the application's Redis.
 
 Records live in Redis and never pass through Temporal. The key layout, the stored values and
 the Lua scripts are the ones the SDKs used before the store moved into Core, apart from the
-append's topic check, so a stream one wrote stays readable and writable by the other.
+append's topic check and the arm reports, so a stream one wrote stays readable and writable by
+the other.
 
 **Appends.** One script writes a whole batch, so a reader never sees part of one. The topic's
 meta hash keeps one field per producer attempt: the newest batch's first sequence, its record
 count, its first and last entry ids, and lang's digest of it in hex. The script refuses a
 new batch once the chain or the topic is closed, in the same step as the write, so no batch
-lands after a close returned. Only that topic check differs from the SDKs' script.
+lands after a close returned. That topic check and the arm report differ from the SDKs' script.
+
+**Arms.** A reader that sleeps until it hears of progress arms the topic when its read ends
+with nothing. The topic's meta holds two more fields. `arm_seq` counts the arms the topic ever
+took, and `arm` holds the newest one's generation while a reader waits. One script finds the
+log empty after the read's position and sets `arm` to the next `arm_seq`, or answers the newer
+record. The append script answers the topic's `arm` with its positions, so a producer
+notifies only while a reader waits. Once its notification landed, the producer
+deletes `arm` only when it still holds the generation that notification carried, so a reader
+that armed again keeps its arm. An arm on a topic with no meta creates the meta with the
+tombstone's expiry, and an arm on a meta leaves its expiry as the last write set it. The
+append script's hash differs from the SDKs', so a server's script cache entry for an SDK's
+provider no longer serves Core. The stored format only gains the two fields, and
+an SDK's provider ignores them.
 
 **Retention.** Every script that writes a log trims it with `XTRIM MINID` to the retention and
 slides the expiry of the log and its meta, so a stream dies a retention after its last write

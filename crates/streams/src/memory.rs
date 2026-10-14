@@ -6,7 +6,7 @@
 //! position keeps naming the same record after [MemoryStore::truncate] drops older ones.
 
 use crate::{
-    StreamError, StreamResult, StreamStore,
+    NewestOrArm, StreamError, StreamResult, StreamStore,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredRecord,
@@ -72,6 +72,29 @@ impl Topic {
 struct Chain {
     topics: HashMap<String, Topic>,
     closed: bool,
+    /// Kept apart from the topics, so an arm on a topic with no records leaves it unknown to
+    /// reads and to the topic list.
+    arms: HashMap<String, Arm>,
+}
+
+/// A topic's arm: the generation a reader set, zero once cleared, and the last one handed out.
+#[derive(Debug, Default)]
+struct Arm {
+    generation: u64,
+    last: u64,
+}
+
+impl Chain {
+    fn arm(&self, topic: &str) -> u64 {
+        self.arms.get(topic).map_or(0, |arm| arm.generation)
+    }
+
+    fn set_arm(&mut self, topic: &str) -> u64 {
+        let arm = self.arms.entry(topic.to_string()).or_default();
+        arm.last += 1;
+        arm.generation = arm.last;
+        arm.generation
+    }
 }
 
 /// A [StreamStore] in process memory. For tests only.
@@ -118,9 +141,33 @@ impl MemoryStore {
         self.written.send_modify(|version| *version += 1);
     }
 
-    /// One look at what a read gets now: `None` when it should wait for more.
-    fn read_now(&self, request: &StoreReadRequest) -> StreamResult<Option<StoreReadResponse>> {
-        let chains = self.chains.lock().unwrap();
+    /// One look at what a read gets now: `None` when it should wait for more. With `arm`, a look
+    /// that finds nothing arms the topic instead.
+    fn read_now(
+        &self,
+        request: &StoreReadRequest,
+        arm: bool,
+    ) -> StreamResult<Option<StoreReadResponse>> {
+        let mut chains = self.chains.lock().unwrap();
+        let found = Self::look(&chains, request)?;
+        if found.is_some() || !arm {
+            return Ok(found);
+        }
+        // Under the lock the look held, so no append lands between finding nothing and the arm.
+        chains
+            .entry(chain_key(chain_of(request.chain.as_ref())?))
+            .or_default()
+            .set_arm(&request.topic);
+        Ok(Some(StoreReadResponse {
+            armed: true,
+            ..Default::default()
+        }))
+    }
+
+    fn look(
+        chains: &HashMap<ChainKey, Chain>,
+        request: &StoreReadRequest,
+    ) -> StreamResult<Option<StoreReadResponse>> {
         let chain = chains.get(&chain_key(chain_of(request.chain.as_ref())?));
         let topic = chain.and_then(|chain| chain.topics.get(&request.topic));
         let closed = chain.is_some_and(|chain| chain.closed) || topic.is_some_and(|t| t.closed);
@@ -134,8 +181,8 @@ impl MemoryStore {
                 )));
             }
             return Ok(closed.then(|| StoreReadResponse {
-                records: Vec::new(),
                 closed,
+                ..Default::default()
             }));
         };
         let start = after.map_or(topic.base, |after| after + 1);
@@ -159,7 +206,13 @@ impl MemoryStore {
                 record: topic.at(offset).cloned().unwrap_or_default(),
             })
             .collect();
-        Ok((!records.is_empty() || closed).then_some(StoreReadResponse { records, closed }))
+        Ok(
+            (!records.is_empty() || closed).then_some(StoreReadResponse {
+                records,
+                closed,
+                armed: false,
+            }),
+        )
     }
 }
 
@@ -222,6 +275,7 @@ impl StreamStore for MemoryStore {
                 return Ok(StoreAppendResponse {
                     first_position: held.first.to_string(),
                     last_position: last.to_string(),
+                    arm: Some(chain.arm(&request.topic)),
                 });
             }
             let next = held.sequence + held.count;
@@ -241,6 +295,7 @@ impl StreamStore for MemoryStore {
                 "the Workflow that owns this stream has closed",
             ));
         }
+        let arm = chain.arm(&request.topic);
         let topic = chain.topics.entry(request.topic.clone()).or_default();
         let count = request.records.len() as i64;
         let mut positions = request.records.into_iter().map(|record| topic.push(record));
@@ -260,6 +315,7 @@ impl StreamStore for MemoryStore {
         Ok(StoreAppendResponse {
             first_position: first.to_string(),
             last_position: last.to_string(),
+            arm: Some(arm),
         })
     }
 
@@ -267,14 +323,14 @@ impl StreamStore for MemoryStore {
         let deadline = Instant::now() + wait_of(&request);
         let mut written = self.written.subscribe();
         loop {
-            if let Some(response) = self.read_now(&request)? {
+            if let Some(response) = self.read_now(&request, false)? {
                 return Ok(response);
             }
             if tokio::time::timeout_at(deadline, written.changed())
                 .await
                 .is_err()
             {
-                return Ok(StoreReadResponse::default());
+                return Ok(self.read_now(&request, request.arm)?.unwrap_or_default());
             }
         }
     }
@@ -359,6 +415,27 @@ impl StreamStore for MemoryStore {
             .closed = true;
         self.wrote();
         Ok(())
+    }
+
+    async fn disarm(&self, chain: &ChainId, topic: &str, generation: u64) -> StreamResult<()> {
+        let mut chains = self.chains.lock().unwrap();
+        if let Some(arm) = chains
+            .get_mut(&chain_key(chain))
+            .and_then(|chain| chain.arms.get_mut(topic))
+            && arm.generation == generation
+        {
+            arm.generation = 0;
+        }
+        Ok(())
+    }
+
+    async fn newest_or_arm(&self, chain: &ChainId, topic: &str) -> StreamResult<NewestOrArm> {
+        let mut chains = self.chains.lock().unwrap();
+        let chain = chains.entry(chain_key(chain)).or_default();
+        if let Some(held) = chain.topics.get(topic).filter(|t| !t.records.is_empty()) {
+            return Ok(NewestOrArm::Newest((held.head() - 1).to_string()));
+        }
+        Ok(NewestOrArm::Armed(chain.set_arm(topic)))
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {

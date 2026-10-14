@@ -1119,6 +1119,9 @@ where
                     ActivationJobResult::None
                 }
                 Some(ActivationVariant::RemoveFromCache(_)) => ActivationJobResult::None,
+                // This runtime has no stream reader yet. A wake carries no records, only a hint
+                // to read the stream, so dropping it loses nothing.
+                Some(ActivationVariant::ResolveStreamWake(_)) => ActivationJobResult::None,
                 None => {
                     return Err(Box::new(Failure {
                         message: "Activation job missing variant".to_string(),
