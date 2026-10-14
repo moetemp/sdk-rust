@@ -26,6 +26,16 @@ append script's hash differs from the SDKs', so a server's script cache entry fo
 provider no longer serves Core. The stored format only gains the two fields, and
 an SDK's provider ignores them.
 
+**Closes.** A topic close sets `closed` in the topic's meta. In the same script it sets `close`,
+a serialized `StoredClose` with the close's result or failure and its `closed_by`, but only when
+the meta has no `close` yet. So the first close wins, as on the server's notifier, and a close
+with no outcome is a first close too. A chain close, when the owner ended, sets the chain's flag
+and keeps no outcome. A read answers the first close with the closed topic, so a reader that
+reaches the end sees the outcome without a wake. An append that the close refuses names its
+`closed_by`. The field takes at most 1.5 MiB, lives as long as the meta, and needs no ACL rule
+beyond the documented ones, since the script uses `HGET`, `HSET` and `PEXPIRE` only. An SDK's
+provider ignores it.
+
 **Retired producers.** A field stays until a write's trim finds it older than the retention, so
 a topic written by many short-lived producers holds one field per producer attempt of the last
 retention window, about 235 bytes each. `RetireProducer` deletes one attempt's field with

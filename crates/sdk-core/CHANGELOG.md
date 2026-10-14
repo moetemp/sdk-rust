@@ -86,6 +86,13 @@ relevant information.
   complete the workflow task now while local activities run, as at a local activity heartbeat.
   The task carries the commands and markers so far and asks for a new task. Core ignores the
   flag while replaying, since lang sets it from a count or a clock.
+* Experimental: a store keeps the first close of each topic, with its result or failure and the
+  new `CloseRequest.closed_by`, at most 1.5 MiB. A read that ends with `done` answers it as
+  `close_result`, `close_failure` and `closed_by`, so a reader that reaches the end before a
+  close wake still sees the outcome. A chain close, when the owner ended, keeps none. A CLOSED
+  append refusal names the close's `closed_by` in `StreamFailure.closed_by`. The Redis store
+  keeps it in the topic's meta as `close`, set only once by the close script.
+  `StreamStore::close_topic_with` and `close_stream` take a `StoredClose`.
 * Experimental: the stream service's `RetireProducer` call drops one producer attempt's dedupe
   state on a stream, which the Redis store keeps as one field of the topic's meta hash until
   retention. A producer that writes once per short-lived attempt calls it after the attempt's

@@ -224,6 +224,13 @@ message ReadResponse {
   // stream. A notification with a higher counter names a record after the position, so the
   // reader waits for a counter above this one. One that landed before the wait started counts.
   int64 wake_after = 6;
+  // Set with `done` when the stream's topic was closed with a result. A chain close, when the
+  // owner ended with no close, sets none of these three.
+  temporal.api.common.v1.Payload close_result = 7;
+  // Set with `done` when the stream's topic was closed with a failure.
+  temporal.api.failure.v1.Failure close_failure = 8;
+  // Set with `done` to the `closed_by` of the topic's first close.
+  string closed_by = 9;
 }
 
 message LatestRequest {
@@ -239,13 +246,26 @@ message CloseRequest {
   StreamAddress stream = 1;
   // What every callback attached to the stream's notifier completes with, after lang's payload
   // codec. The stream's notifier on the server closes once the store has. When set, a notifier
-  // that doesn't take the close fails the call, and Core keeps trying in the background too. Unset, the callbacks complete with a `binary/null` result, and the notifier
-  // close is retried in the background.
+  // that doesn't take the close fails the call, and Core keeps trying in the background too.
+  // Unset, the callbacks complete with a `binary/null` result, and the notifier close is retried
+  // in the background.
   temporal.api.common.v1.Payload result = 2;
   // Closes the stream with a failure instead of `result`, after lang's failure converter and
   // codec. The callbacks complete as failed, or as canceled for a failure with canceled info.
   // A close carries a result or a failure, never both.
   temporal.api.failure.v1.Failure failure = 3;
+  // Who closed the stream, opaque to Core. At most 256 bytes. The store keeps it with the first
+  // close's outcome, and readers and refused appends see it, so a writer can tell a close by its
+  // own run.
+  string closed_by = 4;
+}
+
+// The first close of a topic, as a store keeps it. A later close of the topic keeps this one. A
+// chain close, when the owner ended, keeps none. With `result` and `failure`, at most 1.5 MiB.
+message StoredClose {
+  temporal.api.common.v1.Payload result = 1;
+  temporal.api.failure.v1.Failure failure = 2;
+  string closed_by = 3;
 }
 
 message CloseResponse {}
@@ -370,6 +390,9 @@ message StreamFailure {
   string message = 2;
   // The cursor of the record that failed, for RECORD.
   string cursor = 3;
+  // For CLOSED, the `closed_by` of the topic's first close. Empty when the owner's chain closed
+  // or the close named no one.
+  string closed_by = 4;
 }
 
 // The calls below are what Core asks of a store, below owner checks, cursors and supersession.
@@ -420,6 +443,8 @@ message StoreReadResponse {
   // The read asked to arm, found no record and armed the topic. Never set with records or with
   // `closed`.
   bool armed = 3;
+  // The topic's first close, when it was closed as a topic. Unset for a chain close.
+  StoredClose close = 4;
 }
 
 message StoreLatestRequest {

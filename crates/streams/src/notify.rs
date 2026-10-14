@@ -7,7 +7,7 @@ use crate::{
     CloseOutcome, NewestOrArm, StreamResult, StreamStore, WORKFLOW_OWNER_KIND, mint_cursor,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
-        StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse,
+        StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
     },
     stream_hash,
 };
@@ -885,23 +885,18 @@ impl StreamStore for NotifyingStore {
     }
 
     async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()> {
-        self.close_topic_with(
-            chain,
-            topic,
-            CloseOutcome::Result(crate::empty_close_result()),
-        )
-        .await
+        self.close_topic_with(chain, topic, StoredClose::default())
+            .await
     }
 
     async fn close_topic_with(
         &self,
         chain: &ChainId,
         topic: &str,
-        outcome: CloseOutcome,
+        close: StoredClose,
     ) -> StreamResult<()> {
-        self.inner
-            .close_topic_with(chain, topic, outcome.clone())
-            .await?;
+        let outcome = CloseOutcome::of(&close);
+        self.inner.close_topic_with(chain, topic, close).await?;
         self.close_notifier_in_background(chain, topic, outcome);
         Ok(())
     }
@@ -926,11 +921,10 @@ impl StreamStore for NotifyingStore {
         &self,
         chain: &ChainId,
         topic: &str,
-        outcome: CloseOutcome,
+        close: StoredClose,
     ) -> StreamResult<()> {
-        self.inner
-            .close_topic_with(chain, topic, outcome.clone())
-            .await?;
+        let outcome = CloseOutcome::of(&close);
+        self.inner.close_topic_with(chain, topic, close).await?;
         let closed = match close_position(self.inner.as_ref(), chain, topic).await {
             Ok((cursor, counter)) => {
                 self.notifier
@@ -1465,7 +1459,7 @@ mod tests {
         let run = chain("run-1");
         store.append(append_request(&run, "t", 1)).await.unwrap();
         store
-            .close_topic_with(&run, "t", CloseOutcome::Failure(gave_up()))
+            .close_topic_with(&run, "t", CloseOutcome::Failure(gave_up()).into())
             .await
             .unwrap();
         store.flush_notifications().await;
@@ -1488,7 +1482,7 @@ mod tests {
         store.append(append_request(&run, "t", 2)).await.unwrap();
         store.flush_notifications().await;
         store
-            .close_stream(&run, "t", CloseOutcome::Result(summary()))
+            .close_stream(&run, "t", CloseOutcome::Result(summary()).into())
             .await
             .unwrap();
         let sent = client.sent.lock().unwrap().clone();
@@ -1512,7 +1506,7 @@ mod tests {
     async fn a_close_of_an_empty_stream_carries_the_first_counter() {
         let (client, store) = sees_the_store(None);
         store
-            .close_stream(&chain("run-1"), "t", CloseOutcome::Result(summary()))
+            .close_stream(&chain("run-1"), "t", CloseOutcome::Result(summary()).into())
             .await
             .unwrap();
         let sent = client.sent.lock().unwrap().clone();
@@ -1523,13 +1517,13 @@ mod tests {
     async fn a_close_says_whether_trying_again_can_help() {
         let (_, store) = sees_the_store(Some(NotifyError::Refused("no notifier".to_string())));
         let error = store
-            .close_stream(&chain("run-1"), "t", CloseOutcome::Result(summary()))
+            .close_stream(&chain("run-1"), "t", CloseOutcome::Result(summary()).into())
             .await
             .unwrap_err();
         assert_eq!(error.kind, crate::proto::StreamFailureKind::Refused);
         let (_, store) = sees_the_store(Some(NotifyError::Failed("down".to_string())));
         let error = store
-            .close_stream(&chain("run-1"), "t", CloseOutcome::Result(summary()))
+            .close_stream(&chain("run-1"), "t", CloseOutcome::Result(summary()).into())
             .await
             .unwrap_err();
         assert_ne!(error.kind, crate::proto::StreamFailureKind::Refused);
@@ -1540,7 +1534,7 @@ mod tests {
         let store = MemoryStore::new();
         let run = chain("run-1");
         store
-            .close_stream(&run, "t", CloseOutcome::Result(summary()))
+            .close_stream(&run, "t", CloseOutcome::Result(summary()).into())
             .await
             .unwrap();
         let error = store
@@ -1663,7 +1657,7 @@ mod tests {
         let client = flaky(1, false);
         let store = closing_through(client.clone()).await;
         let error = store
-            .close_stream(&chain("run-1"), "t", CloseOutcome::Result(summary()))
+            .close_stream(&chain("run-1"), "t", CloseOutcome::Result(summary()).into())
             .await
             .unwrap_err();
         assert_ne!(error.kind, crate::proto::StreamFailureKind::Refused);

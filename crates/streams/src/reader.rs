@@ -10,7 +10,7 @@ use crate::{
     progress_counter,
     proto::{
         ChainId, ReadRecord, ReadRequest, ReadResponse, StoreLatestRequest, StoreReadRequest,
-        StreamRecord, StreamRecordKind, Supersession, read_record,
+        StoredClose, StreamRecord, StreamRecordKind, Supersession, read_record,
     },
 };
 use prost::Message;
@@ -157,19 +157,20 @@ pub async fn read_page(
     request: &ReadRequest,
 ) -> StreamResult<ReadResponse> {
     let mut state = ReadState::decode_from(&request.state)?;
-    let (mut response, _) = read_with(store, target, request, &mut state).await?;
+    let (mut response, _, _) = read_with(store, target, request, &mut state).await?;
     response.state = state.encode_to_vec();
     Ok(response)
 }
 
 /// [read_page] with the state already decoded, for a caller that keeps fields of its own in it.
-/// The answer's `state` is left empty. Also answers whether the store marked the stream closed.
+/// The answer's `state` is left empty. Also answers whether the store marked the stream closed,
+/// and the topic's first close when it was closed as a topic.
 pub(crate) async fn read_with(
     store: &dyn StreamStore,
     target: &ReadTarget,
     request: &ReadRequest,
     state: &mut ReadState,
-) -> StreamResult<(ReadResponse, bool)> {
+) -> StreamResult<(ReadResponse, bool, Option<StoredClose>)> {
     let from_end = request.after == END;
     let position = if from_end {
         store
@@ -228,7 +229,7 @@ pub(crate) async fn read_with(
             arm: request.arm,
         })
         .await?;
-    let (closed, armed) = (page.closed, page.armed);
+    let (closed, armed, close) = (page.closed, page.armed, page.close);
     let mut records = Vec::with_capacity(page.records.len());
     let mut previous = start;
     for stored in page.records {
@@ -281,8 +282,10 @@ pub(crate) async fn read_with(
             } else {
                 0
             },
+            ..Default::default()
         },
         closed,
+        close,
     ))
 }
 

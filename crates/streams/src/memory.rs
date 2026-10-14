@@ -9,8 +9,8 @@ use crate::{
     NewestOrArm, StreamError, StreamResult, StreamStore,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
-        StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredRecord,
-        StreamOwnerKind,
+        StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
+        StoredRecord, StreamOwnerKind,
     },
 };
 use std::{
@@ -49,6 +49,8 @@ struct Topic {
     /// One entry per producer attempt, so the state stays bounded however long a producer writes.
     held: HashMap<(String, i64), Held>,
     closed: bool,
+    /// The first close of the topic, which later closes keep.
+    close: Option<StoredClose>,
 }
 
 impl Topic {
@@ -211,6 +213,7 @@ impl MemoryStore {
                 records,
                 closed,
                 armed: false,
+                close: topic.close.clone(),
             }),
         )
     }
@@ -291,9 +294,14 @@ impl StreamStore for MemoryStore {
         }
         // Checked before the topic exists, so a refused batch leaves no trace of it.
         if chain_closed || existing.is_some_and(|topic| topic.closed) {
-            return Err(StreamError::closed(
-                "the Workflow that owns this stream has closed",
-            ));
+            let closed_by = existing
+                .and_then(|topic| topic.close.as_ref())
+                .map(|close| close.closed_by.clone())
+                .unwrap_or_default();
+            return Err(
+                StreamError::closed("the Workflow that owns this stream has closed")
+                    .with_closed_by(closed_by),
+            );
         }
         let arm = chain.arm(&request.topic);
         let topic = chain.topics.entry(request.topic.clone()).or_default();
@@ -404,15 +412,27 @@ impl StreamStore for MemoryStore {
     }
 
     async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()> {
-        self.chains
-            .lock()
-            .unwrap()
-            .entry(chain_key(chain))
-            .or_default()
-            .topics
-            .entry(topic.to_string())
-            .or_default()
-            .closed = true;
+        self.close_topic_with(chain, topic, StoredClose::default())
+            .await
+    }
+
+    async fn close_topic_with(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        close: StoredClose,
+    ) -> StreamResult<()> {
+        {
+            let mut chains = self.chains.lock().unwrap();
+            let topic = chains
+                .entry(chain_key(chain))
+                .or_default()
+                .topics
+                .entry(topic.to_string())
+                .or_default();
+            topic.closed = true;
+            topic.close.get_or_insert(close);
+        }
         self.wrote();
         Ok(())
     }

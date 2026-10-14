@@ -1185,6 +1185,112 @@ mod cases {
         }
     }
 
+    async fn close_of(case: &dyn Case, chain: &ChainId, topic: &str) -> StoreReadResponse {
+        case.store()
+            .read(StoreReadRequest {
+                chain: Some(chain.clone()),
+                topic: topic.to_string(),
+                max_records: 10,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+    }
+
+    fn failure(message: &str) -> temporalio_common::protos::temporal::api::failure::v1::Failure {
+        temporalio_common::protos::temporal::api::failure::v1::Failure {
+            message: message.to_string(),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) async fn a_topic_keeps_its_first_close(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        let first = StoredClose {
+            failure: Some(failure("the agent gave up")),
+            closed_by: "run-1".to_string(),
+            ..Default::default()
+        };
+        store
+            .close_topic_with(&chain, OUT, first.clone())
+            .await
+            .unwrap();
+        // A later close, with another outcome, leaves the first one.
+        store
+            .close_topic_with(
+                &chain,
+                OUT,
+                StoredClose {
+                    result: Some(Payload {
+                        data: b"late".to_vec(),
+                        ..Default::default()
+                    }),
+                    closed_by: "run-2".to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        store.close_topic(&chain, OUT).await.unwrap();
+        let read = close_of(case, &chain, OUT).await;
+        assert!(read.closed);
+        assert_eq!(read.close, Some(first));
+        let refused = Producer::new(case, &chain, OUT, "q", 1)
+            .send(&[data("2")])
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind, StreamFailureKind::Closed);
+        assert_eq!(refused.closed_by.as_deref(), Some("run-1"));
+    }
+
+    pub(crate) async fn a_close_with_no_outcome_is_the_first_close_too(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        store.close_topic(&chain, OUT).await.unwrap();
+        store
+            .close_topic_with(
+                &chain,
+                OUT,
+                StoredClose {
+                    failure: Some(failure("too late")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            close_of(case, &chain, OUT).await.close,
+            Some(StoredClose::default())
+        );
+        let refused = Producer::new(case, &chain, OUT, "p", 1)
+            .send(&[data("1")])
+            .await
+            .unwrap_err();
+        assert_eq!(refused.closed_by, None, "the close named no one");
+    }
+
+    pub(crate) async fn a_chain_close_keeps_no_outcome(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        store.close_chain(&chain).await.unwrap();
+        let read = close_of(case, &chain, OUT).await;
+        assert!(read.closed);
+        assert_eq!(read.close, None);
+        let refused = Producer::new(case, &chain, OUT, "q", 1)
+            .send(&[data("2")])
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind, StreamFailureKind::Closed);
+        assert_eq!(refused.closed_by, None);
+    }
+
     pub(crate) async fn retiring_a_producer_drops_only_its_dedupe_state(case: &dyn Case) {
         let store = case.store();
         let chain = case.chain();
@@ -1432,6 +1538,9 @@ macro_rules! store_cases {
             a_closed_topic_leaves_the_others_open,
             a_closed_topic_answers_a_repeat_and_ends_reads,
             retiring_a_producer_drops_only_its_dedupe_state,
+            a_topic_keeps_its_first_close,
+            a_close_with_no_outcome_is_the_first_close_too,
+            a_chain_close_keeps_no_outcome,
         );
     };
 }

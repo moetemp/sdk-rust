@@ -712,6 +712,7 @@ mod tests {
                     stream: Some(address()),
                     result: Some(result.clone()),
                     failure: None,
+                    closed_by: Default::default(),
                 }
                 .encode_to_vec(),
             )
@@ -759,6 +760,7 @@ mod tests {
                     stream: Some(address()),
                     result: Some(Payload::default()),
                     failure: None,
+                    closed_by: Default::default(),
                 }
                 .encode_to_vec(),
             )
@@ -858,6 +860,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_read_after_the_close_ends_with_the_outcome_the_notifier_got() {
+        let recorder = Arc::new(Recorder::default());
+        let service = service_notifying(true, recorder.clone()).await;
+        let appended = AppendResponse::decode(
+            service
+                .call("Append", &append(1, &["a"]))
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        let result = Payload {
+            data: b"summary".to_vec(),
+            ..Default::default()
+        };
+        service
+            .call(
+                "Close",
+                &CloseRequest {
+                    stream: Some(address()),
+                    result: Some(result.clone()),
+                    failure: None,
+                    closed_by: "run-1".to_string(),
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap();
+        let read = ReadResponse::decode(
+            service
+                .call(
+                    "Read",
+                    &ReadRequest {
+                        stream: Some(address()),
+                        after: appended.last_cursor,
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap();
+        assert!(read.done && read.records.is_empty());
+        assert_eq!(read.close_result, Some(result.clone()));
+        assert_eq!(read.closed_by, "run-1");
+        let sent = recorder.0.lock().unwrap().clone();
+        assert_eq!(sent.last().unwrap().close_result(), Some(result));
+        let refused = service
+            .call("Append", &append(2, &["b"]))
+            .await
+            .unwrap_err();
+        assert_eq!(refused.kind, StreamFailureKind::Closed as i32);
+        assert_eq!(refused.closed_by, "run-1");
+    }
+
+    #[tokio::test]
     async fn a_close_with_a_result_closes_the_store_and_then_the_notifier() {
         let recorder = Arc::new(Recorder::default());
         let service = service_notifying(true, recorder.clone()).await;
@@ -878,6 +938,7 @@ mod tests {
                     stream: Some(address()),
                     result: Some(result.clone()),
                     failure: None,
+                    closed_by: Default::default(),
                 }
                 .encode_to_vec(),
             )
@@ -905,6 +966,7 @@ mod tests {
                     stream: Some(address()),
                     result: None,
                     failure: None,
+                    closed_by: Default::default(),
                 }
                 .encode_to_vec(),
             )

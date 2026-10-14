@@ -723,6 +723,7 @@ mod tests {
                     ..Default::default()
                 }),
                 failure: None,
+                closed_by: String::new(),
             })
             .await;
         assert_eq!(state, "succeeded", "{body}");
@@ -753,6 +754,7 @@ mod tests {
                     )),
                     ..Default::default()
                 }),
+                closed_by: String::new(),
             })
             .await;
         assert_eq!(state, "failed", "{body}");

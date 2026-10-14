@@ -77,6 +77,7 @@ fn cancelled(rpc: &str) -> proto::StreamFailure {
         kind: proto::StreamFailureKind::OutcomeUnknown as i32,
         message: message.to_string(),
         cursor: String::new(),
+        closed_by: String::new(),
     }
 }
 

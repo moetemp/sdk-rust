@@ -9,13 +9,14 @@ use crate::{
     NewestOrArm, StreamError, StreamResult, StreamStore,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
-        StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredRecord,
-        StreamOwnerKind,
+        StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
+        StoredRecord, StreamFailureKind, StreamOwnerKind,
     },
 };
 use conn::{BlockingPool, Shared};
 use errors::{Call, Mapped};
 use keys::{ChainKeys, owner_pattern, session_field};
+use prost::Message;
 use redis::{Cmd, Value, streams::StreamReadReply};
 use std::{collections::HashMap, time::Duration};
 use tokio::time::Instant;
@@ -24,6 +25,8 @@ const NAME: &str = "redis";
 const RECORD_FIELD: &str = "r";
 const TOMBSTONE_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const CLOSED_FIELD: &str = "closed";
+/// The meta field that holds the topic's first close, a serialized `StoredClose`.
+const CLOSE_FIELD: &str = "close";
 const DELETE_BATCH: usize = 500;
 
 /// How to reach Redis and how long streams live there.
@@ -114,6 +117,27 @@ impl RedisStore {
             retention_ms,
             grace_ms: TOMBSTONE_GRACE.as_millis() as u64,
         })
+    }
+
+    /// Names who closed the topic on a refusal, from the topic's first close. The close is kept
+    /// once and never changes, so reading it after the refusal gives the close that refused.
+    async fn with_closed_by(
+        &self,
+        error: StreamError,
+        keys: &ChainKeys,
+        topic: &str,
+    ) -> StreamError {
+        let close: Option<Vec<u8>> = redis::cmd("HGET")
+            .arg(keys.meta(topic))
+            .arg(CLOSE_FIELD)
+            .query_async(&mut self.shared.clone())
+            .await
+            .unwrap_or_default();
+        let closed_by = close
+            .and_then(|bytes| StoredClose::decode(bytes.as_slice()).ok())
+            .map(|close| close.closed_by)
+            .unwrap_or_default();
+        error.with_closed_by(closed_by)
     }
 
     fn keys(&self, chain: Option<&ChainId>) -> StreamResult<ChainKeys> {
@@ -307,7 +331,8 @@ fn records(reply: Value) -> StreamResult<Vec<StoredRecord>> {
 const TOPIC_STATE: &str = "\
 return {redis.call('EXISTS', KEYS[1]), redis.call('EXISTS', KEYS[2]), \
 redis.call('HGET', KEYS[2], 'trimmed'), redis.call('HGET', KEYS[2], 'last'), \
-redis.call('HGET', KEYS[3], ARGV[1]), redis.call('HGET', KEYS[4], ARGV[1])}";
+redis.call('HGET', KEYS[3], ARGV[1]), redis.call('HGET', KEYS[4], ARGV[1]), \
+redis.call('HGET', KEYS[2], 'close')}";
 
 /// What the store knows about a topic besides its records.
 #[derive(Debug, Default)]
@@ -320,6 +345,8 @@ struct TopicState {
     last: Option<String>,
     chain_closed: bool,
     topic_closed: bool,
+    /// The topic's first close, when it was closed as a topic.
+    close: Option<StoredClose>,
 }
 
 impl redis::FromRedisValue for TopicState {
@@ -332,8 +359,16 @@ impl redis::FromRedisValue for TopicState {
         let Value::Array(values) = value else {
             return Err(format!("a topic state is a list, not {value:?}").into());
         };
-        let [log, meta, trimmed, last, chain_closed, topic_closed] = values.as_slice() else {
-            return Err(format!("a topic state has six values, not {}", values.len()).into());
+        let [log, meta, trimmed, last, chain_closed, topic_closed, close] = values.as_slice()
+        else {
+            return Err(format!("a topic state has seven values, not {}", values.len()).into());
+        };
+        let close = match close {
+            Value::BulkString(bytes) => Some(
+                StoredClose::decode(bytes.as_slice())
+                    .map_err(|error| format!("a topic's close does not decode: {error}"))?,
+            ),
+            _ => None,
         };
         Ok(Self {
             log_exists: number(log),
@@ -342,6 +377,7 @@ impl redis::FromRedisValue for TopicState {
             last: text(last),
             chain_closed: text(chain_closed).is_some(),
             topic_closed: text(topic_closed).is_some(),
+            close,
         })
     }
 }
@@ -442,10 +478,16 @@ impl StreamStore for RedisStore {
         for record in &request.records {
             script.arg(record.as_slice());
         }
-        let (first_position, last_position, arm): (String, String, String) = script
+        let appended: StreamResult<(String, String, String)> = script
             .invoke_async(&mut self.shared.clone())
             .await
-            .mapped(Call::Append)?;
+            .mapped(Call::Append);
+        let (first_position, last_position, arm) = match appended {
+            Err(error) if error.kind == StreamFailureKind::Closed => {
+                return Err(self.with_closed_by(error, &keys, &request.topic).await);
+            }
+            appended => appended?,
+        };
         Ok(StoreAppendResponse {
             first_position,
             last_position,
@@ -515,6 +557,7 @@ impl StreamStore for RedisStore {
             records: found,
             closed,
             armed,
+            close: state.close.filter(|_| state.topic_closed),
         })
     }
 
@@ -607,15 +650,27 @@ impl StreamStore for RedisStore {
     }
 
     async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()> {
+        self.close_topic_with(chain, topic, StoredClose::default())
+            .await
+    }
+
+    async fn close_topic_with(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        close: StoredClose,
+    ) -> StreamResult<()> {
         let meta = ChainKeys::new(&self.prefix, chain).meta(topic);
-        // The meta is the topic's tombstone, so the mark lives as long as the topic is known.
-        redis::pipe()
-            .atomic()
-            .hset(&meta, CLOSED_FIELD, "1")
-            .pexpire(&meta, (self.retention_ms + self.grace_ms) as i64)
-            .query_async::<()>(&mut self.shared.clone())
+        // The meta is the topic's tombstone, so the mark and the outcome live as long as the topic
+        // is known.
+        scripts::CLOSE_SCRIPT
+            .key(meta)
+            .arg(close.encode_to_vec())
+            .arg(self.retention_ms + self.grace_ms)
+            .invoke_async::<i64>(&mut self.shared.clone())
             .await
             .mapped(Call::Write)
+            .map(drop)
     }
 
     async fn retire_producer(

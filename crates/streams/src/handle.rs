@@ -4,15 +4,15 @@
 //! where the contract says so, and mints and checks cursors. Stores only move records.
 
 use crate::{
-    CloseOutcome, ReadTarget, StreamError, StreamResult, StreamStore, WORKFLOW_OWNER_KIND,
+    MAX_CLOSE_BYTES, ReadTarget, StreamError, StreamResult, StreamStore, WORKFLOW_OWNER_KIND,
     activity_producer_id, check_append_digest, mint_cursor,
     owner::{OwnerClient, OwnerDescription, OwnerError},
     proto::{
         ActivityProducer, AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse,
         DeleteOwnerRequest, DeleteOwnerResponse, LatestRequest, LatestResponse, NamedProducer,
         ReadRequest, ReadResponse, RetireProducerRequest, RetireProducerResponse,
-        StoreAppendRequest, StoreLatestRequest, StreamAddress, StreamOwnerKind, append_request,
-        retire_producer_request,
+        StoreAppendRequest, StoreLatestRequest, StoredClose, StreamAddress, StreamOwnerKind,
+        append_request, retire_producer_request,
     },
     reader::{ReadState, read_with},
     stored_append_record, stream_hash,
@@ -25,6 +25,9 @@ use std::{
 };
 use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
 use tokio::time::Instant;
+
+/// The longest `closed_by` a close takes.
+const MAX_CLOSED_BY_BYTES: usize = 256;
 
 /// The longest a producer writes without asking whether its owner's chain ended.
 pub const OWNER_RECHECK: Duration = Duration::from_secs(60);
@@ -255,6 +258,7 @@ impl Streams {
         let deadline = Instant::now() + wait;
         let minimum = self.options.owner_check_min;
         let mut page_request = request.clone();
+        let mut topic_close = None;
         let response = loop {
             let now = unix_ms();
             if state.check_interval_ms == 0 {
@@ -272,8 +276,11 @@ impl Streams {
             // Only the pass that waits out the read's own wait arms, so a shorter pass before an
             // owner check doesn't wake the caller for a gap shorter than the reader chose.
             page_request.arm = request.arm && !state.owner_ended && remaining <= until_check;
-            let (mut page, closed) =
+            let (mut page, closed, close) =
                 read_with(&*self.store, &target, &page_request, &mut state).await?;
+            if close.is_some() {
+                topic_close = close;
+            }
             page_request.after = page.cursor.clone();
             if !page.records.is_empty() {
                 state.check_interval_ms = millis(minimum);
@@ -289,6 +296,13 @@ impl Streams {
                 page.done = true;
                 page.armed = false;
                 page.wake_after = 0;
+                // A reader can reach the end before a close wake does, so the end carries what the
+                // stream closed with.
+                if let Some(close) = topic_close.take() {
+                    page.close_result = close.result;
+                    page.close_failure = close.failure;
+                    page.closed_by = close.closed_by;
+                }
                 break page;
             }
             if unix_ms() >= state.next_check_ms {
@@ -364,24 +378,38 @@ impl Streams {
     /// it, since the close completes every callback attached there.
     pub async fn close(&self, request: CloseRequest) -> StreamResult<CloseResponse> {
         let stream = address(request.stream.as_ref())?;
-        let chain = self.chain(stream).await?;
-        let outcome = match (request.result, request.failure) {
-            (Some(_), Some(_)) => {
-                return Err(StreamError::invalid_argument(
-                    "a close carries a result or a failure, not both",
-                ));
-            }
-            (Some(result), None) => Some(CloseOutcome::Result(result)),
-            (None, Some(failure)) => Some(CloseOutcome::Failure(failure)),
-            (None, None) => None,
+        if request.result.is_some() && request.failure.is_some() {
+            return Err(StreamError::invalid_argument(
+                "a close carries a result or a failure, not both",
+            ));
+        }
+        if request.closed_by.len() > MAX_CLOSED_BY_BYTES {
+            return Err(StreamError::invalid_argument(format!(
+                "closed_by is at most {MAX_CLOSED_BY_BYTES} bytes, not {}",
+                request.closed_by.len()
+            )));
+        }
+        let has_outcome = request.result.is_some() || request.failure.is_some();
+        let close = StoredClose {
+            result: request.result,
+            failure: request.failure,
+            closed_by: request.closed_by,
         };
-        match outcome {
-            Some(outcome) => {
-                self.store
-                    .close_stream(&chain, &stream.topic, outcome)
-                    .await?
-            }
-            None => self.store.close_topic(&chain, &stream.topic).await?,
+        if close.encoded_len() > MAX_CLOSE_BYTES {
+            return Err(StreamError::invalid_argument(format!(
+                "a close's outcome is at most {MAX_CLOSE_BYTES} bytes, not {}",
+                close.encoded_len()
+            )));
+        }
+        let chain = self.chain(stream).await?;
+        if has_outcome {
+            self.store
+                .close_stream(&chain, &stream.topic, close)
+                .await?
+        } else {
+            self.store
+                .close_topic_with(&chain, &stream.topic, close)
+                .await?
         }
         Ok(CloseResponse {})
     }
@@ -1195,6 +1223,7 @@ mod tests {
                 stream: Some(stream("out")),
                 result: None,
                 failure: None,
+                closed_by: Default::default(),
             })
             .await
             .unwrap();
@@ -1288,6 +1317,84 @@ mod tests {
             last = read_after(&page.cursor, &page.state, wait);
         }
         panic!("the read never ended");
+    }
+
+    fn gave_up() -> temporalio_common::protos::temporal::api::failure::v1::Failure {
+        temporalio_common::protos::temporal::api::failure::v1::Failure {
+            message: "the agent gave up".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reader_that_reaches_the_end_sees_the_first_close() {
+        let setup = setup(quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup
+            .streams
+            .close(CloseRequest {
+                stream: Some(stream("out")),
+                failure: Some(gave_up()),
+                closed_by: "run-1".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        setup
+            .streams
+            .close(CloseRequest {
+                stream: Some(stream("out")),
+                closed_by: "run-2".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (delivered, end) = read_to_end(&setup.streams, Duration::from_millis(50)).await;
+        assert_eq!(delivered, 1);
+        assert!(end.done);
+        assert_eq!(end.close_failure, Some(gave_up()));
+        assert_eq!(end.close_result, None);
+        assert_eq!(end.closed_by, "run-1", "the first close stays");
+        let refused = setup.streams.append(append("q", 1, "2")).await.unwrap_err();
+        assert_eq!(refused.kind, StreamFailureKind::Closed);
+        assert_eq!(refused.closed_by.as_deref(), Some("run-1"));
+    }
+
+    #[tokio::test]
+    async fn a_reader_whose_owner_ended_with_no_close_sees_no_outcome() {
+        let setup = setup(quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup.owners.end("wf", WorkflowExecutionStatus::Completed);
+        let (_, end) = read_to_end(&setup.streams, Duration::from_millis(50)).await;
+        assert!(end.done);
+        assert_eq!(
+            (end.close_result, end.close_failure, end.closed_by.as_str()),
+            (None, None, "")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_close_too_large_to_keep_is_refused_and_closes_nothing() {
+        let setup = setup(quick());
+        for close in [
+            CloseRequest {
+                stream: Some(stream("out")),
+                closed_by: "x".repeat(MAX_CLOSED_BY_BYTES + 1),
+                ..Default::default()
+            },
+            CloseRequest {
+                stream: Some(stream("out")),
+                result: Some(Payload {
+                    data: vec![0; MAX_CLOSE_BYTES],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ] {
+            let error = setup.streams.close(close).await.unwrap_err();
+            assert_eq!(error.kind, StreamFailureKind::InvalidArgument);
+        }
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
     }
 
     #[tokio::test]
@@ -1559,6 +1666,7 @@ mod tests {
                 stream: Some(stream("out")),
                 result: None,
                 failure: None,
+                closed_by: Default::default(),
             })
             .await
             .unwrap();

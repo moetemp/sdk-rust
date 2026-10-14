@@ -2,9 +2,13 @@ use crate::{
     StreamResult,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
-        StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse,
+        StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
     },
 };
+
+/// The most bytes a close's outcome takes in the store, `closed_by` included. A store keeps it
+/// with the stream as it keeps a record, so it gets the bound one record gets.
+pub const MAX_CLOSE_BYTES: usize = 1536 * 1024;
 
 /// The result a stream closes with when its owner gave none: a `binary/null` payload, which every
 /// SDK's converter reads as no value. A payload with no encoding fails a caller that expects a
@@ -33,6 +37,31 @@ impl CloseOutcome {
         match self {
             CloseOutcome::Result(result) => Some(result.clone()),
             CloseOutcome::Failure(_) => None,
+        }
+    }
+
+    /// What the waiters of a stream closed with `close` see. A close with no outcome gives them
+    /// [empty_close_result].
+    pub fn of(close: &StoredClose) -> Self {
+        match (&close.failure, &close.result) {
+            (Some(failure), _) => CloseOutcome::Failure(failure.clone()),
+            (None, Some(result)) => CloseOutcome::Result(result.clone()),
+            (None, None) => CloseOutcome::Result(empty_close_result()),
+        }
+    }
+}
+
+impl From<CloseOutcome> for StoredClose {
+    fn from(outcome: CloseOutcome) -> Self {
+        match outcome {
+            CloseOutcome::Result(result) => StoredClose {
+                result: Some(result),
+                ..Default::default()
+            },
+            CloseOutcome::Failure(failure) => StoredClose {
+                failure: Some(failure),
+                ..Default::default()
+            },
         }
     }
 }
@@ -111,15 +140,17 @@ pub trait StreamStore: Send + Sync {
     /// Marks one topic of a chain closed, like [StreamStore::close_chain] for that topic alone.
     async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()>;
 
-    /// Like [StreamStore::close_topic], with the outcome the stream's waiters get. A store keeps
-    /// no outcome, but a wrapper that tells the stream's notifier needs it.
+    /// Like [StreamStore::close_topic], with the close's outcome and who closed it. A store that
+    /// keeps the outcome keeps the topic's first close only, and a read of the closed topic
+    /// answers it. A store that keeps none keeps the default, but a wrapper that tells the
+    /// stream's notifier still needs the outcome.
     async fn close_topic_with(
         &self,
         chain: &ChainId,
         topic: &str,
-        outcome: CloseOutcome,
+        close: StoredClose,
     ) -> StreamResult<()> {
-        let _ = outcome;
+        let _ = close;
         self.close_topic(chain, topic).await
     }
 
@@ -140,7 +171,7 @@ pub trait StreamStore: Send + Sync {
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse>;
 
     /// Closes one topic of a chain in the store, then tells the topic's notifier on the server,
-    /// which completes every attached callback with `outcome`. The store closes first, so a
+    /// which completes every attached callback with the outcome. The store closes first, so a
     /// reader the completion reaches always finds the stream's end. A store that sends no
     /// notifications only closes the topic. Fails as refused when the server will never take the
     /// close, and with another kind when trying again may help.
@@ -148,9 +179,9 @@ pub trait StreamStore: Send + Sync {
         &self,
         chain: &ChainId,
         topic: &str,
-        outcome: CloseOutcome,
+        close: StoredClose,
     ) -> StreamResult<()> {
-        self.close_topic_with(chain, topic, outcome).await
+        self.close_topic_with(chain, topic, close).await
     }
 
     /// Waits until the notifications this store sent are out. A store that sends none returns at

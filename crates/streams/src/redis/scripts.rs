@@ -18,6 +18,10 @@ pub(crate) static ARM_SCRIPT: LazyLock<Script> =
     LazyLock::new(|| Script::new(include_str!("../../lua/arm.lua")));
 pub(crate) static DISARM_SCRIPT: LazyLock<Script> =
     LazyLock::new(|| Script::new(include_str!("../../lua/disarm.lua")));
+// Marks the topic closed and keeps its first close's outcome in one step, so two closes can't both
+// find no outcome and the second overwrite the first.
+pub(crate) static CLOSE_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::new(include_str!("../../lua/close.lua")));
 
 #[cfg(test)]
 mod tests {
