@@ -508,6 +508,7 @@ fn memory_store_config() -> Vec<u8> {
     };
     StreamStoreConfig {
         store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+        ..Default::default()
     }
     .encode_to_vec()
 }

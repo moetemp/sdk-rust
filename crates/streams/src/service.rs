@@ -52,11 +52,13 @@ impl StreamService {
                 ));
             }
         };
-        Ok(Self::new(
-            store,
-            owner,
-            StreamsOptions::for_retention(retention),
-        ))
+        let mut options = StreamsOptions::for_retention(retention);
+        if let Some(grace) = config.owner_start_grace {
+            options.owner_start_grace = Duration::try_from(grace).map_err(|_| {
+                StreamError::refused("the stream store's owner start grace must not be negative")
+            })?;
+        }
+        Ok(Self::new(store, owner, options))
     }
 
     /// Serves calls on `store`.
@@ -216,6 +218,7 @@ mod tests {
         StreamService::connect(
             StreamStoreConfig {
                 store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+                ..Default::default()
             },
             Arc::new(Running),
         )
@@ -453,10 +456,24 @@ mod tests {
 
     #[tokio::test]
     async fn a_config_that_names_no_store_is_refused() {
-        let error = StreamService::connect(StreamStoreConfig { store: None }, Arc::new(Running))
+        let error = StreamService::connect(StreamStoreConfig::default(), Arc::new(Running))
             .await
             .unwrap_err();
         assert_eq!(error.kind, StreamFailureKind::Refused);
+    }
+
+    #[tokio::test]
+    async fn a_negative_owner_start_grace_is_refused() {
+        let mut config = StreamStoreConfig {
+            store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+            owner_start_grace: Some(Default::default()),
+        };
+        config.owner_start_grace.as_mut().unwrap().seconds = -1;
+        let error = StreamService::connect(config, Arc::new(Running))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Refused);
+        assert!(error.message.contains("owner start grace"), "{error}");
     }
 
     #[cfg(not(feature = "redis"))]
@@ -465,6 +482,7 @@ mod tests {
         let error = StreamService::connect(
             StreamStoreConfig {
                 store: Some(stream_store_config::Store::Redis(Default::default())),
+                ..Default::default()
             },
             Arc::new(Running),
         )

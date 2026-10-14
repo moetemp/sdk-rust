@@ -56,6 +56,10 @@ relevant information.
 * Experimental: a read reports `SUPERSEDED` for a Workflow producer (`@<run id>`) only when its
   attempt keeps the high bits (the same task) and raises the low 16 bits (a rerun). A higher
   prefix is the next task and reads with no supersession.
+* Experimental: a read of a Workflow that Temporal doesn't know yet answers empty for
+  `StreamStoreConfig.owner_start_grace` (60 seconds unless set, counted from the read's first
+  owner check), so a reader can start before its owner. After the grace it fails as `NOT_FOUND`
+  as before. Zero turns the grace off.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

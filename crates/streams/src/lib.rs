@@ -24,7 +24,7 @@ mod store;
 pub use self::redis::{RedisStore, RedisStoreOptions};
 pub use cursor::{BEGINNING, END, cursor_position, mint_cursor, stream_hash};
 pub use error::{StreamError, StreamResult};
-pub use handle::{OWNER_RECHECK, Streams, StreamsOptions};
+pub use handle::{OWNER_RECHECK, OWNER_START_GRACE, Streams, StreamsOptions};
 pub use memory::MemoryStore;
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};
 pub use reader::{

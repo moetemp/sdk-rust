@@ -78,6 +78,10 @@ pub(crate) struct ReadState {
     watermark_known: bool,
     #[prost(uint64, tag = "10")]
     clock: u64,
+    /// When the read first found no owner, in milliseconds since the Unix epoch, or 0 once it
+    /// found one. The owner start grace counts from it.
+    #[prost(uint64, tag = "11")]
+    pub(crate) owner_missing_since_ms: u64,
 }
 
 /// What a read knows of one producer.
