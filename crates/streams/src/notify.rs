@@ -83,11 +83,50 @@ pub enum NotifyError {
     Unsupported(String),
 }
 
-/// Sends notifications to the stream notifier on the server.
+/// A Workflow's reader, to attach to a stream's notifier as a wake target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowAttachment {
+    /// The run chain whose stream it reads. Its first run keys the notifier.
+    pub chain: ChainId,
+    /// The stream's topic.
+    pub topic: String,
+    /// The attach is idempotent by it, and a detach names it.
+    pub request_id: String,
+    /// The reader's Workflow, in the chain's namespace.
+    pub workflow_id: String,
+    /// The reader's run.
+    pub run_id: String,
+    /// Names the reader in its run.
+    pub subscription_id: String,
+}
+
+/// Sends notifications to the stream notifier on the server, and attaches and detaches the
+/// Workflows it wakes.
 #[async_trait::async_trait]
 pub trait NotifierClient: Send + Sync {
     /// Sends one notification.
     async fn notify(&self, notification: StreamNotification) -> Result<(), NotifyError>;
+
+    /// Attaches a Workflow's reader to a stream's notifier. Idempotent by its request id.
+    async fn attach_workflow(&self, attachment: WorkflowAttachment) -> Result<(), NotifyError> {
+        let _ = attachment;
+        Err(NotifyError::Unsupported(
+            "this client can't attach readers".to_string(),
+        ))
+    }
+
+    /// Detaches what the attach with `request_id` attached to `chain`'s stream on `topic`.
+    async fn detach(
+        &self,
+        chain: ChainId,
+        topic: String,
+        request_id: String,
+    ) -> Result<(), NotifyError> {
+        let _ = (chain, topic, request_id);
+        Err(NotifyError::Unsupported(
+            "this client can't detach readers".to_string(),
+        ))
+    }
 }
 
 /// The notifier counter for a store position.

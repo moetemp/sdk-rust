@@ -6,20 +6,22 @@ use temporalio_client::Connection;
 use temporalio_common::protos::temporal::api::{
     common::v1::WorkflowExecution,
     enums::v1::StreamOwnerKind,
-    stream::v1::StreamReference,
+    stream::v1::{StreamReference, WorkflowWakeTarget},
     workflowservice::v1::{
-        DescribeWorkflowExecutionRequest, DescribeWorkflowExecutionResponse, NotifyStreamRequest,
+        AttachStreamCallbackRequest, DescribeWorkflowExecutionRequest,
+        DescribeWorkflowExecutionResponse, DetachStreamCallbackRequest, NotifyStreamRequest,
     },
 };
 use temporalio_streams::{
     CloseOutcome, NotifierClient, NotifyError, OwnerClient, OwnerDescription, OwnerError,
-    StreamNotification,
+    StreamNotification, WorkflowAttachment, proto::ChainId,
 };
 pub use temporalio_streams::{StreamError, StreamResult, StreamService, StreamStore, proto};
 use tonic::IntoRequest;
 
 /// Connects to the store `config` names. The service asks `connection`'s server about streams'
-/// owners and sends the stream notifications the config turns on to it.
+/// owners, sends the stream notifications the config turns on to it, and attaches Workflow
+/// readers there.
 pub async fn connect_stream_service(
     config: proto::StreamStoreConfig,
     connection: Connection,
@@ -49,19 +51,69 @@ impl NotifierClient for ConnectionNotifierClient {
             .map(|_| ())
             .map_err(notify_error)
     }
+
+    async fn attach_workflow(&self, attachment: WorkflowAttachment) -> Result<(), NotifyError> {
+        self.connection
+            .workflow_service()
+            .attach_stream_callback(attach_request(attachment).into_request())
+            .await
+            .map(|_| ())
+            .map_err(notify_error)
+    }
+
+    async fn detach(
+        &self,
+        chain: ChainId,
+        topic: String,
+        request_id: String,
+    ) -> Result<(), NotifyError> {
+        self.connection
+            .workflow_service()
+            .detach_stream_callback(
+                DetachStreamCallbackRequest {
+                    namespace: chain.namespace.clone(),
+                    stream_ref: Some(chain_reference(&chain, topic)),
+                    request_id,
+                    ..Default::default()
+                }
+                .into_request(),
+            )
+            .await
+            .map(|_| ())
+            .map_err(notify_error)
+    }
+}
+
+/// The notifier of `chain`'s stream on `topic`. The run chain's first run keys the notifier, so one
+/// notifier serves the stream across Continue-as-New and a new chain on the same Workflow id gets
+/// its own.
+fn chain_reference(chain: &ChainId, topic: String) -> StreamReference {
+    StreamReference {
+        owner_kind: StreamOwnerKind::Workflow as i32,
+        workflow_id: chain.workflow_id.clone(),
+        run_id: chain.first_run_id.clone(),
+        topic,
+    }
+}
+
+fn attach_request(attachment: WorkflowAttachment) -> AttachStreamCallbackRequest {
+    AttachStreamCallbackRequest {
+        namespace: attachment.chain.namespace.clone(),
+        stream_ref: Some(chain_reference(&attachment.chain, attachment.topic)),
+        request_id: attachment.request_id,
+        workflow_target: Some(WorkflowWakeTarget {
+            workflow_id: attachment.workflow_id,
+            run_id: attachment.run_id,
+            subscription_id: attachment.subscription_id,
+        }),
+        ..Default::default()
+    }
 }
 
 fn notify_request(notification: StreamNotification) -> NotifyStreamRequest {
     NotifyStreamRequest {
+        stream_ref: Some(chain_reference(&notification.chain, notification.topic)),
         namespace: notification.chain.namespace,
-        // The run chain's first run keys the notifier, so one notifier serves the stream across
-        // Continue-as-New and a new chain on the same Workflow id gets its own.
-        stream_ref: Some(StreamReference {
-            owner_kind: StreamOwnerKind::Workflow as i32,
-            workflow_id: notification.chain.workflow_id,
-            run_id: notification.chain.first_run_id,
-            topic: notification.topic,
-        }),
         position: notification.position,
         counter: notification.counter,
         close: notification.close.is_some(),
@@ -259,6 +311,42 @@ mod tests {
         assert_eq!((request.position.as_str(), request.counter), ("cursor", 7));
         assert!(!request.close);
         assert!(request.close_result.is_none());
+    }
+
+    #[test]
+    fn an_attach_names_the_chains_notifier_and_wakes_the_reader() {
+        let request = attach_request(WorkflowAttachment {
+            chain: proto::ChainId {
+                namespace: "ns".to_string(),
+                workflow_id: "owner".to_string(),
+                first_run_id: "chain-1".to_string(),
+            },
+            topic: "tokens".to_string(),
+            request_id: "jetty/reader-run/1".to_string(),
+            workflow_id: "reader".to_string(),
+            run_id: "reader-run".to_string(),
+            subscription_id: "1".to_string(),
+        });
+        assert_eq!(request.namespace, "ns");
+        assert_eq!(
+            request.stream_ref,
+            Some(StreamReference {
+                owner_kind: StreamOwnerKind::Workflow as i32,
+                workflow_id: "owner".to_string(),
+                run_id: "chain-1".to_string(),
+                topic: "tokens".to_string(),
+            })
+        );
+        assert_eq!(request.request_id, "jetty/reader-run/1");
+        assert_eq!(
+            request.workflow_target,
+            Some(WorkflowWakeTarget {
+                workflow_id: "reader".to_string(),
+                run_id: "reader-run".to_string(),
+                subscription_id: "1".to_string(),
+            })
+        );
+        assert!(request.callback.is_none(), "exactly one target");
     }
 
     #[test]

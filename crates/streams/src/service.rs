@@ -6,8 +6,9 @@ use crate::{
     proto::{
         AppendRequest, CloseRequest, DeleteOwnerRequest, FlushNotificationsRequest,
         FlushNotificationsResponse, LatestRequest, ReadRequest, StreamFailure, StreamStoreConfig,
-        stream_store_config,
+        SubscribeRequest, UnsubscribeRequest, stream_store_config,
     },
+    subscribe::Subscriptions,
 };
 use prost::Message;
 use std::{sync::Arc, time::Duration};
@@ -27,6 +28,7 @@ const MAX_READ_WAIT: Duration = Duration::from_secs(60);
 pub struct StreamService {
     store: Arc<dyn StreamStore>,
     streams: Streams,
+    subscriptions: Subscriptions,
 }
 
 impl std::fmt::Debug for StreamService {
@@ -48,7 +50,8 @@ impl StreamService {
     }
 
     /// Like [StreamService::connect], closing each stream's notifier through `notifier` after
-    /// the store closes the stream, and sending progress too when the config turns it on.
+    /// the store closes the stream, sending progress too when the config turns it on, and
+    /// attaching and detaching Workflow readers through it.
     pub async fn connect_with_notifier(
         config: StreamStoreConfig,
         owner: Arc<dyn OwnerClient>,
@@ -70,7 +73,7 @@ impl StreamService {
                 "stream notifications need a client to send them with",
             ));
         }
-        let store: Arc<dyn StreamStore> = match notifier {
+        let store: Arc<dyn StreamStore> = match notifier.clone() {
             Some(client) => {
                 let max_notifiers = match config.max_notifiers {
                     0 => DEFAULT_MAX_NOTIFIERS,
@@ -84,11 +87,11 @@ impl StreamService {
             }
             None => store,
         };
-        Ok(Self::new(
-            store,
-            owner,
-            StreamsOptions::for_retention(retention),
-        ))
+        let service = Self::new(store, owner, StreamsOptions::for_retention(retention));
+        Ok(match notifier {
+            Some(client) => service.with_subscriptions(client),
+            None => service,
+        })
     }
 
     /// Serves calls on `store`.
@@ -98,7 +101,17 @@ impl StreamService {
         options: StreamsOptions,
     ) -> Self {
         let streams = Streams::new(store.clone(), owner, options);
-        Self { store, streams }
+        Self {
+            store,
+            streams,
+            subscriptions: Subscriptions::default(),
+        }
+    }
+
+    /// Attaches and detaches Workflow readers through `client`.
+    pub fn with_subscriptions(mut self, client: Arc<dyn NotifierClient>) -> Self {
+        self.subscriptions = Subscriptions::new(Some(client));
+        self
     }
 
     /// Serves one call: `rpc` is a `StreamService` method name and `request` its serialized
@@ -138,6 +151,20 @@ impl StreamService {
                     .await;
                 Ok(FlushNotificationsResponse {}.encode_to_vec())
             }
+            "Subscribe" => self
+                .subscriptions
+                .subscribe(
+                    &self.streams,
+                    self.store.as_ref(),
+                    decode::<SubscribeRequest>(rpc, request)?,
+                )
+                .await
+                .map(|r| r.encode_to_vec()),
+            "Unsubscribe" => self
+                .subscriptions
+                .unsubscribe(&self.streams, decode::<UnsubscribeRequest>(rpc, request)?)
+                .await
+                .map(|r| r.encode_to_vec()),
             other => Err(StreamError::unsupported(format!(
                 "the stream service has no call {other:?}"
             ))),

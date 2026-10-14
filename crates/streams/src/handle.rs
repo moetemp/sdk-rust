@@ -484,6 +484,21 @@ impl Streams {
         ))
     }
 
+    /// The run chain a checked stream address names now. A pinned run's chain comes from the
+    /// owner cache, since it never changes. The latest run's chain comes from a fresh describe,
+    /// for a caller that must not land on a chain that already ended.
+    pub(crate) async fn chain_now(&self, stream: &StreamAddress) -> StreamResult<ChainId> {
+        let key = owner_key(stream);
+        if !key.run_id.is_empty() {
+            return self.chain(stream).await;
+        }
+        let described = self.describe(&key, "").await.map_err(not_found)?;
+        let first_run_id = first_run_id(&key, &described)?;
+        self.chains
+            .put(key, &first_run_id, self.options.owner_recheck);
+        Ok(chain_of(stream, &first_run_id))
+    }
+
     /// The chain a stream address names now.
     async fn chain(&self, stream: &StreamAddress) -> StreamResult<ChainId> {
         let key = owner_key(stream);
@@ -526,7 +541,7 @@ impl Streams {
 }
 
 /// The address of a stream this release keeps, checked.
-fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
+pub(crate) fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
     let stream =
         stream.ok_or_else(|| StreamError::invalid_argument("a stream call needs its stream"))?;
     if stream.owner_kind != StreamOwnerKind::Workflow as i32 {

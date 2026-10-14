@@ -66,6 +66,12 @@ relevant information.
   finds the owner ended closes only the store. The notifier's owner check closes the notifier.
 * Experimental: `StreamStore` has `close_topic_with` and `close_stream`, which carry the close
   outcome to a wrapper that tells the notifier.
+* Experimental: the new `Subscribe` and `Unsubscribe` stream calls attach a Workflow's reader to
+  a stream's notifier as a `workflow_target`, and detach it. The attach's request id is
+  `jetty/<run id>/<subscription id>`, so a rerun attaches as the same reader. A process attaches
+  each subscription once and answers a repeat from memory. The attach names the chain that holds
+  the Workflow id now, and on an empty stream it arms the stream, so the first append wakes the
+  Workflow.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
