@@ -23,17 +23,19 @@ local function sweep_sessions(meta, floor_ms)
   end
   redis.call('HSET', meta, 'hwscan', found[1])
 end
-local function keep(log, meta, added, last, retention, grace)
+local function keep(log, meta, added, last, retention, grace, floors)
   local floor_ms = now_ms() - retention
   local floor = floor_ms .. '-0'
+  local life
+  floor, life = held(floors, floor, retention)
   local doomed = redis.call('XREVRANGE', log, '(' .. floor, '-', 'COUNT', 1)
   if #doomed > 0 then
     redis.call('XTRIM', log, 'MINID', floor)
     redis.call('HSET', meta, 'trimmed', doomed[1][1])
   end
-  redis.call('PEXPIRE', log, retention)
+  redis.call('PEXPIRE', log, life)
   redis.call('HINCRBY', meta, 'added', added)
   redis.call('HSET', meta, 'last', last)
-  redis.call('PEXPIRE', meta, retention + grace)
+  redis.call('PEXPIRE', meta, life + grace)
   sweep_sessions(meta, floor_ms)
 end

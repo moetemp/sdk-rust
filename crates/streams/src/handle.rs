@@ -4,15 +4,16 @@
 //! where the contract says so, and mints and checks cursors. Stores only move records.
 
 use crate::{
-    MAX_CLOSE_BYTES, ReadTarget, StreamError, StreamResult, StreamStore, WORKFLOW_OWNER_KIND,
-    activity_producer_id, check_append_digest, mint_cursor,
+    END, MAX_CLOSE_BYTES, ReadTarget, StreamError, StreamResult, StreamStore, WORKFLOW_OWNER_KIND,
+    activity_producer_id, check_append_digest, cursor_position, mint_cursor,
     owner::{OwnerClient, OwnerDescription, OwnerError},
     proto::{
         ActivityProducer, AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse,
         DeleteOwnerRequest, DeleteOwnerResponse, LatestRequest, LatestResponse, NamedProducer,
-        ReadRequest, ReadResponse, RetireProducerRequest, RetireProducerResponse,
-        StoreAppendRequest, StoreLatestRequest, StoredClose, StreamAddress, StreamOwnerKind,
-        append_request, retire_producer_request,
+        ReadRangeRequest, ReadRequest, ReadResponse, ReleaseFloorRequest, ReleaseFloorResponse,
+        RetireProducerRequest, RetireProducerResponse, StoreAppendRequest, StoreLatestRequest,
+        StoredClose, StreamAddress, StreamFailureKind, StreamOwnerKind, append_request,
+        read_record, retire_producer_request,
     },
     reader::{Attempts, ReadState, read_with},
     stored_append_record, stream_hash,
@@ -25,6 +26,9 @@ use std::{
 };
 use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
 use tokio::time::Instant;
+
+/// The longest `floor_holder` a read takes.
+const MAX_FLOOR_HOLDER_BYTES: usize = 512;
 
 /// The longest `closed_by` a close takes.
 const MAX_CLOSED_BY_BYTES: usize = 256;
@@ -285,6 +289,10 @@ impl Streams {
             topic: stream.topic.clone(),
             stream_hash: self.hash(stream),
         };
+        if !request.floor_holder.is_empty() {
+            self.hold_floor(&target, &request.after, &request.floor_holder)
+                .await?;
+        }
         let wait = request
             .wait
             .and_then(|wait| Duration::try_from(wait).ok())
@@ -400,6 +408,162 @@ impl Streams {
         self.carried_chains
             .put(key, first_run_id, self.options.owner_recheck);
         Ok(())
+    }
+
+    /// Holds the records after `after` against retention for `holder`, a positions-only reader.
+    async fn hold_floor(&self, target: &ReadTarget, after: &str, holder: &str) -> StreamResult<()> {
+        if holder.len() > MAX_FLOOR_HOLDER_BYTES {
+            return Err(StreamError::invalid_argument(format!(
+                "a floor holder is at most {MAX_FLOOR_HOLDER_BYTES} bytes, not {}",
+                holder.len()
+            )));
+        }
+        let position = if after == END {
+            self.store
+                .latest(StoreLatestRequest {
+                    chain: Some(target.chain.clone()),
+                    topic: target.topic.clone(),
+                })
+                .await?
+                .position
+        } else {
+            cursor_position(after, self.store.name(), &target.stream_hash)?
+                .unwrap_or_default()
+                .to_string()
+        };
+        self.store
+            .hold_floor(&target.chain, &target.topic, holder, &position)
+            .await
+    }
+
+    /// Reads again the exact range of an earlier answer and checks it against that answer's
+    /// digest (RR-2). It runs the read that the answer came from, with the same input state, so
+    /// it gives the same supersessions and stale marks, and it waits for nothing and checks no
+    /// owner. Records with other content fail as a mismatch. Records the store no longer holds
+    /// fail as lost (REC-01).
+    pub async fn read_range(&self, request: ReadRangeRequest) -> StreamResult<ReadResponse> {
+        let stream = address(request.stream.as_ref())?;
+        if request.chain_first_run_id.is_empty() {
+            return Err(StreamError::invalid_argument(
+                "a replay read needs the chain its read read",
+            ));
+        }
+        if request.after == END {
+            return Err(StreamError::invalid_argument(
+                "a replay read starts at the read's resolved start_cursor, not at $end",
+            ));
+        }
+        let mut state = ReadState::decode_from(&request.state)?;
+        if state.first_run_id.is_empty() {
+            state.first_run_id = request.chain_first_run_id.clone();
+        }
+        let target = ReadTarget {
+            chain: chain_of(stream, &request.chain_first_run_id),
+            topic: stream.topic.clone(),
+            stream_hash: self.hash(stream),
+        };
+        if !request.floor_holder.is_empty() {
+            self.hold_floor(&target, &request.after, &request.floor_holder)
+                .await?;
+        }
+        let expected = request.stored_records as usize;
+        let lost = |message: String| {
+            StreamError::new(
+                StreamFailureKind::ReplayRangeLost,
+                format!("REC-01: {message}"),
+            )
+        };
+        let mismatch =
+            |message: String| StreamError::new(StreamFailureKind::ReplayMismatch, message);
+        let page = if expected == 0 {
+            ReadResponse {
+                cursor: request.after.clone(),
+                records_digest: crate::reader::records_digest(&[]),
+                chain_first_run_id: request.chain_first_run_id.clone(),
+                start_cursor: request.after.clone(),
+                ..Default::default()
+            }
+        } else {
+            let page_request = ReadRequest {
+                stream: Some(stream.clone()),
+                after: request.after.clone(),
+                max_records: request.stored_records,
+                ..Default::default()
+            };
+            match read_with(&*self.store, &target, &page_request, &mut state).await {
+                Ok(read) => read.response,
+                Err(error)
+                    if matches!(
+                        error.kind,
+                        StreamFailureKind::Expired | StreamFailureKind::NotFound
+                    ) =>
+                {
+                    return Err(lost(error.message));
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let stored = page
+            .records
+            .iter()
+            .filter(|record| matches!(record.record, Some(read_record::Record::Stored(_))))
+            .count();
+        if stored < expected {
+            return Err(lost(format!(
+                "the store holds {stored} of the {expected} records after {:?} that the read got",
+                request.after
+            )));
+        }
+        if page.cursor != request.to {
+            return Err(mismatch(format!(
+                "the replayed read ends at {:?}, not at {:?}",
+                page.cursor, request.to
+            )));
+        }
+        if page.records_digest != request.records_digest {
+            // A read from the beginning has no position to check, so a trim since the read shows
+            // as other records.
+            if request.after.is_empty()
+                && self
+                    .store
+                    .dropped_after(&target.chain, &target.topic, "")
+                    .await?
+                    .is_some()
+            {
+                return Err(lost(
+                    "retention trimmed the start of the stream, which the read began at"
+                        .to_string(),
+                ));
+            }
+            return Err(mismatch(
+                "the replayed records differ from the records the read got".to_string(),
+            ));
+        }
+        Ok(ReadResponse {
+            state: state.encode_to_vec(),
+            ..page
+        })
+    }
+
+    /// Ends a positions-only reader's hold after the store's release grace.
+    pub async fn release_floor(
+        &self,
+        request: ReleaseFloorRequest,
+    ) -> StreamResult<ReleaseFloorResponse> {
+        let stream = address(request.stream.as_ref())?;
+        if request.chain_first_run_id.is_empty() || request.floor_holder.is_empty() {
+            return Err(StreamError::invalid_argument(
+                "a release needs the chain and the floor holder",
+            ));
+        }
+        self.store
+            .release_floor(
+                &chain_of(stream, &request.chain_first_run_id),
+                &stream.topic,
+                &request.floor_holder,
+            )
+            .await?;
+        Ok(ReleaseFloorResponse {})
     }
 
     /// Whether the owner a read follows ended. Following the chain, a run that continued as
@@ -1471,6 +1635,167 @@ mod tests {
             assert_eq!(error.kind, StreamFailureKind::InvalidArgument);
         }
         setup.streams.append(append("p", 1, "1")).await.unwrap();
+    }
+
+    /// The replay read that repeats the live `read` of `request` that answered `page`.
+    fn replay_of(request: &ReadRequest, page: &ReadResponse) -> ReadRangeRequest {
+        ReadRangeRequest {
+            stream: Some(stream("out")),
+            chain_first_run_id: page.chain_first_run_id.clone(),
+            after: page.start_cursor.clone(),
+            to: page.cursor.clone(),
+            stored_records: page
+                .records
+                .iter()
+                .filter(|r| matches!(r.record, Some(read_record::Record::Stored(_))))
+                .count() as u32,
+            state: request.state.clone(),
+            records_digest: page.records_digest.clone(),
+            floor_holder: String::new(),
+        }
+    }
+
+    fn attempt(producer: &str, attempt: i64, sequence: i64, value: &str) -> AppendRequest {
+        AppendRequest {
+            producer: Some(Producer::Named(NamedProducer {
+                producer_id: producer.to_string(),
+                attempt,
+            })),
+            ..append(producer, sequence, value)
+        }
+    }
+
+    /// A read after the stream's first record, with its replay request.
+    async fn first_page(setup: &Setup, holder: &str) -> (ReadRequest, ReadResponse) {
+        let first = setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup.streams.append(append("p", 2, "2")).await.unwrap();
+        // A newer attempt makes the read synthesize a supersession.
+        setup.streams.append(attempt("p", 2, 1, "3")).await.unwrap();
+        let request = ReadRequest {
+            floor_holder: holder.to_string(),
+            ..read_after(&first.last_cursor, &[], Duration::ZERO)
+        };
+        let page = setup.streams.read(request.clone()).await.unwrap();
+        (request, page)
+    }
+
+    #[tokio::test]
+    async fn a_replay_read_gives_the_records_the_read_got() {
+        let setup = setup(quick());
+        let (request, page) = first_page(&setup, "").await;
+        assert!(
+            page.records
+                .iter()
+                .any(|r| matches!(r.record, Some(read_record::Record::Superseded(_)))),
+            "{page:?}"
+        );
+        assert_eq!(page.chain_first_run_id, "run-1");
+        assert_eq!(page.start_cursor, request.after);
+        assert_eq!(page.records_digest.len(), 32);
+        // More records after the range change nothing in it.
+        setup.streams.append(attempt("p", 2, 2, "4")).await.unwrap();
+        let replayed = setup
+            .streams
+            .read_range(replay_of(&request, &page))
+            .await
+            .unwrap();
+        assert_eq!(replayed.records, page.records);
+        assert_eq!(replayed.cursor, page.cursor);
+        assert_eq!(replayed.records_digest, page.records_digest);
+    }
+
+    #[tokio::test]
+    async fn a_replay_read_needs_no_owner() {
+        let setup = setup(quick());
+        let (request, page) = first_page(&setup, "").await;
+        // History dropped the owner, as for a Replayer with only the store.
+        setup.owners.end("wf", WorkflowExecutionStatus::Completed);
+        let before = setup.owners.describes();
+        setup
+            .streams
+            .read_range(replay_of(&request, &page))
+            .await
+            .unwrap();
+        assert_eq!(setup.owners.describes(), before);
+    }
+
+    #[tokio::test]
+    async fn a_replay_read_with_other_records_is_a_mismatch() {
+        let setup = setup(quick());
+        let (request, page) = first_page(&setup, "").await;
+        let mut other_digest = replay_of(&request, &page);
+        other_digest.records_digest[0] ^= 1;
+        let mut other_end = replay_of(&request, &page);
+        other_end.stored_records -= 1;
+        for replay in [other_digest, other_end] {
+            let error = setup.streams.read_range(replay).await.unwrap_err();
+            assert_eq!(error.kind, StreamFailureKind::ReplayMismatch, "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replay_read_of_records_retention_dropped_is_rec_01() {
+        let setup = setup(quick());
+        let (request, page) = first_page(&setup, "").await;
+        setup.store.truncate(&chain("run-1"), "out", 1);
+        let error = setup
+            .streams
+            .read_range(replay_of(&request, &page))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::ReplayRangeLost, "{error}");
+        assert!(error.message.starts_with("REC-01"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_floor_keeps_what_a_positions_only_reader_read_until_it_is_released() {
+        let setup = setup(quick());
+        let (request, page) = first_page(&setup, "reader-run/1").await;
+        setup.store.truncate(&chain("run-1"), "out", 1);
+        let replayed = setup
+            .streams
+            .read_range(ReadRangeRequest {
+                floor_holder: "reader-run/1".to_string(),
+                ..replay_of(&request, &page)
+            })
+            .await
+            .unwrap();
+        assert_eq!(replayed.records, page.records, "the floor kept the range");
+        setup
+            .streams
+            .release_floor(ReleaseFloorRequest {
+                stream: Some(stream("out")),
+                chain_first_run_id: "run-1".to_string(),
+                floor_holder: "reader-run/1".to_string(),
+            })
+            .await
+            .unwrap();
+        setup.store.truncate(&chain("run-1"), "out", 1);
+        let error = setup
+            .streams
+            .read_range(replay_of(&request, &page))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::ReplayRangeLost, "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_replay_read_needs_its_chain_and_a_resolved_start() {
+        let setup = setup(quick());
+        let (request, page) = first_page(&setup, "").await;
+        for replay in [
+            ReadRangeRequest {
+                chain_first_run_id: String::new(),
+                ..replay_of(&request, &page)
+            },
+            ReadRangeRequest {
+                after: crate::END.to_string(),
+                ..replay_of(&request, &page)
+            },
+        ] {
+            let error = setup.streams.read_range(replay).await.unwrap_err();
+            assert_eq!(error.kind, StreamFailureKind::InvalidArgument, "{error}");
+        }
     }
 
     #[tokio::test]

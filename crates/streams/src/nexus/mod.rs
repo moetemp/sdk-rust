@@ -347,6 +347,7 @@ impl NexusCalls {
             max_records: max_records as u32,
             state: state.clone(),
             arm: false,
+            floor_holder: String::new(),
         };
         let mut read = match self.streams.read_carried(request).await {
             Ok(read) => read,

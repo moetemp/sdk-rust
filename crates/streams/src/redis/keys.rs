@@ -7,6 +7,7 @@
 //! ```text
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:t:<topic>        the log
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:t:<topic>:meta   its meta
+//! <prefix>:{<namespace>:<workflow id>:<first run id>}:t:<topic>:floors the readers that hold it
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:chain            the close flag
 //! ```
 //!
@@ -57,6 +58,11 @@ impl ChainKeys {
 
     pub(crate) fn chain(&self) -> String {
         format!("{}:chain", self.base)
+    }
+
+    /// The positions-only readers that hold a topic's records, so a replay finds them again.
+    pub(crate) fn floors(&self, topic: &str) -> String {
+        format!("{}:floors", self.log(topic))
     }
 }
 
