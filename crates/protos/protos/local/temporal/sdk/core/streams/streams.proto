@@ -159,6 +159,10 @@ message ReadRequest {
   uint32 max_records = 4;
   // The `state` of the previous answer of the same read. Empty on its first call.
   bytes state = 5;
+  // For a reader that sleeps on the stream's notifier. When the read waits its whole `wait` and
+  // finds nothing, the store arms the stream in the same step, so the next append notifies the
+  // notifier. A reader that doesn't wait on the notifier leaves it unset.
+  bool arm = 6;
 }
 
 // A later attempt of a producer started writing. Readers synthesize it, and no store holds it.
@@ -193,6 +197,13 @@ message ReadResponse {
   // The owner's chain ended and the read delivered every record the stream retains. No later
   // call returns a record.
   bool done = 4;
+  // The read asked to arm, found nothing and armed the stream, so the next append notifies the
+  // stream's notifier. Never set with records or with `done`.
+  bool armed = 5;
+  // Set with `armed`: the notification counter of the read's position, zero for an empty
+  // stream. A notification with a higher counter names a record after the position, so the
+  // reader waits for a counter above this one. One that landed before the wait started counts.
+  int64 wake_after = 6;
 }
 
 message LatestRequest {
