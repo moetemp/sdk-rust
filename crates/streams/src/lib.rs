@@ -6,7 +6,7 @@
 //! Workflow's run chain. This crate holds what every store and every SDK share: the
 //! [StreamStore] trait a store implements, the cursor format, the record helpers that stamp
 //! records, and the error every call fails with. Lang reaches a store through Core's
-//! `StreamService`.
+//! `StreamService`, and Core's Worker appends a Workflow's own output through the same trait.
 
 mod cursor;
 mod error;
@@ -32,6 +32,7 @@ pub use reader::{
 };
 pub use record::{
     WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, stored_append_record,
+    workflow_batch_digest, workflow_producer_id,
 };
 pub use service::StreamService;
 pub use store::StreamStore;
