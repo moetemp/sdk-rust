@@ -188,6 +188,46 @@ async fn a_batch_is_one_script_and_keeps_one_high_water_field() {
 }
 
 #[tokio::test]
+async fn retiring_a_producer_deletes_its_session_field_only() {
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    for producer in ["p", "q"] {
+        setup
+            .store
+            .append(append(&chain, producer, 1, 1, b"\x01"))
+            .await
+            .unwrap();
+    }
+    let meta = format!("{}:meta", log_key(&setup.prefix, &chain, "events"));
+    setup
+        .store
+        .retire_producer(&chain, "events", "p", 1)
+        .await
+        .unwrap();
+    let fields: HashMap<String, String> = setup.raw.hgetall(&meta).await.unwrap();
+    assert!(!fields.contains_key("hw:1:p:1"), "{fields:?}");
+    assert!(fields.contains_key("hw:1:q:1"), "{fields:?}");
+    assert_eq!(fields["added"], "2");
+    // A topic Redis holds nothing for keeps holding nothing.
+    setup
+        .store
+        .retire_producer(&chain, "unknown", "p", 1)
+        .await
+        .unwrap();
+    let exists: bool = setup
+        .raw
+        .exists(format!(
+            "{}:meta",
+            log_key(&setup.prefix, &chain, "unknown")
+        ))
+        .await
+        .unwrap();
+    assert!(!exists);
+}
+
+#[tokio::test]
 async fn appends_answer_as_the_python_sdk_recorded() {
     // The outcomes D1b's script gave the Python provider, run again through the Core store.
     let Some(mut setup) = setup().await else {
