@@ -3813,3 +3813,34 @@ message PollStreamNotifierResponse {
     // The failure the stream closed with, when `closed` is set and it closed with one.
     temporal.api.failure.v1.Failure close_failure = 6;
 }
+
+message ExecuteSyncNexusOperationRequest {
+    // The caller namespace. Authorization and the endpoint lookup run against it.
+    string namespace = 1;
+    // The identity of the client who sent this request.
+    string identity = 2;
+    // A unique identifier for this call. Typically UUIDv4. The handler gets it as the Nexus
+    // request ID.
+    string request_id = 3;
+    // Endpoint name, resolved through the cluster's endpoint registry for the caller namespace.
+    string endpoint = 4;
+    // Service name.
+    string service = 5;
+    // Operation name.
+    string operation = 6;
+    // Serialized input to the operation. Passed as the request payload.
+    temporal.api.common.v1.Payload input = 7;
+    // Header to attach to the Nexus request. Keys are lowercased. The server owns the
+    // `temporal-caller-namespace` key and refuses a request that sets it.
+    map<string, string> nexus_header = 8;
+}
+
+message ExecuteSyncNexusOperationResponse {
+    oneof outcome {
+        // The result of an operation that completed.
+        temporal.api.common.v1.Payload result = 1;
+        // The failure of the call. A handler error has `nexus_handler_failure_info`. An operation
+        // that failed or was canceled has `application_failure_info` or `canceled_failure_info`.
+        temporal.api.failure.v1.Failure failure = 2;
+    }
+}

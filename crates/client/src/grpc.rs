@@ -1924,6 +1924,15 @@ proxier! {
             r.extensions_mut().insert(IsUserLongPoll);
         }
     );
+    (
+        execute_sync_nexus_operation,
+        ExecuteSyncNexusOperationRequest,
+        ExecuteSyncNexusOperationResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
 }
 
 proxier! {

@@ -2088,4 +2088,18 @@ service WorkflowService {
     //     aip.dev/not-precedent: SDKs reach the stream notifier through System Nexus or gRPC. --)
     rpc PollStreamNotifier (PollStreamNotifierRequest) returns (PollStreamNotifierResponse) {
     }
+
+    // ExecuteSyncNexusOperation runs one synchronous Nexus operation on an endpoint for a caller in
+    // `namespace`, and returns its result or its failure. The server persists nothing and does not
+    // retry. Authorization runs against the caller namespace, and the endpoint must be reachable
+    // from it. An operation that answers asynchronously is refused with `FailedPrecondition`. Use
+    // `StartNexusOperationExecution` for those.
+    //
+    // The server sets the Nexus header `temporal-caller-namespace` to the caller namespace, so the
+    // handler can trust it. A request that sets this header is refused.
+    //
+    // (-- api-linter: core::0127::http-annotation=disabled
+    //     aip.dev/not-precedent: SDKs call it through gRPC. --)
+    rpc ExecuteSyncNexusOperation (ExecuteSyncNexusOperationRequest) returns (ExecuteSyncNexusOperationResponse) {
+    }
 }

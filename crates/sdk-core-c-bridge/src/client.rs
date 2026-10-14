@@ -719,6 +719,9 @@ async fn call_workflow_service(
         "ExecuteMultiOperation" => {
             rpc_call_on_trait!(client, call, WorkflowService, execute_multi_operation)
         }
+        "ExecuteSyncNexusOperation" => {
+            rpc_call_on_trait!(client, call, WorkflowService, execute_sync_nexus_operation)
+        }
         "FetchWorkerConfig" => {
             rpc_call_on_trait!(client, call, WorkflowService, fetch_worker_config)
         }

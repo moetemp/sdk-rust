@@ -133,6 +133,9 @@ relevant information.
   over them. The new Nexus `read_range` operation, `NexusReadRange` for lang, reads that range
   again through the codec step and checks the digest. Its answer has no byte budget and carries
   only the records and `next_token`. It checks that the chain it names is one of the Workflow's.
+* Experimental: the API protos carry `WorkflowService.ExecuteSyncNexusOperation`, which runs one
+  synchronous Nexus operation for a caller namespace and persists nothing. The client and the C
+  bridge call it, and its `input` counts against the blob size limit.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
