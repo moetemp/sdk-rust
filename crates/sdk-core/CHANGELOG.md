@@ -81,6 +81,11 @@ relevant information.
   `stream_wakes` on the task's scheduled events. Replay delivers the same jobs in the same
   activations. A task scheduled with wakes ends a workflow task heartbeat chain, so it keeps an
   activation of its own on replay.
+  `jetty/<run id>/<subscription id>`, so a rerun attaches as the same reader. After a wake with
+  `resubscribe`, lang raises `SubscribeRequest.generation`, which makes a new attach. A process
+  attaches each subscription once and answers a repeat from memory. The attach names the chain
+  that holds the Workflow id now, and on an empty stream it arms the stream, so the first append
+  wakes the Workflow.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
