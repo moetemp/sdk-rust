@@ -170,6 +170,33 @@ pub trait StreamStore: Send + Sync {
     /// Deletes every stream of one owner, across all its chains.
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse>;
 
+    /// Holds the records of a topic after `position` against retention for `holder`, a
+    /// positions-only reader that must find them again on replay. The store keeps the lowest
+    /// position a holder held, and renews the holder's lease. An empty position holds the whole
+    /// topic. A store that can't hold refuses, so a positions-only read fails at once and not
+    /// at replay.
+    async fn hold_floor(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        holder: &str,
+        position: &str,
+    ) -> StreamResult<()> {
+        let _ = (chain, topic, holder, position);
+        Err(crate::StreamError::unsupported(
+            "this store can't hold records for a positions-only reader",
+        ))
+    }
+
+    /// Ends `holder`'s hold after the store's release grace, so a replay right after the reader
+    /// ended still finds its records. A holder the store doesn't know is no failure.
+    async fn release_floor(&self, chain: &ChainId, topic: &str, holder: &str) -> StreamResult<()> {
+        let _ = (chain, topic, holder);
+        Err(crate::StreamError::unsupported(
+            "this store can't hold records for a positions-only reader",
+        ))
+    }
+
     /// Closes one topic of a chain in the store, then tells the topic's notifier on the server,
     /// which completes every attached callback with the outcome. The store closes first, so a
     /// reader the completion reaches always finds the stream's end. A store that sends no

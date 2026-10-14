@@ -46,6 +46,11 @@ pub struct RedisStoreOptions {
     pub blocking_reads_per_node: usize,
     /// How long a short call waits for its reply.
     pub response_timeout: Duration,
+    /// How long a positions-only reader's hold lasts after its last read. `None` uses the
+    /// retention.
+    pub floor_lease: Option<Duration>,
+    /// How long a hold lasts after its reader released it.
+    pub floor_release_grace: Duration,
 }
 
 impl RedisStoreOptions {
@@ -58,6 +63,8 @@ impl RedisStoreOptions {
             retention: Duration::from_secs(7 * 24 * 60 * 60),
             blocking_reads_per_node: 256,
             response_timeout: Duration::from_secs(5),
+            floor_lease: None,
+            floor_release_grace: Duration::from_secs(24 * 60 * 60),
         }
     }
 }
@@ -69,6 +76,8 @@ pub struct RedisStore {
     prefix: String,
     retention_ms: u64,
     grace_ms: u64,
+    floor_lease_ms: u64,
+    floor_release_grace_ms: u64,
 }
 
 impl std::fmt::Debug for RedisStore {
@@ -116,6 +125,10 @@ impl RedisStore {
             prefix: options.key_prefix,
             retention_ms,
             grace_ms: TOMBSTONE_GRACE.as_millis() as u64,
+            floor_lease_ms: options
+                .floor_lease
+                .map_or(retention_ms, |lease| millis(lease).max(1)),
+            floor_release_grace_ms: millis(options.floor_release_grace),
         })
     }
 
@@ -441,6 +454,10 @@ fn wait_of(request: &StoreReadRequest) -> Duration {
     })
 }
 
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 /// A topic's arm as a script answered it, zero when none.
 fn generation(arm: &str) -> StreamResult<u64> {
     arm.parse()
@@ -470,6 +487,7 @@ impl StreamStore for RedisStore {
             .key(keys.log(&request.topic))
             .key(keys.meta(&request.topic))
             .key(keys.chain())
+            .key(keys.floors(&request.topic))
             .arg(self.retention_ms)
             .arg(self.grace_ms)
             .arg(session_field(&request.producer_id, request.attempt))
@@ -636,6 +654,47 @@ impl StreamStore for RedisStore {
             return Ok(None);
         }
         Ok(Some(trimmed))
+    }
+
+    async fn hold_floor(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        holder: &str,
+        position: &str,
+    ) -> StreamResult<()> {
+        let keys = ChainKeys::new(&self.prefix, chain);
+        // Redis never stores `0-0`, so `0-1` holds every record, and the trim's exclusive range
+        // below it stays valid.
+        let position = if position.is_empty() {
+            "0-1"
+        } else {
+            entry(position)?;
+            position
+        };
+        scripts::HOLD_SCRIPT
+            .key(keys.floors(topic))
+            .key(keys.log(topic))
+            .key(keys.meta(topic))
+            .arg(holder)
+            .arg(position)
+            .arg(self.floor_lease_ms)
+            .arg(self.grace_ms)
+            .invoke_async::<i64>(&mut self.shared.clone())
+            .await
+            .mapped(Call::Write)
+            .map(drop)
+    }
+
+    async fn release_floor(&self, chain: &ChainId, topic: &str, holder: &str) -> StreamResult<()> {
+        scripts::RELEASE_SCRIPT
+            .key(ChainKeys::new(&self.prefix, chain).floors(topic))
+            .arg(holder)
+            .arg(self.floor_release_grace_ms)
+            .invoke_async::<i64>(&mut self.shared.clone())
+            .await
+            .mapped(Call::Write)
+            .map(drop)
     }
 
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {

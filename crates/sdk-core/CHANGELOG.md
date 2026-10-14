@@ -93,6 +93,14 @@ relevant information.
   append refusal names the close's `closed_by` in `StreamFailure.closed_by`. The Redis store
   keeps it in the topic's meta as `close`, set only once by the close script.
   `StreamStore::close_topic_with` and `close_stream` take a `StoredClose`.
+* Experimental: a positions-only Workflow reader can record what it read in place of the records.
+  `ReadResponse` gains `records_digest`, `chain_first_run_id` and `start_cursor`, and the new
+  `ReadRange` stream call reads that exact range again on replay and checks the digest. Other
+  records fail as `REPLAY_MISMATCH`, and records the store no longer holds as
+  `REPLAY_RANGE_LOST` (REC-01). `ReadRequest.floor_holder` holds the records a reader read
+  against retention, under a lease that each read renews, and the new `ReleaseFloor` call ends
+  the hold after a grace. The Redis store keeps holds in a `floors` hash per topic, and its append
+  script trims around them. `RedisStoreConfig` gains `floor_lease` and `floor_release_grace`.
 * Experimental: the stream service's `RetireProducer` call drops one producer attempt's dedupe
   state on a stream, which the Redis store keeps as one field of the topic's meta hash until
   retention. A producer that writes once per short-lived attempt calls it after the attempt's

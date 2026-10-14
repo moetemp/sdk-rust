@@ -944,6 +944,20 @@ impl StreamStore for NotifyingStore {
         self.inner.delete_owner(request).await
     }
 
+    async fn hold_floor(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        holder: &str,
+        position: &str,
+    ) -> StreamResult<()> {
+        self.inner.hold_floor(chain, topic, holder, position).await
+    }
+
+    async fn release_floor(&self, chain: &ChainId, topic: &str, holder: &str) -> StreamResult<()> {
+        self.inner.release_floor(chain, topic, holder).await
+    }
+
     async fn close_stream(
         &self,
         chain: &ChainId,
