@@ -500,7 +500,7 @@ impl Streams {
     }
 
     /// The chain a stream address names now.
-    async fn chain(&self, stream: &StreamAddress) -> StreamResult<ChainId> {
+    pub(crate) async fn chain(&self, stream: &StreamAddress) -> StreamResult<ChainId> {
         let key = owner_key(stream);
         // A pinned run's chain never changes. The latest run's chain changes when a new chain
         // takes the Workflow id.

@@ -1,16 +1,18 @@
-//! Workflow readers that sleep on a stream's notifier.
+//! Readers that sleep on a stream's notifier.
 //!
 //! A Workflow's reader attaches to the stream's notifier before its first read, so the notifier
 //! wakes the Workflow on its next Workflow Task when the stream moves. The attach names the reader
 //! by its run and its subscription id, which replay gives back, so a rerun attaches as the same
-//! reader and the server keeps one callback.
+//! reader and the server keeps one callback. A client reader has no task to wake, so it waits on
+//! the notifier with a long poll.
 
 use crate::{
     NotifierClient, NotifyError, StreamError, StreamResult, StreamStore, Streams,
     WorkflowAttachment,
     handle::address,
     proto::{
-        StreamAddress, SubscribeRequest, SubscribeResponse, UnsubscribeRequest, UnsubscribeResponse,
+        StreamAddress, SubscribeRequest, SubscribeResponse, UnsubscribeRequest,
+        UnsubscribeResponse, WaitForNotificationRequest, WaitForNotificationResponse,
     },
 };
 use std::{
@@ -177,14 +179,45 @@ impl Subscriptions {
         self.attached.lock().unwrap().remove(&key);
         Ok(UnsubscribeResponse {})
     }
+
+    /// Waits on the notifier of the chain the stream names. A wait that reached its limit answers
+    /// `timed_out`, and the reader's next read checks the store itself, which covers a
+    /// notification that a producer never sent.
+    pub(crate) async fn wait(
+        &self,
+        streams: &Streams,
+        request: WaitForNotificationRequest,
+    ) -> StreamResult<WaitForNotificationResponse> {
+        let stream = address(request.stream.as_ref())?;
+        let client = self.client()?;
+        let chain = streams.chain(stream).await?;
+        let polled = client
+            .poll(chain, stream.topic.clone(), request.after_counter)
+            .await
+            .map_err(subscribe_error)?;
+        let Some(polled) = polled else {
+            return Ok(WaitForNotificationResponse {
+                timed_out: true,
+                ..Default::default()
+            });
+        };
+        Ok(WaitForNotificationResponse {
+            timed_out: !polled.closed && polled.counter <= request.after_counter,
+            counter: polled.counter,
+            position: polled.position,
+            closed: polled.closed,
+            close_result: polled.close_result,
+            close_failure: polled.close_failure,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
-        MemoryStore, OwnerClient, OwnerDescription, OwnerError, StreamNotification, StreamService,
-        StreamsOptions,
+        MemoryStore, NotifierPoll, OwnerClient, OwnerDescription, OwnerError, StreamNotification,
+        StreamService, StreamsOptions,
         proto::{ChainId, StoreAppendRequest, StreamFailureKind, StreamOwnerKind},
     };
     use prost::Message;
@@ -216,6 +249,8 @@ mod tests {
         attached: Mutex<Vec<WorkflowAttachment>>,
         detached: Mutex<Vec<(ChainId, String, String)>>,
         answer: Mutex<Option<NotifyError>>,
+        polled: Mutex<Vec<(ChainId, String, i64)>>,
+        poll_answer: Mutex<Option<Result<Option<NotifierPoll>, NotifyError>>>,
     }
 
     #[async_trait::async_trait]
@@ -243,6 +278,23 @@ mod tests {
                 .unwrap()
                 .push((chain, topic, request_id));
             Ok(())
+        }
+
+        async fn poll(
+            &self,
+            chain: ChainId,
+            topic: String,
+            after_counter: i64,
+        ) -> Result<Option<NotifierPoll>, NotifyError> {
+            self.polled
+                .lock()
+                .unwrap()
+                .push((chain, topic, after_counter));
+            self.poll_answer
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the test sets the poll's answer")
         }
     }
 
@@ -522,5 +574,104 @@ mod tests {
             .unwrap();
         assert!(answer.attached, "a new subscription attaches again");
         assert_eq!(answer.chain_first_run_id, "chain-2");
+    }
+
+    async fn wait(
+        setup: &Setup,
+        after_counter: i64,
+        answer: Result<Option<NotifierPoll>, NotifyError>,
+    ) -> Result<WaitForNotificationResponse, crate::proto::StreamFailure> {
+        *setup.server.poll_answer.lock().unwrap() = Some(answer);
+        setup
+            .service
+            .call(
+                "WaitForNotification",
+                &WaitForNotificationRequest {
+                    stream: Some(stream()),
+                    after_counter,
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .map(|answer| WaitForNotificationResponse::decode(answer.as_slice()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_wait_asks_the_notifier_of_the_streams_chain_for_a_counter_above_the_arm() {
+        let setup = setup();
+        let answer = wait(
+            &setup,
+            41,
+            Ok(Some(NotifierPoll {
+                counter: 42,
+                position: "cursor-42".to_string(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            setup.server.polled.lock().unwrap().clone(),
+            [(chain("chain-1"), "tokens".to_string(), 41)]
+        );
+        assert!(!answer.timed_out && !answer.closed);
+        assert_eq!(
+            (answer.counter, answer.position.as_str()),
+            (42, "cursor-42")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wait_with_no_new_counter_times_out_for_a_re_read() {
+        let setup = setup();
+        let unchanged = wait(
+            &setup,
+            41,
+            Ok(Some(NotifierPoll {
+                counter: 41,
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(unchanged.timed_out);
+        let deadline = wait(&setup, 41, Ok(None)).await.unwrap();
+        assert!(deadline.timed_out && !deadline.closed);
+    }
+
+    #[tokio::test]
+    async fn a_wait_on_a_closed_stream_carries_the_outcome() {
+        let setup = setup();
+        let failure = temporalio_common::protos::temporal::api::failure::v1::Failure {
+            message: "the agent gave up".to_string(),
+            ..Default::default()
+        };
+        let answer = wait(
+            &setup,
+            41,
+            Ok(Some(NotifierPoll {
+                counter: 41,
+                closed: true,
+                close_failure: Some(failure.clone()),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        assert!(answer.closed && !answer.timed_out);
+        assert_eq!(answer.close_failure, Some(failure));
+    }
+
+    #[tokio::test]
+    async fn a_wait_on_a_server_without_the_poll_is_unsupported() {
+        let setup = setup();
+        let error = wait(
+            &setup,
+            0,
+            Err(NotifyError::Unsupported("unimplemented".to_string())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Unsupported as i32);
     }
 }

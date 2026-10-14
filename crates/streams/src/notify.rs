@@ -100,8 +100,23 @@ pub struct WorkflowAttachment {
     pub subscription_id: String,
 }
 
-/// Sends notifications to the stream notifier on the server, and attaches and detaches the
-/// Workflows it wakes.
+/// What a stream's notifier answered a client's wait with.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NotifierPoll {
+    /// The highest counter the notifier has seen.
+    pub counter: i64,
+    /// The position that came with `counter`.
+    pub position: String,
+    /// Whether the stream closed.
+    pub closed: bool,
+    /// The result the stream closed with, when it gave one.
+    pub close_result: Option<Payload>,
+    /// The failure the stream closed with, when it closed with one.
+    pub close_failure: Option<temporalio_common::protos::temporal::api::failure::v1::Failure>,
+}
+
+/// Sends notifications to the stream notifier on the server, attaches and detaches the
+/// Workflows it wakes, and waits on it for clients.
 #[async_trait::async_trait]
 pub trait NotifierClient: Send + Sync {
     /// Sends one notification.
@@ -125,6 +140,21 @@ pub trait NotifierClient: Send + Sync {
         let _ = (chain, topic, request_id);
         Err(NotifyError::Unsupported(
             "this client can't detach readers".to_string(),
+        ))
+    }
+
+    /// Waits until the notifier of `chain`'s stream on `topic` has a counter above
+    /// `after_counter`, or the stream closed. Answers `None` when the wait reached its limit with
+    /// no answer from the server.
+    async fn poll(
+        &self,
+        chain: ChainId,
+        topic: String,
+        after_counter: i64,
+    ) -> Result<Option<NotifierPoll>, NotifyError> {
+        let _ = (chain, topic, after_counter);
+        Err(NotifyError::Unsupported(
+            "this client can't wait on a notifier".to_string(),
         ))
     }
 }

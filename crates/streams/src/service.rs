@@ -6,7 +6,7 @@ use crate::{
     proto::{
         AppendRequest, CloseRequest, DeleteOwnerRequest, FlushNotificationsRequest,
         FlushNotificationsResponse, LatestRequest, ReadRequest, StreamFailure, StreamStoreConfig,
-        SubscribeRequest, UnsubscribeRequest, stream_store_config,
+        SubscribeRequest, UnsubscribeRequest, WaitForNotificationRequest, stream_store_config,
     },
     subscribe::Subscriptions,
 };
@@ -50,8 +50,8 @@ impl StreamService {
     }
 
     /// Like [StreamService::connect], closing each stream's notifier through `notifier` after
-    /// the store closes the stream, sending progress too when the config turns it on, and
-    /// attaching and detaching Workflow readers through it.
+    /// the store closes the stream, sending progress too when the config turns it on, attaching
+    /// and detaching Workflow readers through it, and waiting on it for client readers.
     pub async fn connect_with_notifier(
         config: StreamStoreConfig,
         owner: Arc<dyn OwnerClient>,
@@ -108,7 +108,7 @@ impl StreamService {
         }
     }
 
-    /// Attaches and detaches Workflow readers through `client`.
+    /// Attaches and detaches Workflow readers, and waits for client readers, through `client`.
     pub fn with_subscriptions(mut self, client: Arc<dyn NotifierClient>) -> Self {
         self.subscriptions = Subscriptions::new(Some(client));
         self
@@ -163,6 +163,14 @@ impl StreamService {
             "Unsubscribe" => self
                 .subscriptions
                 .unsubscribe(&self.streams, decode::<UnsubscribeRequest>(rpc, request)?)
+                .await
+                .map(|r| r.encode_to_vec()),
+            "WaitForNotification" => self
+                .subscriptions
+                .wait(
+                    &self.streams,
+                    decode::<WaitForNotificationRequest>(rpc, request)?,
+                )
                 .await
                 .map(|r| r.encode_to_vec()),
             other => Err(StreamError::unsupported(format!(

@@ -35,6 +35,11 @@ service StreamService {
   rpc Subscribe(SubscribeRequest) returns (SubscribeResponse);
   // Detaches a Workflow's reader that stops before the stream ends.
   rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
+  // Waits on the stream's notifier, for a client reader whose read armed the stream. Returns when
+  // the notifier's counter is above `after_counter`, when the stream closed, or at the server's
+  // wait limit (`streamnotifier.pollMaxWait`). The reader then reads again with `arm`. After the
+  // wait limit, that read finds records whose notification was lost, or arms again.
+  rpc WaitForNotification(WaitForNotificationRequest) returns (WaitForNotificationResponse);
 }
 
 // Which store holds a process's streams, and how to reach it. Lang builds one store from it and
@@ -272,6 +277,28 @@ message UnsubscribeRequest {
 }
 
 message UnsubscribeResponse {}
+
+message WaitForNotificationRequest {
+  // The stream the reader reads.
+  StreamAddress stream = 1;
+  // The `wake_after` of the read that armed the stream.
+  int64 after_counter = 2;
+}
+
+message WaitForNotificationResponse {
+  // The highest counter the notifier has seen.
+  int64 counter = 1;
+  // The position that came with `counter`.
+  string position = 2;
+  // The wait reached its limit with no counter above `after_counter` and no close.
+  bool timed_out = 3;
+  // The stream closed. The reader reads to its end.
+  bool closed = 4;
+  // The result the stream closed with, when it gave one.
+  temporal.api.common.v1.Payload close_result = 5;
+  // The failure the stream closed with, when it closed with one.
+  temporal.api.failure.v1.Failure close_failure = 6;
+}
 
 message DeleteOwnerRequest {
   string namespace = 1;

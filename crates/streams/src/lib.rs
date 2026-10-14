@@ -30,8 +30,8 @@ pub use handle::{OWNER_RECHECK, Streams, StreamsOptions};
 pub use memory::MemoryStore;
 pub use notify::{
     Arm, CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT, NOTIFIER_REFRESH,
-    Notifier, NotifierClient, NotifyError, NotifyingStore, StreamNotification, WorkflowAttachment,
-    progress_counter,
+    Notifier, NotifierClient, NotifierPoll, NotifyError, NotifyingStore, StreamNotification,
+    WorkflowAttachment, progress_counter,
 };
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};
 pub use reader::{DEFAULT_MAX_RECORDS, MAX_TRACKED_PRODUCERS, ReadTarget, read_page};

@@ -10,11 +10,12 @@ use temporalio_common::protos::temporal::api::{
     workflowservice::v1::{
         AttachStreamCallbackRequest, DescribeWorkflowExecutionRequest,
         DescribeWorkflowExecutionResponse, DetachStreamCallbackRequest, NotifyStreamRequest,
+        PollStreamNotifierRequest, PollStreamNotifierResponse,
     },
 };
 use temporalio_streams::{
-    CloseOutcome, NotifierClient, NotifyError, OwnerClient, OwnerDescription, OwnerError,
-    StreamNotification, WorkflowAttachment, proto::ChainId,
+    CloseOutcome, NotifierClient, NotifierPoll, NotifyError, OwnerClient, OwnerDescription,
+    OwnerError, StreamNotification, WorkflowAttachment, proto::ChainId,
 };
 pub use temporalio_streams::{StreamError, StreamResult, StreamService, StreamStore, proto};
 use tonic::IntoRequest;
@@ -81,6 +82,44 @@ impl NotifierClient for ConnectionNotifierClient {
             .await
             .map(|_| ())
             .map_err(notify_error)
+    }
+
+    async fn poll(
+        &self,
+        chain: ChainId,
+        topic: String,
+        after_counter: i64,
+    ) -> Result<Option<NotifierPoll>, NotifyError> {
+        let answer = self
+            .connection
+            .workflow_service()
+            .poll_stream_notifier(
+                PollStreamNotifierRequest {
+                    namespace: chain.namespace.clone(),
+                    stream_ref: Some(chain_reference(&chain, topic)),
+                    after_counter,
+                    identity: self.connection.identity().to_string(),
+                }
+                .into_request(),
+            )
+            .await;
+        match answer {
+            Ok(response) => Ok(Some(poll_answer(response.into_inner()))),
+            // The server answers at its own wait limit, before the client's deadline. A deadline
+            // that passes anyway asks for the same re-read.
+            Err(status) if status.code() == tonic::Code::DeadlineExceeded => Ok(None),
+            Err(status) => Err(notify_error(status)),
+        }
+    }
+}
+
+fn poll_answer(response: PollStreamNotifierResponse) -> NotifierPoll {
+    NotifierPoll {
+        counter: response.counter,
+        position: response.position,
+        closed: response.closed,
+        close_result: response.close_result,
+        close_failure: response.close_failure,
     }
 }
 
