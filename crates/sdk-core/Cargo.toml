@@ -49,7 +49,8 @@ antithesis_assertions = ["dep:antithesis_sdk"]
 dynamic-tls = ["temporalio-client/dynamic-tls"]
 # Used by the integration-test runner to make Cloud exclusions native libtest ignores.
 cloud-test-mode = []
-# The stream store integration: lang reaches the store in process.
+# The stream store integration: a Worker appends a Workflow's stream output, and lang reaches the
+# store in process.
 streams = ["dep:temporalio-streams"]
 
 [dependencies]
@@ -155,6 +156,8 @@ path = "../macros"
 version = "~1.1.0"
 
 [dev-dependencies]
+# Turns on the stream store integration for this crate's own tests.
+temporalio-sdk-core = { path = ".", features = ["streams"] }
 assert_matches = "1.5"
 bimap = "0.6.3"
 bytes = "1.10"

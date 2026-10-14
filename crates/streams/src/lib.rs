@@ -6,7 +6,7 @@
 //! Workflow's run chain. This crate holds what every store and every SDK share: the
 //! [StreamStore] trait a store implements, the cursor format, the record helpers that stamp
 //! records, and the error every call fails with. Lang reaches a store through Core's
-//! `StreamService`.
+//! `StreamService`, and Core's Worker appends a Workflow's own output through the same trait.
 
 mod cursor;
 mod error;
@@ -26,7 +26,7 @@ mod subscribe;
 pub use self::redis::{RedisStore, RedisStoreOptions};
 pub use cursor::{BEGINNING, END, cursor_position, mint_cursor, stream_hash};
 pub use error::{StreamError, StreamResult};
-pub use handle::{OWNER_RECHECK, Streams, StreamsOptions};
+pub use handle::{OWNER_RECHECK, OWNER_START_GRACE, Streams, StreamsOptions};
 pub use memory::MemoryStore;
 pub use notify::{
     Arm, CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT, NOTIFIER_REFRESH,
@@ -39,6 +39,7 @@ pub use reader::{
 };
 pub use record::{
     WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, stored_append_record,
+    workflow_batch_digest, workflow_producer_id,
 };
 pub use service::StreamService;
 pub use store::{CloseOutcome, NewestOrArm, StreamStore, empty_close_result};
