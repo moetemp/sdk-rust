@@ -57,7 +57,7 @@ pub(crate) struct StreamRef {
     pub(crate) kind: String,
     pub(crate) workflow_id: String,
     #[serde(default)]
-    pub(crate) run_id: Option<String>,
+    pub(crate) chain_run_id: Option<String>,
     pub(crate) topic: String,
 }
 
@@ -189,11 +189,11 @@ mod tests {
         assert!(!bad.to_string().contains("!!"), "{bad}");
         // Null is what a generated caller sends for an absent optional member.
         let null: ReadInput = serde_json::from_str(
-            r#"{"stream":{"kind":"workflow","workflow_id":"wf","run_id":null,"topic":"t"},
+            r#"{"stream":{"kind":"workflow","workflow_id":"wf","chain_run_id":null,"topic":"t"},
                 "after_token":null,"max_records":null}"#,
         )
         .unwrap();
-        assert_eq!(null.stream.run_id, None);
+        assert_eq!(null.stream.chain_run_id, None);
         assert_eq!(null.max_records, None);
     }
 
