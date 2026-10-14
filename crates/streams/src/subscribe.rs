@@ -52,9 +52,13 @@ impl SubscriptionKey {
 }
 
 /// The request id of a reader's attach. The server dedupes attaches by it, so it depends only on
-/// what replay gives back.
-fn request_id(run_id: &str, subscription_id: &str) -> String {
-    format!("jetty/{run_id}/{subscription_id}")
+/// what replay gives back. A later generation is a new attach, after the notifier dropped the
+/// reader and the server would answer the old id as already done.
+fn request_id(run_id: &str, subscription_id: &str, generation: u32) -> String {
+    match generation {
+        0 => format!("jetty/{run_id}/{subscription_id}"),
+        generation => format!("jetty/{run_id}/{subscription_id}/{generation}"),
+    }
 }
 
 fn check_subscription(run_id: &str, subscription_id: &str) -> StreamResult<()> {
@@ -109,7 +113,11 @@ impl Subscriptions {
             ));
         }
         check_subscription(&request.run_id, &request.subscription_id)?;
-        let request_id = request_id(&request.run_id, &request.subscription_id);
+        let request_id = request_id(
+            &request.run_id,
+            &request.subscription_id,
+            request.generation,
+        );
         let key = SubscriptionKey::new(stream, &request_id);
         if let Some(first_run_id) = self.attached.lock().unwrap().get(&key) {
             return Ok(SubscribeResponse {
@@ -160,7 +168,11 @@ impl Subscriptions {
     ) -> StreamResult<UnsubscribeResponse> {
         let stream = address(request.stream.as_ref())?;
         check_subscription(&request.run_id, &request.subscription_id)?;
-        let request_id = request_id(&request.run_id, &request.subscription_id);
+        let request_id = request_id(
+            &request.run_id,
+            &request.subscription_id,
+            request.generation,
+        );
         let client = self.client()?;
         let key = SubscriptionKey::new(stream, &request_id);
         let known = self.attached.lock().unwrap().get(&key).cloned();
@@ -335,6 +347,7 @@ mod tests {
             workflow_id: "reader".to_string(),
             run_id: "reader-run".to_string(),
             subscription_id: subscription_id.to_string(),
+            generation: 0,
         }
     }
 
@@ -397,6 +410,31 @@ mod tests {
                 run_id: "reader-run".to_string(),
                 subscription_id: "1".to_string(),
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_new_generation_attaches_again_after_the_notifier_dropped_the_reader() {
+        let setup = setup();
+        subscribe(&setup.service, subscribe_request("1"))
+            .await
+            .unwrap();
+        let again = subscribe(
+            &setup.service,
+            SubscribeRequest {
+                generation: 1,
+                ..subscribe_request("1")
+            },
+        )
+        .await
+        .unwrap();
+        assert!(again.attached, "a resubscribe sends a new attach");
+        let attached = setup.server.attached.lock().unwrap().clone();
+        let ids: Vec<&str> = attached.iter().map(|a| a.request_id.as_str()).collect();
+        assert_eq!(ids, ["jetty/reader-run/1", "jetty/reader-run/1/1"]);
+        assert!(
+            attached.iter().all(|a| a.subscription_id == "1"),
+            "the wakes still name the same reader"
         );
     }
 
@@ -555,6 +593,7 @@ mod tests {
             stream: Some(stream()),
             run_id: "reader-run".to_string(),
             subscription_id: "1".to_string(),
+            ..Default::default()
         };
         setup
             .service
