@@ -334,6 +334,12 @@ impl NexusCalls {
                 None => return failed(failure::input_mistake("state must be base64-encoded")),
             },
         };
+        // A ref's run only picks the chain, so the read names the chain by its state and follows
+        // it past that run's end.
+        let (address, state) = match self.chain_by_state(address, state).await {
+            Ok(picked) => picked,
+            Err(error) => return failed(failure::of_stream(&error)),
+        };
         let request = ReadRequest {
             stream: Some(address.clone()),
             after,
@@ -410,6 +416,25 @@ impl NexusCalls {
             &input.stream.workflow_id,
             payloads,
         )
+    }
+
+    /// `address` without its run, and a state that names the chain the run picked. A state the
+    /// caller passed back already names its chain.
+    async fn chain_by_state(
+        &self,
+        mut address: StreamAddress,
+        state: Vec<u8>,
+    ) -> Result<(StreamAddress, Vec<u8>), StreamError> {
+        if address.run_id.is_empty() {
+            return Ok((address, state));
+        }
+        let state = if state.is_empty() {
+            ReadState::of_chain(self.streams.first_run_of(&address).await?).encode_to_vec()
+        } else {
+            state
+        };
+        address.run_id.clear();
+        Ok((address, state))
     }
 
     /// The state of a first call that failed, so the reader's next call follows the chain this
@@ -810,7 +835,7 @@ fn address(namespace: &str, stream: &StreamRef) -> Result<StreamAddress, Box<Nex
         namespace: namespace.to_string(),
         owner_kind: StreamOwnerKind::Workflow as i32,
         workflow_id: stream.workflow_id.clone(),
-        run_id: stream.run_id.clone().unwrap_or_default(),
+        run_id: stream.chain_run_id.clone().unwrap_or_default(),
         topic: stream.topic.clone(),
     })
 }

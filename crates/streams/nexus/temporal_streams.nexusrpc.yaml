@@ -69,12 +69,13 @@ $defs:
       workflow_id:
         type: string
         description: "The owning Workflow."
-      run_id:
+      chain_run_id:
         oneOf: [{ type: string }, { type: "null" }]
         description: >-
-          Pins the owner to this run. Absent or null follows the run chain
-          across Continue-as-New, which is what a producer and a reader
-          normally want.
+          Names the run chain that holds this run. Absent or null names the
+          Workflow id's newest chain. It never stops a read at this run: a
+          read follows the chain across Continue-as-New and ends with the
+          chain.
       topic:
         type: string
         description: "The topic on the owner's stream."
