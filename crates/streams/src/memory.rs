@@ -417,6 +417,23 @@ impl StreamStore for MemoryStore {
         Ok(())
     }
 
+    async fn retire_producer(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        producer_id: &str,
+        attempt: i64,
+    ) -> StreamResult<()> {
+        let mut chains = self.chains.lock().unwrap();
+        if let Some(topic) = chains
+            .get_mut(&chain_key(chain))
+            .and_then(|chain| chain.topics.get_mut(topic))
+        {
+            topic.held.remove(&(producer_id.to_string(), attempt));
+        }
+        Ok(())
+    }
+
     async fn disarm(&self, chain: &ChainId, topic: &str, generation: u64) -> StreamResult<()> {
         let mut chains = self.chains.lock().unwrap();
         if let Some(arm) = chains

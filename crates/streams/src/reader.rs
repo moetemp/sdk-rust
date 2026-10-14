@@ -424,6 +424,10 @@ mod tests {
             unreachable!()
         }
 
+        async fn retire_producer(&self, _: &ChainId, _: &str, _: &str, _: i64) -> StreamResult<()> {
+            unreachable!()
+        }
+
         async fn delete_owner(&self, _: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
             unreachable!()
         }

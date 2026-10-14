@@ -73,6 +73,11 @@ relevant information.
   attaches each subscription once and answers a repeat from memory. The attach names the chain
   that holds the Workflow id now, and on an empty stream it arms the stream, so the first append
   wakes the Workflow.
+* Experimental: the stream service's `RetireProducer` call drops one producer attempt's dedupe
+  state on a stream, which the Redis store keeps as one field of the topic's meta hash until
+  retention. A producer that writes once per short-lived attempt calls it after the attempt's
+  last append returned, so the meta hash tracks the attempts in flight. Calling it earlier lets a
+  retried batch land twice.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
