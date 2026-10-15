@@ -85,6 +85,7 @@ async fn raw_entry(store: &Arc<dyn StreamStore>, workflow_id: &str, bytes: Vec<u
                 namespace: NAMESPACE.to_string(),
                 workflow_id: workflow_id.to_string(),
                 first_run_id: "run-1".to_string(),
+                ..Default::default()
             }),
             topic: TOPIC.to_string(),
             producer_id: "raw".to_string(),
@@ -967,6 +968,7 @@ async fn the_store_holds_only_bodies_the_codec_sealed() {
             namespace: NAMESPACE.to_string(),
             workflow_id: wf.clone(),
             first_run_id: "run-1".to_string(),
+            ..Default::default()
         },
         topic: TOPIC.to_string(),
         stream_hash: temporalio_streams::stream_hash(NAMESPACE, "workflow", &wf, TOPIC),
