@@ -447,8 +447,8 @@ impl Streams {
             Ok(described) if described.first_run_id != first_run_id => {
                 return Err(StreamError::cursor(format!(
                     "the read state names run {first_run_id:?}, which doesn't start a run chain \
-                     of Workflow {:?}",
-                    stream.workflow_id
+                     of {}",
+                    key.label()
                 )));
             }
             // A chain Temporal no longer holds leaves nothing another chain's reader could

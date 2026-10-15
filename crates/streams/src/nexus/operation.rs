@@ -136,16 +136,26 @@ async fn detach(
 /// crosses as the caller's input mistake.
 fn checked(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
     let stream = stream.ok_or_else(|| bad_input("an attach needs its stream"))?;
-    if stream.owner_kind != StreamOwnerKind::Workflow as i32 {
-        return Err(StreamError::unsupported(format!(
-            "this release opens streams of Workflows only, not owner kind {}",
-            stream.owner_kind
+    let (owner_id, other_id, kind) = match StreamOwnerKind::try_from(stream.owner_kind) {
+        Ok(StreamOwnerKind::Workflow) => (&stream.workflow_id, &stream.activity_id, "Workflow"),
+        Ok(StreamOwnerKind::Activity) => (&stream.activity_id, &stream.workflow_id, "Activity"),
+        _ => {
+            return Err(StreamError::unsupported(format!(
+                "this release opens streams of Workflows and standalone Activities only, not \
+                 owner kind {}",
+                stream.owner_kind
+            )));
+        }
+    };
+    if stream.namespace.is_empty() || owner_id.is_empty() {
+        return Err(bad_input(&format!(
+            "a stream needs its namespace and its owner's {kind} id"
         )));
     }
-    if stream.namespace.is_empty() || stream.workflow_id.is_empty() {
-        return Err(bad_input(
-            "a stream needs its namespace and its owner's Workflow id",
-        ));
+    if !other_id.is_empty() {
+        return Err(bad_input(&format!(
+            "a stream that a {kind} owns names only its {kind} id"
+        )));
     }
     // The topic is the caller's own value, so the message names the rule and not the topic.
     temporalio_common::streams::check_topic(&stream.topic)
@@ -609,6 +619,49 @@ mod tests {
         assert_eq!(
             (topic.as_str(), request_id.as_str(), *after),
             ("tokens", "attach-2", 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_activity_stream_start_attaches_waits_and_detaches_on_the_activity_run() {
+        let setup = setup();
+        let activity = StreamAddress {
+            owner_kind: StreamOwnerKind::Activity as i32,
+            workflow_id: String::new(),
+            activity_id: "tool-1".to_string(),
+            ..stream("")
+        };
+        let start = AttachCallerRequest {
+            stream: Some(activity.clone()),
+            wake_after_counter: Some(0),
+            ..attach_request("temporal://system")
+        };
+        let token = attach(&setup.service, start).await.unwrap();
+        let run = ChainId {
+            namespace: "default".to_string(),
+            first_run_id: "chain-1".to_string(),
+            owner_kind: StreamOwnerKind::Activity as i32,
+            activity_id: "tool-1".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(setup.notifier.attached.lock().unwrap()[0].chain, run);
+        assert_eq!(setup.notifier.waits.lock().unwrap()[0].0, run);
+        let decoded = OperationToken::decode("default", &token).unwrap();
+        assert_eq!(decoded.stream, activity);
+        assert_eq!(decoded.chain(), run);
+        detach(&setup.service, &token).await.unwrap();
+        assert_eq!(setup.notifier.detached.lock().unwrap()[0].0, run);
+        // An Activity's address names no Workflow id.
+        let refused = AttachCallerRequest {
+            stream: Some(StreamAddress {
+                workflow_id: "owner-1".to_string(),
+                ..activity
+            }),
+            ..attach_request("temporal://system")
+        };
+        assert_eq!(
+            attach(&setup.service, refused).await.unwrap_err().kind,
+            "BAD_REQUEST"
         );
     }
 

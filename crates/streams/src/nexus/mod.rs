@@ -272,14 +272,7 @@ impl NexusCalls {
         if finish {
             return self.finish(work, Vec::new()).await;
         }
-        self.ask_codec(
-            work,
-            bytes,
-            true,
-            &call.namespace,
-            &input.stream.workflow_id,
-            parsed,
-        )
+        self.ask_codec(work, bytes, true, &call.namespace, &input.stream, parsed)
     }
 
     /// Serves the `read` operation: the records after the caller's cursor, waiting for some.
@@ -315,8 +308,12 @@ impl NexusCalls {
         let floor_holder = input.floor_holder.unwrap_or_default();
         let wake = match &input.wake_token {
             Some(token) => match OperationToken::decode(&call.namespace, token) {
+                // A token of another owner with the same topic must not wake this reader, and
+                // every Activity's ref has the same empty Workflow id.
                 Ok(token)
-                    if token.stream.workflow_id == address.workflow_id
+                    if token.stream.owner_kind == address.owner_kind
+                        && token.stream.workflow_id == address.workflow_id
+                        && token.stream.activity_id == address.activity_id
                         && token.stream.topic == address.topic =>
                 {
                     Some(token)
@@ -449,14 +446,7 @@ impl NexusCalls {
         if payloads.is_empty() {
             return self.finish(work, Vec::new()).await;
         }
-        self.ask_codec(
-            work,
-            bytes,
-            false,
-            &call.namespace,
-            &input.stream.workflow_id,
-            payloads,
-        )
+        self.ask_codec(work, bytes, false, &call.namespace, &input.stream, payloads)
     }
 
     /// Asks the notifier to wake the operation callback that `token` names once the stream moves
@@ -476,12 +466,7 @@ impl NexusCalls {
         })?;
         client
             .wait_callback(
-                crate::proto::ChainId {
-                    namespace: address.namespace.clone(),
-                    workflow_id: address.workflow_id.clone(),
-                    first_run_id: token.chain_first_run_id.clone(),
-                    ..Default::default()
-                },
+                crate::handle::chain_of(address, &token.chain_first_run_id),
                 address.topic.clone(),
                 token.attach_request_id.clone(),
                 read.response.wake_after,
@@ -565,14 +550,7 @@ impl NexusCalls {
         if payloads.is_empty() {
             return self.finish(work, Vec::new()).await;
         }
-        self.ask_codec(
-            work,
-            bytes,
-            false,
-            &call.namespace,
-            &input.stream.workflow_id,
-            payloads,
-        )
+        self.ask_codec(work, bytes, false, &call.namespace, &input.stream, payloads)
     }
 
     /// `address` without its run, and a state that names the chain the run picked. A state the
@@ -629,7 +607,7 @@ impl NexusCalls {
         bytes: usize,
         encode: bool,
         namespace: &str,
-        workflow_id: &str,
+        stream: &StreamRef,
         payloads: Vec<Payload>,
     ) -> NexusStep {
         let continuation = self.next.fetch_add(1, Ordering::Relaxed);
@@ -665,10 +643,13 @@ impl NexusCalls {
             step: Some(nexus_step::Step::Codec(CodecWork {
                 encode,
                 namespace: namespace.to_string(),
-                workflow_id: workflow_id.to_string(),
+                workflow_id: stream.workflow_id.clone(),
                 payloads,
                 continuation,
-                ..Default::default()
+                // The address check already refused any other kind.
+                owner_kind: operation::owner_kind(&stream.kind).unwrap_or(StreamOwnerKind::Workflow)
+                    as i32,
+                activity_id: stream.activity_id.clone().unwrap_or_default(),
             })),
         }
     }
@@ -1089,31 +1070,45 @@ fn carried_state(state: Option<String>) -> Result<Vec<u8>, Box<NexusFailure>> {
 /// The stream address a call names. An owner kind this release can't open is refused before any
 /// codec work.
 fn address(namespace: &str, stream: &StreamRef) -> Result<StreamAddress, Box<NexusFailure>> {
-    if stream.kind != "workflow" {
+    let Some(owner_kind) = operation::owner_kind(&stream.kind) else {
         return Err(Box::new(failure::of_stream(&StreamError::unsupported(
             format!(
-                "this release opens streams of Workflows only, not of kind {}",
+                "this release opens streams of Workflows and standalone Activities only, not of \
+                 kind {}",
                 failure::named(&stream.kind)
             ),
         ))));
-    }
+    };
     if let Err(reason) = temporalio_common::streams::check_topic(&stream.topic) {
         return Err(Box::new(failure::input_mistake(failure::without_values(
             &reason,
         ))));
     }
-    if stream.workflow_id.is_empty() {
-        return Err(Box::new(failure::input_mistake(
-            "a stream needs its owner's Workflow id",
-        )));
+    let activity_id = stream.activity_id.clone().unwrap_or_default();
+    let mistake = match owner_kind {
+        StreamOwnerKind::Activity if activity_id.is_empty() => {
+            Some("a stream that an Activity owns needs its owner's Activity id")
+        }
+        StreamOwnerKind::Activity if !stream.workflow_id.is_empty() => {
+            Some("a stream that an Activity owns names an empty Workflow id")
+        }
+        StreamOwnerKind::Activity => None,
+        _ if stream.workflow_id.is_empty() => Some("a stream needs its owner's Workflow id"),
+        _ if stream.activity_id.is_some() => {
+            Some("a stream that a Workflow owns names no Activity id")
+        }
+        _ => None,
+    };
+    if let Some(mistake) = mistake {
+        return Err(Box::new(failure::input_mistake(mistake)));
     }
     Ok(StreamAddress {
         namespace: namespace.to_string(),
-        owner_kind: StreamOwnerKind::Workflow as i32,
+        owner_kind: owner_kind as i32,
         workflow_id: stream.workflow_id.clone(),
         run_id: stream.chain_run_id.clone().unwrap_or_default(),
         topic: stream.topic.clone(),
-        ..Default::default()
+        activity_id,
     })
 }
 

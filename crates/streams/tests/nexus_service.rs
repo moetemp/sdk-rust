@@ -159,6 +159,22 @@ fn operation_token(wf: &str) -> String {
     .encode()
 }
 
+/// The token of Activity `id`'s stream operation, attached as `attach-1` on its run `run-1`.
+fn activity_operation_token(id: &str) -> String {
+    OperationToken {
+        stream: StreamAddress {
+            namespace: NAMESPACE.to_string(),
+            owner_kind: StreamOwnerKind::Activity as i32,
+            activity_id: id.to_string(),
+            topic: TOPIC.to_string(),
+            ..Default::default()
+        },
+        attach_request_id: "attach-1".to_string(),
+        chain_first_run_id: "run-1".to_string(),
+    }
+    .encode()
+}
+
 fn waking(wf: &str, after: &str) -> Value {
     let mut input = read_input(wf, after);
     input["wake_token"] = json!(operation_token(wf));
@@ -533,7 +549,7 @@ mod cases {
         let calls = service(store, NexusOptions::default());
         let refused = read(
             &calls,
-            json!({"stream": {"kind": "activity", "workflow_id": "wf", "topic": "t"}}),
+            json!({"stream": {"kind": "nexus", "workflow_id": "wf", "topic": "t"}}),
         )
         .await
         .unwrap_err();
@@ -543,7 +559,137 @@ mod cases {
             kind_of(&refused),
             ("NOT_IMPLEMENTED", false, "StreamUnsupportedError")
         );
-        assert!(refused.message.contains("activity"), "{}", refused.message);
+        assert!(refused.message.contains("nexus"), "{}", refused.message);
+        // An Activity's ref names the Activity and an empty Workflow id, and a Workflow's ref no
+        // Activity.
+        for stream in [
+            json!({"kind": "activity", "workflow_id": "wf", "activity_id": "a", "topic": "t"}),
+            json!({"kind": "activity", "workflow_id": "", "topic": "t"}),
+            json!({"kind": "activity", "workflow_id": "", "activity_id": "", "topic": "t"}),
+            json!({"kind": "workflow", "workflow_id": "wf", "activity_id": "a", "topic": "t"}),
+        ] {
+            let refused = read(&calls, json!({ "stream": stream.clone() }))
+                .await
+                .unwrap_err();
+            assert_eq!(kind_of(&refused).0, "BAD_REQUEST", "{stream}");
+        }
+    }
+
+    pub(crate) async fn an_activity_stream_appends_and_reads_apart_from_a_workflow(
+        store: Arc<dyn StreamStore>,
+    ) {
+        let calls = service(store, NexusOptions::default());
+        let id = workflow();
+        let activity = |texts: &[&str], sequence: i64| {
+            let mut input = append_input(&id, "p", 1, sequence, texts);
+            input["stream"] = activity_stream(&id, TOPIC);
+            input
+        };
+        append(&calls, activity(&["one", "two"], 1)).await.unwrap();
+        // A Workflow with the same id owns another stream.
+        write(&calls, &id, 1, &["workflow"]).await;
+        let answer = read(&calls, json!({"stream": activity_stream(&id, TOPIC)}))
+            .await
+            .unwrap();
+        assert_eq!(texts(&answer), ["one", "two"]);
+        assert_eq!(texts(&read_after(&calls, &id, "").await), ["workflow"]);
+        let latest = read(
+            &calls,
+            json!({"stream": activity_stream(&id, TOPIC), "latest_only": true}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(latest["next_token"], answer["next_token"]);
+        // A cursor of the Activity's stream is not one of the Workflow's.
+        let refused = read(&calls, read_input(&id, token(&answer)))
+            .await
+            .unwrap_err();
+        assert_eq!(kind_of(&refused).2, "StreamCursorError");
+    }
+
+    pub(crate) async fn an_activity_read_says_done_once_the_run_ends(store: Arc<dyn StreamStore>) {
+        let id = workflow();
+        let mut input = append_input(&id, "p", 1, 1, &["one"]);
+        input["stream"] = activity_stream(&id, TOPIC);
+        append(&service(store.clone(), NexusOptions::default()), input)
+            .await
+            .unwrap();
+        let ended = NexusCalls::new(
+            Arc::new(Streams::new(
+                store,
+                Arc::new(Ended),
+                StreamsOptions::default(),
+            )),
+            NexusOptions::default(),
+        );
+        let mut input = json!({"stream": activity_stream(&id, TOPIC), "wait_ms": 2000});
+        let mut seen = vec![];
+        for _ in 0..10 {
+            let answer = read(&ended, input.clone()).await.unwrap();
+            seen.extend(texts(&answer));
+            if answer["done"] == true {
+                assert_eq!(seen, ["one"]);
+                return;
+            }
+            input["after_token"] = answer["next_token"].clone();
+            input["state"] = answer["state"].clone();
+        }
+        panic!("the read never ended");
+    }
+
+    pub(crate) async fn a_wake_token_of_another_activity_is_refused(store: Arc<dyn StreamStore>) {
+        let waker = Arc::new(Waker::default());
+        let calls = service(store, NexusOptions::default()).with_callers(waker.clone());
+        let id = workflow();
+        // Every Activity's ref has the same empty Workflow id, so only the Activity id tells
+        // the two streams apart.
+        for (stream, token) in [
+            (
+                activity_stream(&id, TOPIC),
+                activity_operation_token("other"),
+            ),
+            (activity_stream(&id, TOPIC), operation_token("")),
+            (stream(&id, TOPIC), activity_operation_token(&id)),
+        ] {
+            let input = json!({"stream": stream, "wake_token": token});
+            let refused = read(&calls, input).await.unwrap_err();
+            assert_eq!(kind_of(&refused).0, "BAD_REQUEST", "{stream}");
+        }
+        assert!(waker.waits.lock().unwrap().is_empty());
+    }
+
+    pub(crate) async fn an_empty_activity_read_wakes_its_operation_on_the_activity_run(
+        store: Arc<dyn StreamStore>,
+    ) {
+        let waker = Arc::new(Waker::default());
+        let calls = service(store, NexusOptions::default()).with_callers(waker.clone());
+        let id = workflow();
+        let mut input = append_input(&id, "p", 1, 1, &["one"]);
+        input["stream"] = activity_stream(&id, TOPIC);
+        let last = append(&calls, input).await.unwrap()["cursor"].clone();
+        let input = json!({
+            "stream": activity_stream(&id, TOPIC),
+            "after_token": last,
+            "wake_token": activity_operation_token(&id),
+        });
+        let caught_up = read(&calls, input).await.unwrap();
+        assert!(records(&caught_up).is_empty());
+        let waits = waker.waits.lock().unwrap().clone();
+        let [(chain, topic, request_id, after)] = waits.as_slice() else {
+            panic!("one wait, not {waits:?}");
+        };
+        assert_eq!(
+            chain,
+            &ChainId {
+                namespace: NAMESPACE.to_string(),
+                first_run_id: "run-1".to_string(),
+                owner_kind: StreamOwnerKind::Activity as i32,
+                activity_id: id.clone(),
+                ..Default::default()
+            }
+        );
+        assert_eq!((topic.as_str(), request_id.as_str()), (TOPIC, "attach-1"));
+        assert!(*after > 0);
     }
 
     pub(crate) async fn a_read_says_done_once_the_owner_ends(store: Arc<dyn StreamStore>) {
@@ -915,6 +1061,10 @@ macro_rules! all_cases {
             a_record_that_lands_before_the_wait_is_in_the_answer,
             a_positions_reader_waits_and_rereads_too,
             a_wake_token_of_another_stream_is_refused,
+            an_activity_stream_appends_and_reads_apart_from_a_workflow,
+            an_activity_read_says_done_once_the_run_ends,
+            a_wake_token_of_another_activity_is_refused,
+            an_empty_activity_read_wakes_its_operation_on_the_activity_run,
         );
     };
 }
@@ -1383,5 +1533,51 @@ async fn a_range_from_a_trimmed_start_is_lost_on_redis() {
         ("BAD_REQUEST", false, "StreamReplayRangeLostError"),
         "{}",
         refused.message
+    );
+}
+
+#[tokio::test]
+async fn an_activity_range_replays_and_names_only_the_activity_run() {
+    let calls = service(memory(), NexusOptions::default());
+    let id = workflow();
+    let mut input = append_input(&id, "p", 1, 1, &["one", "two"]);
+    input["stream"] = activity_stream(&id, TOPIC);
+    append(&calls, input).await.unwrap();
+    let answer = read(
+        &calls,
+        json!({"stream": activity_stream(&id, TOPIC), "floor_holder": HOLDER}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(answer["replay"]["chain_first_run_id"], "run-1");
+    let replay = replay_input(activity_stream(&id, TOPIC), &answer, Value::Null);
+    let replayed = read_range(&calls, replay.clone()).await.unwrap();
+    assert_eq!(replayed["records"], answer["records"]);
+    let mut other_run = replay;
+    other_run["chain_first_run_id"] = json!("run-9");
+    let refused = read_range(&calls, other_run).await.unwrap_err();
+    assert_eq!(
+        kind_of(&refused),
+        ("BAD_REQUEST", false, "StreamCursorError")
+    );
+}
+
+#[tokio::test]
+async fn an_activity_streams_codec_work_names_the_activity() {
+    let calls = service(memory(), NexusOptions::default());
+    let mut input = append_input("unused", "p", 1, 1, &["one"]);
+    input["stream"] = activity_stream("tool-1", TOPIC);
+    let step = calls.append(call(input)).await;
+    let Some(temporalio_streams::proto::nexus_step::Step::Codec(work)) = step.step else {
+        panic!("an append asks for codec work first, not {step:?}");
+    };
+    assert_eq!(
+        (
+            work.namespace.as_str(),
+            work.owner_kind,
+            work.workflow_id.as_str(),
+            work.activity_id.as_str()
+        ),
+        (NAMESPACE, StreamOwnerKind::Activity as i32, "", "tool-1")
     );
 }

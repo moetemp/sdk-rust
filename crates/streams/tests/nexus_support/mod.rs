@@ -189,6 +189,16 @@ pub(crate) fn replay_input(stream: Value, answer: &Value, state: Value) -> Value
     })
 }
 
+/// A stream reference to `topic` of standalone Activity `activity_id`, on its newest run.
+pub(crate) fn activity_stream(activity_id: &str, topic: &str) -> Value {
+    serde_json::json!({
+        "kind": "activity",
+        "workflow_id": "",
+        "activity_id": activity_id,
+        "topic": topic,
+    })
+}
+
 /// A stream reference to `topic` of Workflow `workflow_id`.
 pub(crate) fn stream(workflow_id: &str, topic: &str) -> Value {
     serde_json::json!({"kind": "workflow", "workflow_id": workflow_id, "topic": topic})

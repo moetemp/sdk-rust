@@ -211,6 +211,13 @@ relevant information.
   Activity id, keeps version 2, and leaves `activity_id` out of a Workflow's ref, so a Workflow's
   token keeps its bytes. `operation_token_vectors.json` has Activity tokens. `CodecWork` gains
   `owner_kind` and `activity_id`. The Nexus calls still refuse an Activity ref.
+* Experimental: the stream service's Nexus calls serve streams that a standalone Activity owns.
+  `append`, `read`, `read_range`, `latest_only`, the floor holder, `AttachCaller` with
+  `wake_after_counter`, `DetachCaller` and the read-first wake all take an Activity ref. A read's
+  `wake_token` must name the read's owner kind, Workflow id, Activity id and topic, so a token of
+  one Activity never wakes another Activity's reader on the same topic. `CodecWork` names the
+  Activity, so lang's codec context is the namespace and the Activity id. A ref of kind
+  `activity` with a Workflow id, or of kind `workflow` with an Activity id, is a bad request.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
