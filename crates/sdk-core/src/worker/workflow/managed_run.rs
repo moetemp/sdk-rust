@@ -105,6 +105,9 @@ pub(super) struct ManagedRun {
     /// The attempts the run appended stream records under, with their topics, whose store
     /// sessions are not retired yet.
     stream_sessions: BTreeMap<i64, BTreeSet<String>>,
+    /// Local Activities a completion with stream output scheduled. They start only once the
+    /// output is in the store, so an activity can read what its own activation published.
+    held_local_activities: Vec<LocalActRequest>,
     metrics: MetricsContext,
     /// We store the paginator used for our own run's history fetching
     paginator: Option<HistoryPaginator>,
@@ -133,6 +136,7 @@ impl ManagedRun {
             stream_attempt: 0,
             committed_by_topic: Default::default(),
             stream_sessions: Default::default(),
+            held_local_activities: Default::default(),
             metrics,
             paginator: None,
             completion_waiting_on_page_fetch: None,
@@ -810,6 +814,7 @@ impl ManagedRun {
             }
         };
 
+        let hold_local_activities = output.is_some();
         let outcome = (|| {
             // Send commands from lang into the machines then check if the workflow run needs
             // another activation and mark it if so
@@ -823,7 +828,11 @@ impl ManagedRun {
                 self.wfm.apply_next_task_if_ready()?;
             }
             let new_local_acts = self.wfm.drain_queued_local_activities();
-            self.sink_la_requests(new_local_acts)?;
+            if hold_local_activities {
+                self.held_local_activities.extend(new_local_acts);
+            } else {
+                self.sink_la_requests(new_local_acts)?;
+            }
 
             if self.wfm.machines.outstanding_local_activity_count() == 0 {
                 Ok(None)
@@ -972,6 +981,23 @@ impl ManagedRun {
         #[cfg(not(feature = "streams"))]
         {
             false
+        }
+    }
+
+    /// Starts the Local Activities held for the activation's stream output, once that output is
+    /// in the store. When the append failed, the run is evicted and they never start.
+    pub(super) fn release_held_local_activities(&mut self, output_appended: bool) {
+        let held = mem::take(&mut self.held_local_activities);
+        if !output_appended || held.is_empty() {
+            return;
+        }
+        if let Err(error) = self.sink_la_requests(held) {
+            self.request_eviction(RequestEvictMsg {
+                run_id: self.run_id().to_string(),
+                message: format!("Could not start the Workflow's Local Activities: {error}"),
+                reason: EvictionReason::Fatal,
+                auto_reply_fail: None,
+            });
         }
     }
 
