@@ -36,6 +36,42 @@ pub fn activity_producer_id(activity: &ActivityProducer) -> String {
     format!("{}@{}", activity.activity_id, activity.run_id)
 }
 
+/// The largest Temporal attempt an Activity attempt key holds. A higher attempt keeps this one.
+pub const MAX_KEYED_ACTIVITY_ATTEMPT: i64 = 0xFFFF;
+
+/// The attempt an Activity attempt writes as.
+///
+/// With `attempt_started_time`, it is `started_unix_ms << 16 | min(attempt, 65535)`. A retry and
+/// a reset attempt start later, so they write a higher attempt and supersede the earlier one, even
+/// though a reset sets the Temporal attempt back to 1. An attempt that writes on after a newer one
+/// started reads as stale. With no start time, it is the Temporal attempt, as a lang that sends
+/// none expects. Fails as an invalid argument for an attempt below one or a start time outside
+/// what the key holds.
+pub fn activity_attempt(activity: &ActivityProducer) -> StreamResult<i64> {
+    let attempt = i64::from(activity.attempt);
+    if attempt < 1 {
+        return Err(StreamError::invalid_argument(format!(
+            "a producer's attempt starts at one, not {attempt}"
+        )));
+    }
+    let Some(started) = &activity.attempt_started_time else {
+        return Ok(attempt);
+    };
+    let unix_ms = started
+        .seconds
+        .checked_mul(1000)
+        .and_then(|ms| ms.checked_add(i64::from(started.nanos.div_euclid(1_000_000))))
+        .filter(|ms| (1..1 << 47).contains(ms))
+        .ok_or_else(|| {
+            StreamError::invalid_argument(format!(
+                "an Activity attempt's start time must be after 1970 and before the year 6429, \
+                 not {}s {}ns",
+                started.seconds, started.nanos
+            ))
+        })?;
+    Ok(unix_ms << 16 | attempt.min(MAX_KEYED_ACTIVITY_ATTEMPT))
+}
+
 /// The producer id a Workflow run writes its own records as.
 ///
 /// It is an Activity's id form with no Activity id. An Activity id is never empty, so no Activity

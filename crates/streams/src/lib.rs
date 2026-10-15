@@ -43,8 +43,9 @@ pub use reader::{
     DEFAULT_MAX_RECORDS, MAX_STATE_BYTES, MAX_TRACKED_PRODUCERS, ReadTarget, read_page,
 };
 pub use record::{
-    ACTIVITY_OWNER_KIND, WORKFLOW_OWNER_KIND, activity_producer_id, chain_owner,
-    check_append_digest, stored_append_record, workflow_batch_digest, workflow_producer_id,
+    ACTIVITY_OWNER_KIND, MAX_KEYED_ACTIVITY_ATTEMPT, WORKFLOW_OWNER_KIND, activity_attempt,
+    activity_producer_id, chain_owner, check_append_digest, stored_append_record,
+    workflow_batch_digest, workflow_producer_id,
 };
 pub use service::StreamService;
 pub use store::{CloseOutcome, MAX_CLOSE_BYTES, StreamStore, empty_close_result};

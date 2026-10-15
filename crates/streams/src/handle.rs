@@ -5,7 +5,8 @@
 
 use crate::{
     BEGINNING, END, MAX_CLOSE_BYTES, ReadTarget, StreamError, StreamResult, StreamStore,
-    activity_producer_id, chain_owner, check_append_digest, cursor_position, mint_cursor,
+    activity_attempt, activity_producer_id, chain_owner, check_append_digest, cursor_position,
+    mint_cursor,
     owner::{OwnerClient, OwnerDescription, OwnerError, OwnerId, OwnerStatus},
     proto::{
         ActivityProducer, AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse,
@@ -946,7 +947,7 @@ fn producer(
             }
             (named.producer_id.clone(), named.attempt)
         }
-        (None, Some(activity)) => (activity_producer_id(activity), i64::from(activity.attempt)),
+        (None, Some(activity)) => (activity_producer_id(activity), activity_attempt(activity)?),
         (None, None) => return Err(StreamError::invalid_argument("a call needs its producer")),
     };
     if attempt < 1 {
@@ -2816,5 +2817,162 @@ mod tests {
                 StreamFailureKind::InvalidArgument
             );
         }
+    }
+
+    /// The start of 2026-10-14 in Unix milliseconds.
+    const DAY_START_MS: i64 = 1_791_936_000_000;
+
+    /// Attempt `attempt` of Activity `fetch` of run `run-1` of `wf`, started `after_ms` past
+    /// [DAY_START_MS], writing `value` at `sequence` on the Workflow's stream.
+    fn timed(attempt: i32, after_ms: i64, sequence: i64, value: &str) -> AppendRequest {
+        let mut activity = ActivityProducer {
+            workflow_id: "wf".to_string(),
+            run_id: "run-1".to_string(),
+            activity_id: "fetch".to_string(),
+            attempt,
+            ..Default::default()
+        };
+        let started = activity
+            .attempt_started_time
+            .get_or_insert_with(Default::default);
+        let ms = DAY_START_MS + after_ms;
+        started.seconds = ms / 1000;
+        started.nanos = (ms % 1000) as i32 * 1_000_000;
+        AppendRequest {
+            producer: Some(Producer::Activity(activity)),
+            ..append("", sequence, value)
+        }
+    }
+
+    fn key(attempt: i64, after_ms: i64) -> i64 {
+        (DAY_START_MS + after_ms) << 16 | attempt
+    }
+
+    /// The read's records, as each stored record's value and attempt, or a supersession's two
+    /// attempts with an empty value.
+    async fn shape(
+        setup: &Setup,
+        after: &str,
+        state: &[u8],
+    ) -> (Vec<(String, i64, i64, bool)>, ReadResponse) {
+        let page = setup
+            .streams
+            .read(read_after(after, state, Duration::ZERO))
+            .await
+            .unwrap();
+        let shape = page
+            .records
+            .iter()
+            .map(|record| match &record.record {
+                Some(read_record::Record::Stored(stored)) => (
+                    String::from_utf8(stored.body.clone().unwrap().data).unwrap(),
+                    stored.attempt,
+                    0,
+                    record.stale,
+                ),
+                Some(read_record::Record::Superseded(superseded)) => (
+                    String::new(),
+                    superseded.previous_attempt,
+                    superseded.attempt,
+                    record.stale,
+                ),
+                None => panic!("an empty record"),
+            })
+            .collect();
+        (shape, page)
+    }
+
+    #[tokio::test]
+    async fn a_timed_activity_attempt_writes_its_start_and_attempt_as_its_key() {
+        let setup = setup(quick());
+        setup.streams.append(timed(3, 0, 1, "a")).await.unwrap();
+        let (records, _) = shape(&setup, "", &[]).await;
+        assert_eq!(records, [("a".to_string(), key(3, 0), 0, false)]);
+        let mut late = timed(70_000, 0, 1, "b");
+        if let Some(Producer::Activity(activity)) = &mut late.producer {
+            activity.activity_id = "other".to_string();
+        }
+        setup.streams.append(late).await.unwrap();
+        let (records, _) = shape(&setup, "", &[]).await;
+        assert_eq!(records[1].1, key(crate::MAX_KEYED_ACTIVITY_ATTEMPT, 0));
+        let before_1970 = timed(1, -DAY_START_MS - 1000, 1, "c");
+        assert_eq!(
+            kind(setup.streams.append(before_1970).await),
+            StreamFailureKind::InvalidArgument
+        );
+    }
+
+    #[tokio::test]
+    async fn an_activity_retry_supersedes_the_earlier_attempt() {
+        let setup = setup(quick());
+        setup.streams.append(timed(1, 0, 1, "a1")).await.unwrap();
+        setup
+            .streams
+            .append(timed(2, 1_000, 1, "b1"))
+            .await
+            .unwrap();
+        let (records, _) = shape(&setup, "", &[]).await;
+        assert_eq!(
+            records,
+            [
+                ("a1".to_string(), key(1, 0), 0, false),
+                (String::new(), key(1, 0), key(2, 1_000), false),
+                ("b1".to_string(), key(2, 1_000), 0, false),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reset_activity_attempt_supersedes_with_no_divergence_and_no_drop() {
+        let setup = setup(quick());
+        for (attempt, after_ms) in [(1, 0), (2, 1_000), (3, 2_000)] {
+            setup
+                .streams
+                .append(timed(attempt, after_ms, 1, &format!("attempt {attempt}")))
+                .await
+                .unwrap();
+        }
+        // A reset sets the Temporal attempt back to 1, and the reset attempt starts later.
+        setup
+            .streams
+            .append(timed(1, 3_000, 1, "reset"))
+            .await
+            .unwrap();
+        let (records, _) = shape(&setup, "", &[]).await;
+        assert_eq!(
+            records.last().unwrap(),
+            &("reset".to_string(), key(1, 3_000), 0, false)
+        );
+        assert_eq!(
+            records[records.len() - 2],
+            (String::new(), key(3, 2_000), key(1, 3_000), false)
+        );
+        // With no start time the reset attempt would repeat attempt 1 with other content.
+        let mut untimed = timed(1, 0, 1, "reset");
+        if let Some(Producer::Activity(activity)) = &mut untimed.producer {
+            activity.attempt_started_time = None;
+        }
+        setup.streams.append(untimed.clone()).await.unwrap();
+        untimed.digest = vec![1; 32];
+        assert_eq!(
+            kind(setup.streams.append(untimed).await),
+            StreamFailureKind::ProducerDivergent
+        );
+    }
+
+    #[tokio::test]
+    async fn an_activity_attempt_that_writes_after_a_newer_one_started_is_stale() {
+        let setup = setup(quick());
+        setup.streams.append(timed(1, 0, 1, "a1")).await.unwrap();
+        setup
+            .streams
+            .append(timed(2, 1_000, 1, "b1"))
+            .await
+            .unwrap();
+        let (_, page) = shape(&setup, "", &[]).await;
+        // The first attempt timed out but keeps writing.
+        setup.streams.append(timed(1, 0, 2, "a2")).await.unwrap();
+        let (records, _) = shape(&setup, &page.cursor, &page.state).await;
+        assert_eq!(records, [("a2".to_string(), key(1, 0), 0, true)]);
     }
 }

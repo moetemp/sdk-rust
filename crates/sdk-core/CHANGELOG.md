@@ -162,6 +162,12 @@ relevant information.
   run. Notifications, closes, Workflow reader attaches, detaches and `WaitForNotification` polls
   all do, and a stream driver turns an Activity log key into that reference. Their cursors hash
   under the kind `activity`.
+* Experimental: an `ActivityProducer` with `attempt_started_time` writes as the attempt
+  `started_unix_ms << 16 | min(attempt, 65535)`. A retry and a reset attempt start later, so they
+  supersede the earlier attempt, also after a reset sets the Temporal attempt back to 1. An
+  attempt that writes on after a newer one started reads as stale. Without the field the attempt
+  is the Temporal attempt as before. `testdata/streams/activity_attempts.json` in
+  `temporalio-streams` pins the formula for other SDKs.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
