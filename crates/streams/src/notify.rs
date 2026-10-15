@@ -137,6 +137,18 @@ pub trait NotifierClient: Send + Sync {
     /// Sends one notification.
     async fn notify(&self, notification: StreamNotification) -> Result<(), NotifyError>;
 
+    /// Sends notifications for many streams in one call, as a driver of a notification log does.
+    /// A client without a batch call sends them one at a time.
+    async fn notify_streams(
+        &self,
+        notifications: Vec<StreamNotification>,
+    ) -> Result<(), NotifyError> {
+        for notification in notifications {
+            self.notify(notification).await?;
+        }
+        Ok(())
+    }
+
     /// Attaches a Workflow's reader to a stream's notifier. Idempotent by its request id.
     async fn attach_workflow(&self, attachment: WorkflowAttachment) -> Result<(), NotifyError> {
         let _ = attachment;
@@ -620,7 +632,8 @@ impl NotifierClient for UnlessUnsupported {
 }
 
 /// A store that closes each stream's notifier after the store closes the stream, and with
-/// progress on, notifies it after every append that lands.
+/// progress on, notifies it after every append that lands. A store with a notification log
+/// notifies through its driver, so its appends send nothing here.
 ///
 /// Wraps the store a process hands to its stream calls, so every write path notifies without
 /// knowing about notifiers. It forwards every trait method by name, since a
@@ -710,6 +723,7 @@ impl StreamStore for NotifyingStore {
         let topic = request.topic.clone();
         let landed = self.inner.append(request).await?;
         if self.progress
+            && self.inner.notification_log().is_none()
             && let Some(chain) = &chain
         {
             self.notify_at(chain, &topic, &landed.last_position);
@@ -832,6 +846,10 @@ impl StreamStore for NotifyingStore {
 
     async fn flush_notifications(&self) {
         self.notifier.flush().await;
+    }
+
+    fn notification_log(&self) -> Option<Arc<dyn crate::NotificationLog>> {
+        self.inner.notification_log()
     }
 }
 

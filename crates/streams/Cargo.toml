@@ -34,7 +34,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 sha2 = "0.10"
 thiserror = { workspace = true }
-tokio = { version = "1.47", default-features = false, features = ["rt", "sync", "time"] }
+tokio = { version = "1.47", default-features = false, features = ["macros", "rt", "sync", "time"] }
 tracing = "0.1"
 
 [dependencies.temporalio-common]
