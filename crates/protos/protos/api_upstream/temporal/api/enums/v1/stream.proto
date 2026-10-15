@@ -22,4 +22,11 @@ enum StreamOwnerKind {
     // `streamnotifier.ownerCheckInterval`. A completed run gives no result. A failed, canceled,
     // terminated or timed-out run gives the run's own failure.
     STREAM_OWNER_KIND_ACTIVITY = 2;
+    // An Activity that a Workflow scheduled owns the stream. `workflow_id` names the Workflow,
+    // `run_id` the run that scheduled the Activity, and `activity_id` the Activity. The stream
+    // closes when the Workflow sees the Activity end. If the Activity is no longer pending in the
+    // run and no close came, the stream notifier closes the stream with a failure, after
+    // `streamnotifier.ownerStartGrace` from its start and `streamnotifier.ownerCloseGrace` from
+    // the first check that found the Activity gone.
+    STREAM_OWNER_KIND_WORKFLOW_ACTIVITY = 3;
 }

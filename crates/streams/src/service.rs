@@ -5,10 +5,10 @@ use crate::{
     StreamResult, StreamStore, Streams, StreamsOptions,
     proto::{
         AppendRequest, CloseRequest, DeleteOwnerRequest, FlushNotificationsRequest,
-        FlushNotificationsResponse, LatestRequest, ReadRangeRequest, ReadRequest,
-        ReleaseFloorRequest, RetireProducerRequest, RunStreamDriverRequest,
-        RunStreamDriverResponse, StreamFailure, StreamStoreConfig, SubscribeRequest,
-        UnsubscribeRequest, WaitForNotificationRequest, stream_store_config,
+        FlushNotificationsResponse, FollowRangeRequest, FollowRequest, LatestRequest,
+        ReadRangeRequest, ReadRequest, ReleaseFloorRequest, RetireProducerRequest,
+        RunStreamDriverRequest, RunStreamDriverResponse, StreamFailure, StreamStoreConfig,
+        SubscribeRequest, UnsubscribeRequest, WaitForNotificationRequest, stream_store_config,
     },
     subscribe::Subscriptions,
 };
@@ -173,6 +173,20 @@ impl StreamService {
                 .read_range(decode::<ReadRangeRequest>(rpc, request)?)
                 .await
                 .map(|r| r.encode_to_vec()),
+            "Follow" => {
+                let mut request = decode::<FollowRequest>(rpc, request)?;
+                request.max_records = request.max_records.min(MAX_READ_RECORDS);
+                request.wait = capped_wait(request.wait);
+                crate::follow::follow(&self.streams, &self.subscriptions, request)
+                    .await
+                    .map(|r| r.encode_to_vec())
+            }
+            "FollowRange" => crate::follow::follow_range(
+                &self.streams,
+                decode::<FollowRangeRequest>(rpc, request)?,
+            )
+            .await
+            .map(|r| r.encode_to_vec()),
             "ReleaseFloor" => self
                 .streams
                 .release_floor(decode::<ReleaseFloorRequest>(rpc, request)?)
@@ -230,14 +244,23 @@ impl StreamService {
 /// `request` with its record count and wait cut to what Core allows.
 fn capped(mut request: ReadRequest) -> ReadRequest {
     request.max_records = request.max_records.min(MAX_READ_RECORDS);
-    let too_long = request
-        .wait
+    request.wait = capped_wait(request.wait);
+    request
+}
+
+fn capped_wait<D>(wait: Option<D>) -> Option<D>
+where
+    D: Copy + TryFrom<Duration>,
+    Duration: TryFrom<D>,
+{
+    let too_long = wait
         .and_then(|wait| Duration::try_from(wait).ok())
         .is_some_and(|wait| wait > MAX_READ_WAIT);
     if too_long {
-        request.wait = MAX_READ_WAIT.try_into().ok();
+        MAX_READ_WAIT.try_into().ok()
+    } else {
+        wait
     }
-    request
 }
 
 fn decode<T: Message + Default>(rpc: &str, request: &[u8]) -> Result<T, StreamFailure> {
@@ -395,6 +418,7 @@ mod tests {
                         ..Default::default()
                     }),
                     content_hash: vec![value.as_bytes()[0]; 32],
+                    ..Default::default()
                 })
                 .collect(),
         }
@@ -1246,6 +1270,9 @@ mod tests {
             a: i64,
         ) -> StreamResult<()> {
             self.0.retire_producer(c, t, p, a).await
+        }
+        async fn written_topics(&self, c: &crate::proto::ChainId) -> StreamResult<Vec<String>> {
+            self.0.written_topics(c).await
         }
         async fn delete_owner(
             &self,
