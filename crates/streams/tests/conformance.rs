@@ -2216,3 +2216,28 @@ mod memorydb_acl_cluster_redis {
         deleting_an_owner_drops_every_chain_of_it,
     );
 }
+
+/// Apache Kvrocks, a test lane with no support claim. It has no ACL users and no Redis Cluster.
+#[cfg(feature = "redis")]
+mod kvrocks {
+    store_cases!(super::on_redis::redis("STREAMS_KVROCKS_URL", false));
+    conformance!(super::on_redis::redis("STREAMS_KVROCKS_URL", false);
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+    // Kvrocks answers an empty `XREADGROUP` for a missing group where Redis fails with
+    // `NOGROUP`, so the doorbell's group is never made and its case can't pass.
+    conformance!(super::on_redis::redis_with_log("STREAMS_KVROCKS_URL", false);
+        an_append_writes_one_entry_with_its_last_position,
+        an_entry_stays_until_its_ack,
+        another_consumer_claims_an_entry_only_after_claim_idle,
+        a_refused_append_writes_no_entry,
+    );
+}
+
+#[cfg(feature = "redis")]
+mod workflow_activity_kvrocks {
+    store_cases!(super::workflow_activity(super::on_redis::redis(
+        "STREAMS_KVROCKS_URL",
+        false
+    )));
+}

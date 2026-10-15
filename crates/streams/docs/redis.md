@@ -118,3 +118,9 @@ predates the move.
 **Managed Redis.** [managed-redis.md](managed-redis.md) covers Amazon MemoryDB and ElastiCache,
 with the access string that those services take in place of `ACL SETUSER`.
 
+**Kvrocks lane.** `STREAMS_KVROCKS_URL` names an Apache Kvrocks server, which keeps its data on
+disk. The script starts one when it finds a `kvrocks` binary or Docker. The conformance suite runs
+on it standalone, with the store cases, owner deletes and the notification log. This lane is a
+test only. We make no support claim for Kvrocks. Its doorbell case does not run, since Kvrocks
+answers an empty `XREADGROUP` where Redis fails with `NOGROUP`, so a driver never makes the
+doorbell's group. Kvrocks has no ACL users and runs no Redis Cluster, so those lanes do not run.
