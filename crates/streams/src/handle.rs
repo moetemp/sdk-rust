@@ -79,32 +79,48 @@ impl StreamsOptions {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Kind {
+    Workflow,
+    Activity,
+    WorkflowActivity,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct OwnerKey {
     namespace: String,
-    activity: bool,
-    /// The Workflow id or the Activity id.
+    kind: Kind,
+    /// The Workflow id, the standalone Activity id, or the Workflow that scheduled a Workflow
+    /// Activity.
     id: String,
+    /// A Workflow Activity's id. Empty for other kinds.
+    activity_id: String,
+    /// The pinned run. A Workflow Activity always names its scheduling run.
     run_id: String,
 }
 
 impl OwnerKey {
     fn owner(&self) -> OwnerId<'_> {
-        if self.activity {
-            OwnerId::Activity(&self.id)
-        } else {
-            OwnerId::Workflow(&self.id)
+        match self.kind {
+            Kind::Workflow => OwnerId::Workflow(&self.id),
+            Kind::Activity => OwnerId::Activity(&self.id),
+            Kind::WorkflowActivity => OwnerId::WorkflowActivity {
+                workflow_id: &self.id,
+                activity_id: &self.activity_id,
+            },
         }
     }
 
     /// The owner as error texts name it.
     fn label(&self) -> String {
-        let kind = if self.activity {
-            "Activity"
-        } else {
-            "Workflow"
-        };
-        format!("{kind} {:?}", self.id)
+        match self.kind {
+            Kind::Workflow => format!("Workflow {:?}", self.id),
+            Kind::Activity => format!("Activity {:?}", self.id),
+            Kind::WorkflowActivity => format!(
+                "Activity {:?} of run {:?} of Workflow {:?}",
+                self.activity_id, self.run_id, self.id
+            ),
+        }
     }
 }
 
@@ -402,7 +418,7 @@ impl Streams {
                 break page;
             }
             if unix_ms() >= state.next_check_ms {
-                state.owner_ended = self.owner_ended(stream, &target.chain).await?;
+                state.owner_ended = self.owner_ended(stream, &target.chain, &mut state).await?;
                 state.check_interval_ms = (state.check_interval_ms * 2)
                     .clamp(millis(minimum), millis(self.options.owner_check_max));
                 state.next_check_ms = unix_ms() + state.check_interval_ms;
@@ -657,10 +673,33 @@ impl Streams {
     }
 
     /// Whether the owner a read follows ended. Following the chain, a run that continued as
-    /// new is not the end, and a new chain on the Workflow id is.
-    async fn owner_ended(&self, stream: &StreamAddress, chain: &ChainId) -> StreamResult<bool> {
+    /// new is not the end, and a new chain on the Workflow id is. A Workflow Activity that its
+    /// running run no longer lists as pending ends the read only after
+    /// [StreamsOptions::owner_start_grace] from the first check that found it so, since a
+    /// Workflow can write a link to the stream before the server takes the Activity's schedule.
+    async fn owner_ended(
+        &self,
+        stream: &StreamAddress,
+        chain: &ChainId,
+        state: &mut ReadState,
+    ) -> StreamResult<bool> {
         let key = owner_key(stream);
         match self.describe(&key, &key.run_id).await {
+            Ok(described) if key.kind == Kind::WorkflowActivity => match described.status {
+                OwnerStatus::Running => {
+                    state.owner_missing_since_ms = 0;
+                    Ok(false)
+                }
+                OwnerStatus::ActivityGone => {
+                    let now = unix_ms();
+                    if state.owner_missing_since_ms == 0 {
+                        state.owner_missing_since_ms = now;
+                    }
+                    let gone_for = now.saturating_sub(state.owner_missing_since_ms);
+                    Ok(gone_for >= millis(self.options.owner_start_grace))
+                }
+                OwnerStatus::ContinuedAsNew | OwnerStatus::Ended => Ok(true),
+            },
             Err(OwnerError::NotFound(_)) => {
                 // The chain came from this owner, so Temporal has since dropped it, and nothing
                 // more will be written for it.
@@ -795,6 +834,11 @@ impl Streams {
         let (id, other) = match StreamOwnerKind::try_from(request.owner_kind) {
             Ok(StreamOwnerKind::Workflow) => (&request.workflow_id, &request.activity_id),
             Ok(StreamOwnerKind::Activity) => (&request.activity_id, &request.workflow_id),
+            Ok(StreamOwnerKind::WorkflowActivity) => {
+                return Err(StreamError::invalid_argument(
+                    "a Workflow Activity's streams go with its Workflow's delete",
+                ));
+            }
             _ => return Err(unsupported_kind(request.owner_kind)),
         };
         if request.namespace.is_empty() || id.is_empty() {
@@ -835,7 +879,21 @@ impl Streams {
         {
             return Ok(chain_of_key(owner, &checked.first_run_id));
         }
-        let chain = if owner.run_id.is_empty() {
+        let chain = if owner.kind == Kind::WorkflowActivity {
+            // A Workflow Activity writes only while it runs, so a run that no longer lists it as
+            // pending refuses at once.
+            let chain = chain_of_key(owner, &owner.run_id);
+            match self.describe(owner, &owner.run_id).await {
+                Err(OwnerError::NotFound(_)) if known.is_some() => {
+                    return Err(self.closed(&chain, gone_text(owner)).await);
+                }
+                Err(error) => return Err(not_found(owner, error)),
+                Ok(described) if described.status != OwnerStatus::Running => {
+                    return Err(self.closed(&chain, "has ended").await);
+                }
+                Ok(_) => chain,
+            }
+        } else if owner.run_id.is_empty() {
             // The latest run names the chain and tells whether it ended, in one call.
             let latest = self.describe(owner, "").await;
             if let (Err(OwnerError::NotFound(_)), Some(checked)) = (&latest, &known) {
@@ -946,7 +1004,7 @@ impl Streams {
     fn hash(&self, stream: &StreamAddress) -> String {
         let chain = chain_of(stream, "");
         let (kind, id) = chain_owner(&chain);
-        stream_hash(&stream.namespace, kind, id, &stream.topic)
+        stream_hash(&stream.namespace, kind, &id, &stream.topic)
     }
 
     fn cursor(&self, stream: &StreamAddress, position: &str) -> String {
@@ -1005,6 +1063,24 @@ pub(crate) fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAdd
                 ));
             }
         }
+        Ok(StreamOwnerKind::WorkflowActivity) => {
+            if stream.namespace.is_empty()
+                || stream.workflow_id.is_empty()
+                || stream.activity_id.is_empty()
+            {
+                return Err(StreamError::invalid_argument(
+                    "a stream that a Workflow Activity owns needs its namespace, its Workflow id \
+                     and its Activity id",
+                ));
+            }
+            if stream.run_id.is_empty() {
+                // An Activity id names nothing across runs, since ids such as `1` repeat after
+                // Continue-as-New.
+                return Err(StreamError::invalid_argument(
+                    "a stream that a Workflow Activity owns needs the run that scheduled it",
+                ));
+            }
+        }
         _ => return Err(unsupported_kind(stream.owner_kind)),
     }
     check_topic(&stream.topic)?;
@@ -1013,8 +1089,8 @@ pub(crate) fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAdd
 
 fn unsupported_kind(owner_kind: i32) -> StreamError {
     StreamError::unsupported(format!(
-        "this release keeps streams of Workflows and standalone Activities only, not owner kind \
-         {owner_kind}"
+        "this release keeps streams of Workflows, standalone Activities and Workflow Activities \
+         only, not owner kind {owner_kind}"
     ))
 }
 
@@ -1058,28 +1134,48 @@ fn millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
+fn kind_of(owner_kind: i32) -> Kind {
+    match StreamOwnerKind::try_from(owner_kind) {
+        Ok(StreamOwnerKind::Activity) => Kind::Activity,
+        Ok(StreamOwnerKind::WorkflowActivity) => Kind::WorkflowActivity,
+        _ => Kind::Workflow,
+    }
+}
+
 fn owner_key(stream: &StreamAddress) -> OwnerKey {
-    let activity = stream.owner_kind == StreamOwnerKind::Activity as i32;
+    let kind = kind_of(stream.owner_kind);
+    let (id, activity_id) = match kind {
+        Kind::Workflow => (&stream.workflow_id, ""),
+        Kind::Activity => (&stream.activity_id, ""),
+        Kind::WorkflowActivity => (&stream.workflow_id, stream.activity_id.as_str()),
+    };
     OwnerKey {
         namespace: stream.namespace.clone(),
-        activity,
-        id: if activity {
-            stream.activity_id.clone()
-        } else {
-            stream.workflow_id.clone()
-        },
+        kind,
+        id: id.clone(),
+        activity_id: activity_id.to_string(),
         run_id: stream.run_id.clone(),
     }
 }
 
-/// The latest run of the owner of `chain`.
+/// The latest run of the owner of `chain`, or a Workflow Activity's scheduling run.
 fn chain_owner_key(chain: &ChainId) -> OwnerKey {
-    let activity = chain.owner_kind == StreamOwnerKind::Activity as i32;
+    let kind = kind_of(chain.owner_kind);
+    let (id, activity_id, run_id) = match kind {
+        Kind::Workflow => (&chain.workflow_id, "", ""),
+        Kind::Activity => (&chain.activity_id, "", ""),
+        Kind::WorkflowActivity => (
+            &chain.workflow_id,
+            chain.activity_id.as_str(),
+            chain.first_run_id.as_str(),
+        ),
+    };
     OwnerKey {
         namespace: chain.namespace.clone(),
-        activity,
-        id: chain_owner(chain).1.to_string(),
-        run_id: String::new(),
+        kind,
+        id: id.clone(),
+        activity_id: activity_id.to_string(),
+        run_id: run_id.to_string(),
     }
 }
 
@@ -1091,34 +1187,43 @@ pub(crate) fn chain_of(stream: &StreamAddress, first_run_id: &str) -> ChainId {
 fn chain_of_key(owner: &OwnerKey, first_run_id: &str) -> ChainId {
     // A Workflow chain keeps the kind unset, as every chain from before the Activity kind does,
     // so the two compare equal.
-    if owner.activity {
-        ChainId {
+    match owner.kind {
+        Kind::Workflow => ChainId {
+            namespace: owner.namespace.clone(),
+            workflow_id: owner.id.clone(),
+            first_run_id: first_run_id.to_string(),
+            ..Default::default()
+        },
+        Kind::Activity => ChainId {
             namespace: owner.namespace.clone(),
             first_run_id: first_run_id.to_string(),
             owner_kind: StreamOwnerKind::Activity as i32,
             activity_id: owner.id.clone(),
             ..Default::default()
-        }
-    } else {
-        ChainId {
+        },
+        // The scheduling run keys a Workflow Activity, whatever chain that run is in.
+        Kind::WorkflowActivity => ChainId {
             namespace: owner.namespace.clone(),
             workflow_id: owner.id.clone(),
-            first_run_id: first_run_id.to_string(),
-            ..Default::default()
-        }
+            first_run_id: owner.run_id.clone(),
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            activity_id: owner.activity_id.clone(),
+        },
     }
 }
 
 /// How a refusal says that Temporal no longer holds the owner.
 fn gone_text(owner: &OwnerKey) -> &'static str {
-    if owner.activity {
-        "is gone from Temporal"
-    } else {
-        "is gone from History"
+    match owner.kind {
+        Kind::Activity => "is gone from Temporal",
+        Kind::Workflow | Kind::WorkflowActivity => "is gone from History",
     }
 }
 
 fn first_run_id(owner: &OwnerKey, described: &OwnerDescription) -> StreamResult<String> {
+    if owner.kind == Kind::WorkflowActivity {
+        return Ok(owner.run_id.clone());
+    }
     if described.first_run_id.is_empty() {
         // The owner's own output is keyed by the chain's first run, so an empty one would split
         // the stream in two without an error.
@@ -1171,6 +1276,8 @@ mod tests {
     struct Owners {
         latest: Mutex<HashMap<String, Result<OwnerDescription, OwnerError>>>,
         runs: Mutex<HashMap<String, OwnerDescription>>,
+        /// The Activities each run lists as pending, by run id and Activity id.
+        pending: Mutex<std::collections::HashSet<(String, String)>>,
         describes: AtomicUsize,
     }
 
@@ -1227,6 +1334,17 @@ mod tests {
         fn describes(&self) -> usize {
             self.describes.load(Ordering::Relaxed)
         }
+
+        /// Sets whether run `run_id` lists Activity `activity_id` as pending.
+        fn pending(&self, run_id: &str, activity_id: &str, pending: bool) {
+            let key = (run_id.to_string(), activity_id.to_string());
+            let mut all = self.pending.lock().unwrap();
+            if pending {
+                all.insert(key);
+            } else {
+                all.remove(&key);
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -1241,6 +1359,26 @@ mod tests {
             let workflow_id = &match owner {
                 OwnerId::Workflow(id) => id.to_string(),
                 OwnerId::Activity(id) => format!("activity/{id}"),
+                OwnerId::WorkflowActivity { activity_id, .. } => {
+                    let run = self
+                        .runs
+                        .lock()
+                        .unwrap()
+                        .get(run_id)
+                        .cloned()
+                        .ok_or_else(|| OwnerError::NotFound(run_id.to_string()))?;
+                    let pending = self
+                        .pending
+                        .lock()
+                        .unwrap()
+                        .contains(&(run_id.to_string(), activity_id.to_string()));
+                    let status = match run.status {
+                        OwnerStatus::Running if pending => OwnerStatus::Running,
+                        OwnerStatus::Running => OwnerStatus::ActivityGone,
+                        _ => OwnerStatus::Ended,
+                    };
+                    return Ok(OwnerDescription { status, ..run });
+                }
             };
             if !run_id.is_empty() {
                 return self
@@ -1297,6 +1435,7 @@ mod tests {
                 ..Default::default()
             }),
             content_hash: Sha256::digest(value.as_bytes()).to_vec(),
+            ..Default::default()
         }
     }
 
@@ -3065,5 +3204,333 @@ mod tests {
         setup.streams.append(timed(1, 0, 2, "a2")).await.unwrap();
         let (records, _) = shape(&setup, &page.cursor, &page.state).await;
         assert_eq!(records, [("a2".to_string(), key(1, 0), 0, true)]);
+    }
+
+    /// A stream of Activity `tool` that run `run-1` of Workflow `wf` scheduled.
+    fn wfa_stream(topic: &str) -> StreamAddress {
+        StreamAddress {
+            namespace: "ns".to_string(),
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            workflow_id: "wf".to_string(),
+            run_id: "run-1".to_string(),
+            activity_id: "tool".to_string(),
+            topic: topic.to_string(),
+        }
+    }
+
+    fn wfa_chain(run_id: &str) -> ChainId {
+        ChainId {
+            namespace: "ns".to_string(),
+            workflow_id: "wf".to_string(),
+            first_run_id: run_id.to_string(),
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            activity_id: "tool".to_string(),
+        }
+    }
+
+    /// Run `run-1` of `wf` lists `tool` as pending.
+    fn wfa_setup(options: StreamsOptions) -> Setup {
+        let setup = setup(options);
+        setup.owners.pending("run-1", "tool", true);
+        setup
+    }
+
+    fn wfa_append(sequence: i64, value: &str) -> AppendRequest {
+        AppendRequest {
+            stream: Some(wfa_stream("out")),
+            producer: Some(Producer::Activity(ActivityProducer {
+                workflow_id: "wf".to_string(),
+                run_id: "run-1".to_string(),
+                activity_id: "tool".to_string(),
+                attempt: 1,
+                ..Default::default()
+            })),
+            ..append("", sequence, value)
+        }
+    }
+
+    fn wfa_read(after: &str, state: &[u8], wait: Duration) -> ReadRequest {
+        ReadRequest {
+            stream: Some(wfa_stream("out")),
+            ..read_after(after, state, wait)
+        }
+    }
+
+    fn end_run(setup: &Setup, run_id: &str) {
+        setup
+            .owners
+            .runs
+            .lock()
+            .unwrap()
+            .get_mut(run_id)
+            .unwrap()
+            .status = OwnerStatus::Ended;
+    }
+
+    async fn wfa_chain_closed(store: &MemoryStore, run_id: &str) -> bool {
+        store
+            .read(StoreReadRequest {
+                chain: Some(wfa_chain(run_id)),
+                topic: "out".to_string(),
+                max_records: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .closed
+    }
+
+    #[tokio::test]
+    async fn a_workflow_activity_writes_its_own_stream_keyed_by_its_run() {
+        let setup = wfa_setup(quick());
+        let landed = setup.streams.append(wfa_append(1, "1")).await.unwrap();
+        let held = setup
+            .store
+            .latest(StoreLatestRequest {
+                chain: Some(wfa_chain("run-1")),
+                topic: "out".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(held.position, "0");
+        assert_eq!(
+            setup
+                .store
+                .written_topics(&wfa_chain("run-1"))
+                .await
+                .unwrap(),
+            ["out"]
+        );
+        let read = setup
+            .streams
+            .read(wfa_read("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(read.records[0].cursor, landed.last_cursor);
+        assert_eq!(read.chain_first_run_id, "run-1");
+        // Activity ids repeat after Continue-as-New, so the next run's `tool` is another stream.
+        setup.owners.run("wf", "run-2", "run-1");
+        setup.owners.pending("run-2", "tool", true);
+        let mut next = wfa_stream("out");
+        next.run_id = "run-2".to_string();
+        let error = setup
+            .streams
+            .read(ReadRequest {
+                stream: Some(next),
+                after: landed.last_cursor.clone(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Cursor, "{error}");
+        // The Workflow's own stream on the same topic is another stream too.
+        let error = setup
+            .streams
+            .read(ReadRequest {
+                stream: Some(stream("out")),
+                after: landed.last_cursor,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Cursor, "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_workflow_activity_address_needs_its_workflow_run_and_activity() {
+        let setup = wfa_setup(quick());
+        let mut bad = Vec::new();
+        for clear in [
+            |s: &mut StreamAddress| s.workflow_id.clear(),
+            |s: &mut StreamAddress| s.run_id.clear(),
+            |s: &mut StreamAddress| s.activity_id.clear(),
+            |s: &mut StreamAddress| s.namespace.clear(),
+        ] {
+            let mut stream = wfa_stream("out");
+            clear(&mut stream);
+            bad.push(stream);
+        }
+        for bad in bad {
+            assert_eq!(
+                kind(
+                    setup
+                        .streams
+                        .latest(LatestRequest { stream: Some(bad) })
+                        .await
+                ),
+                StreamFailureKind::InvalidArgument
+            );
+        }
+        assert_eq!(setup.owners.describes(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_workflow_activity_read_ends_done_at_a_stored_close() {
+        let setup = wfa_setup(quick());
+        setup.streams.append(wfa_append(1, "1")).await.unwrap();
+        setup
+            .streams
+            .close(CloseRequest {
+                stream: Some(wfa_stream("out")),
+                closed_by: "tool@run-1".to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (delivered, end) =
+            read_activity_to_end(&setup.streams, wfa_read("", &[], Duration::from_secs(5))).await;
+        assert_eq!(delivered, 1);
+        assert!(end.done);
+        assert_eq!(end.closed_by, "tool@run-1");
+    }
+
+    #[tokio::test]
+    async fn a_workflow_activity_read_ends_at_once_when_its_run_closed() {
+        let setup = wfa_setup(quick());
+        setup.streams.append(wfa_append(1, "1")).await.unwrap();
+        end_run(&setup, "run-1");
+        let started = std::time::Instant::now();
+        let (delivered, end) =
+            read_activity_to_end(&setup.streams, wfa_read("", &[], Duration::from_secs(5))).await;
+        assert_eq!(delivered, 1);
+        assert!(end.done);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // A pinned run's end marks nothing closed, as for other pinned reads.
+        assert!(!wfa_chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test]
+    async fn a_gone_workflow_activity_ends_a_read_only_after_the_grace() {
+        let grace = Duration::from_millis(400);
+        let setup = wfa_setup(StreamsOptions {
+            owner_start_grace: grace,
+            ..quick()
+        });
+        setup.streams.append(wfa_append(1, "1")).await.unwrap();
+        setup.owners.pending("run-1", "tool", false);
+        let first = setup
+            .streams
+            .read(wfa_read("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let idle = setup
+            .streams
+            .read(wfa_read(
+                &first.cursor,
+                &first.state,
+                Duration::from_millis(150),
+            ))
+            .await
+            .unwrap();
+        assert!(!idle.done);
+        let (delivered, end) = read_activity_to_end(
+            &setup.streams,
+            wfa_read(&idle.cursor, &idle.state, Duration::from_secs(5)),
+        )
+        .await;
+        assert_eq!(delivered, 0);
+        assert!(end.done);
+        assert!(started.elapsed() >= grace - Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn a_workflow_activity_read_before_its_schedule_stays_open() {
+        let setup = setup(quick());
+        let idle = setup
+            .streams
+            .read(wfa_read("", &[], Duration::from_millis(150)))
+            .await
+            .unwrap();
+        assert!(idle.records.is_empty() && !idle.done);
+        setup.owners.pending("run-1", "tool", true);
+        setup.streams.append(wfa_append(1, "1")).await.unwrap();
+        let read = setup
+            .streams
+            .read(wfa_read(&idle.cursor, &idle.state, Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(read.records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_workflow_activity_read_of_a_missing_run_waits_the_grace() {
+        let setup = before_owner_starts(Duration::ZERO);
+        let error = setup
+            .streams
+            .read(wfa_read("", &[], Duration::from_secs(5)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::NotFound);
+        assert!(error.message.contains("Activity \"tool\""), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_workflow_activity_producer_is_refused_once_the_activity_is_gone() {
+        let setup = wfa_setup(quick());
+        setup.streams.append(wfa_append(1, "1")).await.unwrap();
+        setup.owners.pending("run-1", "tool", false);
+        tokio::time::advance(OWNER_RECHECK + Duration::from_secs(1)).await;
+        let error = setup.streams.append(wfa_append(2, "2")).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Closed);
+        assert!(error.message.contains("Activity \"tool\""), "{error}");
+        assert!(wfa_chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test]
+    async fn a_workflow_activity_producer_of_a_closed_run_is_refused() {
+        let setup = wfa_setup(quick());
+        end_run(&setup, "run-1");
+        assert_eq!(
+            kind(setup.streams.append(wfa_append(1, "1")).await),
+            StreamFailureKind::Closed
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workflow_delete_removes_the_streams_of_its_workflow_activities() {
+        let setup = wfa_setup(quick());
+        setup.streams.append(wfa_append(1, "1")).await.unwrap();
+        let mut request = DeleteOwnerRequest {
+            namespace: "ns".to_string(),
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            workflow_id: "wf".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(
+            kind(setup.streams.delete_owner(request.clone()).await),
+            StreamFailureKind::InvalidArgument
+        );
+        request.owner_kind = StreamOwnerKind::Workflow as i32;
+        // A Workflow whose id only starts with `wf` keeps its Activities' streams.
+        setup.owners.run("wf2", "run-9", "run-9");
+        setup.owners.pending("run-9", "tool", true);
+        let mut other = wfa_append(1, "1");
+        other.stream.as_mut().unwrap().workflow_id = "wf2".to_string();
+        other.stream.as_mut().unwrap().run_id = "run-9".to_string();
+        setup.streams.append(other).await.unwrap();
+        assert!(setup.streams.delete_owner(request).await.unwrap().deleted > 0);
+        let gone = setup
+            .store
+            .latest(StoreLatestRequest {
+                chain: Some(wfa_chain("run-1")),
+                topic: "out".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(gone.position, "");
+        let kept = setup
+            .store
+            .latest(StoreLatestRequest {
+                chain: Some(ChainId {
+                    workflow_id: "wf2".to_string(),
+                    ..wfa_chain("run-9")
+                }),
+                topic: "out".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(kept.position, "0");
     }
 }
