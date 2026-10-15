@@ -654,7 +654,8 @@ impl Workflows {
             );
             return Ok(());
         };
-        let completion_outcome = self.append_output(&run_id, completion_outcome).await;
+        let (completion_outcome, output_appended) =
+            self.append_output(&run_id, completion_outcome).await;
         let replaying = completion_outcome.replaying;
 
         let mut wft_from_complete = None;
@@ -686,6 +687,7 @@ impl Workflows {
         }
 
         self.post_activation(PostActivationMsg {
+            output_appended,
             run_id,
             wft_report_status,
             wft_from_complete: maybe_pwft,
@@ -707,12 +709,23 @@ impl Workflows {
         &self,
         run_id: &str,
         mut result: ActivationCompleteResult,
-    ) -> ActivationCompleteResult {
+    ) -> (ActivationCompleteResult, bool) {
         let Some(output) = result.output.take() else {
-            return result;
+            return (result, true);
         };
-        let Err(failure) = self.append_to_store(&output.batch).await else {
-            return result;
+        let failure = match self.append_to_store(&output.batch).await {
+            Ok(dropped) => {
+                for topic in dropped {
+                    warn!(
+                        run_id,
+                        topic = %topic,
+                        "Dropped the Workflow Task's stream output for a topic the store has closed"
+                    );
+                    output.metrics.stream_output_dropped();
+                }
+                return (result, true);
+            }
+            Err(failure) => failure,
         };
         self.request_eviction(
             run_id,
@@ -729,10 +742,15 @@ impl Workflows {
                 WftFailureKind::Task,
                 &output.metrics,
             )));
-        result
+        (result, false)
     }
 
-    async fn append_to_store(&self, batch: &stream_output::OutputBatch) -> Result<(), Failure> {
+    /// Appends `batch`, answering the topics whose records it dropped because the store has
+    /// closed them.
+    async fn append_to_store(
+        &self,
+        batch: &stream_output::OutputBatch,
+    ) -> Result<Vec<String>, Failure> {
         #[cfg(feature = "streams")]
         if let Some(store) = &self.output_store {
             return store.append(batch).await.map_err(|e| {
@@ -1325,6 +1343,9 @@ struct LocalResolutionMsg {
 #[derive(Debug)]
 struct PostActivationMsg {
     run_id: String,
+    /// False when the activation's stream output could not be appended. Its Local Activities
+    /// then never start.
+    output_appended: bool,
     wft_report_status: WFTReportStatus,
     wft_from_complete: Option<WFTWithPaginator>,
     is_autocomplete: bool,
