@@ -658,6 +658,152 @@ mod tests {
         assert_eq!(setup.server.detached.lock().unwrap()[0].0, activity_chain);
     }
 
+    #[tokio::test]
+    async fn a_workflow_reader_subscribes_to_a_stream_that_a_workflow_activity_owns() {
+        let setup = setup();
+        let tool = |run_id: &str| StreamAddress {
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            run_id: run_id.to_string(),
+            activity_id: "1".to_string(),
+            ..stream()
+        };
+        let tool_chain = |run_id: &str| ChainId {
+            namespace: "ns".to_string(),
+            workflow_id: "owner".to_string(),
+            first_run_id: run_id.to_string(),
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            activity_id: "1".to_string(),
+        };
+        // Activity `1` of two runs, and the Workflow's own stream, are three streams.
+        for (address, id) in [(tool("run-a"), "1"), (tool("run-b"), "2")] {
+            let request = SubscribeRequest {
+                stream: Some(address),
+                ..subscribe_request(id)
+            };
+            let answer = subscribe(&setup.service, request).await.unwrap();
+            assert!(answer.attached);
+        }
+        assert!(
+            subscribe(&setup.service, subscribe_request("3"))
+                .await
+                .unwrap()
+                .attached
+        );
+        let attached = setup.server.attached.lock().unwrap().clone();
+        assert_eq!(attached[0].chain, tool_chain("run-a"));
+        assert_eq!(attached[1].chain, tool_chain("run-b"));
+        assert_eq!(attached[2].chain, chain("chain-1"));
+        let unsubscribe = UnsubscribeRequest {
+            stream: Some(tool("run-b")),
+            run_id: "reader-run".to_string(),
+            subscription_id: "2".to_string(),
+            ..Default::default()
+        };
+        setup
+            .service
+            .call("Unsubscribe", &unsubscribe.encode_to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            setup.server.detached.lock().unwrap()[0].0,
+            tool_chain("run-b")
+        );
+    }
+
+    async fn follow(service: &StreamService, request: crate::proto::FollowRequest) -> FollowAnswer {
+        FollowAnswer::decode(
+            service
+                .call("Follow", &request.encode_to_vec())
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap()
+    }
+
+    type FollowAnswer = crate::proto::FollowResponse;
+
+    fn append_one(value: &str) -> crate::proto::AppendRequest {
+        crate::proto::AppendRequest {
+            stream: Some(stream()),
+            producer: Some(crate::proto::append_request::Producer::Named(
+                crate::proto::NamedProducer {
+                    producer_id: "p".to_string(),
+                    attempt: 1,
+                },
+            )),
+            sequence: 1,
+            digest: vec![1; 32],
+            records: vec![crate::proto::AppendRecord {
+                kind: crate::proto::StreamRecordKind::Data as i32,
+                body: Some(Default::default()),
+                content_hash: vec![value.as_bytes()[0]; 32],
+                link: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_workflow_follower_attaches_each_idle_source_and_answers_its_wake() {
+        let setup = setup();
+        let request = crate::proto::FollowRequest {
+            stream: Some(stream()),
+            subscriber: Some(crate::proto::FollowSubscriber {
+                workflow_id: "reader".to_string(),
+                run_id: "reader-run".to_string(),
+                subscription_prefix: "7".to_string(),
+                generation: 0,
+            }),
+            ..Default::default()
+        };
+        let idle = follow(&setup.service, request.clone()).await;
+        assert!(idle.records.is_empty());
+        assert_eq!(idle.wakes.len(), 1);
+        assert_eq!(idle.wakes[0].source, 0);
+        assert_eq!(idle.wakes[0].subscription_id, "7.0");
+        let attached = setup.server.attached.lock().unwrap().clone();
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].subscription_id, "7.0");
+        // A record that lands later wakes the run, and the next step reads it.
+        setup
+            .service
+            .call("Append", &append_one("a").encode_to_vec())
+            .await
+            .unwrap();
+        let next = follow(
+            &setup.service,
+            crate::proto::FollowRequest {
+                state: idle.state,
+                ..request
+            },
+        )
+        .await;
+        assert_eq!(next.records.len(), 1);
+        assert!(next.wakes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_client_follower_waits_for_the_first_record_of_any_source() {
+        let setup = setup();
+        let append = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            setup
+                .service
+                .call("Append", &append_one("a").encode_to_vec())
+                .await
+                .unwrap();
+        };
+        let request = crate::proto::FollowRequest {
+            stream: Some(stream()),
+            wait: Duration::from_secs(10).try_into().ok(),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let (answer, ()) = tokio::join!(follow(&setup.service, request), append);
+        assert_eq!(answer.records.len(), 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
     async fn wait(
         setup: &Setup,
         after_counter: i64,
