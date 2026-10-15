@@ -2102,3 +2102,42 @@ async fn a_store_without_an_archive_refuses_to_move_its_hold() {
     assert_eq!(error.kind, StreamFailureKind::Unsupported);
     assert_eq!(setup.store.archived(&chain, "events").await.unwrap(), None);
 }
+
+#[tokio::test]
+async fn a_readers_short_hold_never_ends_the_archives_hold() {
+    let Some(url) = url() else {
+        return;
+    };
+    let mut setup = setup_with(&url, &url, &unique("archive-reader"), |options| {
+        options.retention = Duration::from_millis(200);
+        options.notification_log = true;
+        options.archive_lease = Some(Duration::from_secs(60));
+        options.floor_lease = Some(Duration::from_millis(100));
+        options.floor_release_grace = Duration::from_millis(100);
+    })
+    .await;
+    let chain = chain();
+    let first = setup
+        .store
+        .append(append(&chain, "p", 1, 2, b"\x01"))
+        .await
+        .unwrap();
+    // A positions-only reader holds with a lease far shorter than the archive's, and the archive
+    // lags behind it.
+    setup
+        .store
+        .hold_floor(&chain, "events", "reader-run/1", &first.first_position)
+        .await
+        .unwrap();
+    let floors = format!("{}:floors", log_key(&setup.prefix, &chain, "events"));
+    let ttl: i64 = setup.raw.pttl(&floors).await.unwrap();
+    assert!(ttl > 50_000, "{ttl}");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    setup
+        .store
+        .append(append(&chain, "p", 3, 1, b"\x02"))
+        .await
+        .unwrap();
+    // The reader's lease ended, and the records the archive has not taken stay.
+    assert_eq!(sequences(&mut setup, &chain).await, [1, 2, 3]);
+}
