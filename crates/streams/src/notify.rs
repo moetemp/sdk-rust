@@ -801,6 +801,19 @@ impl StreamStore for NotifyingStore {
         self.inner.release_floor(chain, topic, holder).await
     }
 
+    async fn advance_archive(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        position: &str,
+    ) -> StreamResult<()> {
+        self.inner.advance_archive(chain, topic, position).await
+    }
+
+    async fn archived(&self, chain: &ChainId, topic: &str) -> StreamResult<Option<String>> {
+        self.inner.archived(chain, topic).await
+    }
+
     async fn close_stream(
         &self,
         chain: &ChainId,

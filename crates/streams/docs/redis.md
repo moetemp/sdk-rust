@@ -54,6 +54,21 @@ streams and the doorbells as the consumer group `streams-driver` (`XREADGROUP`, 
 SLOTS`. The slot streams have no expiry, and a driver empties them. The logged append script has
 its own hash. The plain one is unchanged, and an SDK's provider writes no entries.
 
+**Archive hold.** With `archive_lease` set, a driver copies each topic into an archive, and the
+store holds what the archive doesn't hold yet. The floors hash keeps the holder `archive`. The
+append script makes it at a topic's first write as `0-1|<now + lease>`, so it holds the whole
+topic. `advance.lua` moves it to the archive's newest position with no minimum, renews the lease,
+extends the keys' expiry to it, and keeps the position in the meta's `archived` field. The trim
+reads the hold as it reads a reader's, so retention drops only what the archive holds. When the
+archive stops for longer than the lease, the hold ends and the trim goes on, and nothing blocks
+appends. The append script also adds the log key to `<prefix>:{<tag of slot s>}:a`, a sorted set
+in the slot of the chain's notification stream, scored by the time of the write. A close adds it
+with score `0`, so the archive takes closed topics first. `advance.lua` takes it out once the
+archive holds the meta's `last`, and the archive's release takes it out after a closed topic's
+end. The archive needs the notification log. The archived append script has its own hash. With an
+archive, an application also needs `~temporal-streams:{*}:a +zadd`, and a driver also needs
+`+zrangebyscore +zrem` on those keys.
+
 **Retired producers.** A field stays until a write's trim finds it older than the retention, so
 a topic written by many short-lived producers holds one field per producer attempt of the last
 retention window, about 235 bytes each. `RetireProducer` deletes one attempt's field with
@@ -114,3 +129,13 @@ a slot and fail a primary over, so set it only for a cluster of the tests' own. 
 conformance suite runs on each, and once more as a user with exactly the ACL above. The
 cross-implementation test also needs `STREAMS_BROOK_PY`, a Python SDK checkout whose provider
 predates the move.
+
+**Managed Redis.** [managed-redis.md](managed-redis.md) covers Amazon MemoryDB and ElastiCache,
+with the access string that those services take in place of `ACL SETUSER`.
+
+**Kvrocks lane.** `STREAMS_KVROCKS_URL` names an Apache Kvrocks server, which keeps its data on
+disk. The script starts one when it finds a `kvrocks` binary or Docker. The conformance suite runs
+on it standalone, with the store cases, owner deletes and the notification log. This lane is a
+test only. We make no support claim for Kvrocks. Its doorbell case does not run, since Kvrocks
+answers an empty `XREADGROUP` where Redis fails with `NOGROUP`, so a driver never makes the
+doorbell's group. Kvrocks has no ACL users and runs no Redis Cluster, so those lanes do not run.

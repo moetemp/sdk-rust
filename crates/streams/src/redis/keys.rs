@@ -31,6 +31,7 @@
 //! ```text
 //! <prefix>:{<tag of slot s>}:n      slot s's notification entries
 //! <prefix>:{<tag of slot d>}:bell   doorbell d, which slots s with s % doorbells == d ring
+//! <prefix>:{<tag of slot s>}:a      slot s's topics with records to archive, with an archive
 //! ```
 //!
 //! Each part, the prefix included, is percent-encoded, so a `:` or a brace in an id cannot make
@@ -108,6 +109,11 @@ impl ChainKeys {
 /// Slot `slot`'s notification stream.
 pub(crate) fn notifications(prefix: &str, slot: u16) -> String {
     format!("{}:{{{}}}:n", part(prefix), slots::tag(slot))
+}
+
+/// Slot `slot`'s set of log keys with records to archive, scored by their newest write.
+pub(crate) fn archive_pending(prefix: &str, slot: u16) -> String {
+    format!("{}:{{{}}}:a", part(prefix), slots::tag(slot))
 }
 
 /// Doorbell `doorbell`'s stream.

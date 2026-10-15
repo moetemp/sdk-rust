@@ -10,6 +10,10 @@ use crate::{
 /// with the stream as it keeps a record, so it gets the bound one record gets.
 pub const MAX_CLOSE_BYTES: usize = 1536 * 1024;
 
+/// The floor holder that stands for the archive in a hot store. Readers can't use it, since a
+/// reader's release would end the archive's hold.
+pub const ARCHIVE_HOLDER: &str = "archive";
+
 /// The result a stream closes with when its owner gave none: a `binary/null` payload, which every
 /// SDK's converter reads as no value. A payload with no encoding fails a caller that expects a
 /// typed result.
@@ -197,6 +201,30 @@ pub trait StreamStore: Send + Sync {
         Err(crate::StreamError::unsupported(
             "this store can't hold records for a positions-only reader",
         ))
+    }
+
+    /// Moves the archive's hold on a topic to `position`, once the archive holds every record up
+    /// to it. Unlike [StreamStore::hold_floor], this hold moves forward, so retention drops only
+    /// what the archive holds. It also renews the archive's lease, and [StreamStore::archived]
+    /// answers `position` from then on. A store with no archive hold refuses.
+    async fn advance_archive(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        position: &str,
+    ) -> StreamResult<()> {
+        let _ = (chain, topic, position);
+        Err(crate::StreamError::unsupported(
+            "this store keeps no archive hold",
+        ))
+    }
+
+    /// The newest position the archive holds for a topic, as [StreamStore::advance_archive] last
+    /// set it, or empty when the archive holds none yet. `None` when the store knows nothing of
+    /// the topic, or keeps no archive hold.
+    async fn archived(&self, chain: &ChainId, topic: &str) -> StreamResult<Option<String>> {
+        let _ = (chain, topic);
+        Ok(None)
     }
 
     /// Closes one topic of a chain in the store, then tells the topic's notifier on the server,
