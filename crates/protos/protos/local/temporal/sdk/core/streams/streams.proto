@@ -170,7 +170,7 @@ message ActivityProducer {
   string activity_id = 3;
   int32 attempt = 4;
   // When the attempt started, as the Activity task gives it. With it, Core writes the attempt as
-  // `started_unix_ms << 16 | min(attempt, 65535)`, so a later attempt and a reset attempt both
+  // `started_unix_ms << 11 | min(attempt, 2047)`, so a later attempt and a reset attempt both
   // supersede an earlier one. Unset writes `attempt` as it is.
   google.protobuf.Timestamp attempt_started_time = 5;
 }
