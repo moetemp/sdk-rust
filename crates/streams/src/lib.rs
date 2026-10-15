@@ -9,11 +9,13 @@
 //! `StreamService`, and Core's Worker appends a Workflow's own output through the same trait.
 
 mod cursor;
+mod driver;
 mod error;
 mod handle;
 mod memory;
 pub mod nexus;
 mod notify;
+mod notifylog;
 mod owner;
 mod reader;
 mod record;
@@ -24,8 +26,9 @@ mod store;
 mod subscribe;
 
 #[cfg(feature = "redis")]
-pub use self::redis::{RedisStore, RedisStoreOptions};
+pub use self::redis::{DEFAULT_NOTIFY_DOORBELLS, RedisStore, RedisStoreOptions};
 pub use cursor::{BEGINNING, END, cursor_position, mint_cursor, stream_hash};
+pub use driver::{StreamDriver, StreamDriverOptions};
 pub use error::{StreamError, StreamResult};
 pub use handle::{OWNER_RECHECK, OWNER_START_GRACE, Streams, StreamsOptions};
 pub use memory::MemoryStore;
@@ -34,6 +37,7 @@ pub use notify::{
     NotifierClient, NotifierPoll, NotifyError, NotifyingStore, StreamNotification,
     WorkflowAttachment, progress_counter,
 };
+pub use notifylog::{NotificationEntry, NotificationLog};
 pub use owner::{OwnerClient, OwnerDescription, OwnerError};
 pub use reader::{
     DEFAULT_MAX_RECORDS, MAX_STATE_BYTES, MAX_TRACKED_PRODUCERS, ReadTarget, read_page,

@@ -40,9 +40,16 @@ service StreamService {
   rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
   // Waits on the stream's notifier, for a client reader whose read came back empty. Returns when
   // the notifier's counter is above `after_counter`, when the stream closed, or at the server's
-  // wait limit (`streamnotifier.pollMaxWait`). The reader then reads again. After the wait limit,
-  // that read finds records whose notification was lost, or comes back empty again.
+  // wait limit (`streamnotifier.pollMaxWait`). The poll starts the notifier, and Core reads the
+  // stream once more just after it sends the poll, since a record that landed before the notifier
+  // existed woke no one. A newer record there answers at once. The reader then reads again.
+  // After the wait limit, that read finds records whose notification was lost, or comes back
+  // empty again.
   rpc WaitForNotification(WaitForNotificationRequest) returns (WaitForNotificationResponse);
+  // Runs a stream driver over the store's notification log until the caller cancels the call.
+  // It answers only when the server takes no stream notifications, or when the store keeps no
+  // log. Each driver of one store needs its own consumer name.
+  rpc RunStreamDriver(RunStreamDriverRequest) returns (RunStreamDriverResponse);
   // Reads again the exact range an earlier read answered, for a positions-only Workflow reader on
   // replay, and checks it against that read's digest. Waits for nothing and checks no owner.
   rpc ReadRange(ReadRangeRequest) returns (ReadResponse);
@@ -73,6 +80,10 @@ message StreamStoreConfig {
   // owner does. After it the read fails as NOT_FOUND. Unset waits 60 seconds, and zero fails at
   // once.
   google.protobuf.Duration owner_start_grace = 6;
+  // Each append writes a notification entry in the same store step, and producers send no
+  // notifications. A `StreamDriver` reads the entries and notifies the server, so readers wake
+  // only while one runs. Off by default. A store without a notification log refuses it.
+  bool notification_log = 7;
 }
 
 // Streams in a Redis or Redis Cluster that Core connects to itself.
@@ -96,6 +107,9 @@ message RedisStoreConfig {
   google.protobuf.Duration floor_lease = 7;
   // How long a hold lasts after its reader released it. Unset keeps one day.
   google.protobuf.Duration floor_release_grace = 8;
+  // With `StreamStoreConfig.notification_log`, how many doorbell streams the log rings, each one
+  // a driver blocks on. Zero uses 16.
+  uint32 notify_doorbells = 9;
 }
 
 // Streams in this process's memory, for tests and local development. Nothing survives the
@@ -347,6 +361,10 @@ message SubscribeResponse {
   string chain_first_run_id = 1;
   // Whether this call sent the attach. False when this process attached the reader before.
   bool attached = 2;
+  // The notification counter of the stream's newest record, read after the attach landed, zero
+  // for an empty stream. A record that landed before the notifier existed woke no one, so a
+  // reader whose last read stopped below this counter reads once more before it sleeps.
+  int64 newest_counter = 3;
 }
 
 message UnsubscribeRequest {
@@ -381,6 +399,21 @@ message WaitForNotificationResponse {
   // The failure the stream closed with, when it closed with one.
   temporal.api.failure.v1.Failure close_failure = 6;
 }
+
+message RunStreamDriverRequest {
+  // The driver's name in the log's consumer group, unique among the store's drivers.
+  string consumer = 1;
+  // How often the driver looks at every slot that holds entries. Unset uses 30 seconds.
+  google.protobuf.Duration sweep_interval = 2;
+  // How long another driver's unacked entries wait before this one takes them. Unset uses 60
+  // seconds.
+  google.protobuf.Duration claim_idle = 3;
+  // The most entries one read takes, and so the most streams one notify call names. Zero uses
+  // 100.
+  uint32 batch = 4;
+}
+
+message RunStreamDriverResponse {}
 
 message DeleteOwnerRequest {
   string namespace = 1;
