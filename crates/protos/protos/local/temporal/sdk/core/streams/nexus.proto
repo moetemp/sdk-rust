@@ -111,6 +111,10 @@ message AttachCallerRequest {
   // hear about the stream.
   string callback_url = 3;
   map<string, string> callback_headers = 4;
+  // The start is a follower's, which reads only when its callback hears progress. Its callback is
+  // attached awake and hears every change of the stream. Unset, the callback is attached idle,
+  // since a reader that reads first asks to be woken through its reads' `wake_token`.
+  bool follow = 5;
 }
 
 message AttachCallerResponse {

@@ -149,6 +149,9 @@ relevant information.
   operation's idle callback once the stream moves past the answer, then reads once more and
   answers what that finds. A reader that finds records on each call never waits. Reads through a
   transport, positions-only ones too, take the same path.
+* Experimental: `AttachCallerRequest` takes `follow`. A follower's start sets it, and Core
+  attaches that callback awake, so it hears every change of the stream. A start without it keeps
+  the idle attach.
 * Experimental: the Nexus `read` takes `floor_holder`. With it the read holds the floor and
   answers `replay`, the range of the records that crossed after the byte cut, with Core's digest
   over them. The new Nexus `read_range` operation, `NexusReadRange` for lang, reads that range

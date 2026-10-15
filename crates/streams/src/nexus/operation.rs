@@ -3,7 +3,8 @@
 //! The operation's start attaches the caller's callback to the stream's notifier on the server as
 //! an idle one, and answers with a token that names the stream. An idle callback hears nothing of
 //! the stream's progress until its reader, caught up, asks to be woken after a counter. It still
-//! gets the completion when the stream closes. Its cancel detaches the callback the start
+//! gets the completion when the stream closes. A follower's start attaches the callback awake,
+//! since the follower reads only when it hears progress. Its cancel detaches the callback the start
 //! attached. The token format is shared with every SDK, which decodes it on the Workflow side, so
 //! it must stay byte for byte what `crates/streams/nexus/operation_token_vectors.json` holds.
 
@@ -70,6 +71,7 @@ async fn attach(
     // Fresh for the latest run, since the Workflow id may have moved on to a new chain since a
     // read warmed the cache, and an attach to the ended chain would never hear the new stream.
     let chain = streams.chain_now(stream).await?;
+    let follow = request.follow;
     let operation_token = OperationToken {
         stream: stream.clone(),
         attach_request_id: request.request_id.clone(),
@@ -87,8 +89,9 @@ async fn attach(
             callback_headers: request.callback_headers,
             operation_token: operation_token.clone(),
             start_time: SystemTime::now(),
-            // A reader reads first, and a busy one never waits, so it costs no deliveries.
-            idle: true,
+            // A reader reads first, and a busy one never waits, so it costs no deliveries. A
+            // follower never reads first, so an idle callback would never hear its first records.
+            idle: !follow,
         })
         .await
         .map_err(caller_error)?;
@@ -413,6 +416,7 @@ mod tests {
             request_id: "attach-1".to_string(),
             callback_url: callback_url.to_string(),
             callback_headers: [("nexus-callback-token".to_string(), "abc".to_string())].into(),
+            follow: false,
         }
     }
 
@@ -518,6 +522,21 @@ mod tests {
         let attached = setup.notifier.attached.lock().unwrap().clone();
         assert!(attached.iter().all(|a| a.idle), "{attached:?}");
         assert!(setup.notifier.notified.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_follower_start_attaches_an_awake_callback() {
+        let setup = setup();
+        let follower = AttachCallerRequest {
+            follow: true,
+            ..attach_request("temporal://system")
+        };
+        attach(&setup.service, follower).await.unwrap();
+        let attached = setup.notifier.attached.lock().unwrap().clone();
+        let [attachment] = attached.as_slice() else {
+            panic!("one attach, not {attached:?}");
+        };
+        assert!(!attachment.idle);
     }
 
     #[tokio::test]
