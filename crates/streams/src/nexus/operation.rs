@@ -281,6 +281,7 @@ impl OperationToken {
                 workflow_id: body.stream.workflow_id,
                 run_id: body.stream.chain_run_id.unwrap_or_default(),
                 topic: body.stream.topic,
+                ..Default::default()
             },
             attach_request_id: body.attach,
             chain_first_run_id: body.chain,
@@ -293,6 +294,7 @@ impl OperationToken {
             namespace: self.stream.namespace.clone(),
             workflow_id: self.stream.workflow_id.clone(),
             first_run_id: self.chain_first_run_id.clone(),
+            ..Default::default()
         }
     }
 }
@@ -345,9 +347,11 @@ mod tests {
         async fn describe(
             &self,
             _: &str,
-            workflow_id: &str,
+            owner: crate::OwnerId<'_>,
             run_id: &str,
         ) -> Result<OwnerDescription, OwnerError> {
+            let (crate::OwnerId::Workflow(workflow_id) | crate::OwnerId::Activity(workflow_id)) =
+                owner;
             self.described.lock().unwrap().push(run_id.to_string());
             if self.missing.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(OwnerError::NotFound(workflow_id.to_string()));
@@ -366,7 +370,7 @@ mod tests {
                     run_id.to_string()
                 },
                 first_run_id,
-                status: WorkflowExecutionStatus::Running,
+                status: crate::OwnerStatus::of_workflow(WorkflowExecutionStatus::Running),
             })
         }
     }
@@ -445,6 +449,7 @@ mod tests {
             workflow_id: "owner-1".to_string(),
             run_id: run_id.to_string(),
             topic: "tokens".to_string(),
+            ..Default::default()
         }
     }
 
@@ -662,6 +667,7 @@ mod tests {
                 namespace: "default".to_string(),
                 workflow_id: "owner-1".to_string(),
                 first_run_id: "chain-1".to_string(),
+                ..Default::default()
             },
             "the notifier is keyed by the chain's first run"
         );
@@ -1011,6 +1017,7 @@ mod tests {
                 workflow_id: vector.stream.workflow_id.clone(),
                 run_id: vector.stream.chain_run_id.clone().unwrap_or_default(),
                 topic: vector.stream.topic.clone(),
+                ..Default::default()
             },
             attach_request_id: vector.attach.clone(),
             chain_first_run_id: vector.chain.clone(),

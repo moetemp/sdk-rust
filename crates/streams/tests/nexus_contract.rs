@@ -245,6 +245,7 @@ async fn every_output_member_is_declared() {
                 namespace: NAMESPACE.to_string(),
                 workflow_id: wf.to_string(),
                 first_run_id: "run-1".to_string(),
+                ..Default::default()
             }),
             topic: "out".to_string(),
             producer_id: "raw".to_string(),
