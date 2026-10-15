@@ -9,6 +9,7 @@
 //! `StreamService`, and Core's Worker appends a Workflow's own output through the same trait.
 
 mod cursor;
+mod driver;
 mod error;
 mod handle;
 mod memory;
@@ -26,6 +27,7 @@ mod subscribe;
 #[cfg(feature = "redis")]
 pub use self::redis::{DEFAULT_NOTIFY_DOORBELLS, RedisStore, RedisStoreOptions};
 pub use cursor::{BEGINNING, END, cursor_position, mint_cursor, stream_hash};
+pub use driver::{StreamDriver, StreamDriverOptions};
 pub use error::{StreamError, StreamResult};
 pub use handle::{OWNER_RECHECK, OWNER_START_GRACE, Streams, StreamsOptions};
 pub use memory::MemoryStore;

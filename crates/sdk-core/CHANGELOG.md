@@ -58,6 +58,12 @@ relevant information.
   `<prefix>:{<slot tag>}:n`, and Core rings one of `notify_doorbells` (16 when zero) doorbell
   streams when that stream takes its first entry. `testdata/redis/notify_slots.json` pins the slot
   tags for other SDKs. Drivers read as the consumer group `streams-driver`.
+* Experimental: the new `RunStreamDriver` stream call runs a stream driver until the caller
+  cancels it. The driver blocks on each doorbell and sweeps every busy slot every
+  `sweep_interval` (30 seconds). It folds each drain to the newest counter per stream, sends one
+  `NotifyStreams` call per namespace, and acks the entries only once the call landed. It takes
+  entries another driver left unacked for `claim_idle` (60 seconds). Each driver needs its own
+  `consumer`. `StreamDriver` runs the same in Rust.
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with

@@ -96,7 +96,7 @@ impl Subscriptions {
         }
     }
 
-    fn client(&self) -> StreamResult<&Arc<dyn NotifierClient>> {
+    pub(crate) fn client(&self) -> StreamResult<&Arc<dyn NotifierClient>> {
         self.client.as_ref().ok_or_else(|| {
             StreamError::unsupported("a Workflow reader needs a client connected to the server")
         })

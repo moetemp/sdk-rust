@@ -6,8 +6,9 @@ use crate::{
     proto::{
         AppendRequest, CloseRequest, DeleteOwnerRequest, FlushNotificationsRequest,
         FlushNotificationsResponse, LatestRequest, ReadRangeRequest, ReadRequest,
-        ReleaseFloorRequest, RetireProducerRequest, StreamFailure, StreamStoreConfig,
-        SubscribeRequest, UnsubscribeRequest, WaitForNotificationRequest, stream_store_config,
+        ReleaseFloorRequest, RetireProducerRequest, RunStreamDriverRequest,
+        RunStreamDriverResponse, StreamFailure, StreamStoreConfig, SubscribeRequest,
+        UnsubscribeRequest, WaitForNotificationRequest, stream_store_config,
     },
     subscribe::Subscriptions,
 };
@@ -182,6 +183,16 @@ impl StreamService {
                 .retire_producer(decode::<RetireProducerRequest>(rpc, request)?)
                 .await
                 .map(|r| r.encode_to_vec()),
+            "RunStreamDriver" => {
+                let request = decode::<RunStreamDriverRequest>(rpc, request)?;
+                let driver = crate::StreamDriver::new(
+                    self.store.clone(),
+                    self.subscriptions.client()?.clone(),
+                    driver_options(request)?,
+                )?;
+                Arc::new(driver).run().await?;
+                Ok(RunStreamDriverResponse {}.encode_to_vec())
+            }
             "FlushNotifications" => {
                 decode::<FlushNotificationsRequest>(rpc, request)?;
                 // A close retries until the server takes it, so a stopping process waits only
@@ -233,6 +244,27 @@ fn decode<T: Message + Default>(rpc: &str, request: &[u8]) -> Result<T, StreamFa
     T::decode(request).map_err(|error| {
         StreamError::invalid_argument(format!("the {rpc} request did not decode ({error})")).into()
     })
+}
+
+fn driver_options(request: RunStreamDriverRequest) -> StreamResult<crate::StreamDriverOptions> {
+    let mut options = crate::StreamDriverOptions {
+        consumer: request.consumer,
+        ..Default::default()
+    };
+    if let Some(interval) = request.sweep_interval {
+        options.sweep_interval = Duration::try_from(interval)
+            .ok()
+            .filter(|interval| !interval.is_zero())
+            .ok_or_else(|| StreamError::invalid_argument("a sweep interval must be positive"))?;
+    }
+    if let Some(idle) = request.claim_idle {
+        options.claim_idle = Duration::try_from(idle)
+            .map_err(|_| StreamError::invalid_argument("a claim idle time must not be negative"))?;
+    }
+    if request.batch > 0 {
+        options.batch = request.batch as usize;
+    }
+    Ok(options)
 }
 
 #[cfg(feature = "redis")]
@@ -734,6 +766,66 @@ mod tests {
                 assert_eq!((log.partitions(), log.doorbells()), (16_384, 4));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_driver_runs_as_a_call_until_its_caller_drops_it() {
+        let recorder = Arc::new(Recorder::default());
+        let service = Arc::new(
+            StreamService::connect_with_notifier(
+                StreamStoreConfig {
+                    store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+                    notify_on_append: true,
+                    notification_log: true,
+                    ..Default::default()
+                },
+                Arc::new(Running),
+                Some(recorder.clone()),
+            )
+            .await
+            .unwrap(),
+        );
+        let driving = service.clone();
+        let driver = tokio::spawn(async move {
+            driving
+                .call(
+                    "RunStreamDriver",
+                    &RunStreamDriverRequest {
+                        consumer: "d1".to_string(),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                )
+                .await
+        });
+        service.call("Append", &append(1, &["a"])).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while recorder.0.lock().unwrap().is_empty() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the driver notified the append");
+        assert_eq!(recorder.0.lock().unwrap()[0].counter, 1);
+        assert!(!driver.is_finished(), "a driver runs until it is dropped");
+        driver.abort();
+    }
+
+    #[tokio::test]
+    async fn a_driver_needs_a_store_with_a_log() {
+        let service = service_notifying(true, Arc::new(Recorder::default())).await;
+        let failure = service
+            .call(
+                "RunStreamDriver",
+                &RunStreamDriverRequest {
+                    consumer: "d1".to_string(),
+                    ..Default::default()
+                }
+                .encode_to_vec(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.kind, StreamFailureKind::Refused as i32);
     }
 
     #[tokio::test]

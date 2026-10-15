@@ -93,7 +93,9 @@ write, and `+xreadgroup +xautoclaim +xack +xdel +xgroup|create +xlen +xadd +clus
 `+config|get` only reads `maxmemory-policy`, and the store goes on when a server refuses it.
 
 **Tests.** The Redis tests run when `STREAMS_REDIS_URL` names a standalone server and
-`STREAMS_REDIS_CLUSTER_URL` a cluster seed. `scripts/redis-test-servers.sh` starts both. The
+`STREAMS_REDIS_CLUSTER_URL` a cluster seed. `scripts/redis-test-servers.sh` starts both, the
+cluster with one replica per primary. `STREAMS_REDIS_CLUSTER_ADMIN=1` lets the driver tests move
+a slot and fail a primary over, so set it only for a cluster of the tests' own. The
 conformance suite runs on each, and once more as a user with exactly the ACL above. The
 cross-implementation test also needs `STREAMS_BROOK_PY`, a Python SDK checkout whose provider
 predates the move.
