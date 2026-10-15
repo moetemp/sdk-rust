@@ -888,6 +888,7 @@ fn address(namespace: &str, stream: &StreamRef) -> Result<StreamAddress, Box<Nex
         workflow_id: stream.workflow_id.clone(),
         run_id: stream.chain_run_id.clone().unwrap_or_default(),
         topic: stream.topic.clone(),
+        ..Default::default()
     })
 }
 
