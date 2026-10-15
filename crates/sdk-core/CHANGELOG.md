@@ -195,6 +195,10 @@ relevant information.
   attempt that writes on after a newer one started reads as stale. Without the field the attempt
   is the Temporal attempt as before. `testdata/streams/activity_attempts.json` in
   `temporalio-streams` pins the formula for other SDKs.
+* Experimental: the Activity attempt key is `started_unix_ms << 11 | min(attempt, 2047)`, so it
+  fits 53 bits and a JSON number holds it exactly. The Nexus contract's models and JavaScript
+  refused the earlier 16-bit form. A start time from May 2109 on is refused. The vector file
+  holds the new keys.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
