@@ -32,6 +32,13 @@ for i = 6, #ARGV do
     first = last
   end
 end
+local topics = KEYS[5]
+if topics then
+  if sequence == 1 then
+    redis.call('SADD', topics, KEYS[1])
+  end
+  redis.call('PEXPIRE', topics, retention + grace)
+end
 redis.call('HSET', KEYS[2], field,
   ARGV[4] .. '|' .. (#ARGV - 5) .. '|' .. first .. '|' .. last .. '|' .. digest_arg)
 keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace, KEYS[4])

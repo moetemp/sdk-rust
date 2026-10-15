@@ -72,8 +72,17 @@ the tombstone that tells a log that expired from one that never existed.
 part escapes `!`, so no Workflow id makes that tag, and a Workflow's delete pattern never matches
 an Activity's keys. The tag starts with the namespace, so the documented ACL covers it.
 
+**Workflow Activity owners.** An Activity that a Workflow run scheduled is a chain of one too.
+Its keys have the hash tag `{<namespace>:!wa:<workflow id>:<run id>:<activity id>}`, so each
+Activity lands in a slot of its own and Activity `1` of the next run is another chain. Such a
+chain has one more key, `<prefix>:{<tag>}:topics`, a set of the log keys its producers wrote. The
+append script adds the log key with `SADD` when a producer attempt writes its first batch, and
+slides the set's expiry to the retention plus the grace on each append. The scheduling Workflow's
+Core reads it with `SMEMBERS` to close every topic when the Activity ends.
+
 **Deletes.** Deleting an owner's streams scans every primary for the owner id's keys, across all
-the Workflow's chains or all the Activity's runs. `SCAN` makes no promise about keys that move to
+the Workflow's chains or all the Activity's runs. A Workflow's delete also scans for the keys of
+every Activity it scheduled, in all its runs. `SCAN` makes no promise about keys that move to
 another node while it runs, so a delete during a cluster reshard can miss some. Run it again once
 the reshard is done.
 
@@ -87,7 +96,7 @@ percent-encoded. A Redis ACL user for one namespace's applications, with the rul
 conformance suite runs as:
 
 ```text
-ACL SETUSER streams-app on >secret resetkeys ~temporal-streams:{my-ns:* resetchannels -@all +evalsha +eval +script|load +multi +exec +xadd +xread +xrevrange +xrange +xtrim +xlen +hget +hset +hgetall +hincrby +hdel +hscan +rpush +lrange +exists +del +unlink +pexpire +pttl +time +info +config|get +ping +hello +client|setinfo +cluster|slots
+ACL SETUSER streams-app on >secret resetkeys ~temporal-streams:{my-ns:* resetchannels -@all +evalsha +eval +script|load +multi +exec +xadd +xread +xrevrange +xrange +xtrim +xlen +hget +hset +hgetall +hincrby +hdel +hscan +sadd +smembers +rpush +lrange +exists +del +unlink +pexpire +pttl +time +info +config|get +ping +hello +client|setinfo +cluster|slots
 ```
 
 A cluster client reads the topology with `CLUSTER SLOTS` first. An ACL user lives on one node,

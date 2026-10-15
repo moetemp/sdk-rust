@@ -655,6 +655,7 @@ impl NexusCalls {
                 kind: StreamRecordKind::Data as i32,
                 body: Some(body),
                 content_hash: Sha256::digest(plain).to_vec(),
+                ..Default::default()
             });
         }
         if records.is_empty() {
