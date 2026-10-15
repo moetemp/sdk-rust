@@ -140,18 +140,23 @@ impl OutputStore {
         }
     }
 
-    /// Appends `batch` as its run's producer, one topic after another.
+    /// Appends `batch` as its run's producer, one topic after another, and answers the topics
+    /// whose records it dropped.
     ///
     /// A failure that may have landed is sent again with a short backoff. The store answers a
-    /// repeat of the attempt's newest batch with its positions, so this never writes twice. Any
-    /// other failure, or one that lasts, is returned, and the Workflow Task must fail.
+    /// repeat of the attempt's newest batch with its positions, so this never writes twice. A
+    /// topic the store has closed refuses every retry of the task too, so its records are
+    /// dropped and the other topics go on. That holds when the run closed the topic itself
+    /// before its task reran. Any other failure, or one that lasts, is returned, and the
+    /// Workflow Task must fail.
     pub(crate) async fn append(
         &self,
         batch: &OutputBatch,
-    ) -> Result<(), temporalio_streams::StreamError> {
+    ) -> Result<Vec<String>, temporalio_streams::StreamError> {
         use prost::Message;
         use temporalio_streams::proto::{AppendRecord, StoreAppendRequest, StreamFailureKind};
         let producer_id = temporalio_streams::workflow_producer_id(&batch.run_id);
+        let mut dropped = vec![];
         for topic in &batch.topics {
             let records = topic
                 .records
@@ -193,6 +198,10 @@ impl OutputStore {
             loop {
                 match self.store.append(request.clone()).await {
                     Ok(_) => break,
+                    Err(error) if error.kind == StreamFailureKind::Closed => {
+                        dropped.push(topic.topic.clone());
+                        break;
+                    }
                     Err(error)
                         if tries < APPEND_TRIES
                             && matches!(
@@ -209,7 +218,7 @@ impl OutputStore {
                 }
             }
         }
-        Ok(())
+        Ok(dropped)
     }
 
     /// Drops the store's dedupe sessions of attempts that will not write again. A failure only
