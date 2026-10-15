@@ -36,12 +36,19 @@ pub fn activity_producer_id(activity: &ActivityProducer) -> String {
     format!("{}@{}", activity.activity_id, activity.run_id)
 }
 
+/// The low bits of an Activity attempt key that hold the Temporal attempt.
+const ACTIVITY_ATTEMPT_BITS: u32 = 11;
+
+/// The high bits of an Activity attempt key that hold the start time in Unix milliseconds. The
+/// whole key fits 53 bits, so a JSON number holds it exactly.
+const ACTIVITY_START_BITS: u32 = 53 - ACTIVITY_ATTEMPT_BITS;
+
 /// The largest Temporal attempt an Activity attempt key holds. A higher attempt keeps this one.
-pub const MAX_KEYED_ACTIVITY_ATTEMPT: i64 = 0xFFFF;
+pub const MAX_KEYED_ACTIVITY_ATTEMPT: i64 = (1 << ACTIVITY_ATTEMPT_BITS) - 1;
 
 /// The attempt an Activity attempt writes as.
 ///
-/// With `attempt_started_time`, it is `started_unix_ms << 16 | min(attempt, 65535)`. A retry and
+/// With `attempt_started_time`, it is `started_unix_ms << 11 | min(attempt, 2047)`. A retry and
 /// a reset attempt start later, so they write a higher attempt and supersede the earlier one, even
 /// though a reset sets the Temporal attempt back to 1. An attempt that writes on after a newer one
 /// started reads as stale. With no start time, it is the Temporal attempt, as a lang that sends
@@ -61,15 +68,15 @@ pub fn activity_attempt(activity: &ActivityProducer) -> StreamResult<i64> {
         .seconds
         .checked_mul(1000)
         .and_then(|ms| ms.checked_add(i64::from(started.nanos.div_euclid(1_000_000))))
-        .filter(|ms| (1..1 << 47).contains(ms))
+        .filter(|ms| (1..1 << ACTIVITY_START_BITS).contains(ms))
         .ok_or_else(|| {
             StreamError::invalid_argument(format!(
-                "an Activity attempt's start time must be after 1970 and before the year 6429, \
+                "an Activity attempt's start time must be after 1970 and before the year 2109, \
                  not {}s {}ns",
                 started.seconds, started.nanos
             ))
         })?;
-    Ok(unix_ms << 16 | attempt.min(MAX_KEYED_ACTIVITY_ATTEMPT))
+    Ok(unix_ms << ACTIVITY_ATTEMPT_BITS | attempt.min(MAX_KEYED_ACTIVITY_ATTEMPT))
 }
 
 /// The producer id a Workflow run writes its own records as.
