@@ -104,7 +104,7 @@ impl TieredStore {
             tokio::time::sleep(wait_of(request)).await;
             return Ok(Some(StoreReadResponse::default()));
         };
-        let segment = self.segment(&name).await?;
+        let mut segment = self.segment(&name).await?;
         let after_key = (!after.is_empty()).then(|| sort_key(after)).transpose()?;
         if let Some(after_key) = &after_key
             && !segment.after_position.is_empty()
@@ -116,37 +116,70 @@ impl TieredStore {
                 request.topic
             )));
         }
-        let last = segment.last_position().to_string();
-        let mut records = Vec::new();
-        for record in segment.records {
-            if records.len() >= request.max_records.max(1) as usize {
-                break;
+        // A page fills from as many segments as it needs and then from the hot store, as a page
+        // of the hot store alone would, so a caller that reads an exact range gets it in one page.
+        let max = request.max_records.max(1) as usize;
+        let mut page = StoreReadResponse::default();
+        let mut name = name;
+        loop {
+            let last = segment.last_position().to_string();
+            for record in segment.records {
+                if page.records.len() >= max {
+                    break;
+                }
+                if after_key.as_ref().is_none_or(|after_key| {
+                    sort_key(&record.position).is_ok_and(|key| key > *after_key)
+                }) {
+                    page.records.push(record);
+                }
             }
-            if after_key.as_ref().is_none_or(|after_key| {
-                sort_key(&record.position).is_ok_and(|key| key > *after_key)
-            }) {
-                records.push(record);
+            if page.records.len() >= max
+                || page
+                    .records
+                    .last()
+                    .is_none_or(|record| record.position != last)
+            {
+                return Ok(Some(page));
+            }
+            match self.archive.first_after(&prefix, &name).await? {
+                Some(next) => {
+                    let next_segment = self.segment(&next).await?;
+                    // A segment that doesn't start at this one's end follows lost records, which
+                    // the next read reports.
+                    if next_segment.after_position != last {
+                        return Ok(Some(page));
+                    }
+                    (name, segment) = (next, next_segment);
+                }
+                None => {
+                    if let Some(close) = self
+                        .close_of(&prefix)
+                        .await?
+                        .filter(|close| close.last_position == last)
+                    {
+                        page.closed = true;
+                        page.close = close.close;
+                        return Ok(Some(page));
+                    }
+                    // The rest is in the hot store. A failure there reaches the next read.
+                    let rest = self
+                        .hot
+                        .read(StoreReadRequest {
+                            after_position: last,
+                            wait: None,
+                            max_records: (max - page.records.len()) as u32,
+                            ..request.clone()
+                        })
+                        .await;
+                    if let Ok(rest) = rest {
+                        page.records.extend(rest.records);
+                        page.closed = rest.closed;
+                        page.close = rest.close;
+                    }
+                    return Ok(Some(page));
+                }
             }
         }
-        let mut page = StoreReadResponse {
-            records,
-            ..Default::default()
-        };
-        let at_end = page
-            .records
-            .last()
-            .is_some_and(|record| record.position == last);
-        if at_end
-            && self.archive.first_after(&prefix, &name).await?.is_none()
-            && let Some(close) = self
-                .close_of(&prefix)
-                .await?
-                .filter(|close| close.last_position == last)
-        {
-            page.closed = true;
-            page.close = close.close;
-        }
-        Ok(Some(page))
     }
 
     /// The newest position the archive holds of a topic.
