@@ -5,8 +5,8 @@
 
 use crate::{
     BEGINNING, END, MAX_CLOSE_BYTES, ReadTarget, StreamError, StreamResult, StreamStore,
-    WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, cursor_position, mint_cursor,
-    owner::{OwnerClient, OwnerDescription, OwnerError},
+    activity_producer_id, chain_owner, check_append_digest, cursor_position, mint_cursor,
+    owner::{OwnerClient, OwnerDescription, OwnerError, OwnerId, OwnerStatus},
     proto::{
         ActivityProducer, AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse,
         DeleteOwnerRequest, DeleteOwnerResponse, LatestRequest, LatestResponse, NamedProducer,
@@ -24,7 +24,6 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
 use tokio::time::Instant;
 
 /// The longest `floor_holder` a read takes.
@@ -82,8 +81,30 @@ impl StreamsOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct OwnerKey {
     namespace: String,
-    workflow_id: String,
+    activity: bool,
+    /// The Workflow id or the Activity id.
+    id: String,
     run_id: String,
+}
+
+impl OwnerKey {
+    fn owner(&self) -> OwnerId<'_> {
+        if self.activity {
+            OwnerId::Activity(&self.id)
+        } else {
+            OwnerId::Workflow(&self.id)
+        }
+    }
+
+    /// The owner as error texts name it.
+    fn label(&self) -> String {
+        let kind = if self.activity {
+            "Activity"
+        } else {
+            "Workflow"
+        };
+        format!("{kind} {:?}", self.id)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -181,9 +202,10 @@ impl Streams {
     /// Appends one batch for one producer attempt.
     ///
     /// The first batch for an owner, and the first after [StreamsOptions::owner_recheck], asks
-    /// whether the owner's chain ended. All producers of the owner share that check. If it did, or Temporal no longer holds the owner,
-    /// or a new chain took the Workflow id, the chain is marked closed and the batch is refused
-    /// as closed.
+    /// whether the owner's chain ended. All producers of the owner share that check. If it did, or
+    /// Temporal no longer holds the owner, or a new chain took the owner id, the chain is marked
+    /// closed and the batch is refused as closed. A standalone Activity run is a chain of one
+    /// run, so a new run of the Activity id ends the earlier run's streams.
     pub async fn append(&self, request: AppendRequest) -> StreamResult<AppendResponse> {
         let stream = address(request.stream.as_ref())?;
         let (producer_id, attempt) = match &request.producer {
@@ -560,17 +582,15 @@ impl Streams {
         let key = owner_key(stream);
         match self.describe(&key, &key.run_id).await {
             Err(OwnerError::NotFound(_)) => {
-                // The chain came from this Workflow, so History has since dropped it, and
-                // nothing more will be written for it.
+                // The chain came from this owner, so Temporal has since dropped it, and nothing
+                // more will be written for it.
                 if key.run_id.is_empty() {
                     self.store.close_chain(chain).await?;
                 }
                 Ok(true)
             }
             Err(error) => Err(describe_failed(&error)),
-            Ok(described) if !key.run_id.is_empty() => {
-                Ok(described.status != WorkflowExecutionStatus::Running)
-            }
+            Ok(described) if !key.run_id.is_empty() => Ok(described.status != OwnerStatus::Running),
             Ok(latest) if !latest.chain_ended() && latest.first_run_id == chain.first_run_id => {
                 Ok(false)
             }
@@ -687,22 +707,26 @@ impl Streams {
         &self,
         request: DeleteOwnerRequest,
     ) -> StreamResult<DeleteOwnerResponse> {
-        if request.owner_kind != StreamOwnerKind::Workflow as i32 {
-            return Err(StreamError::unsupported(format!(
-                "this release keeps streams of Workflows only, not owner kind {}",
-                request.owner_kind
-            )));
-        }
-        if request.namespace.is_empty() || request.workflow_id.is_empty() {
+        let (id, other) = match StreamOwnerKind::try_from(request.owner_kind) {
+            Ok(StreamOwnerKind::Workflow) => (&request.workflow_id, &request.activity_id),
+            Ok(StreamOwnerKind::Activity) => (&request.activity_id, &request.workflow_id),
+            _ => return Err(unsupported_kind(request.owner_kind)),
+        };
+        if request.namespace.is_empty() || id.is_empty() {
             return Err(StreamError::invalid_argument(
-                "a delete needs the namespace and the owner's Workflow id",
+                "a delete needs the namespace and the owner's id of its kind",
+            ));
+        }
+        if !other.is_empty() {
+            return Err(StreamError::invalid_argument(
+                "a delete names the owner's id of its kind only",
             ));
         }
         self.store.delete_owner(request).await
     }
 
     /// The chain a producer writes on. A producer attempt stays on the chain it began on, and
-    /// is refused once a new chain took the Workflow id.
+    /// is refused once a new chain took the owner id.
     async fn producer_chain(&self, key: ProducerKey) -> StreamResult<ChainId> {
         let chain = self.owner_chain(&key.owner).await?;
         if let Some(began) = self.producers.get(&key)
@@ -730,11 +754,11 @@ impl Streams {
             // The latest run names the chain and tells whether it ended, in one call.
             let latest = self.describe(owner, "").await;
             if let (Err(OwnerError::NotFound(_)), Some(checked)) = (&latest, &known) {
-                // The chain came from this Workflow, so History has since dropped it.
+                // The chain came from this owner, so Temporal has since dropped it.
                 let gone = chain_of_key(owner, &checked.first_run_id);
-                return Err(self.closed(&gone, "is gone from History").await);
+                return Err(self.closed(&gone, gone_text(owner)).await);
             }
-            let latest = latest.map_err(not_found)?;
+            let latest = latest.map_err(|error| not_found(owner, error))?;
             let chain = chain_of_key(owner, &first_run_id(owner, &latest)?);
             if latest.chain_ended() {
                 return Err(self.closed(&chain, "has closed").await);
@@ -749,10 +773,10 @@ impl Streams {
             let pinned = self
                 .describe(owner, &owner.run_id)
                 .await
-                .map_err(not_found)?;
+                .map_err(|error| not_found(owner, error))?;
             let chain = chain_of_key(owner, &first_run_id(owner, &pinned)?);
             // A running run is its chain's latest, so it answers the end check too.
-            if pinned.status != WorkflowExecutionStatus::Running {
+            if pinned.status != OwnerStatus::Running {
                 self.refuse_if_ended(&chain).await?;
             }
             chain
@@ -762,16 +786,12 @@ impl Streams {
     }
 
     /// Marks the chain closed and refuses when its latest run ended, when Temporal no longer
-    /// holds it, or when a new chain took its Workflow id.
+    /// holds it, or when a new chain took its owner id.
     async fn refuse_if_ended(&self, chain: &ChainId) -> StreamResult<()> {
-        let key = OwnerKey {
-            namespace: chain.namespace.clone(),
-            workflow_id: chain.workflow_id.clone(),
-            run_id: String::new(),
-        };
+        let key = chain_owner_key(chain);
         match self.describe(&key, "").await {
-            // The chain came from this Workflow, so History has since dropped it.
-            Err(OwnerError::NotFound(_)) => Err(self.closed(chain, "is gone from History").await),
+            // The chain came from this owner, so Temporal has since dropped it.
+            Err(OwnerError::NotFound(_)) => Err(self.closed(chain, gone_text(&key)).await),
             Err(error) => Err(describe_failed(&error)),
             Ok(latest) if latest.chain_ended() || latest.first_run_id != chain.first_run_id => {
                 Err(self.closed(chain, "has closed").await)
@@ -785,8 +805,8 @@ impl Streams {
             return error;
         }
         StreamError::closed(format!(
-            "the Workflow {:?} that owns this stream {how}",
-            chain.workflow_id
+            "the {} that owns this stream {how}",
+            chain_owner_key(chain).label()
         ))
     }
 
@@ -798,7 +818,10 @@ impl Streams {
         if !key.run_id.is_empty() {
             return self.chain(stream).await;
         }
-        let described = self.describe(&key, "").await.map_err(not_found)?;
+        let described = self
+            .describe(&key, "")
+            .await
+            .map_err(|error| not_found(&key, error))?;
         let first_run_id = first_run_id(&key, &described)?;
         self.chains
             .put(key, &first_run_id, self.options.owner_recheck);
@@ -809,13 +832,16 @@ impl Streams {
     pub(crate) async fn chain(&self, stream: &StreamAddress) -> StreamResult<ChainId> {
         let key = owner_key(stream);
         // A pinned run's chain never changes. The latest run's chain changes when a new chain
-        // takes the Workflow id.
+        // takes the owner id.
         if let Some(checked) = self.chains.get(&key)
             && (!key.run_id.is_empty() || checked.at.elapsed() < self.options.owner_recheck)
         {
             return Ok(chain_of(stream, &checked.first_run_id));
         }
-        let described = self.describe(&key, &key.run_id).await.map_err(not_found)?;
+        let described = self
+            .describe(&key, &key.run_id)
+            .await
+            .map_err(|error| not_found(&key, error))?;
         let first_run_id = first_run_id(&key, &described)?;
         self.chains
             .put(key, &first_run_id, self.options.owner_recheck);
@@ -828,17 +854,14 @@ impl Streams {
         run_id: &str,
     ) -> Result<OwnerDescription, OwnerError> {
         self.owner
-            .describe(&owner.namespace, &owner.workflow_id, run_id)
+            .describe(&owner.namespace, owner.owner(), run_id)
             .await
     }
 
     fn hash(&self, stream: &StreamAddress) -> String {
-        stream_hash(
-            &stream.namespace,
-            WORKFLOW_OWNER_KIND,
-            &stream.workflow_id,
-            &stream.topic,
-        )
+        let chain = chain_of(stream, "");
+        let (kind, id) = chain_owner(&chain);
+        stream_hash(&stream.namespace, kind, id, &stream.topic)
     }
 
     fn cursor(&self, stream: &StreamAddress, position: &str) -> String {
@@ -872,19 +895,42 @@ impl Streams {
 pub(crate) fn address(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
     let stream =
         stream.ok_or_else(|| StreamError::invalid_argument("a stream call needs its stream"))?;
-    if stream.owner_kind != StreamOwnerKind::Workflow as i32 {
-        return Err(StreamError::unsupported(format!(
-            "this release keeps streams of Workflows only, not owner kind {}",
-            stream.owner_kind
-        )));
-    }
-    if stream.namespace.is_empty() || stream.workflow_id.is_empty() {
-        return Err(StreamError::invalid_argument(
-            "a stream needs its namespace and its owner's Workflow id",
-        ));
+    match StreamOwnerKind::try_from(stream.owner_kind) {
+        Ok(StreamOwnerKind::Workflow) => {
+            if stream.namespace.is_empty() || stream.workflow_id.is_empty() {
+                return Err(StreamError::invalid_argument(
+                    "a stream needs its namespace and its owner's Workflow id",
+                ));
+            }
+            if !stream.activity_id.is_empty() {
+                return Err(StreamError::invalid_argument(
+                    "a stream that a Workflow owns names no Activity id",
+                ));
+            }
+        }
+        Ok(StreamOwnerKind::Activity) => {
+            if stream.namespace.is_empty() || stream.activity_id.is_empty() {
+                return Err(StreamError::invalid_argument(
+                    "a stream needs its namespace and its owner's Activity id",
+                ));
+            }
+            if !stream.workflow_id.is_empty() {
+                return Err(StreamError::invalid_argument(
+                    "a stream that an Activity owns names no Workflow id",
+                ));
+            }
+        }
+        _ => return Err(unsupported_kind(stream.owner_kind)),
     }
     check_topic(&stream.topic)?;
     Ok(stream)
+}
+
+fn unsupported_kind(owner_kind: i32) -> StreamError {
+    StreamError::unsupported(format!(
+        "this release keeps streams of Workflows and standalone Activities only, not owner kind \
+         {owner_kind}"
+    ))
 }
 
 /// Refuses a topic no store keys reliably, by the rules Core's Workflow path also applies.
@@ -928,44 +974,83 @@ fn millis(duration: Duration) -> u64 {
 }
 
 fn owner_key(stream: &StreamAddress) -> OwnerKey {
+    let activity = stream.owner_kind == StreamOwnerKind::Activity as i32;
     OwnerKey {
         namespace: stream.namespace.clone(),
-        workflow_id: stream.workflow_id.clone(),
+        activity,
+        id: if activity {
+            stream.activity_id.clone()
+        } else {
+            stream.workflow_id.clone()
+        },
         run_id: stream.run_id.clone(),
     }
 }
 
-fn chain_of(stream: &StreamAddress, first_run_id: &str) -> ChainId {
+/// The latest run of the owner of `chain`.
+fn chain_owner_key(chain: &ChainId) -> OwnerKey {
+    let activity = chain.owner_kind == StreamOwnerKind::Activity as i32;
+    OwnerKey {
+        namespace: chain.namespace.clone(),
+        activity,
+        id: chain_owner(chain).1.to_string(),
+        run_id: String::new(),
+    }
+}
+
+/// The chain of `stream`'s owner that starts at `first_run_id`.
+pub(crate) fn chain_of(stream: &StreamAddress, first_run_id: &str) -> ChainId {
     chain_of_key(&owner_key(stream), first_run_id)
 }
 
 fn chain_of_key(owner: &OwnerKey, first_run_id: &str) -> ChainId {
-    ChainId {
-        namespace: owner.namespace.clone(),
-        workflow_id: owner.workflow_id.clone(),
-        first_run_id: first_run_id.to_string(),
-        ..Default::default()
+    // A Workflow chain keeps the kind unset, as every chain from before the Activity kind does,
+    // so the two compare equal.
+    if owner.activity {
+        ChainId {
+            namespace: owner.namespace.clone(),
+            first_run_id: first_run_id.to_string(),
+            owner_kind: StreamOwnerKind::Activity as i32,
+            activity_id: owner.id.clone(),
+            ..Default::default()
+        }
+    } else {
+        ChainId {
+            namespace: owner.namespace.clone(),
+            workflow_id: owner.id.clone(),
+            first_run_id: first_run_id.to_string(),
+            ..Default::default()
+        }
+    }
+}
+
+/// How a refusal says that Temporal no longer holds the owner.
+fn gone_text(owner: &OwnerKey) -> &'static str {
+    if owner.activity {
+        "is gone from Temporal"
+    } else {
+        "is gone from History"
     }
 }
 
 fn first_run_id(owner: &OwnerKey, described: &OwnerDescription) -> StreamResult<String> {
     if described.first_run_id.is_empty() {
-        // The Workflow's own output is keyed by the chain's first run, so an empty one would
-        // split the stream in two without an error.
+        // The owner's own output is keyed by the chain's first run, so an empty one would split
+        // the stream in two without an error.
         return Err(StreamError::unsupported(format!(
-            "Temporal did not report the first run id of Workflow {:?}, which streams are \
-             keyed by",
-            owner.workflow_id
+            "Temporal did not report the first run id of {}, which streams are keyed by",
+            owner.label()
         )));
     }
     Ok(described.first_run_id.clone())
 }
 
-fn not_found(error: OwnerError) -> StreamError {
+fn not_found(owner: &OwnerKey, error: OwnerError) -> StreamError {
     match error {
         OwnerError::NotFound(message) => StreamError::not_found(format!(
-            "the Workflow that owns the stream was not found, and its stream is keyed by its \
-             run chain: {message}"
+            "the {} that owns the stream was not found, and its stream is keyed by its run \
+             chain: {message}",
+            owner.label()
         )),
         error => describe_failed(&error),
     }
@@ -991,10 +1076,12 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use temporalio_common::protos::temporal::api::{
-        common::v1::Payload, enums::v1::WorkflowExecutionStatus,
+        common::v1::Payload,
+        enums::v1::{ActivityExecutionStatus, WorkflowExecutionStatus},
     };
 
-    /// Temporal as the tests need it: the latest run of each Workflow id, and pinned runs.
+    /// Temporal as the tests need it: the latest run of each owner, and pinned runs. A Workflow
+    /// owner is keyed by its id, and an Activity owner by `activity/<id>`.
     #[derive(Default)]
     struct Owners {
         latest: Mutex<HashMap<String, Result<OwnerDescription, OwnerError>>>,
@@ -1007,7 +1094,7 @@ mod tests {
             let described = OwnerDescription {
                 run_id: run_id.to_string(),
                 first_run_id: first_run_id.to_string(),
-                status: WorkflowExecutionStatus::Running,
+                status: OwnerStatus::Running,
             };
             self.runs
                 .lock()
@@ -1019,8 +1106,28 @@ mod tests {
                 .insert(workflow_id.to_string(), Ok(described));
         }
 
+        /// Starts run `run_id` of Activity `activity_id`, which is its own chain.
+        fn activity_run(&self, activity_id: &str, run_id: &str) {
+            self.run(&format!("activity/{activity_id}"), run_id, run_id);
+        }
+
         fn end(&self, workflow_id: &str, status: WorkflowExecutionStatus) {
-            if let Some(Ok(latest)) = self.latest.lock().unwrap().get_mut(workflow_id) {
+            self.end_as(workflow_id, OwnerStatus::of_workflow(status));
+        }
+
+        fn end_activity(&self, activity_id: &str, status: ActivityExecutionStatus) {
+            let status = OwnerStatus::of_activity(status);
+            let key = format!("activity/{activity_id}");
+            if let Some(Ok(latest)) = self.latest.lock().unwrap().get(&key)
+                && let Some(run) = self.runs.lock().unwrap().get_mut(&latest.run_id)
+            {
+                run.status = status;
+            }
+            self.end_as(&key, status);
+        }
+
+        fn end_as(&self, key: &str, status: OwnerStatus) {
+            if let Some(Ok(latest)) = self.latest.lock().unwrap().get_mut(key) {
                 latest.status = status;
             }
         }
@@ -1042,10 +1149,14 @@ mod tests {
         async fn describe(
             &self,
             _namespace: &str,
-            workflow_id: &str,
+            owner: OwnerId<'_>,
             run_id: &str,
         ) -> Result<OwnerDescription, OwnerError> {
             self.describes.fetch_add(1, Ordering::Relaxed);
+            let workflow_id = &match owner {
+                OwnerId::Workflow(id) => id.to_string(),
+                OwnerId::Activity(id) => format!("activity/{id}"),
+            };
             if !run_id.is_empty() {
                 return self
                     .runs
@@ -1455,15 +1566,35 @@ mod tests {
             OwnerDescription {
                 run_id: String::new(),
                 first_run_id: String::new(),
-                status,
+                status: OwnerStatus::of_workflow(status),
             }
             .chain_ended()
         };
         for status in [Completed, Failed, Canceled, Terminated, TimedOut] {
             assert!(ended(status), "{status:?}");
         }
-        for status in [Running, ContinuedAsNew, Unspecified] {
+        for status in [Running, ContinuedAsNew, Unspecified, Paused] {
             assert!(!ended(status), "{status:?}");
+        }
+        assert_eq!(OwnerStatus::of_workflow(Paused), OwnerStatus::Running);
+    }
+
+    #[test]
+    fn only_a_terminal_activity_status_ends_its_run() {
+        use ActivityExecutionStatus::*;
+        for status in [Completed, Failed, Canceled, Terminated, TimedOut] {
+            assert_eq!(
+                OwnerStatus::of_activity(status),
+                OwnerStatus::Ended,
+                "{status:?}"
+            );
+        }
+        for status in [Running, Paused, Unspecified] {
+            assert_eq!(
+                OwnerStatus::of_activity(status),
+                OwnerStatus::Running,
+                "{status:?}"
+            );
         }
     }
 
@@ -2103,7 +2234,7 @@ mod tests {
             .unwrap()
             .get_mut("run-1")
             .unwrap()
-            .status = WorkflowExecutionStatus::ContinuedAsNew;
+            .status = OwnerStatus::ContinuedAsNew;
         setup.owners.run("wf", "run-2", "run-1");
         let mut request = read_after("", &[], Duration::from_secs(5));
         request.stream.as_mut().unwrap().run_id = "run-1".to_string();
@@ -2353,5 +2484,337 @@ mod tests {
             );
         }
         assert_eq!(setup.owners.describes(), 0);
+    }
+
+    /// A stream of standalone Activity `act`, whose run `act-run-1` is running.
+    fn activity_stream(topic: &str) -> StreamAddress {
+        StreamAddress {
+            namespace: "ns".to_string(),
+            owner_kind: StreamOwnerKind::Activity as i32,
+            activity_id: "act".to_string(),
+            topic: topic.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn activity_chain(run_id: &str) -> ChainId {
+        ChainId {
+            namespace: "ns".to_string(),
+            first_run_id: run_id.to_string(),
+            owner_kind: StreamOwnerKind::Activity as i32,
+            activity_id: "act".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn activity_setup() -> Setup {
+        let setup = setup(quick());
+        setup.owners.activity_run("act", "act-run-1");
+        setup
+    }
+
+    fn activity_append(sequence: i64, value: &str) -> AppendRequest {
+        AppendRequest {
+            stream: Some(activity_stream("out")),
+            producer: Some(Producer::Activity(ActivityProducer {
+                run_id: "act-run-1".to_string(),
+                activity_id: "act".to_string(),
+                attempt: 1,
+                ..Default::default()
+            })),
+            ..append("", sequence, value)
+        }
+    }
+
+    fn activity_read(after: &str, state: &[u8], wait: Duration) -> ReadRequest {
+        ReadRequest {
+            stream: Some(activity_stream("out")),
+            ..read_after(after, state, wait)
+        }
+    }
+
+    async fn read_activity_to_end(
+        streams: &Streams,
+        request: ReadRequest,
+    ) -> (usize, ReadResponse) {
+        let mut delivered = 0;
+        let mut request = request;
+        for _ in 0..50 {
+            let page = streams.read(request.clone()).await.unwrap();
+            delivered += page.records.len();
+            if page.done {
+                return (delivered, page);
+            }
+            request.after = page.cursor;
+            request.state = page.state;
+        }
+        panic!("the read never ended");
+    }
+
+    async fn activity_chain_closed(store: &MemoryStore, run_id: &str) -> bool {
+        store
+            .read(StoreReadRequest {
+                chain: Some(activity_chain(run_id)),
+                topic: "out".to_string(),
+                max_records: 1,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .closed
+    }
+
+    #[tokio::test]
+    async fn an_activity_writes_its_own_stream_on_the_chain_of_its_run() {
+        let setup = activity_setup();
+        let landed = setup.streams.append(activity_append(1, "1")).await.unwrap();
+        let held = setup
+            .store
+            .latest(StoreLatestRequest {
+                chain: Some(activity_chain("act-run-1")),
+                topic: "out".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(held.position, "0");
+        let read = setup
+            .streams
+            .read(activity_read("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(read.records.len(), 1);
+        assert_eq!(read.records[0].cursor, landed.last_cursor);
+        assert_eq!(read.chain_first_run_id, "act-run-1");
+        // A Workflow with the same id owns other streams, and their cursors don't mix.
+        setup.owners.run("act", "run-1", "run-1");
+        let mut workflow = stream("out");
+        workflow.workflow_id = "act".to_string();
+        let workflow_read = setup
+            .streams
+            .read(ReadRequest {
+                stream: Some(workflow.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(workflow_read.records.is_empty());
+        let error = setup
+            .streams
+            .read(ReadRequest {
+                stream: Some(workflow),
+                after: landed.last_cursor,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Cursor, "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_activity_address_names_the_activity_only() {
+        let setup = activity_setup();
+        let mut no_id = activity_stream("out");
+        no_id.activity_id.clear();
+        let mut with_workflow = activity_stream("out");
+        with_workflow.workflow_id = "wf".to_string();
+        let mut workflow_with_activity = stream("out");
+        workflow_with_activity.activity_id = "act".to_string();
+        for bad in [no_id, with_workflow, workflow_with_activity] {
+            assert_eq!(
+                kind(
+                    setup
+                        .streams
+                        .latest(LatestRequest { stream: Some(bad) })
+                        .await
+                ),
+                StreamFailureKind::InvalidArgument
+            );
+        }
+        assert_eq!(setup.owners.describes(), 0);
+    }
+
+    #[tokio::test]
+    async fn an_activity_read_ends_done_when_the_run_reaches_a_terminal_status() {
+        let setup = activity_setup();
+        setup.streams.append(activity_append(1, "1")).await.unwrap();
+        setup
+            .owners
+            .end_activity("act", ActivityExecutionStatus::Failed);
+        let (delivered, end) = read_activity_to_end(
+            &setup.streams,
+            activity_read("", &[], Duration::from_secs(5)),
+        )
+        .await;
+        assert_eq!(delivered, 1);
+        assert!(end.done);
+        assert!(activity_chain_closed(&setup.store, "act-run-1").await);
+    }
+
+    #[tokio::test]
+    async fn an_activity_read_that_retries_and_pauses_stays_open() {
+        let setup = activity_setup();
+        setup
+            .owners
+            .end_activity("act", ActivityExecutionStatus::Paused);
+        let idle = setup
+            .streams
+            .read(activity_read("", &[], Duration::from_millis(200)))
+            .await
+            .unwrap();
+        assert!(!idle.done);
+        assert!(!activity_chain_closed(&setup.store, "act-run-1").await);
+    }
+
+    #[tokio::test]
+    async fn an_activity_read_before_the_run_exists_waits_the_grace() {
+        let setup = before_owner_starts(Duration::from_secs(60));
+        let empty = setup
+            .streams
+            .read(activity_read(END, &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert!(empty.records.is_empty() && !empty.done);
+        setup.owners.activity_run("act", "act-run-1");
+        setup.streams.append(activity_append(1, "1")).await.unwrap();
+        let read = setup
+            .streams
+            .read(activity_read(&empty.cursor, &empty.state, Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(read.records.len(), 1);
+        let late = before_owner_starts(Duration::ZERO);
+        let error = late
+            .streams
+            .read(activity_read("", &[], Duration::from_secs(5)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::NotFound);
+        assert!(error.message.contains("Activity \"act\""), "{error}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_activity_producer_is_refused_once_the_run_ended() {
+        let setup = activity_setup();
+        setup.streams.append(activity_append(1, "1")).await.unwrap();
+        setup
+            .owners
+            .end_activity("act", ActivityExecutionStatus::Completed);
+        tokio::time::advance(OWNER_RECHECK + Duration::from_secs(1)).await;
+        let error = setup
+            .streams
+            .append(activity_append(2, "2"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Closed);
+        assert!(error.message.contains("Activity \"act\""), "{error}");
+        assert!(activity_chain_closed(&setup.store, "act-run-1").await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_new_run_of_the_activity_id_ends_the_earlier_runs_streams() {
+        let setup = activity_setup();
+        setup.streams.append(activity_append(1, "1")).await.unwrap();
+        setup.owners.activity_run("act", "act-run-2");
+        tokio::time::advance(OWNER_RECHECK + Duration::from_secs(1)).await;
+        assert_eq!(
+            kind(setup.streams.append(activity_append(2, "2")).await),
+            StreamFailureKind::Closed
+        );
+        assert!(activity_chain_closed(&setup.store, "act-run-1").await);
+        // A producer of the new run writes on the new run's chain.
+        let mut next = activity_append(1, "3");
+        if let Some(Producer::Activity(activity)) = &mut next.producer {
+            activity.run_id = "act-run-2".to_string();
+        }
+        setup.streams.append(next).await.unwrap();
+        assert!(!activity_chain_closed(&setup.store, "act-run-2").await);
+    }
+
+    #[tokio::test]
+    async fn an_activity_read_pinned_to_a_run_reads_that_run() {
+        let setup = activity_setup();
+        setup.streams.append(activity_append(1, "1")).await.unwrap();
+        setup.owners.activity_run("act", "act-run-2");
+        let mut pinned = activity_read("", &[], Duration::ZERO);
+        pinned.stream.as_mut().unwrap().run_id = "act-run-1".to_string();
+        let page = setup.streams.read(pinned).await.unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert_eq!(page.chain_first_run_id, "act-run-1");
+    }
+
+    #[tokio::test]
+    async fn an_activity_read_follows_the_newest_run_at_its_start_until_a_newer_run() {
+        let setup = activity_setup();
+        setup.streams.append(activity_append(1, "1")).await.unwrap();
+        let first = setup
+            .streams
+            .read(activity_read("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(first.chain_first_run_id, "act-run-1");
+        setup.owners.activity_run("act", "act-run-2");
+        let (delivered, end) = read_activity_to_end(
+            &setup.streams,
+            activity_read(&first.cursor, &first.state, Duration::from_secs(5)),
+        )
+        .await;
+        assert_eq!(delivered, 0);
+        assert!(end.done);
+        assert!(activity_chain_closed(&setup.store, "act-run-1").await);
+    }
+
+    #[tokio::test]
+    async fn an_activity_owner_delete_removes_only_that_activitys_streams() {
+        let setup = activity_setup();
+        setup.streams.append(activity_append(1, "1")).await.unwrap();
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        let request = DeleteOwnerRequest {
+            namespace: "ns".to_string(),
+            owner_kind: StreamOwnerKind::Activity as i32,
+            activity_id: "act".to_string(),
+            ..Default::default()
+        };
+        assert!(
+            setup
+                .streams
+                .delete_owner(request.clone())
+                .await
+                .unwrap()
+                .deleted
+                > 0
+        );
+        let gone = setup
+            .store
+            .latest(StoreLatestRequest {
+                chain: Some(activity_chain("act-run-1")),
+                topic: "out".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(gone.position, "");
+        let kept = setup
+            .store
+            .latest(StoreLatestRequest {
+                chain: Some(chain("run-1")),
+                topic: "out".to_string(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(kept.position, "0");
+        for bad in [
+            DeleteOwnerRequest {
+                activity_id: String::new(),
+                ..request.clone()
+            },
+            DeleteOwnerRequest {
+                workflow_id: "wf".to_string(),
+                ..request.clone()
+            },
+        ] {
+            assert_eq!(
+                kind(setup.streams.delete_owner(bad).await),
+                StreamFailureKind::InvalidArgument
+            );
+        }
     }
 }

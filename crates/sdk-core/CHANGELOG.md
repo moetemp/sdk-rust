@@ -149,6 +149,15 @@ relevant information.
   `owner_kind` and `activity_id`. `ActivityProducer` gains `attempt_started_time`. The vendored
   API's `StreamReference` gains `activity_id` and its owner kind gains `ACTIVITY`. Core still
   refuses the Activity kind as `UNSUPPORTED`.
+* Experimental: a standalone Activity owns streams. A `StreamAddress` of the `ACTIVITY` kind names
+  the Activity id and, optionally, its run. One Activity run is a chain of one run, so every chain
+  rule holds with the run as `first_run_id`. Core checks the owner with
+  `DescribeActivityExecution`. Any terminal status ends the run's streams, and retries, backoff,
+  pause and reset keep them open. A new run of the Activity id ends the earlier run's streams.
+  Cursors hash under the kind `activity`. The Redis keys of an Activity run have the hash tag
+  `{<namespace>:!a:<activity id>:<run id>}`, which no Workflow id makes. `DeleteOwner` takes the
+  Activity kind. `OwnerClient::describe` takes an `OwnerId`, and `OwnerDescription.status` is an
+  `OwnerStatus`. A paused Workflow run now counts as running for a read pinned to it.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

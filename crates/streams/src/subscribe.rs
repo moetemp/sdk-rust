@@ -249,13 +249,12 @@ impl Subscriptions {
 mod tests {
     use super::*;
     use crate::{
-        MemoryStore, NotifierPoll, OwnerClient, OwnerDescription, OwnerError, StreamNotification,
-        StreamService, StreamsOptions,
+        MemoryStore, NotifierPoll, OwnerClient, OwnerDescription, OwnerError, OwnerId, OwnerStatus,
+        StreamNotification, StreamService, StreamsOptions,
         proto::{ChainId, StreamFailureKind, StreamOwnerKind},
     };
     use prost::Message;
     use std::sync::Mutex;
-    use temporalio_common::protos::temporal::api::enums::v1::WorkflowExecutionStatus;
 
     /// The owner's chain is `first_run_id`, which a test moves to a new chain.
     struct Owner(Mutex<String>);
@@ -265,14 +264,14 @@ mod tests {
         async fn describe(
             &self,
             _: &str,
-            _: &str,
+            _: OwnerId<'_>,
             _: &str,
         ) -> Result<OwnerDescription, OwnerError> {
             let first_run_id = self.0.lock().unwrap().clone();
             Ok(OwnerDescription {
                 run_id: first_run_id.clone(),
                 first_run_id,
-                status: WorkflowExecutionStatus::Running,
+                status: OwnerStatus::Running,
             })
         }
     }

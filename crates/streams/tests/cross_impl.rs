@@ -18,12 +18,10 @@ use std::{
     },
     time::Duration,
 };
-use temporalio_common::protos::temporal::api::{
-    common::v1::Payload, enums::v1::WorkflowExecutionStatus,
-};
+use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
-    OwnerClient, OwnerDescription, OwnerError, ReadTarget, RedisStore, RedisStoreOptions,
-    StreamStore, Streams, StreamsOptions, mint_cursor,
+    OwnerClient, OwnerDescription, OwnerError, OwnerId, OwnerStatus, ReadTarget, RedisStore,
+    RedisStoreOptions, StreamStore, Streams, StreamsOptions, mint_cursor,
     proto::{
         AppendRecord, AppendRequest, ChainId, NamedProducer, ReadRequest, StoreAppendRequest,
         StreamAddress, StreamFailureKind, StreamOwnerKind, StreamRecordKind,
@@ -272,13 +270,13 @@ impl OwnerClient for Running {
     async fn describe(
         &self,
         _namespace: &str,
-        _workflow_id: &str,
+        _owner: OwnerId<'_>,
         _run_id: &str,
     ) -> Result<OwnerDescription, OwnerError> {
         Ok(OwnerDescription {
             run_id: FIRST_RUN.to_string(),
             first_run_id: FIRST_RUN.to_string(),
-            status: WorkflowExecutionStatus::Running,
+            status: OwnerStatus::Running,
         })
     }
 }

@@ -2,7 +2,9 @@
 
 use crate::{
     StreamError, StreamResult,
-    proto::{ActivityProducer, AppendRecord, StreamRecord, StreamRecordKind},
+    proto::{
+        ActivityProducer, AppendRecord, ChainId, StreamOwnerKind, StreamRecord, StreamRecordKind,
+    },
 };
 use temporalio_common::{
     protos::temporal::api::common::v1::Payload,
@@ -11,6 +13,18 @@ use temporalio_common::{
 
 /// The owner kind a Workflow's streams hash under in their cursors.
 pub const WORKFLOW_OWNER_KIND: &str = "workflow";
+
+/// The owner kind a standalone Activity's streams hash under in their cursors.
+pub const ACTIVITY_OWNER_KIND: &str = "activity";
+
+/// The owner kind a chain's streams hash under, and the owner's id.
+pub fn chain_owner(chain: &ChainId) -> (&'static str, &str) {
+    if chain.owner_kind == StreamOwnerKind::Activity as i32 {
+        (ACTIVITY_OWNER_KIND, &chain.activity_id)
+    } else {
+        (WORKFLOW_OWNER_KIND, &chain.workflow_id)
+    }
+}
 
 const HASH_LENGTH: usize = 32;
 

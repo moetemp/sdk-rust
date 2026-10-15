@@ -11,6 +11,10 @@
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:chain            the close flag
 //! ```
 //!
+//! A standalone Activity run is a chain of one run. Its tag has the literal `!a` after the
+//! namespace, `{<namespace>:!a:<activity id>:<run id>}`, and the same keys follow it. Each part
+//! escapes `!`, so no Workflow id makes that tag.
+//!
 //! The notification log lives apart from the chains, one stream per Cluster slot and a few
 //! doorbells, each under the hash tag of a slot (see `slots.rs`). A chain's appends go to the
 //! stream of the chain's own slot, so the append script writes both:
@@ -24,7 +28,11 @@
 //! two streams share a key.
 
 use super::{conn::slot, slots};
-use crate::proto::ChainId;
+use crate::proto::{ChainId, StreamOwnerKind};
+
+/// The part after the namespace that marks an Activity chain's tag. [part] escapes `!`, so no
+/// Workflow id makes it.
+const ACTIVITY_MARK: &str = "!a";
 
 /// Percent-encodes every byte but the unreserved ones, as Python's `quote(text, safe="")` does.
 pub(crate) fn part(text: &str) -> String {
@@ -47,12 +55,16 @@ pub(crate) struct ChainKeys {
 
 impl ChainKeys {
     pub(crate) fn new(prefix: &str, chain: &ChainId) -> Self {
+        let owner = if chain.owner_kind == StreamOwnerKind::Activity as i32 {
+            format!("{ACTIVITY_MARK}:{}", part(&chain.activity_id))
+        } else {
+            part(&chain.workflow_id)
+        };
         Self {
             base: format!(
-                "{}:{{{}:{}:{}}}",
+                "{}:{{{}:{owner}:{}}}",
                 part(prefix),
                 part(&chain.namespace),
-                part(&chain.workflow_id),
                 part(&chain.first_run_id)
             ),
         }
@@ -96,20 +108,24 @@ pub(crate) fn doorbell(prefix: &str, doorbell: u32) -> String {
 pub(crate) fn chain_of_log(prefix: &str, key: &str) -> Option<(ChainId, String)> {
     let rest = key.strip_prefix(&format!("{}:{{", part(prefix)))?;
     let (tag, topic) = rest.split_once("}:t:")?;
-    let mut parts = tag.split(':');
-    let (namespace, workflow_id, first_run_id) = (parts.next()?, parts.next()?, parts.next()?);
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((
-        ChainId {
+    let parts: Vec<&str> = tag.split(':').collect();
+    let chain = match parts[..] {
+        [namespace, workflow_id, first_run_id] if workflow_id != ACTIVITY_MARK => ChainId {
             namespace: unpart(namespace)?,
             workflow_id: unpart(workflow_id)?,
             first_run_id: unpart(first_run_id)?,
             ..Default::default()
         },
-        unpart(topic)?,
-    ))
+        [namespace, ACTIVITY_MARK, activity_id, run_id] => ChainId {
+            namespace: unpart(namespace)?,
+            first_run_id: unpart(run_id)?,
+            owner_kind: StreamOwnerKind::Activity as i32,
+            activity_id: unpart(activity_id)?,
+            ..Default::default()
+        },
+        _ => return None,
+    };
+    Some((chain, unpart(topic)?))
 }
 
 /// Undoes [part].
@@ -145,6 +161,16 @@ pub(crate) fn owner_pattern(prefix: &str, namespace: &str, workflow_id: &str) ->
     )
 }
 
+/// The pattern that matches every key of one standalone Activity id, across all its runs.
+pub(crate) fn activity_owner_pattern(prefix: &str, namespace: &str, activity_id: &str) -> String {
+    format!(
+        "{}:{{{}:{ACTIVITY_MARK}:{}:*",
+        part(prefix),
+        part(namespace),
+        part(activity_id)
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -154,22 +180,34 @@ mod tests {
         case[field].as_str().unwrap()
     }
 
+    fn case_chain(case: &Value) -> ChainId {
+        if case["owner_kind"] == "activity" {
+            ChainId {
+                namespace: text(case, "namespace").to_string(),
+                first_run_id: text(case, "first_run_id").to_string(),
+                owner_kind: StreamOwnerKind::Activity as i32,
+                activity_id: text(case, "activity_id").to_string(),
+                ..Default::default()
+            }
+        } else {
+            ChainId {
+                namespace: text(case, "namespace").to_string(),
+                workflow_id: text(case, "workflow_id").to_string(),
+                first_run_id: text(case, "first_run_id").to_string(),
+                ..Default::default()
+            }
+        }
+    }
+
     #[test]
     fn keys_match_the_python_sdk() {
         // Streams written by an SDK before the store moved into Core must stay readable.
         let cases: Vec<Value> =
             serde_json::from_str(include_str!("../../testdata/redis/keys.json")).unwrap();
         assert!(cases.len() >= 4);
+        assert!(cases.iter().any(|case| case["owner_kind"] == "activity"));
         for case in &cases {
-            let keys = ChainKeys::new(
-                text(case, "prefix"),
-                &ChainId {
-                    namespace: text(case, "namespace").to_string(),
-                    workflow_id: text(case, "workflow_id").to_string(),
-                    first_run_id: text(case, "first_run_id").to_string(),
-                    ..Default::default()
-                },
-            );
+            let keys = ChainKeys::new(text(case, "prefix"), &case_chain(case));
             let topic = text(case, "topic");
             assert_eq!(keys.log(topic), text(case, "log"));
             assert_eq!(keys.meta(topic), text(case, "meta"));
@@ -182,12 +220,7 @@ mod tests {
         let cases: Vec<Value> =
             serde_json::from_str(include_str!("../../testdata/redis/keys.json")).unwrap();
         for case in &cases {
-            let chain = ChainId {
-                namespace: text(case, "namespace").to_string(),
-                workflow_id: text(case, "workflow_id").to_string(),
-                first_run_id: text(case, "first_run_id").to_string(),
-                ..Default::default()
-            };
+            let chain = case_chain(case);
             let prefix = text(case, "prefix");
             let keys = ChainKeys::new(prefix, &chain);
             let topic = text(case, "topic");
@@ -201,6 +234,8 @@ mod tests {
         }
         assert_eq!(chain_of_log("p", "q:{ns:wf:run}:t:out"), None);
         assert_eq!(chain_of_log("p", "p:{ns:wf}:t:out"), None);
+        assert_eq!(chain_of_log("p", "p:{ns:!b:act:run}:t:out"), None);
+        assert_eq!(chain_of_log("p", "p:{ns:!a:act}:t:out"), None);
     }
 
     #[test]
@@ -235,5 +270,43 @@ mod tests {
         assert!(!matches(&ChainKeys::new("p", &other).chain()));
         // Each part is encoded as the keys encode it, so a glob character matches only itself.
         assert_eq!(owner_pattern("p", "ns", "a*b"), "p:{ns:a%2Ab:*");
+    }
+
+    #[test]
+    fn an_activity_chain_keeps_apart_from_every_workflow() {
+        let activity = |id: &str| ChainId {
+            namespace: "ns".to_string(),
+            first_run_id: "run-1".to_string(),
+            owner_kind: StreamOwnerKind::Activity as i32,
+            activity_id: id.to_string(),
+            ..Default::default()
+        };
+        let workflow = |id: &str| ChainId {
+            namespace: "ns".to_string(),
+            workflow_id: id.to_string(),
+            first_run_id: "run-1".to_string(),
+            ..Default::default()
+        };
+        let matcher =
+            |pattern: String| move |key: &str| key.starts_with(pattern.trim_end_matches('*'));
+        for id in ["wf", "!a", "a", "!a:wf"] {
+            let keys = ChainKeys::new("p", &activity(id));
+            for workflow_id in [id, "!a", "a", "%21a"] {
+                assert!(
+                    !matcher(owner_pattern("p", "ns", workflow_id))(&keys.chain()),
+                    "{id}"
+                );
+                assert_ne!(keys, ChainKeys::new("p", &workflow(workflow_id)), "{id}");
+            }
+            let own = matcher(activity_owner_pattern("p", "ns", id));
+            assert!(own(&keys.chain()) && own(&keys.log("out")), "{id}");
+            assert!(!own(&ChainKeys::new("p", &workflow(id)).chain()), "{id}");
+            // The `:` after the id keeps `wf` from matching the runs of `wf2`.
+            assert!(
+                !own(&ChainKeys::new("p", &activity(&format!("{id}2"))).chain()),
+                "{id}"
+            );
+        }
+        assert_eq!(activity_owner_pattern("p", "ns", "a*b"), "p:{ns:!a:a%2Ab:*");
     }
 }

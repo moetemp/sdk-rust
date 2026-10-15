@@ -761,13 +761,13 @@ impl temporalio_streams::OwnerClient for OneOwner {
     async fn describe(
         &self,
         _namespace: &str,
-        _workflow_id: &str,
+        _owner: temporalio_streams::OwnerId<'_>,
         _run_id: &str,
     ) -> Result<temporalio_streams::OwnerDescription, temporalio_streams::OwnerError> {
         Ok(temporalio_streams::OwnerDescription {
             run_id: "run-1".to_string(),
             first_run_id: "run-1".to_string(),
-            status: *self.status.lock().unwrap(),
+            status: temporalio_streams::OwnerStatus::of_workflow(*self.status.lock().unwrap()),
         })
     }
 }
