@@ -123,29 +123,36 @@ enum StreamOwnerKind {
   STREAM_OWNER_KIND_WORKFLOW = 1;
   // A standalone Activity run. It is a chain of one run, so its streams end with the run.
   STREAM_OWNER_KIND_ACTIVITY = 2;
+  // An Activity that a Workflow run scheduled. It is a chain of one, keyed by the scheduling run
+  // and the Activity id, so its streams end with the Activity.
+  STREAM_OWNER_KIND_WORKFLOW_ACTIVITY = 3;
 }
 
 // One stream, a topic of an owner in a namespace.
 message StreamAddress {
   string namespace = 1;
   StreamOwnerKind owner_kind = 2;
-  // The owning Workflow. Empty for an Activity owner.
+  // The owning Workflow, or the Workflow that scheduled a Workflow Activity. Empty for a
+  // standalone Activity owner.
   string workflow_id = 3;
   // Pins the stream to the run chain that holds this run. Empty follows the chain that holds the
   // Workflow id when the call starts. For an Activity owner, the Activity run, and empty names
-  // the newest run of the Activity id when the call starts.
+  // the newest run of the Activity id when the call starts. For a Workflow Activity owner, the
+  // run that scheduled the Activity. It is required, since an Activity id names nothing across
+  // runs.
   string run_id = 4;
   string topic = 5;
-  // The owning standalone Activity. Empty for a Workflow owner.
+  // The owning Activity. Empty for a Workflow owner.
   string activity_id = 6;
 }
 
 // A Workflow's run chain. Its streams are keyed by its first run, so they follow
 // Continue-as-New, and a new chain on the same Workflow id gets streams of its own. A standalone
-// Activity run is a chain of one run, with the run as `first_run_id`.
+// Activity run is a chain of one run, with the run as `first_run_id`. A Workflow Activity is a
+// chain of one, with the scheduling run as `first_run_id`.
 message ChainId {
   string namespace = 1;
-  // Empty for an Activity owner.
+  // Empty for a standalone Activity owner.
   string workflow_id = 2;
   string first_run_id = 3;
   // `UNSPECIFIED` is a Workflow owner, so a chain from before the Activity kind stays valid.
@@ -435,7 +442,8 @@ message RunStreamDriverResponse {}
 message DeleteOwnerRequest {
   string namespace = 1;
   StreamOwnerKind owner_kind = 2;
-  // The Workflow whose streams go, for a Workflow owner.
+  // The Workflow whose streams go, for a Workflow owner. The streams of every Activity that the
+  // Workflow scheduled go too.
   string workflow_id = 3;
   // The standalone Activity whose streams go, across all its runs, for an Activity owner.
   string activity_id = 4;

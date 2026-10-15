@@ -172,6 +172,11 @@ relevant information.
   fits 53 bits and a JSON number holds it exactly. The Nexus contract's models and JavaScript
   refused the earlier 16-bit form. A start time from May 2109 on is refused. The vector file
   holds the new keys.
+* Experimental: the stream protos name a Workflow Activity owner. `StreamOwnerKind` gains
+  `WORKFLOW_ACTIVITY`, an Activity that a Workflow run scheduled. Its `StreamAddress` and
+  `ChainId` set `workflow_id`, the scheduling run and `activity_id`, with no new field. The
+  vendored API's owner kind gains `WORKFLOW_ACTIVITY`. Core still refuses the kind as
+  `UNSUPPORTED`.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
