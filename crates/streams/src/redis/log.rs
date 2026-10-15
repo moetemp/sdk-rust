@@ -4,10 +4,10 @@
 use super::{
     conn::{BlockingPool, Node, Shared},
     errors::{Call, Mapped},
-    keys::{chain_of_log, doorbell, notifications},
+    keys::{archive_pending, chain_of_log, doorbell, notifications},
     slots::SLOTS,
 };
-use crate::{NotificationEntry, NotificationLog, StreamError, StreamResult};
+use crate::{ArchiveMark, NotificationEntry, NotificationLog, StreamError, StreamResult};
 use redis::{RedisError, Value};
 use std::{collections::BTreeSet, time::Duration};
 use tokio::time::Instant;
@@ -28,6 +28,8 @@ pub(crate) struct RedisLog {
     blocking: BlockingPool,
     prefix: String,
     doorbells: u32,
+    /// Whether the store marks topics for an archive, so the slots' sets are worth reading.
+    archive: bool,
 }
 
 impl RedisLog {
@@ -36,12 +38,14 @@ impl RedisLog {
         blocking: BlockingPool,
         prefix: String,
         doorbells: u32,
+        archive: bool,
     ) -> Self {
         Self {
             shared,
             blocking,
             prefix,
             doorbells: doorbells.clamp(1, SLOTS as u32),
+            archive,
         }
     }
 
@@ -333,6 +337,40 @@ impl NotificationLog for RedisLog {
             );
         }
         Ok(busy)
+    }
+
+    async fn archive_marks(&self, max: usize) -> StreamResult<Vec<ArchiveMark>> {
+        if !self.archive || max == 0 {
+            return Ok(vec![]);
+        }
+        let mut marks = vec![];
+        for (node, slots) in self.primaries().await? {
+            let mut pipeline = redis::pipe();
+            for &slot in &slots {
+                pipeline
+                    .cmd("ZRANGE")
+                    .arg(archive_pending(&self.prefix, slot))
+                    .arg(0)
+                    .arg(max - 1)
+                    .arg("WITHSCORES");
+            }
+            let sets: Vec<Vec<(String, f64)>> = self
+                .shared
+                .query_pipeline_on(node.as_ref(), pipeline, slots.len())
+                .await
+                .mapped(Call::Read)?;
+            for (log, written_ms) in sets.into_iter().flatten() {
+                match chain_of_log(&self.prefix, &log) {
+                    Some((chain, topic)) => marks.push(ArchiveMark {
+                        chain,
+                        topic,
+                        written_ms: written_ms as u64,
+                    }),
+                    None => tracing::warn!(log, "A slot's set to archive names no log key"),
+                }
+            }
+        }
+        Ok(marks)
     }
 }
 

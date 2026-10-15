@@ -6,8 +6,9 @@
 //! position keeps naming the same record after [MemoryStore::truncate] drops older ones.
 
 use crate::{
-    ACTIVITY_OWNER_KIND, NotificationEntry, NotificationLog, StreamError, StreamResult,
-    StreamStore, WORKFLOW_ACTIVITY_OWNER_KIND, WORKFLOW_OWNER_KIND, chain_owner,
+    ACTIVITY_OWNER_KIND, ARCHIVE_HOLDER, ArchiveMark, NotificationEntry, NotificationLog,
+    StreamError, StreamResult, StreamStore, WORKFLOW_ACTIVITY_OWNER_KIND, WORKFLOW_OWNER_KIND,
+    chain_owner,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
@@ -56,6 +57,8 @@ struct Topic {
     closed: bool,
     /// The first close of the topic, which later closes keep.
     close: Option<StoredClose>,
+    /// The newest offset the archive holds.
+    archived: Option<u64>,
 }
 
 impl Topic {
@@ -96,6 +99,8 @@ pub struct MemoryStore {
     /// Bumped on every write, so a waiting read checks again.
     written: watch::Sender<u64>,
     log: Option<Arc<MemoryLog>>,
+    /// Whether a topic's first append makes the archive's hold, from the topic's start.
+    archive_hold: bool,
 }
 
 impl Default for MemoryStore {
@@ -104,6 +109,7 @@ impl Default for MemoryStore {
             chains: Mutex::default(),
             written: watch::Sender::new(0),
             log: None,
+            archive_hold: false,
         }
     }
 }
@@ -120,6 +126,8 @@ struct MemoryLog {
 struct LogState {
     next_id: u64,
     items: VecDeque<LogItem>,
+    /// The topics with records to archive, with the time of each one's newest write.
+    marks: HashMap<(ChainKey, String), ArchiveMark>,
 }
 
 #[derive(Debug)]
@@ -145,6 +153,25 @@ impl MemoryLog {
         });
         drop(state);
         self.rung.send_modify(|rung| *rung += 1);
+    }
+
+    fn mark(&self, chain: &ChainId, topic: &str, written_ms: u64) {
+        self.state.lock().unwrap().marks.insert(
+            (chain_key(chain), topic.to_string()),
+            ArchiveMark {
+                chain: chain.clone(),
+                topic: topic.to_string(),
+                written_ms,
+            },
+        );
+    }
+
+    fn unmark(&self, chain: &ChainId, topic: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .marks
+            .remove(&(chain_key(chain), topic.to_string()));
     }
 
     fn holds_entries(&self) -> bool {
@@ -215,6 +242,14 @@ impl NotificationLog for MemoryLog {
         Ok(())
     }
 
+    async fn archive_marks(&self, max: usize) -> StreamResult<Vec<ArchiveMark>> {
+        let state = self.state.lock().unwrap();
+        let mut marks: Vec<ArchiveMark> = state.marks.values().cloned().collect();
+        marks.sort_by_key(|mark| mark.written_ms);
+        marks.truncate(max);
+        Ok(marks)
+    }
+
     async fn busy(&self) -> StreamResult<Vec<u32>> {
         Ok(if self.holds_entries() {
             vec![0]
@@ -238,6 +273,22 @@ impl MemoryStore {
                 rung: watch::Sender::new(0),
             })),
             ..Self::default()
+        }
+    }
+
+    /// This store, with an archive hold on every topic from its first append, so
+    /// [MemoryStore::truncate] drops only what [StreamStore::advance_archive] says an archive
+    /// holds.
+    pub fn holding_for_archive(mut self) -> Self {
+        self.archive_hold = true;
+        self
+    }
+
+    /// Forgets a topic and its holds, as a store does when the topic's last key expired.
+    pub fn forget(&self, chain: &ChainId, topic: &str) {
+        if let Some(chain) = self.chains.lock().unwrap().get_mut(&chain_key(chain)) {
+            chain.topics.remove(topic);
+            chain.floors.remove(topic);
         }
     }
 
@@ -333,6 +384,12 @@ fn parse_position(position: &str) -> StreamResult<Option<u64>> {
     })
 }
 
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
 fn wait_of(request: &StoreReadRequest) -> Duration {
     request.wait.as_ref().map_or(Duration::ZERO, |wait| {
         Duration::new(
@@ -408,6 +465,13 @@ impl StreamStore for MemoryStore {
         if keeps_topics && request.sequence == 1 {
             chain.written.insert(request.topic.clone());
         }
+        if self.archive_hold && !chain.topics.contains_key(&request.topic) {
+            chain
+                .floors
+                .entry(request.topic.clone())
+                .or_default()
+                .insert(ARCHIVE_HOLDER.to_string(), None);
+        }
         let topic = chain.topics.entry(request.topic.clone()).or_default();
         let count = request.records.len() as i64;
         let mut positions = request.records.into_iter().map(|record| topic.push(record));
@@ -425,6 +489,9 @@ impl StreamStore for MemoryStore {
         // Under the store's lock, so the entry lands in the same step as the records.
         if let (Some(log), Some(chain)) = (&self.log, &request.chain) {
             log.push(chain, &request.topic, last.to_string());
+            if self.archive_hold {
+                log.mark(chain, &request.topic, unix_ms());
+            }
         }
         drop(chains);
         self.wrote();
@@ -542,7 +609,54 @@ impl StreamStore for MemoryStore {
         {
             holders.remove(holder);
         }
+        if let (Some(log), true) = (&self.log, holder == ARCHIVE_HOLDER) {
+            log.unmark(chain, topic);
+        }
         Ok(())
+    }
+
+    async fn advance_archive(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        position: &str,
+    ) -> StreamResult<()> {
+        if !self.archive_hold {
+            return Err(StreamError::unsupported("this store keeps no archive hold"));
+        }
+        let position = parse_position(position)?;
+        let mut chains = self.chains.lock().unwrap();
+        let stored = chains.entry(chain_key(chain)).or_default();
+        stored
+            .floors
+            .entry(topic.to_string())
+            .or_default()
+            .insert(ARCHIVE_HOLDER.to_string(), position);
+        if let Some(held) = stored.topics.get_mut(topic) {
+            held.archived = position;
+            if let Some(log) = &self.log
+                && position.is_some_and(|position| position + 1 == held.head())
+            {
+                log.unmark(chain, topic);
+            }
+        }
+        Ok(())
+    }
+
+    async fn archived(&self, chain: &ChainId, topic: &str) -> StreamResult<Option<String>> {
+        if !self.archive_hold {
+            return Ok(None);
+        }
+        let chains = self.chains.lock().unwrap();
+        Ok(chains
+            .get(&chain_key(chain))
+            .and_then(|chain| chain.topics.get(topic))
+            .map(|topic| {
+                topic
+                    .archived
+                    .map(|offset| offset.to_string())
+                    .unwrap_or_default()
+            }))
     }
 
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {
@@ -579,6 +693,9 @@ impl StreamStore for MemoryStore {
             topic.closed = true;
             topic.close.get_or_insert(close).clone()
         };
+        if let (Some(log), true) = (&self.log, self.archive_hold) {
+            log.mark(chain, topic, 0);
+        }
         self.wrote();
         Ok(stored)
     }
