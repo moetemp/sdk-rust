@@ -76,8 +76,43 @@ A segment holds every record after `after_position` up to `last_position`. `clos
 
 `testdata/archive/names.json` and `testdata/archive/objects.json` pin the names and the bytes.
 
+## The sink
+
+The `StreamDriver` writes the archive when the service has an `ArchiveConfig`. A store with an
+archive marks each topic with records to archive, with the time of its newest write, and marks a
+closed topic first. At each sweep, the driver reads the marks and runs `archive_topic` on each
+topic that is closed, idle for `segment_idle`, or not taken for `segment_idle`. So a busy topic
+gets a segment at least that often. The hot store unmarks a topic once the archive holds its last
+record, and once the archive released a closed topic.
+
+Every driver archives every mark. The writes are create-once, so two drivers on one topic are safe
+and only cost reads. Without a running driver, nothing is archived, and the hold's lease,
+`stall_limit`, ends after its time. Then retention goes on as without an archive.
+
+## Config
+
+`StreamStoreConfig.archive` takes `url` (`s3://<bucket>/<prefix>` or `file:///<directory>`),
+`segment_bytes` (4 MiB), `segment_idle` (five minutes) and `stall_limit` (seven days). It needs
+`notification_log`. S3 settings come from the environment, as `object_store` reads them:
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT_URL` for an
+S3-compatible store, and `AWS_ALLOW_HTTP` for one without TLS. The archive deletes nothing but an
+owner's delete, so a bucket lifecycle rule sets how long it keeps streams. Bodies are as lang's
+codec encoded them, and bucket encryption, such as SSE-KMS, is the bucket's setting.
+
 ## Archives
 
 `LocalFileArchive` keeps objects in a directory. It writes each object to a hidden file and then
 links it to its name, which fails when the name exists. So a name is written once and no reader
 sees part of an object.
+
+`ObjectStoreArchive` keeps objects in S3 or an S3-compatible store through the `object_store`
+crate, behind the `archive` feature. A write sends `If-None-Match: *`, and a `412` answer means the
+name exists. Its listings take the whole listing after their start, since `object_store` makes no
+promise about the order.
+
+## Tests
+
+`tests/archive_sink.rs` runs the driver's sink on memory, on Redis with `STREAMS_REDIS_URL`, and on
+S3 with `STREAMS_S3_URL`. The conformance suite runs the archive cases on a local directory, and
+on S3 with `STREAMS_S3_URL`, such as `s3://archive/tests` on a local S3-compatible server with
+`AWS_ENDPOINT_URL` and `AWS_ALLOW_HTTP=true`.

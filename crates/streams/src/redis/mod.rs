@@ -161,6 +161,7 @@ impl RedisStore {
                 doorbell_reads,
                 options.key_prefix.clone(),
                 options.notify_doorbells,
+                options.archive_lease.is_some(),
             )))
         } else {
             None

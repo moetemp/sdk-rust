@@ -146,7 +146,8 @@ impl Forgets for Memory {
 struct Tiered<C> {
     inner: C,
     store: Arc<TieredStore>,
-    root: std::path::PathBuf,
+    /// The directory of a local archive, which the case deletes at its end.
+    root: Option<std::path::PathBuf>,
 }
 
 async fn tiered<C: Case>(inner: impl std::future::Future<Output = Option<C>>) -> Option<Tiered<C>> {
@@ -156,12 +157,38 @@ async fn tiered<C: Case>(inner: impl std::future::Future<Output = Option<C>>) ->
         inner.store(),
         Arc::new(LocalFileArchive::new(&root)),
     ));
-    Some(Tiered { inner, store, root })
+    Some(Tiered {
+        inner,
+        store,
+        root: Some(root),
+    })
+}
+
+/// [tiered] with the archive under a prefix of its own at `STREAMS_S3_URL`.
+#[cfg(feature = "archive")]
+async fn tiered_on_s3<C: Case>(
+    inner: impl std::future::Future<Output = Option<C>>,
+) -> Option<Tiered<C>> {
+    let Ok(url) = std::env::var("STREAMS_S3_URL") else {
+        eprintln!("set STREAMS_S3_URL to run the S3 archive cases");
+        return None;
+    };
+    let inner = inner.await?;
+    let url = format!("{}/{}", url.trim_end_matches('/'), unique("conformance"));
+    let archive = temporalio_streams::ObjectStoreArchive::from_s3_url(&url).unwrap();
+    let store = Arc::new(TieredStore::new(inner.store(), Arc::new(archive)));
+    Some(Tiered {
+        inner,
+        store,
+        root: None,
+    })
 }
 
 impl<C> Drop for Tiered<C> {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
+        if let Some(root) = &self.root {
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 }
 
@@ -224,7 +251,10 @@ impl<C: Forgets> ArchiveCase for Tiered<C> {
     }
 
     async fn lose(&self, name: &str) {
-        std::fs::remove_file(self.root.join(name)).unwrap();
+        match &self.root {
+            Some(root) => std::fs::remove_file(root.join(name)).unwrap(),
+            None => assert_eq!(self.archive().delete_prefix(name).await.unwrap(), 1),
+        }
     }
 }
 
@@ -2813,5 +2843,21 @@ mod archive_cluster_redis {
 mod archive_workflow_activity_cluster_redis {
     archive_cases!(super::tiered(super::workflow_activity(
         super::on_redis::redis_with_archive("STREAMS_REDIS_CLUSTER_URL", true)
+    )));
+}
+
+#[cfg(feature = "archive")]
+mod archive_s3_memory {
+    archive_cases!(super::tiered_on_s3(super::memory_holding_for_archive()));
+    archive_conformance!(super::tiered_on_s3(super::memory_holding_for_archive());
+        the_trim_keeps_what_the_archive_does_not_hold,
+    );
+}
+
+#[cfg(all(feature = "archive", feature = "redis"))]
+mod archive_s3_cluster_redis {
+    archive_cases!(super::tiered_on_s3(super::on_redis::redis_with_archive(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
     )));
 }

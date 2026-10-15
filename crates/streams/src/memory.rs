@@ -6,8 +6,9 @@
 //! position keeps naming the same record after [MemoryStore::truncate] drops older ones.
 
 use crate::{
-    ACTIVITY_OWNER_KIND, ARCHIVE_HOLDER, NotificationEntry, NotificationLog, StreamError,
-    StreamResult, StreamStore, WORKFLOW_ACTIVITY_OWNER_KIND, WORKFLOW_OWNER_KIND, chain_owner,
+    ACTIVITY_OWNER_KIND, ARCHIVE_HOLDER, ArchiveMark, NotificationEntry, NotificationLog,
+    StreamError, StreamResult, StreamStore, WORKFLOW_ACTIVITY_OWNER_KIND, WORKFLOW_OWNER_KIND,
+    chain_owner,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
@@ -125,6 +126,8 @@ struct MemoryLog {
 struct LogState {
     next_id: u64,
     items: VecDeque<LogItem>,
+    /// The topics with records to archive, with the time of each one's newest write.
+    marks: HashMap<(ChainKey, String), ArchiveMark>,
 }
 
 #[derive(Debug)]
@@ -150,6 +153,25 @@ impl MemoryLog {
         });
         drop(state);
         self.rung.send_modify(|rung| *rung += 1);
+    }
+
+    fn mark(&self, chain: &ChainId, topic: &str, written_ms: u64) {
+        self.state.lock().unwrap().marks.insert(
+            (chain_key(chain), topic.to_string()),
+            ArchiveMark {
+                chain: chain.clone(),
+                topic: topic.to_string(),
+                written_ms,
+            },
+        );
+    }
+
+    fn unmark(&self, chain: &ChainId, topic: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .marks
+            .remove(&(chain_key(chain), topic.to_string()));
     }
 
     fn holds_entries(&self) -> bool {
@@ -218,6 +240,14 @@ impl NotificationLog for MemoryLog {
             .items
             .retain(|item| !ids.contains(&item.entry.id));
         Ok(())
+    }
+
+    async fn archive_marks(&self, max: usize) -> StreamResult<Vec<ArchiveMark>> {
+        let state = self.state.lock().unwrap();
+        let mut marks: Vec<ArchiveMark> = state.marks.values().cloned().collect();
+        marks.sort_by_key(|mark| mark.written_ms);
+        marks.truncate(max);
+        Ok(marks)
     }
 
     async fn busy(&self) -> StreamResult<Vec<u32>> {
@@ -354,6 +384,12 @@ fn parse_position(position: &str) -> StreamResult<Option<u64>> {
     })
 }
 
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
 fn wait_of(request: &StoreReadRequest) -> Duration {
     request.wait.as_ref().map_or(Duration::ZERO, |wait| {
         Duration::new(
@@ -453,6 +489,9 @@ impl StreamStore for MemoryStore {
         // Under the store's lock, so the entry lands in the same step as the records.
         if let (Some(log), Some(chain)) = (&self.log, &request.chain) {
             log.push(chain, &request.topic, last.to_string());
+            if self.archive_hold {
+                log.mark(chain, &request.topic, unix_ms());
+            }
         }
         drop(chains);
         self.wrote();
@@ -570,6 +609,9 @@ impl StreamStore for MemoryStore {
         {
             holders.remove(holder);
         }
+        if let (Some(log), true) = (&self.log, holder == ARCHIVE_HOLDER) {
+            log.unmark(chain, topic);
+        }
         Ok(())
     }
 
@@ -584,14 +626,19 @@ impl StreamStore for MemoryStore {
         }
         let position = parse_position(position)?;
         let mut chains = self.chains.lock().unwrap();
-        let chain = chains.entry(chain_key(chain)).or_default();
-        chain
+        let stored = chains.entry(chain_key(chain)).or_default();
+        stored
             .floors
             .entry(topic.to_string())
             .or_default()
             .insert(ARCHIVE_HOLDER.to_string(), position);
-        if let Some(topic) = chain.topics.get_mut(topic) {
-            topic.archived = position;
+        if let Some(held) = stored.topics.get_mut(topic) {
+            held.archived = position;
+            if let Some(log) = &self.log
+                && position.is_some_and(|position| position + 1 == held.head())
+            {
+                log.unmark(chain, topic);
+            }
         }
         Ok(())
     }
@@ -646,6 +693,9 @@ impl StreamStore for MemoryStore {
             topic.closed = true;
             topic.close.get_or_insert(close).clone()
         };
+        if let (Some(log), true) = (&self.log, self.archive_hold) {
+            log.mark(chain, topic, 0);
+        }
         self.wrote();
         Ok(stored)
     }

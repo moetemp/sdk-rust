@@ -8,12 +8,16 @@
 
 mod format;
 mod local;
+#[cfg(feature = "archive")]
+mod object;
 
 pub(crate) use format::{
     ArchivedClose, CLOSE_NAME, Segment, holding_start, owner_prefixes, segment_name,
     segments_start, sort_key, topic_prefix,
 };
 pub use local::LocalFileArchive;
+#[cfg(feature = "archive")]
+pub use object::ObjectStoreArchive;
 
 use crate::{
     ARCHIVE_HOLDER, StreamResult, StreamStore,
