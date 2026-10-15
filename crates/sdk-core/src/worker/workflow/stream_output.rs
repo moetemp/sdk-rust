@@ -5,12 +5,56 @@ use super::WFMachinesError;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use temporalio_common::{
     protos::{
-        coresdk::workflow_commands::OutputRecord, temporal::sdk::streams::v1::StreamRecordKind,
+        coresdk::{
+            activity_result::{ActivityResolution, activity_resolution},
+            workflow_commands::OutputRecord,
+        },
+        temporal::{api::failure::v1::Failure, sdk::streams::v1::StreamRecordKind},
     },
-    streams::check_topic,
+    streams::{check_link, check_topic},
 };
 
 const CONTENT_HASH_BYTES: usize = 32;
+
+/// The `ScheduleActivity` header that marks an Activity as the owner of its own streams. The
+/// scheduling Workflow's Core closes them when it resolves the Activity. The command holds it, so
+/// replay rebuilds the mark with no History read, and the Activity's Worker sees it too.
+pub(crate) const STREAM_OWNER_HEADER: &str = "__temporal_stream_owner";
+
+/// The streams of one Workflow Activity to close, with the outcome its scheduling Workflow saw.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ActivityStreamClose {
+    pub(crate) workflow_id: String,
+    /// The run that scheduled the Activity, which keys its streams.
+    pub(crate) run_id: String,
+    pub(crate) activity_id: String,
+    /// `None` for a completed Activity, which closes with a null result.
+    pub(crate) failure: Option<Failure>,
+}
+
+impl ActivityStreamClose {
+    /// The close for `resolution`, or `None` for one that does not end the Activity.
+    pub(crate) fn of(
+        workflow_id: &str,
+        run_id: &str,
+        activity_id: &str,
+        resolution: Option<&ActivityResolution>,
+    ) -> Option<Self> {
+        let failure = match resolution?.status.as_ref()? {
+            activity_resolution::Status::Completed(_) => None,
+            activity_resolution::Status::Failed(failed) => Some(failed.failure.clone()?),
+            activity_resolution::Status::Cancelled(cancelled) => Some(cancelled.failure.clone()?),
+            // Only Local Activities back off, and they own no streams.
+            activity_resolution::Status::Backoff(_) => return None,
+        };
+        Some(Self {
+            workflow_id: workflow_id.to_string(),
+            run_id: run_id.to_string(),
+            activity_id: activity_id.to_string(),
+            failure,
+        })
+    }
+}
 
 /// The records one activation committed, appended when its completion reaches Core.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,6 +128,9 @@ fn check_record(record: &OutputRecord) -> Result<(), String> {
         return Err("has no topic".to_string());
     }
     check_topic(&record.topic)?;
+    if record.link.is_some() != (record.kind == StreamRecordKind::Link as i32) {
+        return Err("has a link and is not LINK, or is LINK without a link".to_string());
+    }
     match StreamRecordKind::try_from(record.kind) {
         Ok(StreamRecordKind::Data) => {
             if record.body.is_none() {
@@ -102,7 +149,27 @@ fn check_record(record: &OutputRecord) -> Result<(), String> {
                 return Err("is FINISH with a body".to_string());
             }
         }
-        _ => return Err(format!("has kind {}, not DATA or FINISH", record.kind)),
+        Ok(StreamRecordKind::Link) => {
+            check_link(record.link.as_ref().expect("checked above"))?;
+            let hash_fits = if record.body.is_some() {
+                record.content_hash.len() == CONTENT_HASH_BYTES
+            } else {
+                record.content_hash.is_empty()
+            };
+            if !hash_fits {
+                return Err(format!(
+                    "is LINK with a {}-byte content hash, which a body needs as the \
+                     {CONTENT_HASH_BYTES}-byte SHA-256 of its plaintext and no body leaves empty",
+                    record.content_hash.len()
+                ));
+            }
+        }
+        _ => {
+            return Err(format!(
+                "has kind {}, not DATA, FINISH or LINK",
+                record.kind
+            ));
+        }
     }
     Ok(())
 }
@@ -168,6 +235,7 @@ impl OutputStore {
                         kind: record.kind,
                         body: record.body.clone(),
                         content_hash: record.content_hash.clone(),
+                        link: record.link.clone(),
                     };
                     temporalio_streams::stored_append_record(
                         &topic.topic,
@@ -190,7 +258,7 @@ impl OutputStore {
                     topic
                         .records
                         .iter()
-                        .map(|r| (r.kind, r.content_hash.as_slice())),
+                        .map(|r| (r.kind, r.content_hash.as_slice(), r.link.as_ref())),
                 ),
                 records,
             };
@@ -222,6 +290,22 @@ impl OutputStore {
         Ok(dropped)
     }
 
+    /// Closes every topic each Workflow Activity in `closes` wrote, in the background. A close
+    /// that fails is logged and dropped, since it must not fail the Workflow Task. The owner
+    /// checks then close the streams with a generic failure.
+    pub(crate) fn close_activity_streams(&self, closes: Vec<ActivityStreamClose>) {
+        if closes.is_empty() {
+            return;
+        }
+        let store = self.store.clone();
+        let namespace = self.namespace.clone();
+        tokio::spawn(async move {
+            for close in closes {
+                close_one(store.as_ref(), &namespace, close).await;
+            }
+        });
+    }
+
     /// Drops the store's dedupe sessions of attempts that will not write again. A failure only
     /// leaves a session in the store until retention, so it is logged and not returned.
     pub(crate) async fn retire(&self, retired: &RetiredSessions) {
@@ -241,10 +325,97 @@ impl OutputStore {
     }
 }
 
+#[cfg(feature = "streams")]
+async fn close_one(
+    store: &dyn temporalio_streams::StreamStore,
+    namespace: &str,
+    close: ActivityStreamClose,
+) {
+    use temporalio_streams::proto::{ChainId, StoredClose, StreamOwnerKind};
+    let chain = ChainId {
+        namespace: namespace.to_string(),
+        workflow_id: close.workflow_id,
+        first_run_id: close.run_id,
+        owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+        activity_id: close.activity_id,
+    };
+    let closed_by = format!("{}@{}", chain.activity_id, chain.first_run_id);
+    let (result, failure) = match close.failure {
+        None => (Some(temporalio_streams::empty_close_result()), None),
+        Some(failure) => (None, Some(fit_failure(failure, closed_by.len()))),
+    };
+    let topics = match store.written_topics(&chain).await {
+        Ok(topics) => topics,
+        Err(error) => {
+            warn!(
+                workflow_id = %chain.workflow_id,
+                activity_id = %chain.activity_id,
+                %error,
+                "Could not list the topics of an Activity's streams to close them"
+            );
+            return;
+        }
+    };
+    for topic in topics {
+        let stored = StoredClose {
+            result: result.clone(),
+            failure: failure.clone(),
+            closed_by: closed_by.clone(),
+        };
+        if let Err(error) = store.close_stream(&chain, &topic, stored).await {
+            warn!(
+                workflow_id = %chain.workflow_id,
+                activity_id = %chain.activity_id,
+                %topic,
+                %error,
+                "Could not close an Activity's stream when its Workflow resolved it"
+            );
+        }
+    }
+}
+
+/// `failure` cut to what a stored close holds. The causes and the stack trace go first, then the
+/// details, and a failure still too large keeps only the start of its message.
+#[cfg(feature = "streams")]
+fn fit_failure(failure: Failure, closed_by_bytes: usize) -> Failure {
+    use prost::Message;
+    // Room for the close's other fields and their tags.
+    let limit = temporalio_streams::MAX_CLOSE_BYTES - closed_by_bytes - 64;
+    if failure.encoded_len() <= limit {
+        return failure;
+    }
+    let mut cut = Failure {
+        cause: None,
+        stack_trace: String::new(),
+        ..failure
+    };
+    if cut.encoded_len() <= limit {
+        return cut;
+    }
+    cut.encoded_attributes = None;
+    cut.failure_info = None;
+    if cut.encoded_len() <= limit {
+        return cut;
+    }
+    let mut end = limit / 2;
+    while !cut.message.is_char_boundary(end) {
+        end -= 1;
+    }
+    cut.message.truncate(end);
+    Failure {
+        message: cut.message,
+        source: cut.source,
+        ..Default::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temporalio_common::protos::temporal::api::common::v1::Payload;
+    use temporalio_common::protos::temporal::{
+        api::common::v1::Payload,
+        sdk::streams::v1::{StreamLink, stream_link},
+    };
 
     fn data(topic: &str, hash: u8) -> OutputRecord {
         OutputRecord {
@@ -255,6 +426,7 @@ mod tests {
                 ..Default::default()
             }),
             content_hash: vec![hash; CONTENT_HASH_BYTES],
+            ..Default::default()
         }
     }
 
@@ -302,11 +474,57 @@ mod tests {
             (short_hash, "record 1 is DATA with a 3-byte content hash"),
             (finish_with_body, "record 1 is FINISH with a body"),
             (unspecified, "record 1 has kind 0"),
+            (
+                OutputRecord {
+                    link: Some(join("x")),
+                    ..data("t", 1)
+                },
+                "has a link and is not LINK",
+            ),
+            (
+                link_record("t", StreamLink::default()),
+                "a link needs a name",
+            ),
+            (
+                OutputRecord {
+                    content_hash: vec![1; 32],
+                    ..link_record("t", join("x"))
+                },
+                "is LINK with a 32-byte content hash",
+            ),
         ] {
             let message = output_by_topic(vec![data("t", 9), record], &mut HashMap::new())
                 .unwrap_err()
                 .to_string();
             assert!(message.contains(expected), "{expected}: {message}");
         }
+    }
+
+    fn join(name: &str) -> StreamLink {
+        StreamLink {
+            event: stream_link::Event::Join as i32,
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn link_record(topic: &str, link: StreamLink) -> OutputRecord {
+        OutputRecord {
+            topic: topic.to_string(),
+            kind: StreamRecordKind::Link as i32,
+            link: Some(link),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_link_is_a_record_of_its_topic_like_any_other() {
+        let topics = output_by_topic(
+            vec![data("t", 1), link_record("t", join("tool-1"))],
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].records[1].link, Some(join("tool-1")));
     }
 }
