@@ -111,6 +111,12 @@ message AttachCallerRequest {
   // hear about the stream.
   string callback_url = 3;
   map<string, string> callback_headers = 4;
+  // The callback is idle, so it hears no progress until a wait. Set, this asks for the first
+  // wait right after the attach: one wake once the stream holds a record above this counter, at
+  // once when it already does. A follower that reads only when woken sets it, zero for the
+  // stream's start. A reader that reads first leaves it unset and waits through its reads'
+  // `wake_token`.
+  optional int64 wake_after_counter = 5;
 }
 
 message AttachCallerResponse {

@@ -70,6 +70,8 @@ async fn attach(
     // Fresh for the latest run, since the Workflow id may have moved on to a new chain since a
     // read warmed the cache, and an attach to the ended chain would never hear the new stream.
     let chain = streams.chain_now(stream).await?;
+    let wake_after_counter = request.wake_after_counter;
+    let attach_request_id = request.request_id.clone();
     let operation_token = OperationToken {
         stream: stream.clone(),
         attach_request_id: request.request_id.clone(),
@@ -92,6 +94,17 @@ async fn attach(
         })
         .await
         .map_err(caller_error)?;
+    if let Some(after_counter) = wake_after_counter {
+        client
+            .wait_callback(
+                chain,
+                stream.topic.clone(),
+                attach_request_id,
+                after_counter,
+            )
+            .await
+            .map_err(caller_error)?;
+    }
     Ok(operation_token)
 }
 
@@ -338,10 +351,25 @@ mod tests {
         notified: Mutex<Vec<StreamNotification>>,
         notify_failures: std::sync::atomic::AtomicUsize,
         answer: Mutex<Option<NotifyError>>,
+        waits: Mutex<Vec<(ChainId, String, String, i64)>>,
     }
 
     #[async_trait::async_trait]
     impl NotifierClient for Notifier {
+        async fn wait_callback(
+            &self,
+            chain: ChainId,
+            topic: String,
+            request_id: String,
+            after_counter: i64,
+        ) -> Result<(), NotifyError> {
+            self.waits
+                .lock()
+                .unwrap()
+                .push((chain, topic, request_id, after_counter));
+            Ok(())
+        }
+
         async fn notify(&self, notification: StreamNotification) -> Result<(), NotifyError> {
             use std::sync::atomic::Ordering;
             if self
@@ -413,6 +441,7 @@ mod tests {
             request_id: "attach-1".to_string(),
             callback_url: callback_url.to_string(),
             callback_headers: [("nexus-callback-token".to_string(), "abc".to_string())].into(),
+            wake_after_counter: None,
         }
     }
 
@@ -506,6 +535,34 @@ mod tests {
                 .collect(),
         }
         .encode_to_vec()
+    }
+
+    #[tokio::test]
+    async fn a_follower_start_asks_for_its_first_wake_and_a_reader_start_does_not() {
+        let setup = setup();
+        attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        assert!(setup.notifier.waits.lock().unwrap().is_empty());
+        let follower = AttachCallerRequest {
+            request_id: "attach-2".to_string(),
+            wake_after_counter: Some(0),
+            ..attach_request("temporal://system")
+        };
+        attach(&setup.service, follower).await.unwrap();
+        let waits = setup.notifier.waits.lock().unwrap().clone();
+        let [(chain, topic, request_id, after)] = waits.as_slice() else {
+            panic!("one wait, not {waits:?}");
+        };
+        assert_eq!(
+            chain,
+            &setup.notifier.attached.lock().unwrap()[1].chain,
+            "the wait names the chain the attach landed on"
+        );
+        assert_eq!(
+            (topic.as_str(), request_id.as_str(), *after),
+            ("tokens", "attach-2", 0)
+        );
     }
 
     #[tokio::test]
