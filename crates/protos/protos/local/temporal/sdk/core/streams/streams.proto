@@ -4,6 +4,7 @@ package coresdk.streams;
 option ruby_package = "Temporalio::Internal::Bridge::Api::Streams";
 
 import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/failure/v1/message.proto";
 import "temporal/sdk/streams/v1/message.proto";
@@ -120,25 +121,37 @@ message MemoryStoreConfig {}
 enum StreamOwnerKind {
   STREAM_OWNER_KIND_UNSPECIFIED = 0;
   STREAM_OWNER_KIND_WORKFLOW = 1;
+  // A standalone Activity run. It is a chain of one run, so its streams end with the run.
+  STREAM_OWNER_KIND_ACTIVITY = 2;
 }
 
 // One stream, a topic of an owner in a namespace.
 message StreamAddress {
   string namespace = 1;
   StreamOwnerKind owner_kind = 2;
+  // The owning Workflow. Empty for an Activity owner.
   string workflow_id = 3;
   // Pins the stream to the run chain that holds this run. Empty follows the chain that holds the
-  // Workflow id when the call starts.
+  // Workflow id when the call starts. For an Activity owner, the Activity run, and empty names
+  // the newest run of the Activity id when the call starts.
   string run_id = 4;
   string topic = 5;
+  // The owning standalone Activity. Empty for a Workflow owner.
+  string activity_id = 6;
 }
 
 // A Workflow's run chain. Its streams are keyed by its first run, so they follow
-// Continue-as-New, and a new chain on the same Workflow id gets streams of its own.
+// Continue-as-New, and a new chain on the same Workflow id gets streams of its own. A standalone
+// Activity run is a chain of one run, with the run as `first_run_id`.
 message ChainId {
   string namespace = 1;
+  // Empty for an Activity owner.
   string workflow_id = 2;
   string first_run_id = 3;
+  // `UNSPECIFIED` is a Workflow owner, so a chain from before the Activity kind stays valid.
+  StreamOwnerKind owner_kind = 4;
+  // Empty for a Workflow owner.
+  string activity_id = 5;
 }
 
 // A producer that names itself.
@@ -156,6 +169,10 @@ message ActivityProducer {
   string run_id = 2;
   string activity_id = 3;
   int32 attempt = 4;
+  // When the attempt started, as the Activity task gives it. With it, Core writes the attempt as
+  // `started_unix_ms << 16 | min(attempt, 65535)`, so a later attempt and a reset attempt both
+  // supersede an earlier one. Unset writes `attempt` as it is.
+  google.protobuf.Timestamp attempt_started_time = 5;
 }
 
 // One record lang appends.
@@ -418,7 +435,10 @@ message RunStreamDriverResponse {}
 message DeleteOwnerRequest {
   string namespace = 1;
   StreamOwnerKind owner_kind = 2;
+  // The Workflow whose streams go, for a Workflow owner.
   string workflow_id = 3;
+  // The standalone Activity whose streams go, across all its runs, for an Activity owner.
+  string activity_id = 4;
 }
 
 message DeleteOwnerResponse {
