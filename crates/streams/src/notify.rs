@@ -4,7 +4,7 @@
 //! hint that there is something new to read. The records stay on the read path.
 
 use crate::{
-    CloseOutcome, StreamResult, StreamStore, WORKFLOW_OWNER_KIND, mint_cursor,
+    CloseOutcome, StreamResult, StreamStore, chain_owner, mint_cursor,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
@@ -199,6 +199,8 @@ struct StreamKey {
     namespace: String,
     workflow_id: String,
     first_run_id: String,
+    owner_kind: i32,
+    activity_id: String,
     topic: String,
 }
 
@@ -208,6 +210,8 @@ impl StreamKey {
             namespace: chain.namespace.clone(),
             workflow_id: chain.workflow_id.clone(),
             first_run_id: chain.first_run_id.clone(),
+            owner_kind: chain.owner_kind,
+            activity_id: chain.activity_id.clone(),
             topic: topic.to_string(),
         }
     }
@@ -217,6 +221,8 @@ impl StreamKey {
             namespace: self.namespace.clone(),
             workflow_id: self.workflow_id.clone(),
             first_run_id: self.first_run_id.clone(),
+            owner_kind: self.owner_kind,
+            activity_id: self.activity_id.clone(),
         }
     }
 }
@@ -327,6 +333,7 @@ impl Slot {
                 Err(NotifyError::Failed(error)) if tries_left > 0 && !self.superseded() => {
                     tracing::debug!(
                         workflow_id = %self.key.workflow_id,
+                        activity_id = %self.key.activity_id,
                         topic = %self.key.topic,
                         %error,
                         "A stream notification failed; trying again in {delay:?}"
@@ -335,6 +342,7 @@ impl Slot {
                 Err(error) => {
                     tracing::warn!(
                         workflow_id = %self.key.workflow_id,
+                        activity_id = %self.key.activity_id,
                         topic = %self.key.topic,
                         %error,
                         "A stream notification failed. The next write tells the reader again"
@@ -434,6 +442,7 @@ impl Notifier {
                     Err(NotifyError::Refused(error) | NotifyError::Unsupported(error)) => {
                         tracing::warn!(
                             workflow_id = %chain.workflow_id,
+                            activity_id = %chain.activity_id,
                             topic,
                             error,
                             "The server refused the close of a stream's notifier"
@@ -442,6 +451,7 @@ impl Notifier {
                     }
                     Err(NotifyError::Failed(error)) => tracing::warn!(
                         workflow_id = %chain.workflow_id,
+                        activity_id = %chain.activity_id,
                         topic,
                         error,
                         "Could not close a stream's notifier; trying again in {delay:?}"
@@ -655,13 +665,12 @@ impl NotifyingStore {
 }
 
 fn cursor_of(store: &dyn StreamStore, chain: &ChainId, topic: &str, position: &str) -> String {
-    let hash = stream_hash(
-        &chain.namespace,
-        WORKFLOW_OWNER_KIND,
-        &chain.workflow_id,
-        topic,
-    );
-    mint_cursor(store.name(), &hash, position)
+    let (kind, id) = chain_owner(chain);
+    mint_cursor(
+        store.name(),
+        &stream_hash(&chain.namespace, kind, id, topic),
+        position,
+    )
 }
 
 /// The cursor and counter that tell a reader about the record at `position`.
@@ -676,6 +685,7 @@ fn notification_at(
     let Some(counter) = progress_counter(position) else {
         tracing::warn!(
             workflow_id = %chain.workflow_id,
+            activity_id = %chain.activity_id,
             topic,
             position,
             "No notifier counter comes from this position, so the write isn't notified"
@@ -905,6 +915,18 @@ mod tests {
             namespace: "ns".to_string(),
             workflow_id: "wf".to_string(),
             first_run_id: first_run_id.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// The chain of run `run_id` of standalone Activity `wf`, which shares the Workflow's id.
+    fn activity_chain(run_id: &str) -> ChainId {
+        ChainId {
+            namespace: "ns".to_string(),
+            first_run_id: run_id.to_string(),
+            owner_kind: crate::proto::StreamOwnerKind::Activity as i32,
+            activity_id: "wf".to_string(),
+            ..Default::default()
         }
     }
 
@@ -1161,10 +1183,41 @@ mod tests {
             sent[0].position,
             mint_cursor(
                 "memory",
-                &stream_hash("ns", WORKFLOW_OWNER_KIND, "wf", "t"),
+                &stream_hash("ns", crate::WORKFLOW_OWNER_KIND, "wf", "t"),
                 &landed.last_position
             ),
             "the position is the cursor a reader resumes from"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_activity_append_notifies_the_activitys_stream() {
+        let recorder = Arc::new(Recorder::default());
+        let (_, store) = notifying_store(&recorder);
+        // A Workflow with the same id writes too, and its stream is another one.
+        store
+            .append(append_request(&chain("run-1"), "t", 1))
+            .await
+            .unwrap();
+        let landed = store
+            .append(append_request(&activity_chain("run-1"), "t", 1))
+            .await
+            .unwrap();
+        store.flush_notifications().await;
+        let sent = recorder.sent.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2, "one notifier per owner, {sent:?}");
+        let activity = sent
+            .iter()
+            .find(|n| n.chain == activity_chain("run-1"))
+            .unwrap();
+        assert_eq!(
+            activity.position,
+            mint_cursor(
+                "memory",
+                &stream_hash("ns", crate::ACTIVITY_OWNER_KIND, "wf", "t"),
+                &landed.last_position
+            ),
+            "the cursor hashes under the Activity kind"
         );
     }
 
@@ -1364,6 +1417,22 @@ mod tests {
             "the store refused appends before the notifier heard the close"
         );
         assert!(store.notifier().slots.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_activity_close_reaches_its_notifier_with_the_outcome() {
+        let (client, store) = sees_the_store(None);
+        let run = activity_chain("act-run");
+        store.append(append_request(&run, "t", 1)).await.unwrap();
+        store
+            .close_stream(&run, "t", CloseOutcome::Failure(gave_up()).into())
+            .await
+            .unwrap();
+        let sent = client.sent.lock().unwrap().clone();
+        let close = sent.last().unwrap();
+        assert_eq!(close.chain, run);
+        assert_eq!(close.close, Some(CloseOutcome::Failure(gave_up())));
+        assert_eq!(close.counter, 2, "one above the newest record's counter");
     }
 
     #[tokio::test]

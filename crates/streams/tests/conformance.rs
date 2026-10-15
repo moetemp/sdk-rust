@@ -17,7 +17,7 @@ use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     BEGINNING, END, MemoryStore, NotificationEntry, NotificationLog, Notifier, NotifierClient,
     NotifyError, NotifyingStore, ReadTarget, StreamNotification, StreamResult, StreamStore,
-    mint_cursor, proto::*, read_page, stored_append_record, stream_hash,
+    chain_owner, mint_cursor, proto::*, read_page, stored_append_record, stream_hash,
 };
 
 #[async_trait::async_trait]
@@ -58,6 +58,7 @@ impl Case for Memory {
             namespace: "default".to_string(),
             workflow_id: unique("conformance"),
             first_run_id: unique("run"),
+            ..Default::default()
         }
     }
 
@@ -125,6 +126,47 @@ impl<C: Case> Case for Notifying<C> {
     }
 }
 
+/// Another case whose chains are standalone Activity runs, so every case runs on the Activity
+/// keys too.
+struct Activity<C>(C);
+
+async fn activity<C: Case>(
+    inner: impl std::future::Future<Output = Option<C>>,
+) -> Option<Activity<C>> {
+    Some(Activity(inner.await?))
+}
+
+/// The chain of standalone Activity run `run_id` of `activity_id`.
+fn activity_chain(namespace: &str, activity_id: &str, run_id: &str) -> ChainId {
+    ChainId {
+        namespace: namespace.to_string(),
+        first_run_id: run_id.to_string(),
+        owner_kind: StreamOwnerKind::Activity as i32,
+        activity_id: activity_id.to_string(),
+        ..Default::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl<C: Case> Case for Activity<C> {
+    fn store(&self) -> Arc<dyn StreamStore> {
+        self.0.store()
+    }
+
+    fn chain(&self) -> ChainId {
+        let chain = self.0.chain();
+        activity_chain(&chain.namespace, &chain.workflow_id, &chain.first_run_id)
+    }
+
+    async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize) {
+        self.0.drop_oldest(chain, topic, keep).await;
+    }
+
+    async fn expire_log(&self, chain: &ChainId, topic: &str) {
+        self.0.expire_log(chain, topic).await;
+    }
+}
+
 #[cfg(feature = "redis")]
 mod on_redis {
     use super::*;
@@ -176,11 +218,15 @@ mod on_redis {
     }
 
     pub(crate) fn log_key(prefix: &str, chain: &ChainId, topic: &str) -> String {
+        let owner = if chain.owner_kind == StreamOwnerKind::Activity as i32 {
+            format!("!a:{}", part(&chain.activity_id))
+        } else {
+            part(&chain.workflow_id)
+        };
         format!(
-            "{}:{{{}:{}:{}}}:t:{}",
+            "{}:{{{}:{owner}:{}}}:t:{}",
             part(prefix),
             part(&chain.namespace),
-            part(&chain.workflow_id),
             part(&chain.first_run_id),
             part(topic)
         )
@@ -383,6 +429,7 @@ mod on_redis {
                 namespace: "default".to_string(),
                 workflow_id: unique("conformance"),
                 first_run_id: unique("run"),
+                ..Default::default()
             }
         }
 
@@ -521,7 +568,10 @@ fn target(chain: &ChainId, topic: &str) -> ReadTarget {
     ReadTarget {
         chain: chain.clone(),
         topic: topic.to_string(),
-        stream_hash: stream_hash(&chain.namespace, "workflow", &chain.workflow_id, topic),
+        stream_hash: {
+            let (kind, id) = chain_owner(chain);
+            stream_hash(&chain.namespace, kind, id, topic)
+        },
     }
 }
 
@@ -1434,17 +1484,40 @@ mod cases {
             ..chain.clone()
         };
         let bystander = case.chain();
+        let (kind_name, id) = chain_owner(&chain);
+        let activity = kind_name == "activity";
+        // An owner of the other kind with the same id keeps its streams.
+        let twin = if activity {
+            ChainId {
+                namespace: chain.namespace.clone(),
+                workflow_id: id.to_string(),
+                first_run_id: chain.first_run_id.clone(),
+                ..Default::default()
+            }
+        } else {
+            activity_chain(&chain.namespace, id, &chain.first_run_id)
+        };
         let landed = Producer::new(case, &chain, OUT, "p", 1)
             .append(&["1"])
             .await;
         Producer::new(case, &next, OUT, "p", 1).append(&["1"]).await;
-        Producer::new(case, &bystander, OUT, "p", 1)
-            .append(&["1"])
-            .await;
-        let request = DeleteOwnerRequest {
-            namespace: chain.namespace.clone(),
-            owner_kind: StreamOwnerKind::Workflow as i32,
-            workflow_id: chain.workflow_id.clone(),
+        for kept in [&bystander, &twin] {
+            Producer::new(case, kept, OUT, "p", 1).append(&["1"]).await;
+        }
+        let request = if activity {
+            DeleteOwnerRequest {
+                namespace: chain.namespace.clone(),
+                owner_kind: StreamOwnerKind::Activity as i32,
+                activity_id: id.to_string(),
+                ..Default::default()
+            }
+        } else {
+            DeleteOwnerRequest {
+                namespace: chain.namespace.clone(),
+                owner_kind: StreamOwnerKind::Workflow as i32,
+                workflow_id: id.to_string(),
+                ..Default::default()
+            }
         };
         assert!(store.delete_owner(request.clone()).await.unwrap().deleted > 0);
         assert_eq!(store.delete_owner(request).await.unwrap().deleted, 0);
@@ -1455,10 +1528,12 @@ mod cases {
             kind(read(case, &chain, OUT, &after).await),
             StreamFailureKind::NotFound
         );
-        assert_eq!(
-            values(&read(case, &bystander, OUT, BEGINNING).await.unwrap()),
-            ["1"]
-        );
+        for kept in [&bystander, &twin] {
+            assert_eq!(
+                values(&read(case, kept, OUT, BEGINNING).await.unwrap()),
+                ["1"]
+            );
+        }
     }
 
     /// The store's log. A case runs only on a store that keeps one.
@@ -1661,6 +1736,12 @@ mod memory_with_log {
     log_cases!(super::memory_with_log());
 }
 
+mod activity_memory {
+    store_cases!(super::activity(super::memory()));
+    log_cases!(super::activity(super::memory_with_log()));
+    conformance!(super::activity(super::memory()); deleting_an_owner_drops_every_chain_of_it);
+}
+
 mod notifying_memory {
     store_cases!(super::notifying(super::memory()));
     log_cases!(super::notifying(super::memory_with_log()));
@@ -1682,6 +1763,53 @@ mod cluster_redis {
     store_cases!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
     // A Workflow id's chains hash to different slots, so the delete reaches every primary.
     conformance!(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true);
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
+#[cfg(feature = "redis")]
+mod activity_standalone_redis {
+    store_cases!(super::activity(super::on_redis::redis(
+        "STREAMS_REDIS_URL",
+        false
+    )));
+    log_cases!(super::activity(super::on_redis::redis_with_log(
+        "STREAMS_REDIS_URL",
+        false
+    )));
+    conformance!(super::activity(super::on_redis::redis("STREAMS_REDIS_URL", false));
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
+#[cfg(feature = "redis")]
+mod activity_documented_acl_redis {
+    // The documented key rule covers an Activity's keys, since they start with the namespace.
+    store_cases!(super::activity(super::on_redis::redis_as_documented_user(
+        "STREAMS_REDIS_URL",
+        false,
+        &[]
+    )));
+    conformance!(super::activity(super::on_redis::redis_as_documented_user(
+        "STREAMS_REDIS_URL",
+        false,
+        &["+scan"]
+    ));
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
+#[cfg(feature = "redis")]
+mod activity_cluster_redis {
+    store_cases!(super::activity(super::on_redis::redis(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    )));
+    log_cases!(super::activity(super::on_redis::redis_with_log(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    )));
+    conformance!(super::activity(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
         deleting_an_owner_drops_every_chain_of_it,
     );
 }

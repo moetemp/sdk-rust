@@ -8,14 +8,15 @@ use temporalio_common::protos::temporal::api::{
     enums::v1::StreamOwnerKind,
     stream::v1::{self, StreamReference, WorkflowWakeTarget},
     workflowservice::v1::{
-        AttachStreamCallbackRequest, DescribeWorkflowExecutionRequest,
+        AttachStreamCallbackRequest, DescribeActivityExecutionRequest,
+        DescribeActivityExecutionResponse, DescribeWorkflowExecutionRequest,
         DescribeWorkflowExecutionResponse, DetachStreamCallbackRequest, NotifyStreamRequest,
         NotifyStreamsRequest, PollStreamNotifierRequest, PollStreamNotifierResponse,
     },
 };
 use temporalio_streams::{
     CloseOutcome, NotifierClient, NotifierPoll, NotifyError, OwnerClient, OwnerDescription,
-    OwnerError, StreamNotification, WorkflowAttachment, proto::ChainId,
+    OwnerError, OwnerId, OwnerStatus, StreamNotification, WorkflowAttachment, proto::ChainId,
 };
 pub use temporalio_streams::{StreamError, StreamResult, StreamService, StreamStore, proto};
 use tonic::IntoRequest;
@@ -139,13 +140,23 @@ fn poll_answer(response: PollStreamNotifierResponse) -> NotifierPoll {
 
 /// The notifier of `chain`'s stream on `topic`. The run chain's first run keys the notifier, so one
 /// notifier serves the stream across Continue-as-New and a new chain on the same Workflow id gets
-/// its own.
+/// its own. An Activity run is its own chain, so its notifier is keyed by the run.
 fn chain_reference(chain: &ChainId, topic: String) -> StreamReference {
+    if chain.owner_kind == proto::StreamOwnerKind::Activity as i32 {
+        return StreamReference {
+            owner_kind: StreamOwnerKind::Activity as i32,
+            activity_id: chain.activity_id.clone(),
+            run_id: chain.first_run_id.clone(),
+            topic,
+            ..Default::default()
+        };
+    }
     StreamReference {
         owner_kind: StreamOwnerKind::Workflow as i32,
         workflow_id: chain.workflow_id.clone(),
         run_id: chain.first_run_id.clone(),
         topic,
+        ..Default::default()
     }
 }
 
@@ -251,25 +262,46 @@ impl OwnerClient for ConnectionOwnerClient {
     async fn describe(
         &self,
         namespace: &str,
-        workflow_id: &str,
+        owner: OwnerId<'_>,
         run_id: &str,
     ) -> Result<OwnerDescription, OwnerError> {
-        let response = self
-            .connection
-            .workflow_service()
-            .describe_workflow_execution(
-                DescribeWorkflowExecutionRequest {
-                    namespace: namespace.to_string(),
-                    execution: Some(WorkflowExecution {
-                        workflow_id: workflow_id.to_string(),
-                        run_id: run_id.to_string(),
-                    }),
-                }
-                .into_request(),
-            )
-            .await
-            .map_err(owner_error)?;
-        owner_description(response.into_inner())
+        match owner {
+            OwnerId::Workflow(workflow_id) => {
+                let response = self
+                    .connection
+                    .workflow_service()
+                    .describe_workflow_execution(
+                        DescribeWorkflowExecutionRequest {
+                            namespace: namespace.to_string(),
+                            execution: Some(WorkflowExecution {
+                                workflow_id: workflow_id.to_string(),
+                                run_id: run_id.to_string(),
+                            }),
+                        }
+                        .into_request(),
+                    )
+                    .await
+                    .map_err(owner_error)?;
+                owner_description(response.into_inner())
+            }
+            OwnerId::Activity(activity_id) => {
+                let response = self
+                    .connection
+                    .workflow_service()
+                    .describe_activity_execution(
+                        DescribeActivityExecutionRequest {
+                            namespace: namespace.to_string(),
+                            activity_id: activity_id.to_string(),
+                            run_id: run_id.to_string(),
+                            ..Default::default()
+                        }
+                        .into_request(),
+                    )
+                    .await
+                    .map_err(owner_error)?;
+                activity_owner_description(response.into_inner())
+            }
+        }
     }
 }
 
@@ -299,9 +331,33 @@ fn owner_description(
         info.first_run_id.clone()
     };
     Ok(OwnerDescription {
-        status: info.status(),
+        status: OwnerStatus::of_workflow(info.status()),
         run_id,
         first_run_id,
+    })
+}
+
+/// A standalone Activity run is a chain of one run, so it is its own first run.
+fn activity_owner_description(
+    response: DescribeActivityExecutionResponse,
+) -> Result<OwnerDescription, OwnerError> {
+    let info = response
+        .info
+        .ok_or_else(|| OwnerError::Failed("the server described no Activity".to_string()))?;
+    let run_id = if response.run_id.is_empty() {
+        info.run_id.clone()
+    } else {
+        response.run_id
+    };
+    if run_id.is_empty() {
+        return Err(OwnerError::Failed(
+            "the server described an Activity with no run id".to_string(),
+        ));
+    }
+    Ok(OwnerDescription {
+        status: OwnerStatus::of_activity(info.status()),
+        first_run_id: run_id.clone(),
+        run_id,
     })
 }
 
@@ -334,9 +390,52 @@ mod tests {
             OwnerDescription {
                 run_id: "run-2".to_string(),
                 first_run_id: "run-1".to_string(),
-                status: WorkflowExecutionStatus::ContinuedAsNew,
+                status: OwnerStatus::ContinuedAsNew,
             }
         );
+    }
+
+    #[test]
+    fn an_activity_run_is_its_own_chain_and_any_terminal_status_ends_it() {
+        use temporalio_common::protos::temporal::api::{
+            activity::v1::ActivityExecutionInfo, enums::v1::ActivityExecutionStatus,
+        };
+        let described = |status: ActivityExecutionStatus| DescribeActivityExecutionResponse {
+            run_id: "act-run".to_string(),
+            info: Some(ActivityExecutionInfo {
+                activity_id: "gen".to_string(),
+                run_id: "act-run".to_string(),
+                status: status as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            activity_owner_description(described(ActivityExecutionStatus::Paused)).unwrap(),
+            OwnerDescription {
+                run_id: "act-run".to_string(),
+                first_run_id: "act-run".to_string(),
+                status: OwnerStatus::Running,
+            }
+        );
+        for status in [
+            ActivityExecutionStatus::Completed,
+            ActivityExecutionStatus::Failed,
+            ActivityExecutionStatus::Canceled,
+            ActivityExecutionStatus::Terminated,
+            ActivityExecutionStatus::TimedOut,
+        ] {
+            assert!(
+                activity_owner_description(described(status))
+                    .unwrap()
+                    .chain_ended(),
+                "{status:?}"
+            );
+        }
+        assert!(matches!(
+            activity_owner_description(DescribeActivityExecutionResponse::default()),
+            Err(OwnerError::Failed(_))
+        ));
     }
 
     #[test]
@@ -372,6 +471,7 @@ mod tests {
                 namespace: "ns".to_string(),
                 workflow_id: "wf".to_string(),
                 first_run_id: "run-1".to_string(),
+                ..Default::default()
             },
             topic: "tokens".to_string(),
             position: "cursor".to_string(),
@@ -386,11 +486,40 @@ mod tests {
                 workflow_id: "wf".to_string(),
                 run_id: "run-1".to_string(),
                 topic: "tokens".to_string(),
+                ..Default::default()
             })
         );
         assert_eq!((request.position.as_str(), request.counter), ("cursor", 7));
         assert!(!request.close);
         assert!(request.close_result.is_none());
+    }
+
+    #[test]
+    fn a_notification_of_an_activity_stream_names_the_activity_run() {
+        let request = notify_request(StreamNotification {
+            chain: proto::ChainId {
+                namespace: "ns".to_string(),
+                first_run_id: "act-run".to_string(),
+                owner_kind: proto::StreamOwnerKind::Activity as i32,
+                activity_id: "gen".to_string(),
+                ..Default::default()
+            },
+            topic: "tokens".to_string(),
+            position: "cursor".to_string(),
+            counter: 7,
+            close: Some(CloseOutcome::Failure(Default::default())),
+        });
+        assert_eq!(
+            request.stream_ref,
+            Some(StreamReference {
+                owner_kind: StreamOwnerKind::Activity as i32,
+                workflow_id: String::new(),
+                run_id: "act-run".to_string(),
+                topic: "tokens".to_string(),
+                activity_id: "gen".to_string(),
+            })
+        );
+        assert!(request.close && request.close_failure.is_some());
     }
 
     #[test]
@@ -400,6 +529,7 @@ mod tests {
                 namespace: namespace.to_string(),
                 workflow_id: workflow_id.to_string(),
                 first_run_id: "run-1".to_string(),
+                ..Default::default()
             },
             topic: "tokens".to_string(),
             position: format!("cursor-{counter}"),
@@ -444,6 +574,7 @@ mod tests {
                 namespace: "ns".to_string(),
                 workflow_id: "owner".to_string(),
                 first_run_id: "chain-1".to_string(),
+                ..Default::default()
             },
             topic: "tokens".to_string(),
             request_id: "jetty/reader-run/1".to_string(),
@@ -459,6 +590,7 @@ mod tests {
                 workflow_id: "owner".to_string(),
                 run_id: "chain-1".to_string(),
                 topic: "tokens".to_string(),
+                ..Default::default()
             })
         );
         assert_eq!(request.request_id, "jetty/reader-run/1");
@@ -682,6 +814,7 @@ mod tests {
                         workflow_id: workflow_id.clone(),
                         run_id: started.run_id.clone(),
                         topic: "tokens".to_string(),
+                        ..Default::default()
                     }),
                     request_id: "caller".to_string(),
                     callback: Some(
@@ -714,6 +847,7 @@ mod tests {
             workflow_id: workflow_id.clone(),
             run_id: String::new(),
             topic: "tokens".to_string(),
+            ..Default::default()
         };
         Some(Live {
             connection,
@@ -855,6 +989,7 @@ mod tests {
                         workflow_id: live.workflow_id.clone(),
                         run_id: live.run_id.clone(),
                         topic: "tokens".to_string(),
+                        ..Default::default()
                     }),
                 }
                 .into_request(),
