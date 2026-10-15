@@ -634,8 +634,8 @@ $defs:
         type: string
         contentEncoding: base64
         description: >-
-          Pass as state on the next call of this follow. At most 64 KiB, which
-          is about 86 KiB as base64.
+          Pass as state on the next call of this follow. Core always sets it.
+          At most 64 KiB, which is about 86 KiB as base64.
       sources:
         type: array
         items: { $ref: "#/$defs/FollowSourceWire" }
@@ -643,7 +643,7 @@ $defs:
       replay:
         $ref: "#/$defs/FollowReplay"
         description: "Set when the call named a floor_holder."
-    required: [records, done, state, sources]
+    required: [records, done, sources]
     additionalProperties: true
 
   StreamOperationToken:
