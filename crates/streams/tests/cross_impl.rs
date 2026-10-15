@@ -104,6 +104,7 @@ impl Both {
             namespace: NAMESPACE.to_string(),
             workflow_id: self.workflow_id.clone(),
             first_run_id: FIRST_RUN.to_string(),
+            ..Default::default()
         }
     }
 
@@ -303,6 +304,7 @@ impl Both {
                 workflow_id: self.workflow_id.clone(),
                 run_id: String::new(),
                 topic: "events".to_string(),
+                ..Default::default()
             }),
             producer: Some(Producer::Named(NamedProducer {
                 producer_id: "p".to_string(),

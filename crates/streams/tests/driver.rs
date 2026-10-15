@@ -131,6 +131,7 @@ async fn write(
                     namespace: "ns".to_string(),
                     workflow_id: workflow_id.clone(),
                     first_run_id: "run-1".to_string(),
+                    ..Default::default()
                 }),
                 topic: "out".to_string(),
                 producer_id: "p".to_string(),
@@ -422,6 +423,7 @@ async fn traffic(
                     namespace: "ns".to_string(),
                     workflow_id: workflow_id.clone(),
                     first_run_id: "run-1".to_string(),
+                    ..Default::default()
                 }),
                 topic: "out".to_string(),
                 producer_id: "p".to_string(),

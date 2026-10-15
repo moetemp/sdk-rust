@@ -269,6 +269,7 @@ impl ChainKey {
             namespace: self.0,
             workflow_id: self.1,
             first_run_id: self.2,
+            ..Default::default()
         }
     }
 }
@@ -326,6 +327,7 @@ mod tests {
             namespace: "ns".to_string(),
             workflow_id: workflow_id.to_string(),
             first_run_id: "run-1".to_string(),
+            ..Default::default()
         }
     }
 

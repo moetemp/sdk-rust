@@ -944,6 +944,7 @@ fn chain_of_key(owner: &OwnerKey, first_run_id: &str) -> ChainId {
         namespace: owner.namespace.clone(),
         workflow_id: owner.workflow_id.clone(),
         first_run_id: first_run_id.to_string(),
+        ..Default::default()
     }
 }
 
@@ -1088,6 +1089,7 @@ mod tests {
             workflow_id: "wf".to_string(),
             run_id: String::new(),
             topic: topic.to_string(),
+            ..Default::default()
         }
     }
 
@@ -1120,6 +1122,7 @@ mod tests {
             namespace: "ns".to_string(),
             workflow_id: "wf".to_string(),
             first_run_id: first_run_id.to_string(),
+            ..Default::default()
         }
     }
 
@@ -1183,6 +1186,7 @@ mod tests {
             run_id: "run-1".to_string(),
             activity_id: "fetch".to_string(),
             attempt: 2,
+            ..Default::default()
         }));
         setup.streams.append(request).await.unwrap();
         let read = setup
@@ -2261,6 +2265,7 @@ mod tests {
             namespace: "ns".to_string(),
             owner_kind: StreamOwnerKind::Workflow as i32,
             workflow_id: "wf".to_string(),
+            ..Default::default()
         };
         assert!(
             setup

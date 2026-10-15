@@ -87,6 +87,7 @@ fn chain() -> ChainId {
         namespace: "ns".to_string(),
         workflow_id: unique("wf"),
         first_run_id: "run-1".to_string(),
+        ..Default::default()
     }
 }
 
@@ -319,6 +320,7 @@ async fn ids_with_separators_and_braces_keep_their_own_keys() {
         namespace: "ns".to_string(),
         workflow_id: format!("{}:{{b}}", unique("a")),
         first_run_id: "c".to_string(),
+        ..Default::default()
     };
     let (head, tail) = one.workflow_id.split_once(':').unwrap();
     let other = ChainId {
@@ -806,6 +808,7 @@ async fn a_new_producer_marks_an_ended_chain_closed_until_it_expires() {
             workflow_id: chain.workflow_id.clone(),
             run_id: String::new(),
             topic: "events".to_string(),
+            ..Default::default()
         }),
         producer: Some(Producer::Named(NamedProducer {
             producer_id: producer.to_string(),
@@ -1274,6 +1277,7 @@ fn delete_request(workflow_id: &str) -> temporalio_streams::proto::DeleteOwnerRe
         namespace: "ns".to_string(),
         owner_kind: temporalio_streams::proto::StreamOwnerKind::Workflow as i32,
         workflow_id: workflow_id.to_string(),
+        ..Default::default()
     }
 }
 
@@ -1425,6 +1429,7 @@ async fn a_delete_reaches_every_primary_of_a_cluster() {
             namespace: "ns".to_string(),
             workflow_id: workflow_id.clone(),
             first_run_id: format!("run-{run}"),
+            ..Default::default()
         };
         store
             .append(append(&chain, "p", 1, 1, b"\x01"))
@@ -1731,6 +1736,7 @@ async fn a_replay_read_on_redis_repeats_the_read_and_survives_retention_under_a_
         workflow_id: chain.workflow_id.clone(),
         run_id: String::new(),
         topic: "events".to_string(),
+        ..Default::default()
     };
     let append = |attempt: i64, sequence: i64, value: &str| AppendRequest {
         stream: Some(stream.clone()),
@@ -1817,6 +1823,7 @@ async fn a_replay_read_from_a_trimmed_start_on_redis_is_rec_01() {
         workflow_id: chain.workflow_id.clone(),
         run_id: String::new(),
         topic: "events".to_string(),
+        ..Default::default()
     };
     let append = |sequence: i64| AppendRequest {
         stream: Some(stream.clone()),
@@ -1897,6 +1904,7 @@ async fn a_chains_notification_entry_lands_in_the_chains_own_slot() {
             namespace: unique("ns:with{braces}"),
             workflow_id: unique("wf"),
             first_run_id: unique("run"),
+            ..Default::default()
         };
         let landed = store
             .append(append(&chain, "p", 1, 1, b"\x01"))

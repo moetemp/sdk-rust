@@ -188,6 +188,7 @@ mod tests {
             run_id: "run-1".to_string(),
             activity_id: "fetch".to_string(),
             attempt: 3,
+            ..Default::default()
         };
         assert_eq!(activity_producer_id(&activity), "fetch@run-1");
     }

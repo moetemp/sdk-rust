@@ -620,6 +620,7 @@ mod tests {
             namespace: "ns".to_string(),
             workflow_id: "wf".to_string(),
             first_run_id: "run-1".to_string(),
+            ..Default::default()
         }
     }
 
@@ -680,6 +681,7 @@ mod tests {
                 namespace: "ns".to_string(),
                 owner_kind: StreamOwnerKind::Unspecified as i32,
                 workflow_id: "wf".to_string(),
+                ..Default::default()
             })
             .await
             .unwrap_err();

@@ -375,6 +375,7 @@ mod tests {
             workflow_id: "wf".to_string(),
             run_id: String::new(),
             topic: "out".to_string(),
+            ..Default::default()
         }
     }
 
@@ -578,6 +579,7 @@ mod tests {
             namespace: "ns".to_string(),
             owner_kind: StreamOwnerKind::Unspecified as i32,
             workflow_id: "wf".to_string(),
+            ..Default::default()
         };
         let failure = service
             .call("DeleteOwner", &other_owner.encode_to_vec())
@@ -588,6 +590,7 @@ mod tests {
             namespace: "ns".to_string(),
             owner_kind: StreamOwnerKind::Workflow as i32,
             workflow_id: String::new(),
+            ..Default::default()
         };
         let failure = service
             .call("DeleteOwner", &no_id.encode_to_vec())

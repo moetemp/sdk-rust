@@ -144,6 +144,11 @@ relevant information.
   retry would be refused the same way, also when the run closed the topic itself before its task
   reran. Any other store failure still fails the task. Local Activities that a completion with
   stream output schedules start only once that output is in the store.
+* Experimental: the stream protos name a standalone Activity owner. `StreamOwnerKind` gains
+  `ACTIVITY`, `StreamAddress` and `DeleteOwnerRequest` gain `activity_id`, and `ChainId` gains
+  `owner_kind` and `activity_id`. `ActivityProducer` gains `attempt_started_time`. The vendored
+  API's `StreamReference` gains `activity_id` and its owner kind gains `ACTIVITY`. Core still
+  refuses the Activity kind as `UNSUPPORTED`.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

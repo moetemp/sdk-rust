@@ -58,6 +58,7 @@ impl Case for Memory {
             namespace: "default".to_string(),
             workflow_id: unique("conformance"),
             first_run_id: unique("run"),
+            ..Default::default()
         }
     }
 
@@ -383,6 +384,7 @@ mod on_redis {
                 namespace: "default".to_string(),
                 workflow_id: unique("conformance"),
                 first_run_id: unique("run"),
+                ..Default::default()
             }
         }
 
@@ -1445,6 +1447,7 @@ mod cases {
             namespace: chain.namespace.clone(),
             owner_kind: StreamOwnerKind::Workflow as i32,
             workflow_id: chain.workflow_id.clone(),
+            ..Default::default()
         };
         assert!(store.delete_owner(request.clone()).await.unwrap().deleted > 0);
         assert_eq!(store.delete_owner(request).await.unwrap().deleted, 0);

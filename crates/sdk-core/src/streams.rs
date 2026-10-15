@@ -146,6 +146,7 @@ fn chain_reference(chain: &ChainId, topic: String) -> StreamReference {
         workflow_id: chain.workflow_id.clone(),
         run_id: chain.first_run_id.clone(),
         topic,
+        ..Default::default()
     }
 }
 
@@ -372,6 +373,7 @@ mod tests {
                 namespace: "ns".to_string(),
                 workflow_id: "wf".to_string(),
                 first_run_id: "run-1".to_string(),
+                ..Default::default()
             },
             topic: "tokens".to_string(),
             position: "cursor".to_string(),
@@ -386,6 +388,7 @@ mod tests {
                 workflow_id: "wf".to_string(),
                 run_id: "run-1".to_string(),
                 topic: "tokens".to_string(),
+                ..Default::default()
             })
         );
         assert_eq!((request.position.as_str(), request.counter), ("cursor", 7));
@@ -400,6 +403,7 @@ mod tests {
                 namespace: namespace.to_string(),
                 workflow_id: workflow_id.to_string(),
                 first_run_id: "run-1".to_string(),
+                ..Default::default()
             },
             topic: "tokens".to_string(),
             position: format!("cursor-{counter}"),
@@ -444,6 +448,7 @@ mod tests {
                 namespace: "ns".to_string(),
                 workflow_id: "owner".to_string(),
                 first_run_id: "chain-1".to_string(),
+                ..Default::default()
             },
             topic: "tokens".to_string(),
             request_id: "jetty/reader-run/1".to_string(),
@@ -459,6 +464,7 @@ mod tests {
                 workflow_id: "owner".to_string(),
                 run_id: "chain-1".to_string(),
                 topic: "tokens".to_string(),
+                ..Default::default()
             })
         );
         assert_eq!(request.request_id, "jetty/reader-run/1");
@@ -682,6 +688,7 @@ mod tests {
                         workflow_id: workflow_id.clone(),
                         run_id: started.run_id.clone(),
                         topic: "tokens".to_string(),
+                        ..Default::default()
                     }),
                     request_id: "caller".to_string(),
                     callback: Some(
@@ -714,6 +721,7 @@ mod tests {
             workflow_id: workflow_id.clone(),
             run_id: String::new(),
             topic: "tokens".to_string(),
+            ..Default::default()
         };
         Some(Live {
             connection,
@@ -855,6 +863,7 @@ mod tests {
                         workflow_id: live.workflow_id.clone(),
                         run_id: live.run_id.clone(),
                         topic: "tokens".to_string(),
+                        ..Default::default()
                     }),
                 }
                 .into_request(),

@@ -106,6 +106,7 @@ pub(crate) fn chain_of_log(prefix: &str, key: &str) -> Option<(ChainId, String)>
             namespace: unpart(namespace)?,
             workflow_id: unpart(workflow_id)?,
             first_run_id: unpart(first_run_id)?,
+            ..Default::default()
         },
         unpart(topic)?,
     ))
@@ -166,6 +167,7 @@ mod tests {
                     namespace: text(case, "namespace").to_string(),
                     workflow_id: text(case, "workflow_id").to_string(),
                     first_run_id: text(case, "first_run_id").to_string(),
+                    ..Default::default()
                 },
             );
             let topic = text(case, "topic");
@@ -184,6 +186,7 @@ mod tests {
                 namespace: text(case, "namespace").to_string(),
                 workflow_id: text(case, "workflow_id").to_string(),
                 first_run_id: text(case, "first_run_id").to_string(),
+                ..Default::default()
             };
             let prefix = text(case, "prefix");
             let keys = ChainKeys::new(prefix, &chain);
@@ -218,6 +221,7 @@ mod tests {
             namespace: "ns".to_string(),
             workflow_id: "wf".to_string(),
             first_run_id: "run-1".to_string(),
+            ..Default::default()
         };
         let pattern = owner_pattern("p", "ns", "wf");
         assert_eq!(pattern, "p:{ns:wf:*");

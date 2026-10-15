@@ -217,6 +217,7 @@ impl StreamKey {
             namespace: self.namespace.clone(),
             workflow_id: self.workflow_id.clone(),
             first_run_id: self.first_run_id.clone(),
+            ..Default::default()
         }
     }
 }
@@ -905,6 +906,7 @@ mod tests {
             namespace: "ns".to_string(),
             workflow_id: "wf".to_string(),
             first_run_id: first_run_id.to_string(),
+            ..Default::default()
         }
     }
 

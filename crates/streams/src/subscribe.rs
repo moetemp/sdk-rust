@@ -183,6 +183,7 @@ impl Subscriptions {
                 namespace: stream.namespace.clone(),
                 workflow_id: stream.workflow_id.clone(),
                 first_run_id: attached.first_run_id,
+                ..Default::default()
             },
             None => streams.chain_now(stream).await?,
         };
@@ -363,6 +364,7 @@ mod tests {
             workflow_id: "owner".to_string(),
             run_id: String::new(),
             topic: "tokens".to_string(),
+            ..Default::default()
         }
     }
 
@@ -391,6 +393,7 @@ mod tests {
             namespace: "ns".to_string(),
             workflow_id: "owner".to_string(),
             first_run_id: first_run_id.to_string(),
+            ..Default::default()
         }
     }
 
@@ -641,6 +644,7 @@ mod tests {
                     namespace: "ns".to_string(),
                     workflow_id: "owner".to_string(),
                     first_run_id,
+                    ..Default::default()
                 }),
                 topic: "tokens".to_string(),
                 producer_id: "p".to_string(),
