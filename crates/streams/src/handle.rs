@@ -844,6 +844,28 @@ impl Streams {
     fn cursor(&self, stream: &StreamAddress, position: &str) -> String {
         mint_cursor(self.store.name(), &self.hash(stream), position)
     }
+
+    /// The notification counter and the cursor of the newest record of `stream` on `chain`, or
+    /// zero and an empty cursor when it holds none.
+    pub(crate) async fn newest(
+        &self,
+        stream: &StreamAddress,
+        chain: &ChainId,
+    ) -> StreamResult<(i64, String)> {
+        let position = self
+            .store
+            .latest(StoreLatestRequest {
+                chain: Some(chain.clone()),
+                topic: stream.topic.clone(),
+            })
+            .await?
+            .position;
+        if position.is_empty() {
+            return Ok((0, String::new()));
+        }
+        let counter = crate::progress_counter(&position).unwrap_or(0);
+        Ok((counter, self.cursor(stream, &position)))
+    }
 }
 
 /// The address of a stream this release keeps, checked.

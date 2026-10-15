@@ -1,16 +1,16 @@
 //! Streams for lang: one process-wide stream service over the configured store, asking the
 //! client's server about streams' owners.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 use temporalio_client::Connection;
 use temporalio_common::protos::temporal::api::{
     common::v1::WorkflowExecution,
     enums::v1::StreamOwnerKind,
-    stream::v1::{StreamReference, WorkflowWakeTarget},
+    stream::v1::{self, StreamReference, WorkflowWakeTarget},
     workflowservice::v1::{
         AttachStreamCallbackRequest, DescribeWorkflowExecutionRequest,
         DescribeWorkflowExecutionResponse, DetachStreamCallbackRequest, NotifyStreamRequest,
-        PollStreamNotifierRequest, PollStreamNotifierResponse,
+        NotifyStreamsRequest, PollStreamNotifierRequest, PollStreamNotifierResponse,
     },
 };
 use temporalio_streams::{
@@ -51,6 +51,20 @@ impl NotifierClient for ConnectionNotifierClient {
             .await
             .map(|_| ())
             .map_err(notify_error)
+    }
+
+    async fn notify_streams(
+        &self,
+        notifications: Vec<StreamNotification>,
+    ) -> Result<(), NotifyError> {
+        for request in notify_streams_requests(notifications, self.connection.identity()) {
+            self.connection
+                .workflow_service()
+                .notify_streams(request.into_request())
+                .await
+                .map_err(notify_error)?;
+        }
+        Ok(())
     }
 
     async fn attach_workflow(&self, attachment: WorkflowAttachment) -> Result<(), NotifyError> {
@@ -147,6 +161,33 @@ fn attach_request(attachment: WorkflowAttachment) -> AttachStreamCallbackRequest
         }),
         ..Default::default()
     }
+}
+
+/// One `NotifyStreams` request per namespace, since a call names one.
+fn notify_streams_requests(
+    notifications: Vec<StreamNotification>,
+    identity: &str,
+) -> Vec<NotifyStreamsRequest> {
+    let mut by_namespace: BTreeMap<String, Vec<v1::StreamNotification>> = BTreeMap::new();
+    for notification in notifications {
+        by_namespace
+            .entry(notification.chain.namespace.clone())
+            .or_default()
+            .push(v1::StreamNotification {
+                stream_ref: Some(chain_reference(&notification.chain, notification.topic)),
+                position: notification.position,
+                counter: notification.counter,
+                ..Default::default()
+            });
+    }
+    by_namespace
+        .into_iter()
+        .map(|(namespace, notifications)| NotifyStreamsRequest {
+            namespace,
+            notifications,
+            identity: identity.to_string(),
+        })
+        .collect()
 }
 
 fn notify_request(notification: StreamNotification) -> NotifyStreamRequest {
@@ -350,6 +391,50 @@ mod tests {
         assert_eq!((request.position.as_str(), request.counter), ("cursor", 7));
         assert!(!request.close);
         assert!(request.close_result.is_none());
+    }
+
+    #[test]
+    fn a_batch_of_notifications_goes_out_once_per_namespace() {
+        let notification = |namespace: &str, workflow_id: &str, counter: i64| StreamNotification {
+            chain: proto::ChainId {
+                namespace: namespace.to_string(),
+                workflow_id: workflow_id.to_string(),
+                first_run_id: "run-1".to_string(),
+            },
+            topic: "tokens".to_string(),
+            position: format!("cursor-{counter}"),
+            counter,
+            close: None,
+        };
+        let requests = notify_streams_requests(
+            vec![
+                notification("b", "wf-1", 1),
+                notification("a", "wf-2", 2),
+                notification("b", "wf-3", 3),
+            ],
+            "driver",
+        );
+        let shape: Vec<_> = requests
+            .iter()
+            .map(|r| {
+                (
+                    r.namespace.as_str(),
+                    r.identity.as_str(),
+                    r.notifications
+                        .iter()
+                        .map(|n| n.counter)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [("a", "driver", vec![2]), ("b", "driver", vec![1, 3])]
+        );
+        let first = &requests[1].notifications[0];
+        assert_eq!(first.position, "cursor-1");
+        assert_eq!(first.stream_ref.as_ref().unwrap().workflow_id, "wf-1");
+        assert_eq!(first.stream_ref.as_ref().unwrap().run_id, "run-1");
     }
 
     #[test]
