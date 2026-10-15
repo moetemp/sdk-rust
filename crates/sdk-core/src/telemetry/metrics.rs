@@ -67,6 +67,7 @@ struct Instruments {
     sticky_cache_miss: Counter,
     sticky_cache_size: Gauge,
     sticky_cache_forced_evictions: Counter,
+    stream_output_dropped: Counter,
 }
 
 struct HeartbeatLabel {
@@ -337,6 +338,11 @@ impl MetricsContext {
     pub(crate) fn forced_cache_eviction(&self) {
         self.instruments.sticky_cache_forced_evictions.adds(1);
     }
+
+    /// Count a topic's stream output that a Workflow Task dropped, since the store closed it
+    pub(crate) fn stream_output_dropped(&self) {
+        self.instruments.stream_output_dropped.adds(1);
+    }
 }
 
 impl Instruments {
@@ -554,6 +560,13 @@ impl Instruments {
             sticky_cache_size: gauge_with_in_mem(MetricParameters {
                 name: STICKY_CACHE_SIZE_NAME.into(),
                 description: "Current number of cached workflows".into(),
+                unit: "".into(),
+            }),
+            stream_output_dropped: meter.counter(MetricParameters {
+                name: "workflow_stream_output_dropped".into(),
+                description: "Count of a Workflow Task's per-topic stream output dropped, since \
+                              the store has closed the topic"
+                    .into(),
                 unit: "".into(),
             }),
             sticky_cache_forced_evictions: meter.counter(MetricParameters {
@@ -1256,7 +1269,7 @@ mod tests {
         a2.set(Arc::new(DummyCustomAttrs(2))).unwrap();
         // Verify all metrics are created. This number will need to get updated any time a metric
         // is added.
-        let num_metrics = 35;
+        let num_metrics = 36;
         #[allow(clippy::needless_range_loop)] // Sorry clippy, this reads easier.
         for metric_num in 2..=num_metrics + 1 {
             let hole = assert_matches!(&events[metric_num],
