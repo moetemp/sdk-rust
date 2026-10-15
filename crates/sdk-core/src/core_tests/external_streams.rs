@@ -66,6 +66,8 @@ struct RecordingStore {
     failures: Mutex<std::collections::VecDeque<StreamError>>,
     /// The failure every append answers with.
     refuse: Option<StreamError>,
+    /// How long each append takes.
+    append_delay: Option<Duration>,
 }
 
 impl RecordingStore {
@@ -151,6 +153,9 @@ impl StreamStore for RecordingStore {
         }
         if let Some(error) = self.failures.lock().pop_front() {
             return Err(error);
+        }
+        if let Some(delay) = self.append_delay {
+            tokio::time::sleep(delay).await;
         }
         let response = self.inner.append(request.clone()).await?;
         self.appends.lock().push(request);
@@ -1077,5 +1082,205 @@ async fn a_lost_task_repeats_its_attempt_and_the_rerun_supersedes() {
     assert_eq!(
         store.read(TOPIC).await,
         ["encrypted a", "SUPERSEDED", "encrypted b"]
+    );
+}
+
+#[tokio::test]
+async fn a_local_activity_starts_only_once_its_activations_output_is_in_the_store() {
+    // The append is slow, so a Local Activity that started before it would find nothing.
+    let mut history = TestHistoryBuilder::default();
+    history.add_by_type(EventType::WorkflowExecutionStarted);
+    history.add_workflow_task_scheduled_and_started();
+    let store = Arc::new(RecordingStore {
+        append_delay: Some(Duration::from_millis(300)),
+        ..Default::default()
+    });
+    let worker = Arc::new(worker_appending_to(
+        history,
+        vec![1.into()],
+        store.clone(),
+        Default::default(),
+    ));
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    let completing = {
+        let worker = worker.clone();
+        let run_id = run_id.clone();
+        tokio::spawn(async move {
+            complete(
+                &worker,
+                &run_id,
+                vec![
+                    output_commit_command(records(&["a"])),
+                    schedule_local_activity(1),
+                ],
+            )
+            .await
+        })
+    };
+    let task = worker.poll_activity_task().await.unwrap();
+    assert_eq!(
+        store.appends().len(),
+        1,
+        "the activity starts after its activation's records landed"
+    );
+    completing.await.unwrap();
+    worker
+        .complete_activity_task(ActivityTaskCompletion {
+            task_token: task.task_token,
+            result: Some(ActivityExecutionResult::ok(Payload::default())),
+        })
+        .await
+        .unwrap();
+    let resolved = worker.poll_workflow_activation().await.unwrap();
+    assert!(only_resolves_local_activity(&resolved, 1));
+    complete(
+        &worker,
+        &run_id,
+        vec![CompleteWorkflowExecution::default().into()],
+    )
+    .await;
+    let Ok(worker) = Arc::try_unwrap(worker) else {
+        panic!("the completing task let go of the worker");
+    };
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_topic_closed_before_the_publish_drops_its_records_and_the_task_goes_on() {
+    let store = Arc::new(RecordingStore::default());
+    let chain = ChainId {
+        namespace: crate::test_help::NAMESPACE.to_string(),
+        workflow_id: "fakeid".to_string(),
+        first_run_id: String::new(),
+    };
+    let appended_at_completion: Arc<Mutex<Vec<usize>>> = Default::default();
+    let history = timer_history();
+    let first_run_id = history.get_orig_run_id().to_string();
+    // Another party closed the topic before the Workflow published.
+    store
+        .close_topic(
+            &ChainId {
+                first_run_id: first_run_id.clone(),
+                ..chain
+            },
+            TOPIC,
+        )
+        .await
+        .unwrap();
+    let worker = worker_appending_to(
+        history,
+        vec![1.into(), 2.into()],
+        store.clone(),
+        appended_at_completion.clone(),
+    );
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first.run_id,
+        vec![
+            output_commit_command(
+                records(&["a"])
+                    .into_iter()
+                    .chain(records_on("open", &["b"]))
+                    .collect(),
+            ),
+            start_timer_cmd(1, Duration::from_secs(10)),
+        ],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    worker.complete_execution(&fired.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        appended_at_completion.lock().len(),
+        2,
+        "both tasks completed"
+    );
+    let landed: Vec<_> = store.appends().iter().map(|a| a.topic.clone()).collect();
+    assert_eq!(landed, ["open"], "the closed topic's records were dropped");
+}
+
+#[tokio::test]
+async fn a_rerun_after_the_run_closed_its_own_topic_drops_its_records_and_goes_on() {
+    // The task publishes and closes its topic, then the server refuses the completion. The rerun
+    // publishes the same records under the next retry, which the closed topic refuses.
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_failed_with_failure(
+        WorkflowTaskFailedCause::UnhandledCommand,
+        Default::default(),
+    );
+    t.add_we_signaled("go", vec![]);
+    t.add_workflow_task_scheduled_and_started();
+    let first_task =
+        TestHistoryBuilder::from_history(t.get_full_history_info().unwrap().events()[..3].to_vec());
+    let first_task = hist_to_poll_resp(&first_task, "fakeid", 1.into()).resp;
+    let store = Arc::new(RecordingStore::default());
+    let completions = Arc::new(Mutex::new(0));
+    let mut answers = 0;
+    let counted = completions.clone();
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        t,
+        [ResponseType::Raw(first_task), ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    mock_cfg.completion_mock_fn = Some(Box::new(move |_| {
+        answers += 1;
+        *counted.lock() += 1;
+        if answers == 1 {
+            Err(tonic::Status::invalid_argument("UnhandledCommand"))
+        } else {
+            Ok(RespondWorkflowTaskCompletedResponse::default())
+        }
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    with_store(&mut mock, Some(store.clone()));
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let mut finished = records(&["a"]);
+    finished.push(OutputRecord {
+        topic: TOPIC.to_string(),
+        kind: StreamRecordKind::Finish as i32,
+        ..Default::default()
+    });
+    complete(
+        &worker,
+        &first.run_id,
+        vec![
+            output_commit_command(finished.clone()),
+            CompleteWorkflowExecution::default().into(),
+        ],
+    )
+    .await;
+    // The run's close, as lang's close does after the FINISH landed.
+    let chain = store.appends()[0].chain.clone().unwrap();
+    store.close_topic(&chain, TOPIC).await.unwrap();
+    let eviction = worker.poll_workflow_activation().await.unwrap();
+    assert!(eviction.eviction_reason().is_some());
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    let rerun = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &rerun.run_id,
+        vec![
+            output_commit_command(finished),
+            CompleteWorkflowExecution::default().into(),
+        ],
+    )
+    .await;
+    worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(*completions.lock(), 2, "the rerun's completion went out");
+    assert_eq!(
+        store.append_log(),
+        [(TOPIC.to_string(), format!("@{}", first.run_id), 1, 1, 2)],
+        "the rerun's records were dropped"
     );
 }
