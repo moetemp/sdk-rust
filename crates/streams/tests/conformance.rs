@@ -2112,6 +2112,21 @@ mod archive_cases {
         assert_eq!(tail, ["3", "4", "5"]);
     }
 
+    pub(crate) async fn one_page_crosses_segments_and_the_hot_store(case: &dyn ArchiveCase) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer.append(&["1", "2", "3"]).await;
+        case.archive_now(&chain, OUT, 1).await;
+        producer.append(&["4", "5"]).await;
+        case.drop_oldest(&chain, OUT, 2).await;
+        // An exact range, as a replay reads it, comes back in one page.
+        let page = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert_eq!(values(&page), ["1", "2", "3", "4", "5"]);
+        let cursor = page.records[0].cursor.clone();
+        let rest = read(case, &chain, OUT, &cursor).await.unwrap();
+        assert_eq!(values(&rest), ["2", "3", "4", "5"]);
+    }
+
     pub(crate) async fn a_read_crosses_from_the_archive_into_the_hot_store(case: &dyn ArchiveCase) {
         let chain = case.chain();
         let mut producer = Producer::new(case, &chain, OUT, "p", 1);
@@ -2367,6 +2382,7 @@ macro_rules! archive_cases {
     ($case:expr) => {
         archive_conformance!($case;
             archived_records_read_back_with_their_cursors,
+            one_page_crosses_segments_and_the_hot_store,
             a_read_crosses_from_the_archive_into_the_hot_store,
             an_archived_record_is_found_by_its_position,
             archiving_twice_at_once_writes_each_segment_once,
