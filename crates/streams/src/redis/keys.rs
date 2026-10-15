@@ -15,6 +15,15 @@
 //! namespace, `{<namespace>:!a:<activity id>:<run id>}`, and the same keys follow it. Each part
 //! escapes `!`, so no Workflow id makes that tag.
 //!
+//! A Workflow Activity is a chain of one too. Its tag is
+//! `{<namespace>:!wa:<workflow id>:<scheduling run id>:<activity id>}`, so each tool call lands in
+//! a slot of its own. It has one more key, the set of log keys its producers wrote, which the
+//! scheduling Workflow's Core reads to close every topic when the Activity ends:
+//!
+//! ```text
+//! <prefix>:{<namespace>:!wa:<workflow id>:<run id>:<activity id>}:topics
+//! ```
+//!
 //! The notification log lives apart from the chains, one stream per Cluster slot and a few
 //! doorbells, each under the hash tag of a slot (see `slots.rs`). A chain's appends go to the
 //! stream of the chain's own slot, so the append script writes both:
@@ -29,23 +38,14 @@
 
 use super::{conn::slot, slots};
 use crate::proto::{ChainId, StreamOwnerKind};
+pub(crate) use crate::record::part;
 
 /// The part after the namespace that marks an Activity chain's tag. [part] escapes `!`, so no
 /// Workflow id makes it.
 const ACTIVITY_MARK: &str = "!a";
 
-/// Percent-encodes every byte but the unreserved ones, as Python's `quote(text, safe="")` does.
-pub(crate) fn part(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b'~') {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
+/// The part after the namespace that marks a Workflow Activity chain's tag.
+const WORKFLOW_ACTIVITY_MARK: &str = "!wa";
 
 /// The keys of one run chain's streams.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,19 +55,31 @@ pub(crate) struct ChainKeys {
 
 impl ChainKeys {
     pub(crate) fn new(prefix: &str, chain: &ChainId) -> Self {
-        let owner = if chain.owner_kind == StreamOwnerKind::Activity as i32 {
-            format!("{ACTIVITY_MARK}:{}", part(&chain.activity_id))
-        } else {
-            part(&chain.workflow_id)
+        let run = part(&chain.first_run_id);
+        let owner = match StreamOwnerKind::try_from(chain.owner_kind) {
+            Ok(StreamOwnerKind::Activity) => {
+                format!("{ACTIVITY_MARK}:{}:{run}", part(&chain.activity_id))
+            }
+            Ok(StreamOwnerKind::WorkflowActivity) => format!(
+                "{WORKFLOW_ACTIVITY_MARK}:{}:{run}:{}",
+                part(&chain.workflow_id),
+                part(&chain.activity_id)
+            ),
+            _ => format!("{}:{run}", part(&chain.workflow_id)),
         };
         Self {
-            base: format!(
-                "{}:{{{}:{owner}:{}}}",
-                part(prefix),
-                part(&chain.namespace),
-                part(&chain.first_run_id)
-            ),
+            base: format!("{}:{{{}:{owner}}}", part(prefix), part(&chain.namespace)),
         }
+    }
+
+    /// Whether the chain is a Workflow Activity's, which keeps the set of topics it wrote.
+    pub(crate) fn keeps_topics(chain: &ChainId) -> bool {
+        chain.owner_kind == StreamOwnerKind::WorkflowActivity as i32
+    }
+
+    /// The log keys a Workflow Activity chain's producers wrote.
+    pub(crate) fn topics(&self) -> String {
+        format!("{}:topics", self.base)
     }
 
     pub(crate) fn log(&self, topic: &str) -> String {
@@ -123,6 +135,19 @@ pub(crate) fn chain_of_log(prefix: &str, key: &str) -> Option<(ChainId, String)>
             activity_id: unpart(activity_id)?,
             ..Default::default()
         },
+        [
+            namespace,
+            WORKFLOW_ACTIVITY_MARK,
+            workflow_id,
+            run_id,
+            activity_id,
+        ] => ChainId {
+            namespace: unpart(namespace)?,
+            workflow_id: unpart(workflow_id)?,
+            first_run_id: unpart(run_id)?,
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            activity_id: unpart(activity_id)?,
+        },
         _ => return None,
     };
     Some((chain, unpart(topic)?))
@@ -161,6 +186,21 @@ pub(crate) fn owner_pattern(prefix: &str, namespace: &str, workflow_id: &str) ->
     )
 }
 
+/// The pattern that matches every key of the Workflow Activities that one Workflow id scheduled,
+/// across all its runs.
+pub(crate) fn workflow_activity_pattern(
+    prefix: &str,
+    namespace: &str,
+    workflow_id: &str,
+) -> String {
+    format!(
+        "{}:{{{}:{WORKFLOW_ACTIVITY_MARK}:{}:*",
+        part(prefix),
+        part(namespace),
+        part(workflow_id)
+    )
+}
+
 /// The pattern that matches every key of one standalone Activity id, across all its runs.
 pub(crate) fn activity_owner_pattern(prefix: &str, namespace: &str, activity_id: &str) -> String {
     format!(
@@ -181,7 +221,15 @@ mod tests {
     }
 
     fn case_chain(case: &Value) -> ChainId {
-        if case["owner_kind"] == "activity" {
+        if case["owner_kind"] == "workflow_activity" {
+            ChainId {
+                namespace: text(case, "namespace").to_string(),
+                workflow_id: text(case, "workflow_id").to_string(),
+                first_run_id: text(case, "first_run_id").to_string(),
+                owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+                activity_id: text(case, "activity_id").to_string(),
+            }
+        } else if case["owner_kind"] == "activity" {
             ChainId {
                 namespace: text(case, "namespace").to_string(),
                 first_run_id: text(case, "first_run_id").to_string(),
@@ -206,12 +254,25 @@ mod tests {
             serde_json::from_str(include_str!("../../testdata/redis/keys.json")).unwrap();
         assert!(cases.len() >= 4);
         assert!(cases.iter().any(|case| case["owner_kind"] == "activity"));
+        assert!(
+            cases
+                .iter()
+                .any(|case| case["owner_kind"] == "workflow_activity")
+        );
         for case in &cases {
-            let keys = ChainKeys::new(text(case, "prefix"), &case_chain(case));
+            let chain = case_chain(case);
+            let keys = ChainKeys::new(text(case, "prefix"), &chain);
             let topic = text(case, "topic");
             assert_eq!(keys.log(topic), text(case, "log"));
             assert_eq!(keys.meta(topic), text(case, "meta"));
             assert_eq!(keys.chain(), text(case, "chain"));
+            assert_eq!(
+                ChainKeys::keeps_topics(&chain),
+                case.get("topics").is_some()
+            );
+            if let Some(topics) = case.get("topics") {
+                assert_eq!(keys.topics(), topics.as_str().unwrap());
+            }
         }
     }
 
@@ -227,6 +288,7 @@ mod tests {
             let notifications = notifications(prefix, keys.slot());
             assert_eq!(slot(&notifications), slot(&keys.log(topic)));
             assert_eq!(slot(&notifications), slot(&keys.meta(topic)));
+            assert_eq!(slot(&notifications), slot(&keys.topics()));
             assert_eq!(
                 chain_of_log(prefix, &keys.log(topic)),
                 Some((chain, topic.to_string()))
@@ -236,6 +298,8 @@ mod tests {
         assert_eq!(chain_of_log("p", "p:{ns:wf}:t:out"), None);
         assert_eq!(chain_of_log("p", "p:{ns:!b:act:run}:t:out"), None);
         assert_eq!(chain_of_log("p", "p:{ns:!a:act}:t:out"), None);
+        assert_eq!(chain_of_log("p", "p:{ns:!wa:wf:run}:t:out"), None);
+        assert_eq!(chain_of_log("p", "p:{ns:!a:wf:run:act}:t:out"), None);
     }
 
     #[test]
@@ -308,5 +372,50 @@ mod tests {
             );
         }
         assert_eq!(activity_owner_pattern("p", "ns", "a*b"), "p:{ns:!a:a%2Ab:*");
+    }
+
+    #[test]
+    fn a_workflow_activity_chain_keeps_apart_from_its_workflow_and_other_runs() {
+        let wfa = |workflow_id: &str, run_id: &str, activity_id: &str| ChainId {
+            namespace: "ns".to_string(),
+            workflow_id: workflow_id.to_string(),
+            first_run_id: run_id.to_string(),
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            activity_id: activity_id.to_string(),
+        };
+        let starts = |pattern: String, key: String| key.starts_with(pattern.trim_end_matches('*'));
+        for id in ["wf", "!wa", "wa", "!wa:wf", "!a"] {
+            let keys = ChainKeys::new("p", &wfa(id, "run-1", "1"));
+            for workflow_id in [id, "!wa", "wa", "%21wa", "!a"] {
+                assert!(
+                    !starts(owner_pattern("p", "ns", workflow_id), keys.chain()),
+                    "{id}"
+                );
+                assert!(!starts(
+                    activity_owner_pattern("p", "ns", workflow_id),
+                    keys.chain()
+                ));
+            }
+            assert!(starts(
+                workflow_activity_pattern("p", "ns", id),
+                keys.topics()
+            ));
+            assert!(starts(
+                workflow_activity_pattern("p", "ns", id),
+                keys.log("out")
+            ));
+            // The `:` after the id keeps `wf` from matching the Activities of `wf2`.
+            let longer = ChainKeys::new("p", &wfa(&format!("{id}2"), "run-1", "1"));
+            assert!(!starts(
+                workflow_activity_pattern("p", "ns", id),
+                longer.chain()
+            ));
+            // Activity `1` of the next run is another chain.
+            assert_ne!(keys, ChainKeys::new("p", &wfa(id, "run-2", "1")));
+        }
+        assert_eq!(
+            workflow_activity_pattern("p", "ns", "a*b"),
+            "p:{ns:!wa:a%2Ab:*"
+        );
     }
 }

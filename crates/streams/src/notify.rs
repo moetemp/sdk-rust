@@ -714,7 +714,7 @@ fn cursor_of(store: &dyn StreamStore, chain: &ChainId, topic: &str, position: &s
     let (kind, id) = chain_owner(chain);
     mint_cursor(
         store.name(),
-        &stream_hash(&chain.namespace, kind, id, topic),
+        &stream_hash(&chain.namespace, kind, &id, topic),
         position,
     )
 }
@@ -823,6 +823,10 @@ impl StreamStore for NotifyingStore {
         self.inner
             .retire_producer(chain, topic, producer_id, attempt)
             .await
+    }
+
+    async fn written_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        self.inner.written_topics(chain).await
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
@@ -1299,6 +1303,9 @@ mod tests {
         }
         async fn retire_producer(&self, c: &ChainId, t: &str, p: &str, a: i64) -> StreamResult<()> {
             self.0.retire_producer(c, t, p, a).await
+        }
+        async fn written_topics(&self, c: &ChainId) -> StreamResult<Vec<String>> {
+            self.0.written_topics(c).await
         }
         async fn delete_owner(&self, r: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
             self.0.delete_owner(r).await

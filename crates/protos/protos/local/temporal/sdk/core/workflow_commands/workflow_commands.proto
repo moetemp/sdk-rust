@@ -73,14 +73,16 @@ message WorkflowOutputStreamCommit {
 // One record a Workflow published, in publish order across topics.
 message OutputRecord {
     string topic = 1;
-    // DATA or FINISH.
+    // DATA, FINISH or LINK.
     temporal.sdk.streams.v1.StreamRecordKind kind = 2;
-    // The value on DATA, after lang's payload codec. Absent on FINISH.
+    // The value on DATA, after lang's payload codec. Absent on FINISH. Optional on LINK.
     temporal.api.common.v1.Payload body = 3;
-    // The SHA-256 of the body as the payload converter made it, before the codec. Set on DATA.
-    // Core builds each topic's batch digest from these, so a repeat of a batch matches whatever
-    // the codec made of the bodies.
+    // The SHA-256 of the body as the payload converter made it, before the codec. Set with a
+    // body. Core builds each topic's batch digest from these, so a repeat of a batch matches
+    // whatever the codec made of the bodies.
     bytes content_hash = 4;
+    // Set on LINK only.
+    temporal.sdk.streams.v1.StreamLink link = 5;
 }
 
 message StartTimer {

@@ -907,6 +907,7 @@ impl ManagedRun {
                             replaying: self.wfm.machines.replaying,
                             output: None,
                             retired: None,
+                            activity_stream_closes: vec![],
                         },
                         resp_chan: completion.resp_chan,
                     }))
@@ -917,10 +918,12 @@ impl ManagedRun {
                 complete_resp_chan: completion.resp_chan,
             }),
         };
-        // Only a completion the run took has output to append.
+        // Only a completion the run took has output to append and streams to close.
+        let activity_stream_closes = self.wfm.machines.take_activity_stream_closes();
         completed.map(|done| {
             done.map(|mut done| {
                 done.result.output = output;
+                done.result.activity_stream_closes = activity_stream_closes;
                 done
             })
         })
@@ -1421,6 +1424,7 @@ impl ManagedRun {
                 replaying,
                 output: None,
                 retired,
+                activity_stream_closes: vec![],
             },
             resp_chan,
         }
@@ -1457,6 +1461,7 @@ impl ManagedRun {
                     replaying: self.wfm.machines.replaying,
                     output: None,
                     retired: None,
+                    activity_stream_closes: vec![],
                 })
                 .is_err()
         {

@@ -361,6 +361,7 @@ async fn every_output_member_is_declared() {
             kind: temporalio_streams::proto::StreamRecordKind::Data as i32,
             body: Some(Default::default()),
             content_hash: vec![1; 32],
+            ..Default::default()
         },
     )
     .unwrap();
