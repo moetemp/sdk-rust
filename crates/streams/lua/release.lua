@@ -1,4 +1,7 @@
 local held_value = redis.call('HGET', KEYS[1], ARGV[1])
+if KEYS[2] then
+  redis.call('ZREM', KEYS[2], ARGV[3])
+end
 if not held_value then
   return 0
 end
