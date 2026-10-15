@@ -153,6 +153,10 @@ relevant information.
   for the idle callback's first wake right after the attach, once the stream holds a record above
   that counter. A follower that reads only when woken sets it. A reader that reads first leaves it
   unset and waits through its reads' `wake_token`.
+* Experimental: after the first wait, Core notifies the stream's newest record when it is above
+  `wake_after_counter`. A standalone start runs its handler after the caller has the answer, so a
+  record can land before the attach, and the server drops its notification while no notifier
+  exists.
 * Experimental: the Nexus `read` takes `floor_holder`. With it the read holds the floor and
   answers `replay`, the range of the records that crossed after the byte cut, with Core's digest
   over them. The new Nexus `read_range` operation, `NexusReadRange` for lang, reads that range
