@@ -537,6 +537,7 @@ fn test_stream_store_appends_and_reads_through_the_c_bridge() {
             workflow_id: "wf".to_string(),
             run_id: String::new(),
             topic: "out".to_string(),
+            ..Default::default()
         };
 
         let appended = context
@@ -632,6 +633,7 @@ fn test_a_cancelled_stream_read_says_it_only_stopped_reading() {
                 workflow_id: "wf".to_string(),
                 run_id: String::new(),
                 topic: "out".to_string(),
+                ..Default::default()
             }),
             after: "$end".to_string(),
             wait: Some(std::time::Duration::from_secs(30).try_into().unwrap()),
