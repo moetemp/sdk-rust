@@ -121,9 +121,17 @@ impl NexusCalls {
             && answer.records.is_empty()
             && !answer.done
         {
-            // The caller's operation is attached to the root's notifier only, so a record of a
-            // linked stream reaches it with the next record of the root or the next call.
-            match self.wake_on_root(token, &root, request).await {
+            let linked = crate::links::FollowState::decode_from(&answer.state)
+                .is_ok_and(|state| state.has_linked());
+            let again = if linked {
+                // The caller's operation hears only the root's notifier, and an agent's root is
+                // often idle while a tool it links is busy. So the call waits on every open
+                // stream itself, for up to half its deadline.
+                self.follow_longer(request, deadline, limits).await
+            } else {
+                self.wake_on_root(token, &root, request).await
+            };
+            match again {
                 Ok(Some(again)) => answer = again,
                 Ok(None) => {}
                 Err(error) => return failed(failure::of_stream(&error)),
@@ -199,6 +207,30 @@ impl NexusCalls {
             request.wait = None;
         }
         crate::follow::follow(&self.streams, &subscriptions, request).await
+    }
+
+    /// Follows once more, waiting on every open stream for up to half of what is left of the
+    /// deadline, or the longest wait a call takes when there is none. Answers that follow when it
+    /// found something.
+    async fn follow_longer(
+        &self,
+        mut request: FollowRequest,
+        deadline: Option<SystemTime>,
+        limits: Limits,
+    ) -> Result<Option<FollowResponse>, StreamError> {
+        let left = deadline.map_or(Duration::from_millis(MAX_WAIT_MS as u64), |deadline| {
+            deadline
+                .duration_since(SystemTime::now())
+                .unwrap_or_default()
+                / 2
+        });
+        let wait = left.min(Duration::from_millis(MAX_WAIT_MS as u64));
+        if wait.is_zero() {
+            return Ok(None);
+        }
+        request.wait = wait.try_into().ok();
+        let again = self.follow_within(request, limits).await?;
+        Ok((!again.records.is_empty() || again.done).then_some(again))
     }
 
     /// Asks the root's notifier to wake the caller's operation once the root moves, then follows

@@ -301,3 +301,41 @@ fn base64_of(bytes: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
+
+#[tokio::test]
+async fn an_idle_root_with_an_open_tool_waits_for_the_tools_record_in_the_call() {
+    let store = memory();
+    let id = agent();
+    link(store.clone(), &id, 1, open_tool(&id, "")).await;
+    let calls = service(store.clone(), NexusOptions::default());
+    let (first, _) = follow_once(&calls, json!({"stream": stream(&id, TOPIC)})).await;
+    assert_eq!(shape(&first), ["0:link tool-42", "1:opened"]);
+    // The caller's operation hears only the root, so the call itself waits on the tool.
+    let token = temporalio_streams::nexus::OperationToken {
+        stream: StreamAddress {
+            namespace: NAMESPACE.to_string(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: id.clone(),
+            topic: TOPIC.to_string(),
+            ..Default::default()
+        },
+        attach_request_id: "attach-1".to_string(),
+        chain_first_run_id: "run-1".to_string(),
+    }
+    .encode();
+    let input = json!({"stream": stream(&id, TOPIC), "state": first["state"], "wake_token": token});
+    let late = async {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        write(store.clone(), tool(&id), "t", &["t1"]).await;
+    };
+    let started = std::time::Instant::now();
+    let followed = async {
+        let step = calls
+            .follow(call_with(input, 0, 0, std::time::Duration::from_secs(8)))
+            .await;
+        drive(&calls, step, Codec::Sealing).await.unwrap()
+    };
+    let (answer, ()) = tokio::join!(followed, late);
+    assert_eq!(shape(&answer), ["1:t1"]);
+    assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}

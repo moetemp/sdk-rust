@@ -237,6 +237,9 @@ relevant information.
   owner. A follow with a `floor_holder` answers `replay`, opaque ranges and a digest that
   `follow_range` reads again and checks. Links to another namespace or endpoint are skipped. A
   `wake_token` wakes the caller's operation on the root's notifier.
+* Experimental: a `follow` with a `wake_token` that finds nothing new while a linked stream is
+  open waits on every open stream inside the call, for up to half its deadline, in place of the
+  root's wake. Only a follow with no open linked stream sends the root's `WaitStreamCallback`.
 * Experimental: the Activity attempt key is `started_unix_ms << 11 | min(attempt, 2047)`, so it
   fits 53 bits and a JSON number holds it exactly. The Nexus contract's models and JavaScript
   refused the earlier 16-bit form. A start time from May 2109 on is refused. The vector file
