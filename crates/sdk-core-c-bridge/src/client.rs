@@ -817,6 +817,9 @@ async fn call_workflow_service(
         "NotifyStream" => {
             rpc_call_on_trait!(client, call, WorkflowService, notify_stream)
         }
+        "NotifyStreams" => {
+            rpc_call_on_trait!(client, call, WorkflowService, notify_streams)
+        }
         "PatchSchedule" => rpc_call_on_trait!(client, call, WorkflowService, patch_schedule),
         "PauseActivity" => rpc_call_on_trait!(client, call, WorkflowService, pause_activity),
         "PauseActivityExecution" => {
