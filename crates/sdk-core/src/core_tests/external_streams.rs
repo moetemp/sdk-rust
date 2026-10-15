@@ -207,6 +207,11 @@ impl StreamStore for RecordingStore {
             .await
     }
 
+    async fn written_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        self.calls.lock().push("written_topics");
+        self.inner.written_topics(chain).await
+    }
+
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
         self.calls.lock().push("delete_owner");
         self.inner.delete_owner(request).await

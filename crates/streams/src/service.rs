@@ -1247,6 +1247,9 @@ mod tests {
         ) -> StreamResult<()> {
             self.0.retire_producer(c, t, p, a).await
         }
+        async fn written_topics(&self, c: &crate::proto::ChainId) -> StreamResult<Vec<String>> {
+            self.0.written_topics(c).await
+        }
         async fn delete_owner(
             &self,
             r: DeleteOwnerRequest,

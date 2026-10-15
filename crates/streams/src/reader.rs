@@ -535,6 +535,10 @@ mod tests {
             unreachable!()
         }
 
+        async fn written_topics(&self, _: &ChainId) -> StreamResult<Vec<String>> {
+            unreachable!()
+        }
+
         async fn delete_owner(&self, _: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
             unreachable!()
         }

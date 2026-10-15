@@ -6,6 +6,7 @@ use crate::{
         ActivityProducer, AppendRecord, ChainId, StreamOwnerKind, StreamRecord, StreamRecordKind,
     },
 };
+use std::borrow::Cow;
 use temporalio_common::{
     protos::temporal::api::common::v1::Payload,
     streams::{CONTENT_HASH_KEY, METADATA_ENCODING, content_hash_text},
@@ -17,13 +18,40 @@ pub const WORKFLOW_OWNER_KIND: &str = "workflow";
 /// The owner kind a standalone Activity's streams hash under in their cursors.
 pub const ACTIVITY_OWNER_KIND: &str = "activity";
 
+/// The owner kind a Workflow Activity's streams hash under in their cursors.
+pub const WORKFLOW_ACTIVITY_OWNER_KIND: &str = "workflow_activity";
+
 /// The owner kind a chain's streams hash under, and the owner's id.
-pub fn chain_owner(chain: &ChainId) -> (&'static str, &str) {
-    if chain.owner_kind == StreamOwnerKind::Activity as i32 {
-        (ACTIVITY_OWNER_KIND, &chain.activity_id)
-    } else {
-        (WORKFLOW_OWNER_KIND, &chain.workflow_id)
+///
+/// A Workflow Activity's id holds the scheduling run, so a cursor of Activity `"1"` in one run is
+/// refused on Activity `"1"` of the next run.
+pub fn chain_owner(chain: &ChainId) -> (&'static str, Cow<'_, str>) {
+    match StreamOwnerKind::try_from(chain.owner_kind) {
+        Ok(StreamOwnerKind::Activity) => (ACTIVITY_OWNER_KIND, Cow::Borrowed(&chain.activity_id)),
+        Ok(StreamOwnerKind::WorkflowActivity) => (
+            WORKFLOW_ACTIVITY_OWNER_KIND,
+            Cow::Owned(format!(
+                "{}/{}/{}",
+                part(&chain.workflow_id),
+                part(&chain.first_run_id),
+                part(&chain.activity_id)
+            )),
+        ),
+        _ => (WORKFLOW_OWNER_KIND, Cow::Borrowed(&chain.workflow_id)),
     }
+}
+
+/// Percent-encodes every byte but the unreserved ones, as Python's `quote(text, safe="")` does.
+pub(crate) fn part(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 const HASH_LENGTH: usize = 32;

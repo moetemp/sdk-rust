@@ -301,6 +301,27 @@ impl OwnerClient for ConnectionOwnerClient {
                     .map_err(owner_error)?;
                 activity_owner_description(response.into_inner())
             }
+            OwnerId::WorkflowActivity {
+                workflow_id,
+                activity_id,
+            } => {
+                let response = self
+                    .connection
+                    .workflow_service()
+                    .describe_workflow_execution(
+                        DescribeWorkflowExecutionRequest {
+                            namespace: namespace.to_string(),
+                            execution: Some(WorkflowExecution {
+                                workflow_id: workflow_id.to_string(),
+                                run_id: run_id.to_string(),
+                            }),
+                        }
+                        .into_request(),
+                    )
+                    .await
+                    .map_err(owner_error)?;
+                workflow_activity_owner_description(response.into_inner(), activity_id)
+            }
         }
     }
 }
@@ -334,6 +355,26 @@ fn owner_description(
         status: OwnerStatus::of_workflow(info.status()),
         run_id,
         first_run_id,
+    })
+}
+
+/// A Workflow Activity is pending while its scheduling run lists it, through retries and backoff.
+fn workflow_activity_owner_description(
+    response: DescribeWorkflowExecutionResponse,
+    activity_id: &str,
+) -> Result<OwnerDescription, OwnerError> {
+    let pending = response
+        .pending_activities
+        .iter()
+        .any(|activity| activity.activity_id == activity_id);
+    let status = response
+        .workflow_execution_info
+        .as_ref()
+        .map(|info| info.status())
+        .unwrap_or_default();
+    Ok(OwnerDescription {
+        status: OwnerStatus::of_workflow_activity(status, pending),
+        ..owner_description(response)?
     })
 }
 
@@ -436,6 +477,37 @@ mod tests {
             activity_owner_description(DescribeActivityExecutionResponse::default()),
             Err(OwnerError::Failed(_))
         ));
+    }
+
+    #[test]
+    fn a_workflow_activity_runs_while_its_running_run_lists_it_as_pending() {
+        use temporalio_common::protos::temporal::api::workflow::v1::PendingActivityInfo;
+        let described = |status: WorkflowExecutionStatus, pending: &[&str]| {
+            let mut response = described("run-1", "run-1");
+            if let Some(info) = &mut response.workflow_execution_info {
+                info.status = status as i32;
+            }
+            response.pending_activities = pending
+                .iter()
+                .map(|id| PendingActivityInfo {
+                    activity_id: id.to_string(),
+                    ..Default::default()
+                })
+                .collect();
+            response
+        };
+        let status = |status, pending: &[&str]| {
+            workflow_activity_owner_description(described(status, pending), "tool")
+                .unwrap()
+                .status
+        };
+        use WorkflowExecutionStatus::*;
+        assert_eq!(status(Running, &["other", "tool"]), OwnerStatus::Running);
+        assert_eq!(status(Paused, &["tool"]), OwnerStatus::Running);
+        assert_eq!(status(Running, &["other"]), OwnerStatus::ActivityGone);
+        for closed in [Completed, Failed, ContinuedAsNew, Terminated, TimedOut] {
+            assert_eq!(status(closed, &["tool"]), OwnerStatus::Ended, "{closed:?}");
+        }
     }
 
     #[test]

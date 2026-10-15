@@ -177,6 +177,19 @@ relevant information.
   `ChainId` set `workflow_id`, the scheduling run and `activity_id`, with no new field. The
   vendored API's owner kind gains `WORKFLOW_ACTIVITY`. Core still refuses the kind as
   `UNSUPPORTED`.
+* Experimental: a Workflow Activity owns streams. Its `StreamAddress` names the Workflow, the
+  scheduling run and the Activity id, all required. It is a chain of one, keyed by that run, so
+  Activity `1` of the next run after Continue-as-New is another stream. Core describes the run
+  and looks up the Activity in `pending_activities`. A closed run ends reads at once. A running
+  run that no longer lists the Activity ends reads only after the owner start grace from the
+  first check that found it so, and refuses producers at once. Cursors hash under the kind
+  `workflow_activity` with the run in the owner id. The Redis keys have the hash tag
+  `{<namespace>:!wa:<workflow id>:<run id>:<activity id>}`, and the append script (hashes
+  `eec20388`, and `418b9d10` with the notification log) adds each log key to the chain's
+  `topics` set on a producer attempt's first batch. `StreamStore::written_topics` answers that
+  set, and every store and wrapper must implement it. A Workflow's `DeleteOwner` also deletes
+  its Activities' streams. `OwnerId` gains `WorkflowActivity` and `OwnerStatus` gains
+  `ActivityGone`. The documented Redis ACL gains `+sadd +smembers`.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
