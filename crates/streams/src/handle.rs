@@ -2929,7 +2929,7 @@ mod tests {
     }
 
     fn key(attempt: i64, after_ms: i64) -> i64 {
-        (DAY_START_MS + after_ms) << 16 | attempt
+        (DAY_START_MS + after_ms) << 11 | attempt
     }
 
     /// The read's records, as each stored record's value and attempt, or a supersession's two
@@ -2979,11 +2979,18 @@ mod tests {
         setup.streams.append(late).await.unwrap();
         let (records, _) = shape(&setup, "", &[]).await;
         assert_eq!(records[1].1, key(crate::MAX_KEYED_ACTIVITY_ATTEMPT, 0));
+        assert_eq!(crate::MAX_KEYED_ACTIVITY_ATTEMPT, 2047);
+        // A JSON number holds the key exactly, so the Nexus contract's models take it.
+        assert!(records[1].1 < 1 << 53);
         let before_1970 = timed(1, -DAY_START_MS - 1000, 1, "c");
-        assert_eq!(
-            kind(setup.streams.append(before_1970).await),
-            StreamFailureKind::InvalidArgument
-        );
+        // 2^42 ms is in May 2109, and a key past it would need more than 53 bits.
+        let after_2109 = timed(1, (1 << 42) - DAY_START_MS, 1, "d");
+        for refused in [before_1970, after_2109] {
+            assert_eq!(
+                kind(setup.streams.append(refused).await),
+                StreamFailureKind::InvalidArgument
+            );
+        }
     }
 
     #[tokio::test]
