@@ -56,6 +56,11 @@ relevant information.
 * Experimental: a read reports `SUPERSEDED` for a Workflow producer (`@<run id>`) only when its
   attempt keeps the high bits (the same task) and raises the low 16 bits (a rerun). A higher
   prefix is the next task and reads with no supersession.
+* Experimental: a Workflow Task append that the store refuses as closed drops that topic's
+  records, logs a warning, counts `workflow_stream_output_dropped`, and the task goes on. A
+  retry would be refused the same way, also when the run closed the topic itself before its task
+  reran. Any other store failure still fails the task. Local Activities that a completion with
+  stream output schedules start only once that output is in the store.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
