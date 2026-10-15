@@ -53,6 +53,11 @@ relevant information.
   1 per attempt. Replay appends nothing. A store that refuses the append fails the Workflow Task.
   Once the server accepts a task, Core retires the dedupe sessions of the run's earlier attempts.
   The C bridge's worker options take the process's stream store as `stream_store`.
+* Experimental: a Workflow Task append that the store refuses as closed drops that topic's
+  records, logs a warning, counts `workflow_stream_output_dropped`, and the task goes on. A
+  retry would be refused the same way, also when the run closed the topic itself before its task
+  reran. Any other store failure still fails the task. Local Activities that a completion with
+  stream output schedules start only once that output is in the store.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

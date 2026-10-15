@@ -382,6 +382,10 @@ impl WFStream {
 
         let mut res = None;
 
+        if let Some(rh) = self.runs.get_mut(run_id) {
+            rh.release_held_local_activities(report.output_appended);
+        }
+
         let maybe_t = self.complete_wft(
             run_id,
             report.wft_report_status,
