@@ -235,7 +235,7 @@ impl StreamDriver {
             .map(|((chain, topic), (counter, position))| {
                 let chain = chain.into_chain();
                 let (kind, id) = chain_owner(&chain);
-                let hash = stream_hash(&chain.namespace, kind, id, &topic);
+                let hash = stream_hash(&chain.namespace, kind, &id, &topic);
                 StreamNotification {
                     position: mint_cursor(self.store.name(), &hash, &position),
                     chain,

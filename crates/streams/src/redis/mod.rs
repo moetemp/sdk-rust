@@ -17,7 +17,9 @@ use crate::{
 };
 use conn::{BlockingPool, Shared};
 use errors::{Call, Mapped};
-use keys::{ChainKeys, activity_owner_pattern, owner_pattern, session_field};
+use keys::{
+    ChainKeys, activity_owner_pattern, owner_pattern, session_field, workflow_activity_pattern,
+};
 use prost::Message;
 use redis::{Cmd, Value, streams::StreamReadReply};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -501,6 +503,9 @@ impl StreamStore for RedisStore {
         if self.log.is_some() {
             script.key(keys::notifications(&self.prefix, keys.slot()));
         }
+        if request.chain.as_ref().is_some_and(ChainKeys::keeps_topics) {
+            script.key(keys.topics());
+        }
         script
             .arg(self.retention_ms)
             .arg(self.grace_ms)
@@ -756,14 +761,40 @@ impl StreamStore for RedisStore {
             .mapped(Call::Write)
     }
 
+    async fn written_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        if !ChainKeys::keeps_topics(chain) {
+            return Ok(Vec::new());
+        }
+        let keys = ChainKeys::new(&self.prefix, chain);
+        let logs: Vec<String> = redis::cmd("SMEMBERS")
+            .arg(keys.topics())
+            .query_async(&mut self.shared.clone())
+            .await
+            .mapped(Call::Read)?;
+        let mut topics = logs
+            .iter()
+            .map(|log| match keys::chain_of_log(&self.prefix, log) {
+                Some((of, topic)) if of == *chain => Ok(topic),
+                _ => Err(StreamError::storage(format!(
+                    "the topic set of a Workflow Activity holds {log:?}, which is no log key of it"
+                ))),
+            })
+            .collect::<StreamResult<Vec<_>>>()?;
+        topics.sort();
+        Ok(topics)
+    }
+
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
-        let pattern = match StreamOwnerKind::try_from(request.owner_kind) {
-            Ok(StreamOwnerKind::Workflow) => {
-                owner_pattern(&self.prefix, &request.namespace, &request.workflow_id)
-            }
-            Ok(StreamOwnerKind::Activity) => {
-                activity_owner_pattern(&self.prefix, &request.namespace, &request.activity_id)
-            }
+        let patterns = match StreamOwnerKind::try_from(request.owner_kind) {
+            Ok(StreamOwnerKind::Workflow) => vec![
+                owner_pattern(&self.prefix, &request.namespace, &request.workflow_id),
+                workflow_activity_pattern(&self.prefix, &request.namespace, &request.workflow_id),
+            ],
+            Ok(StreamOwnerKind::Activity) => vec![activity_owner_pattern(
+                &self.prefix,
+                &request.namespace,
+                &request.activity_id,
+            )],
             _ => {
                 return Err(StreamError::unsupported(format!(
                     "this release keeps streams of Workflows and standalone Activities only, not \
@@ -775,12 +806,17 @@ impl StreamStore for RedisStore {
         // An owner id's chains hash to different slots, so every primary is scanned. Some keys
         // may be gone when a later step fails, which is why a failure leaves the outcome unknown.
         let mut deleted = 0;
-        for node in self.shared.primaries().await.mapped(Call::Write)? {
+        let nodes = self.shared.primaries().await.mapped(Call::Write)?;
+        for (node, pattern) in nodes
+            .iter()
+            .flat_map(|node| patterns.iter().map(move |pattern| (node, pattern)))
+            .collect::<Vec<_>>()
+        {
             let mut cursor = "0".to_string();
             loop {
                 let (next, keys) = self
                     .shared
-                    .scan(node.as_ref(), &cursor, &pattern)
+                    .scan(node.as_ref(), &cursor, pattern)
                     .await
                     .mapped(Call::Write)?;
                 for batch in keys.chunks(DELETE_BATCH) {

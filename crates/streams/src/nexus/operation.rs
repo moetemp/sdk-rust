@@ -305,8 +305,9 @@ mod tests {
             owner: crate::OwnerId<'_>,
             run_id: &str,
         ) -> Result<OwnerDescription, OwnerError> {
-            let (crate::OwnerId::Workflow(workflow_id) | crate::OwnerId::Activity(workflow_id)) =
-                owner;
+            let (crate::OwnerId::Workflow(workflow_id)
+            | crate::OwnerId::Activity(workflow_id)
+            | crate::OwnerId::WorkflowActivity { workflow_id, .. }) = owner;
             self.described.lock().unwrap().push(run_id.to_string());
             if self.missing.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err(OwnerError::NotFound(workflow_id.to_string()));
