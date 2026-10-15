@@ -159,6 +159,30 @@ relevant information.
   retry would be refused the same way, also when the run closed the topic itself before its task
   reran. Any other store failure still fails the task. Local Activities that a completion with
   stream output schedules start only once that output is in the store.
+* Experimental: the stream protos name a standalone Activity owner. `StreamOwnerKind` gains
+  `ACTIVITY`, `StreamAddress` and `DeleteOwnerRequest` gain `activity_id`, and `ChainId` gains
+  `owner_kind` and `activity_id`. `ActivityProducer` gains `attempt_started_time`. The vendored
+  API's `StreamReference` gains `activity_id` and its owner kind gains `ACTIVITY`. Core still
+  refuses the Activity kind as `UNSUPPORTED`.
+* Experimental: a standalone Activity owns streams. A `StreamAddress` of the `ACTIVITY` kind names
+  the Activity id and, optionally, its run. One Activity run is a chain of one run, so every chain
+  rule holds with the run as `first_run_id`. Core checks the owner with
+  `DescribeActivityExecution`. Any terminal status ends the run's streams, and retries, backoff,
+  pause and reset keep them open. A new run of the Activity id ends the earlier run's streams.
+  Cursors hash under the kind `activity`. The Redis keys of an Activity run have the hash tag
+  `{<namespace>:!a:<activity id>:<run id>}`, which no Workflow id makes. `DeleteOwner` takes the
+  Activity kind. `OwnerClient::describe` takes an `OwnerId`, and `OwnerDescription.status` is an
+  `OwnerStatus`. A paused Workflow run now counts as running for a read pinned to it.
+* Experimental: notifier calls name an Activity-owned stream by its kind, its Activity id and its
+  run. Notifications, closes, Workflow reader attaches, detaches and `WaitForNotification` polls
+  all do, and a stream driver turns an Activity log key into that reference. Their cursors hash
+  under the kind `activity`.
+* Experimental: an `ActivityProducer` with `attempt_started_time` writes as the attempt
+  `started_unix_ms << 16 | min(attempt, 65535)`. A retry and a reset attempt start later, so they
+  supersede the earlier attempt, also after a reset sets the Temporal attempt back to 1. An
+  attempt that writes on after a newer one started reads as stale. Without the field the attempt
+  is the Temporal attempt as before. `testdata/streams/activity_attempts.json` in
+  `temporalio-streams` pins the formula for other SDKs.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

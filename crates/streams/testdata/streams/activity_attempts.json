@@ -1,0 +1,80 @@
+[
+  {
+    "name": "first attempt",
+    "attempt": 1,
+    "started_time": {
+      "seconds": 1791936000,
+      "nanos": 0
+    },
+    "key": "117436317696000001"
+  },
+  {
+    "name": "a retry starts later and keys higher",
+    "attempt": 2,
+    "started_time": {
+      "seconds": 1791936002,
+      "nanos": 500000000
+    },
+    "key": "117436317859840002"
+  },
+  {
+    "name": "the start time keeps whole milliseconds only",
+    "attempt": 3,
+    "started_time": {
+      "seconds": 1791936005,
+      "nanos": 999999
+    },
+    "key": "117436318023680003"
+  },
+  {
+    "name": "a reset attempt 1 starts later than attempt 3 and keys higher",
+    "attempt": 1,
+    "started_time": {
+      "seconds": 1791936009,
+      "nanos": 0
+    },
+    "key": "117436318285824001"
+  },
+  {
+    "name": "an attempt past 65535 keys as 65535",
+    "attempt": 70000,
+    "started_time": {
+      "seconds": 1791936010,
+      "nanos": 1000000
+    },
+    "key": "117436318351491071"
+  },
+  {
+    "name": "no start time writes the Temporal attempt",
+    "attempt": 4,
+    "started_time": null,
+    "key": "4"
+  },
+  {
+    "name": "an attempt below one is refused",
+    "attempt": 0,
+    "started_time": {
+      "seconds": 1791936000,
+      "nanos": 0
+    },
+    "key": null
+  },
+  {
+    "name": "a start time at the epoch is refused",
+    "attempt": 1,
+    "started_time": {
+      "seconds": 0,
+      "nanos": 0
+    },
+    "key": null
+  },
+  {
+    "name": "a start time before the epoch is refused",
+    "attempt": 1,
+    "started_time": {
+      "seconds": -1,
+      "nanos": 0
+    },
+    "key": null
+  }
+]
