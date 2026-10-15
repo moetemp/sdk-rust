@@ -641,6 +641,37 @@ mod on_redis {
         redis_with(variable, cluster, true).await
     }
 
+    /// [redis_with_log] with an archive hold, for a tiered store.
+    pub(crate) async fn redis_with_archive(variable: &str, cluster: bool) -> Option<Redis> {
+        let Ok(url) = std::env::var(variable) else {
+            eprintln!("set {variable} to run the Redis store cases");
+            return None;
+        };
+        let prefix = unique("conformance-archive");
+        let mut options = RedisStoreOptions::new(url.clone());
+        options.cluster = cluster;
+        options.key_prefix = prefix.clone();
+        options.notification_log = true;
+        options.archive_lease = Some(Duration::from_secs(7 * 24 * 60 * 60));
+        Some(Redis {
+            store: Arc::new(RedisStore::connect(options).await.unwrap()),
+            raw: Raw::connect(&url, cluster).await,
+            prefix,
+            _user: None,
+        })
+    }
+
+    #[async_trait::async_trait]
+    impl Forgets for Redis {
+        async fn forget(&self, chain: &ChainId, topic: &str) {
+            let mut raw = self.raw.clone();
+            let log = log_key(&self.prefix, chain, topic);
+            for key in [format!("{log}:meta"), format!("{log}:floors"), log] {
+                let _: i64 = raw.query(redis::cmd("DEL").arg(key)).await;
+            }
+        }
+    }
+
     async fn redis_with(variable: &str, cluster: bool, notification_log: bool) -> Option<Redis> {
         let Ok(url) = std::env::var(variable) else {
             eprintln!("set {variable} to run the Redis store cases");
@@ -2746,5 +2777,41 @@ mod archive_activity_memory {
 mod archive_workflow_activity_memory {
     archive_cases!(super::tiered(super::workflow_activity(
         super::memory_holding_for_archive()
+    )));
+}
+
+#[cfg(feature = "redis")]
+mod archive_standalone_redis {
+    archive_cases!(super::tiered(super::on_redis::redis_with_archive(
+        "STREAMS_REDIS_URL",
+        false
+    )));
+    // The archive hold doesn't change the store contract.
+    store_cases!(super::tiered(super::on_redis::redis_with_archive(
+        "STREAMS_REDIS_URL",
+        false
+    )));
+    log_cases!(super::tiered(super::on_redis::redis_with_archive(
+        "STREAMS_REDIS_URL",
+        false
+    )));
+}
+
+#[cfg(feature = "redis")]
+mod archive_cluster_redis {
+    archive_cases!(super::tiered(super::on_redis::redis_with_archive(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    )));
+    store_cases!(super::tiered(super::on_redis::redis_with_archive(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    )));
+}
+
+#[cfg(feature = "redis")]
+mod archive_workflow_activity_cluster_redis {
+    archive_cases!(super::tiered(super::workflow_activity(
+        super::on_redis::redis_with_archive("STREAMS_REDIS_CLUSTER_URL", true)
     )));
 }
