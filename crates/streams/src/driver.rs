@@ -8,8 +8,8 @@
 
 use crate::{
     NotificationEntry, NotificationLog, NotifierClient, NotifyError, StreamError,
-    StreamNotification, StreamResult, StreamStore, WORKFLOW_OWNER_KIND, mint_cursor,
-    progress_counter, proto::ChainId, stream_hash,
+    StreamNotification, StreamResult, StreamStore, chain_owner, mint_cursor, progress_counter,
+    proto::ChainId, stream_hash,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -215,6 +215,7 @@ impl StreamDriver {
             let Some(counter) = progress_counter(&entry.position) else {
                 tracing::warn!(
                     workflow_id = %entry.chain.workflow_id,
+                    activity_id = %entry.chain.activity_id,
                     topic = %entry.topic,
                     position = %entry.position,
                     "No notifier counter comes from this position, so it isn't notified"
@@ -233,12 +234,8 @@ impl StreamDriver {
             .into_iter()
             .map(|((chain, topic), (counter, position))| {
                 let chain = chain.into_chain();
-                let hash = stream_hash(
-                    &chain.namespace,
-                    WORKFLOW_OWNER_KIND,
-                    &chain.workflow_id,
-                    &topic,
-                );
+                let (kind, id) = chain_owner(&chain);
+                let hash = stream_hash(&chain.namespace, kind, id, &topic);
                 StreamNotification {
                     position: mint_cursor(self.store.name(), &hash, &position),
                     chain,
@@ -251,9 +248,9 @@ impl StreamDriver {
     }
 }
 
-/// A chain as a map key.
+/// A chain as a map key: its namespace, Workflow id, first run, owner kind and Activity id.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ChainKey(String, String, String);
+struct ChainKey(String, String, String, i32, String);
 
 impl ChainKey {
     fn of(chain: &ChainId) -> Self {
@@ -261,6 +258,8 @@ impl ChainKey {
             chain.namespace.clone(),
             chain.workflow_id.clone(),
             chain.first_run_id.clone(),
+            chain.owner_kind,
+            chain.activity_id.clone(),
         )
     }
 
@@ -269,6 +268,8 @@ impl ChainKey {
             namespace: self.0,
             workflow_id: self.1,
             first_run_id: self.2,
+            owner_kind: self.3,
+            activity_id: self.4,
         }
     }
 }
@@ -326,6 +327,7 @@ mod tests {
             namespace: "ns".to_string(),
             workflow_id: workflow_id.to_string(),
             first_run_id: "run-1".to_string(),
+            ..Default::default()
         }
     }
 
@@ -395,6 +397,46 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_activity_chains_entries_notify_the_activitys_stream() {
+        let store = Arc::new(MemoryStore::with_notification_log());
+        let client = Arc::new(Recorder::default());
+        let activity = ChainId {
+            namespace: "ns".to_string(),
+            first_run_id: "run-1".to_string(),
+            owner_kind: crate::proto::StreamOwnerKind::Activity as i32,
+            activity_id: "a".to_string(),
+            ..Default::default()
+        };
+        // A Workflow with the same id and run writes another stream.
+        append(&store, "a", "out", 1).await;
+        let landed = store
+            .append(StoreAppendRequest {
+                chain: Some(activity.clone()),
+                topic: "out".to_string(),
+                producer_id: "p".to_string(),
+                attempt: 1,
+                sequence: 1,
+                digest: vec![1],
+                records: vec![b"record".to_vec(), b"record".to_vec()],
+            })
+            .await
+            .unwrap();
+        driver(&store, &client, "d1").drain(0).await.unwrap();
+        let calls = client.calls.lock().unwrap().clone();
+        assert_eq!(calls[0].len(), 2, "two streams, {calls:?}");
+        let sent = calls[0].iter().find(|n| n.chain == activity).unwrap();
+        assert_eq!(sent.counter, 2);
+        assert_eq!(
+            sent.position,
+            mint_cursor(
+                "memory",
+                &stream_hash("ns", crate::ACTIVITY_OWNER_KIND, "a", "out"),
+                &landed.last_position
+            )
         );
     }
 

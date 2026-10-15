@@ -37,13 +37,13 @@ impl OwnerClient for Running {
     async fn describe(
         &self,
         _: &str,
-        _: &str,
+        _: temporalio_streams::OwnerId<'_>,
         run_id: &str,
     ) -> Result<OwnerDescription, OwnerError> {
         Ok(OwnerDescription {
             run_id: if run_id.is_empty() { "run-1" } else { run_id }.to_string(),
             first_run_id: "run-1".to_string(),
-            status: WorkflowExecutionStatus::Running,
+            status: temporalio_streams::OwnerStatus::of_workflow(WorkflowExecutionStatus::Running),
         })
     }
 }

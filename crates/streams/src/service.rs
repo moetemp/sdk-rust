@@ -347,16 +347,14 @@ fn duration(seconds: i64, nanos: i32, name: &str) -> StreamResult<Duration> {
 mod tests {
     use super::*;
     use crate::{
-        OwnerDescription, OwnerError,
+        OwnerDescription, OwnerError, OwnerId, OwnerStatus,
         proto::{
             AppendRecord, AppendResponse, LatestResponse, MemoryStoreConfig, NamedProducer,
             ReadResponse, StreamAddress, StreamFailureKind, StreamOwnerKind, StreamRecordKind,
             append_request, read_record,
         },
     };
-    use temporalio_common::protos::temporal::api::{
-        common::v1::Payload, enums::v1::WorkflowExecutionStatus,
-    };
+    use temporalio_common::protos::temporal::api::common::v1::Payload;
 
     /// Every Workflow's latest run is `run-1`, the first of its chain, and still running.
     struct Running;
@@ -366,13 +364,13 @@ mod tests {
         async fn describe(
             &self,
             _: &str,
-            _: &str,
+            _: OwnerId<'_>,
             _: &str,
         ) -> Result<OwnerDescription, OwnerError> {
             Ok(OwnerDescription {
                 run_id: "run-1".to_string(),
                 first_run_id: "run-1".to_string(),
-                status: WorkflowExecutionStatus::Running,
+                status: OwnerStatus::Running,
             })
         }
     }
@@ -396,6 +394,7 @@ mod tests {
             workflow_id: "wf".to_string(),
             run_id: String::new(),
             topic: "out".to_string(),
+            ..Default::default()
         }
     }
 
@@ -599,6 +598,7 @@ mod tests {
             namespace: "ns".to_string(),
             owner_kind: StreamOwnerKind::Unspecified as i32,
             workflow_id: "wf".to_string(),
+            ..Default::default()
         };
         let failure = service
             .call("DeleteOwner", &other_owner.encode_to_vec())
@@ -609,6 +609,7 @@ mod tests {
             namespace: "ns".to_string(),
             owner_kind: StreamOwnerKind::Workflow as i32,
             workflow_id: String::new(),
+            ..Default::default()
         };
         let failure = service
             .call("DeleteOwner", &no_id.encode_to_vec())
@@ -956,7 +957,7 @@ mod tests {
         async fn describe(
             &self,
             _: &str,
-            _: &str,
+            _: OwnerId<'_>,
             _: &str,
         ) -> Result<OwnerDescription, OwnerError> {
             let ended = self.0.load(std::sync::atomic::Ordering::SeqCst);
@@ -964,9 +965,9 @@ mod tests {
                 run_id: "run-1".to_string(),
                 first_run_id: "run-1".to_string(),
                 status: if ended {
-                    WorkflowExecutionStatus::Completed
+                    OwnerStatus::Ended
                 } else {
-                    WorkflowExecutionStatus::Running
+                    OwnerStatus::Running
                 },
             })
         }
