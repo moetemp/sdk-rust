@@ -140,8 +140,8 @@ relevant information.
   URL or request id, and a token that names no stream are `BAD_REQUEST`. An attach for the latest
   run describes the Workflow fresh, so it never lands on a chain that already ended.
 * Experimental: with `notify_on_append`, `AttachCaller` tells the stream's notifier about the
-  newest record after the attach, or arms an empty stream, so a caller that only waits for
-  progress hears of the records already there and of the first append. The API protos carry the
+  newest record after the attach, so a caller that only waits for progress hears of the records
+  already there. An empty stream needs nothing, since every append notifies. The API protos carry the
   `NexusHandler` progress fields and `nexus/notification-service.wit`.
 * Experimental: the Nexus `read` takes `floor_holder`. With it the read holds the floor and
   answers `replay`, the range of the records that crossed after the byte cut, with Core's digest
