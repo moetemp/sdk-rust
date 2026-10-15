@@ -80,18 +80,24 @@ $defs:
       kind:
         type: string
         description: >-
-          What owns the stream. Only "workflow" is opened in this release, and
-          a call with another kind is refused.
+          What owns the stream, "workflow" or "activity". A call with another
+          kind is refused.
       workflow_id:
         type: string
-        description: "The owning Workflow."
+        description: "The owning Workflow. Empty for kind activity."
+      activity_id:
+        oneOf: [{ type: string }, { type: "null" }]
+        description: >-
+          The owning standalone Activity, for kind activity. Absent or null
+          for kind workflow.
       chain_run_id:
         oneOf: [{ type: string }, { type: "null" }]
         description: >-
-          Names the run chain that holds this run. Absent or null names the
-          Workflow id's newest chain. It never stops a read at this run: a
-          read follows the chain across Continue-as-New and ends with the
-          chain.
+          For kind workflow, names the run chain that holds this run. Absent
+          or null names the Workflow id's newest chain. It never stops a read
+          at this run: a read follows the chain across Continue-as-New and
+          ends with the chain. For kind activity, the Activity run. Absent or
+          null names the Activity id's newest run when the read starts.
       topic:
         type: string
         description: "The topic on the owner's stream."
@@ -421,5 +427,6 @@ $defs:
         description: >-
           The first run of the run chain the start attached to, so a cancel
           detaches from it even after the Workflow id moved on to a new chain.
+          For an Activity owner, the Activity run.
     required: [v, ref, attach, chain]
     additionalProperties: false

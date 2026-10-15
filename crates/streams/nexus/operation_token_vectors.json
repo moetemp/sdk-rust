@@ -1,5 +1,5 @@
 {
-  "comment": "Token v2 of a stream-returning Nexus operation: base64url JSON, no padding, keys sorted, non-ASCII escaped, and no chain_run_id for a ref to the newest chain. Core's encoder and every SDK's encoder write the vectors, and every decoder reads them. Decoders also read decode_only, the null chain_run_id that SDK releases before Core wrote.",
+  "comment": "Token v2 of a stream-returning Nexus operation: base64url JSON, no padding, keys sorted, non-ASCII escaped, no chain_run_id for a ref to the newest chain, and no activity_id for a Workflow's ref. An Activity's ref has kind activity, an empty workflow_id and its activity_id, and its chain is the Activity run. Core's encoder and every SDK's encoder write the vectors, and every decoder reads them. Decoders also read decode_only, the null chain_run_id that SDK releases before Core wrote.",
   "vectors": [
     {
       "ref": {
@@ -51,6 +51,29 @@
       "attach": "a",
       "chain": "c",
       "token": "eyJhdHRhY2giOiJhXHUwMDdmIiwiY2hhaW4iOiJjIiwicmVmIjp7ImtpbmQiOiJ3b3JrZmxvdyIsInRvcGljIjoidFx1MDA3ZiIsIndvcmtmbG93X2lkIjoiZGVsXHUwMDdmd2YifSwidiI6Mn0"
+    },
+    {
+      "ref": {
+        "kind": "activity",
+        "workflow_id": "",
+        "activity_id": "tool-1",
+        "chain_run_id": "act-run-1",
+        "topic": "tokens"
+      },
+      "attach": "attach-1",
+      "chain": "act-run-1",
+      "token": "eyJhdHRhY2giOiJhdHRhY2gtMSIsImNoYWluIjoiYWN0LXJ1bi0xIiwicmVmIjp7ImFjdGl2aXR5X2lkIjoidG9vbC0xIiwiY2hhaW5fcnVuX2lkIjoiYWN0LXJ1bi0xIiwia2luZCI6ImFjdGl2aXR5IiwidG9waWMiOiJ0b2tlbnMiLCJ3b3JrZmxvd19pZCI6IiJ9LCJ2IjoyfQ"
+    },
+    {
+      "ref": {
+        "kind": "activity",
+        "workflow_id": "",
+        "activity_id": "tool \"é\"",
+        "topic": "tokens"
+      },
+      "attach": "attach-2",
+      "chain": "act-run-2",
+      "token": "eyJhdHRhY2giOiJhdHRhY2gtMiIsImNoYWluIjoiYWN0LXJ1bi0yIiwicmVmIjp7ImFjdGl2aXR5X2lkIjoidG9vbCBcIlx1MDBlOVwiIiwia2luZCI6ImFjdGl2aXR5IiwidG9waWMiOiJ0b2tlbnMiLCJ3b3JrZmxvd19pZCI6IiJ9LCJ2IjoyfQ"
     }
   ],
   "decode_only": [
@@ -73,6 +96,11 @@
     "eyJ2IjogMSwgImF0dGFjaCI6ICJhdHRhY2gtMSIsICJjaGFpbiI6ICJjaGFpbi0xIiwgInJlZiI6IHsia2luZCI6ICJ3b3JrZmxvdyIsICJ3b3JrZmxvd19pZCI6ICJvd25lci0xIiwgInJ1bl9pZCI6IG51bGwsICJ0b3BpYyI6ICJ0b2tlbnMifX0=",
     "eyJhdHRhY2giOiJhIiwiY2hhaW4iOiJjIiwiZXh0cmEiOjEsInJlZiI6eyJraW5kIjoid29ya2Zsb3ciLCJ0b3BpYyI6InQiLCJ3b3JrZmxvd19pZCI6IncifSwidiI6Mn0",
     "eyJhdHRhY2giOiJhIiwiY2hhaW4iOiJjIiwicmVmIjp7ImN1cnNvciI6IngiLCJraW5kIjoid29ya2Zsb3ciLCJ0b3BpYyI6InQiLCJ3b3JrZmxvd19pZCI6IncifSwidiI6Mn0",
-    "eyJhdHRhY2giOiJhdHRhY2gtMSIsImNoYWluIjoicnVuLTEiLCJyZWYiOnsia2luZCI6IndvcmtmbG93IiwicnVuX2lkIjoicnVuLTIiLCJ0b3BpYyI6InRva2VucyIsIndvcmtmbG93X2lkIjoib3duZXItMSJ9LCJ2IjoyfQ"
+    "eyJhdHRhY2giOiJhdHRhY2gtMSIsImNoYWluIjoicnVuLTEiLCJyZWYiOnsia2luZCI6IndvcmtmbG93IiwicnVuX2lkIjoicnVuLTIiLCJ0b3BpYyI6InRva2VucyIsIndvcmtmbG93X2lkIjoib3duZXItMSJ9LCJ2IjoyfQ",
+    "eyJhdHRhY2giOiJhIiwiY2hhaW4iOiJjIiwicmVmIjp7ImtpbmQiOiJhY3Rpdml0eSIsInRvcGljIjoidCIsIndvcmtmbG93X2lkIjoiIn0sInYiOjJ9",
+    "eyJhdHRhY2giOiJhIiwiY2hhaW4iOiJjIiwicmVmIjp7ImFjdGl2aXR5X2lkIjoiIiwia2luZCI6ImFjdGl2aXR5IiwidG9waWMiOiJ0Iiwid29ya2Zsb3dfaWQiOiIifSwidiI6Mn0",
+    "eyJhdHRhY2giOiJhIiwiY2hhaW4iOiJjIiwicmVmIjp7ImFjdGl2aXR5X2lkIjoiYSIsImtpbmQiOiJhY3Rpdml0eSIsInRvcGljIjoidCIsIndvcmtmbG93X2lkIjoidyJ9LCJ2IjoyfQ",
+    "eyJhdHRhY2giOiJhIiwiY2hhaW4iOiJjIiwicmVmIjp7ImFjdGl2aXR5X2lkIjoiYSIsImtpbmQiOiJ3b3JrZmxvdyIsInRvcGljIjoidCIsIndvcmtmbG93X2lkIjoidyJ9LCJ2IjoyfQ",
+    "eyJhdHRhY2giOiJhIiwiY2hhaW4iOiJjIiwicmVmIjp7ImtpbmQiOiJuZXh1cyIsInRvcGljIjoidCIsIndvcmtmbG93X2lkIjoidyJ9LCJ2IjoyfQ"
   ]
 }

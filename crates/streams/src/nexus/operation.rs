@@ -176,7 +176,7 @@ pub struct OperationToken {
     /// The start's request id, which the attach was keyed by.
     pub attach_request_id: String,
     /// The first run of the chain the start attached to, so a cancel detaches from that chain
-    /// even after the Workflow id moved on to a new one.
+    /// even after the Workflow id moved on to a new one. For an Activity owner, the Activity run.
     pub chain_first_run_id: String,
 }
 
@@ -195,6 +195,9 @@ struct TokenBody {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TokenRef {
+    // A Workflow's ref has none, so its tokens keep the bytes they had before the Activity kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activity_id: Option<String>,
     // A ref to the newest chain has none, as the generated SDK writers leave an unset member out.
     // SDK releases before Core wrote null, which reads the same.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,7 +207,28 @@ struct TokenRef {
     workflow_id: String,
 }
 
-const WORKFLOW_KIND: &str = "workflow";
+/// The `kind` of a contract `StreamRef`, by Core's owner kind.
+const KINDS: [(&str, StreamOwnerKind); 2] = [
+    ("workflow", StreamOwnerKind::Workflow),
+    ("activity", StreamOwnerKind::Activity),
+];
+
+/// The owner kind a contract `kind` names, or `None` for a kind no release opens.
+pub(crate) fn owner_kind(kind: &str) -> Option<StreamOwnerKind> {
+    KINDS
+        .iter()
+        .find(|(name, _)| *name == kind)
+        .map(|(_, owner_kind)| *owner_kind)
+}
+
+/// The contract `kind` of an owner kind. Any kind but the Activity one is a Workflow, as an
+/// unset kind is in a `ChainId`.
+pub(crate) fn kind_name(owner_kind: i32) -> &'static str {
+    KINDS
+        .iter()
+        .find(|(_, kind)| *kind as i32 == owner_kind)
+        .map_or(KINDS[0].0, |(name, _)| name)
+}
 
 impl OperationToken {
     /// The token's text: base64url JSON with sorted keys and no padding.
@@ -213,8 +237,10 @@ impl OperationToken {
             attach: self.attach_request_id.clone(),
             chain: self.chain_first_run_id.clone(),
             stream: TokenRef {
+                activity_id: (self.stream.owner_kind == StreamOwnerKind::Activity as i32)
+                    .then(|| self.stream.activity_id.clone()),
                 chain_run_id: (!self.stream.run_id.is_empty()).then(|| self.stream.run_id.clone()),
-                kind: WORKFLOW_KIND.to_string(),
+                kind: kind_name(self.stream.owner_kind).to_string(),
                 topic: self.stream.topic.clone(),
                 workflow_id: self.stream.workflow_id.clone(),
             },
@@ -243,17 +269,38 @@ impl OperationToken {
         }
         let body: TokenBody =
             serde_json::from_value(version).map_err(|error| refuse(&error.to_string()))?;
-        if body.stream.kind != WORKFLOW_KIND {
-            return Err(refuse("the stream's owner is not a Workflow"));
-        }
+        let owner_kind = match owner_kind(&body.stream.kind) {
+            Some(StreamOwnerKind::Activity) => {
+                if body
+                    .stream
+                    .activity_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty()
+                    || !body.stream.workflow_id.is_empty()
+                {
+                    return Err(refuse(
+                        "an Activity's stream names its Activity id and no Workflow id",
+                    ));
+                }
+                StreamOwnerKind::Activity
+            }
+            Some(_) if body.stream.activity_id.is_none() => StreamOwnerKind::Workflow,
+            Some(_) => return Err(refuse("a Workflow's stream names no Activity id")),
+            None => {
+                return Err(refuse(
+                    "the stream's owner is neither a Workflow nor an Activity",
+                ));
+            }
+        };
         Ok(Self {
             stream: StreamAddress {
                 namespace: namespace.to_string(),
-                owner_kind: StreamOwnerKind::Workflow as i32,
+                owner_kind: owner_kind as i32,
                 workflow_id: body.stream.workflow_id,
                 run_id: body.stream.chain_run_id.unwrap_or_default(),
                 topic: body.stream.topic,
-                ..Default::default()
+                activity_id: body.stream.activity_id.unwrap_or_default(),
             },
             attach_request_id: body.attach,
             chain_first_run_id: body.chain,
@@ -262,12 +309,7 @@ impl OperationToken {
 
     /// The chain the start attached to.
     pub fn chain(&self) -> ChainId {
-        ChainId {
-            namespace: self.stream.namespace.clone(),
-            workflow_id: self.stream.workflow_id.clone(),
-            first_run_id: self.chain_first_run_id.clone(),
-            ..Default::default()
-        }
+        crate::handle::chain_of(&self.stream, &self.chain_first_run_id)
     }
 }
 
@@ -948,11 +990,11 @@ mod tests {
         OperationToken {
             stream: StreamAddress {
                 namespace: "ns".to_string(),
-                owner_kind: StreamOwnerKind::Workflow as i32,
+                owner_kind: owner_kind(&vector.stream.kind).unwrap() as i32,
                 workflow_id: vector.stream.workflow_id.clone(),
                 run_id: vector.stream.chain_run_id.clone().unwrap_or_default(),
                 topic: vector.stream.topic.clone(),
-                ..Default::default()
+                activity_id: vector.stream.activity_id.clone().unwrap_or_default(),
             },
             attach_request_id: vector.attach.clone(),
             chain_first_run_id: vector.chain.clone(),
@@ -984,6 +1026,44 @@ mod tests {
                 "padding is optional"
             );
         }
+    }
+
+    #[test]
+    fn an_activity_token_names_the_activity_run_as_its_chain() {
+        let vectors = vectors();
+        let vector = vectors
+            .vectors
+            .iter()
+            .find(|vector| vector.stream.kind == "activity")
+            .unwrap();
+        let token = OperationToken::decode("ns", &vector.token).unwrap();
+        assert_eq!(token.stream.owner_kind, StreamOwnerKind::Activity as i32);
+        assert_eq!(
+            token.chain(),
+            ChainId {
+                namespace: "ns".to_string(),
+                first_run_id: vector.chain.clone(),
+                owner_kind: StreamOwnerKind::Activity as i32,
+                activity_id: vector.stream.activity_id.clone().unwrap(),
+                ..Default::default()
+            }
+        );
+        // A Workflow's token keeps the bytes it had, with no `activity_id` member.
+        let workflow = vectors
+            .vectors
+            .iter()
+            .find(|vector| vector.stream.kind == "workflow")
+            .unwrap();
+        assert_eq!(token_of(workflow).chain().owner_kind, 0);
+        assert!(
+            !String::from_utf8(
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&workflow.token)
+                    .unwrap()
+            )
+            .unwrap()
+            .contains("activity_id")
+        );
     }
 
     #[test]

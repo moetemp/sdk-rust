@@ -57,6 +57,8 @@ pub(crate) struct StreamRef {
     pub(crate) kind: String,
     pub(crate) workflow_id: String,
     #[serde(default)]
+    pub(crate) activity_id: Option<String>,
+    #[serde(default)]
     pub(crate) chain_run_id: Option<String>,
     pub(crate) topic: String,
 }

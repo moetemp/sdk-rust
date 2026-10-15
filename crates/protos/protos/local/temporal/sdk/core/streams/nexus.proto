@@ -73,6 +73,11 @@ message CodecWork {
   repeated temporal.api.common.v1.Payload payloads = 4;
   // Hand back in `NexusResumeRequest`. Core forgets a continuation 60 s after it asked.
   uint64 continuation = 5;
+  // The kind of the stream's owner. For a standalone Activity owner, `workflow_id` is empty and
+  // `activity_id` names the Activity, and the codec context has the namespace and the Activity id
+  // only.
+  StreamOwnerKind owner_kind = 6;
+  string activity_id = 7;
 }
 
 message NexusResumeRequest {

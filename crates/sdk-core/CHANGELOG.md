@@ -205,6 +205,12 @@ relevant information.
   attempt that writes on after a newer one started reads as stale. Without the field the attempt
   is the Temporal attempt as before. `testdata/streams/activity_attempts.json` in
   `temporalio-streams` pins the formula for other SDKs.
+* Experimental: the stream service contract's `StreamRef` gains the optional member
+  `activity_id`, and `kind` takes `"activity"`. An Activity's ref sends `workflow_id` as `""`,
+  and its `chain_run_id` is the Activity run. A stream operation token carries the kind and the
+  Activity id, keeps version 2, and leaves `activity_id` out of a Workflow's ref, so a Workflow's
+  token keeps its bytes. `operation_token_vectors.json` has Activity tokens. `CodecWork` gains
+  `owner_kind` and `activity_id`. The Nexus calls still refuse an Activity ref.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

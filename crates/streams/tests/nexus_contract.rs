@@ -47,6 +47,7 @@ fn full_input(contract: &Value, name: &str, workflow_id: &str) -> Value {
             (_, "stream") => {
                 let mut stream = stream(workflow_id, "out");
                 stream["chain_run_id"] = Value::Null;
+                stream["activity_id"] = Value::Null;
                 stream
             }
             ("AppendInput", "producer_id") => json!("p"),
@@ -192,6 +193,43 @@ fn a_replay_range_names_what_read_range_takes() {
     let holder = &model(&contract, "ReadInput")["properties"]["floor_holder"];
     assert_eq!(holder["type"], "string");
     assert!(!required(model(&contract, "ReadInput")).contains(&"floor_holder".to_string()));
+}
+
+#[test]
+fn a_stream_ref_names_an_activity_owner_by_an_optional_member() {
+    // Every caller built before the Activity kind still parses a Workflow ref, since the member
+    // is optional and `workflow_id` stays required.
+    let contract = contract();
+    let stream_ref = model(&contract, "StreamRef");
+    assert_eq!(
+        stream_ref["properties"]["activity_id"]["oneOf"],
+        json!([{ "type": "string" }, { "type": "null" }])
+    );
+    assert_eq!(
+        stream_ref["properties"]["activity_id"]["oneOf"],
+        stream_ref["properties"]["chain_run_id"]["oneOf"]
+    );
+    let mut required = required(stream_ref);
+    required.sort();
+    assert_eq!(required, ["kind", "topic", "workflow_id"]);
+}
+
+#[tokio::test]
+async fn an_activity_ref_matches_the_contract() {
+    let calls = service(memory(), NexusOptions::default());
+    let input = json!({
+        "stream": {
+            "kind": "activity",
+            "workflow_id": "",
+            "activity_id": "tool-1",
+            "chain_run_id": "act-run-1",
+            "topic": "out",
+        },
+    });
+    let step = calls.read(call(input)).await;
+    if let Err(failure) = drive(&calls, step, Codec::Sealing).await {
+        assert!(!is_contract_mistake(&failure), "{}", failure.message);
+    }
 }
 
 #[test]

@@ -668,6 +668,7 @@ impl NexusCalls {
                 workflow_id: workflow_id.to_string(),
                 payloads,
                 continuation,
+                ..Default::default()
             })),
         }
     }
