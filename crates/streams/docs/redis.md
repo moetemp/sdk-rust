@@ -114,3 +114,7 @@ a slot and fail a primary over, so set it only for a cluster of the tests' own. 
 conformance suite runs on each, and once more as a user with exactly the ACL above. The
 cross-implementation test also needs `STREAMS_BROOK_PY`, a Python SDK checkout whose provider
 predates the move.
+
+**Managed Redis.** [managed-redis.md](managed-redis.md) covers Amazon MemoryDB and ElastiCache,
+with the access string that those services take in place of `ACL SETUSER`.
+

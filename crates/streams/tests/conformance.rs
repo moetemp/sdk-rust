@@ -316,6 +316,21 @@ mod on_redis {
 
     const DOCUMENTED_KEYS: &str = "~temporal-streams:{my-ns:*";
 
+    /// The rules of the MemoryDB access string on the managed Redis page.
+    pub(crate) fn memorydb_rules() -> Vec<String> {
+        let page = include_str!("../docs/managed-redis.md");
+        let lines: Vec<_> = page
+            .lines()
+            .filter(|line| line.starts_with("on ~"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "the managed Redis page should give one access string"
+        );
+        lines[0].split_whitespace().map(str::to_string).collect()
+    }
+
     /// A Redis user with exactly the documented rules, for one prefix and namespace. The page's
     /// key pattern and password are swapped for the test's own, and nothing else changes.
     pub(crate) struct DocumentedUser {
@@ -352,11 +367,42 @@ mod on_redis {
             for rule in extra {
                 setuser.arg(*rule);
             }
+            Self::set(url, name, password, &setuser).await
+        }
+
+        /// A user with exactly the MemoryDB access string, for one prefix and namespace, and a
+        /// password, which MemoryDB keeps apart from the string.
+        pub(crate) async fn create_memorydb(url: &str, prefix: &str, namespace: &str) -> Self {
+            let rules = memorydb_rules();
+            assert!(
+                rules.iter().any(|rule| rule == DOCUMENTED_KEYS),
+                "{rules:?}"
+            );
+            let name = unique("streams-memorydb");
+            let password = unique("pw");
+            let mut setuser = redis::cmd("ACL");
+            setuser
+                .arg("SETUSER")
+                .arg(&name)
+                .arg(format!(">{password}"));
+            for rule in &rules {
+                if rule == DOCUMENTED_KEYS {
+                    setuser.arg(format!("~{}:{{{}:*", part(prefix), part(namespace)));
+                } else if let Some(rest) = rule.strip_prefix("~temporal-streams:{*}") {
+                    setuser.arg(format!("~{}:{{*}}{rest}", part(prefix)));
+                } else {
+                    setuser.arg(rule);
+                }
+            }
+            Self::set(url, name, password, &setuser).await
+        }
+
+        async fn set(url: &str, name: String, password: String, setuser: &redis::Cmd) -> Self {
             // An ACL user lives on one node, so a cluster needs it on every node.
             let admins = nodes(url).await;
             for admin in &admins {
                 let mut admin = Raw::connect(admin, false).await;
-                let _: () = admin.query(&setuser).await;
+                let _: () = admin.query(setuser).await;
             }
             let address = url.trim_start_matches("redis://");
             Self {
@@ -438,6 +484,26 @@ mod on_redis {
         options.key_prefix = prefix.clone();
         options.cluster = cluster;
         options.notification_log = notification_log;
+        Some(Redis {
+            store: Arc::new(RedisStore::connect(options).await.unwrap()),
+            raw: Raw::connect(&url, cluster).await,
+            prefix,
+            _user: Some(user),
+        })
+    }
+
+    /// A store with the notification log on, as a user with exactly the MemoryDB access string.
+    pub(crate) async fn redis_as_memorydb_user(variable: &str, cluster: bool) -> Option<Redis> {
+        let Ok(url) = std::env::var(variable) else {
+            eprintln!("set {variable} to run the Redis store cases");
+            return None;
+        };
+        let prefix = unique("conformance-memorydb");
+        let user = DocumentedUser::create_memorydb(&url, &prefix, "default").await;
+        let mut options = RedisStoreOptions::new(user.url.clone());
+        options.key_prefix = prefix.clone();
+        options.cluster = cluster;
+        options.notification_log = true;
         Some(Redis {
             store: Arc::new(RedisStore::connect(options).await.unwrap()),
             raw: Raw::connect(&url, cluster).await,
@@ -2124,6 +2190,29 @@ mod documented_acl_cluster_redis {
         true,
         &["+scan"]
     );
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
+#[cfg(feature = "redis")]
+mod memorydb_acl_redis {
+    store_cases!(super::on_redis::redis_as_memorydb_user(
+        "STREAMS_REDIS_URL",
+        false
+    ));
+    conformance!(super::on_redis::redis_as_memorydb_user("STREAMS_REDIS_URL", false);
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
+#[cfg(feature = "redis")]
+mod memorydb_acl_cluster_redis {
+    // A MemoryDB cluster is always a Redis Cluster.
+    store_cases!(super::on_redis::redis_as_memorydb_user(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    ));
+    conformance!(super::on_redis::redis_as_memorydb_user("STREAMS_REDIS_CLUSTER_URL", true);
         deleting_an_owner_drops_every_chain_of_it,
     );
 }
