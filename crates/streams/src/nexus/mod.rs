@@ -309,11 +309,14 @@ impl NexusCalls {
         let wake = match &input.wake_token {
             Some(token) => match OperationToken::decode(&call.namespace, token) {
                 // A token of another owner with the same topic must not wake this reader, and
-                // every Activity's ref has the same empty Workflow id.
+                // every Activity's ref has the same empty Workflow id. A Workflow Activity's id
+                // repeats in each run, so its run is part of the owner.
                 Ok(token)
                     if token.stream.owner_kind == address.owner_kind
                         && token.stream.workflow_id == address.workflow_id
                         && token.stream.activity_id == address.activity_id
+                        && (address.owner_kind != StreamOwnerKind::WorkflowActivity as i32
+                            || token.stream.run_id == address.run_id)
                         && token.stream.topic == address.topic =>
                 {
                     Some(token)
@@ -504,8 +507,11 @@ impl NexusCalls {
             Ok(address) => address,
             Err(failure) => return failed(*failure),
         };
-        // The chain names the run chain, so the ref's run picks nothing here.
-        address.run_id.clear();
+        // The chain names the run chain, so the ref's run picks nothing here. A Workflow
+        // Activity's run names the stream itself.
+        if address.owner_kind != StreamOwnerKind::WorkflowActivity as i32 {
+            address.run_id.clear();
+        }
         if !(0..=MAX_RECORDS).contains(&input.stored_records) {
             return failed(failure::input_mistake(format!(
                 "stored_records is from 0 to {MAX_RECORDS}, not {}",
@@ -554,13 +560,16 @@ impl NexusCalls {
     }
 
     /// `address` without its run, and a state that names the chain the run picked. A state the
-    /// caller passed back already names its chain.
+    /// caller passed back already names its chain. A Workflow Activity keeps its run, which names
+    /// the stream itself.
     async fn chain_by_state(
         &self,
         mut address: StreamAddress,
         state: Vec<u8>,
     ) -> Result<(StreamAddress, Vec<u8>), StreamError> {
-        if address.run_id.is_empty() {
+        if address.run_id.is_empty()
+            || address.owner_kind == StreamOwnerKind::WorkflowActivity as i32
+        {
             return Ok((address, state));
         }
         let state = if state.is_empty() {
@@ -1074,8 +1083,8 @@ fn address(namespace: &str, stream: &StreamRef) -> Result<StreamAddress, Box<Nex
     let Some(owner_kind) = operation::owner_kind(&stream.kind) else {
         return Err(Box::new(failure::of_stream(&StreamError::unsupported(
             format!(
-                "this release opens streams of Workflows and standalone Activities only, not of \
-                 kind {}",
+                "this release opens streams of Workflows, standalone Activities and Workflow \
+                 Activities only, not of kind {}",
                 failure::named(&stream.kind)
             ),
         ))));
@@ -1094,6 +1103,21 @@ fn address(namespace: &str, stream: &StreamRef) -> Result<StreamAddress, Box<Nex
             Some("a stream that an Activity owns names an empty Workflow id")
         }
         StreamOwnerKind::Activity => None,
+        StreamOwnerKind::WorkflowActivity
+            if stream.workflow_id.is_empty()
+                || activity_id.is_empty()
+                || stream
+                    .chain_run_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .is_empty() =>
+        {
+            Some(
+                "a stream that a Workflow Activity owns needs its Workflow id, the run that \
+                 scheduled it as chain_run_id, and its Activity id",
+            )
+        }
+        StreamOwnerKind::WorkflowActivity => None,
         _ if stream.workflow_id.is_empty() => Some("a stream needs its owner's Workflow id"),
         _ if stream.activity_id.is_some() => {
             Some("a stream that a Workflow owns names no Activity id")

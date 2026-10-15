@@ -189,10 +189,25 @@ fn checked(stream: Option<&StreamAddress>) -> StreamResult<&StreamAddress> {
     let (owner_id, other_id, kind) = match StreamOwnerKind::try_from(stream.owner_kind) {
         Ok(StreamOwnerKind::Workflow) => (&stream.workflow_id, &stream.activity_id, "Workflow"),
         Ok(StreamOwnerKind::Activity) => (&stream.activity_id, &stream.workflow_id, "Activity"),
+        Ok(StreamOwnerKind::WorkflowActivity) => {
+            if stream.namespace.is_empty()
+                || stream.workflow_id.is_empty()
+                || stream.run_id.is_empty()
+                || stream.activity_id.is_empty()
+            {
+                return Err(bad_input(
+                    "a stream that a Workflow Activity owns needs its namespace, its Workflow \
+                     id, the run that scheduled it and its Activity id",
+                ));
+            }
+            temporalio_common::streams::check_topic(&stream.topic)
+                .map_err(|reason| bad_input(&super::failure::without_values(&reason)))?;
+            return Ok(stream);
+        }
         _ => {
             return Err(StreamError::unsupported(format!(
-                "this release opens streams of Workflows and standalone Activities only, not \
-                 owner kind {}",
+                "this release opens streams of Workflows, standalone Activities and Workflow \
+                 Activities only, not owner kind {}",
                 stream.owner_kind
             )));
         }
@@ -268,9 +283,10 @@ struct TokenRef {
 }
 
 /// The `kind` of a contract `StreamRef`, by Core's owner kind.
-const KINDS: [(&str, StreamOwnerKind); 2] = [
+const KINDS: [(&str, StreamOwnerKind); 3] = [
     ("workflow", StreamOwnerKind::Workflow),
     ("activity", StreamOwnerKind::Activity),
+    ("workflow_activity", StreamOwnerKind::WorkflowActivity),
 ];
 
 /// The owner kind a contract `kind` names, or `None` for a kind no release opens.
@@ -297,7 +313,8 @@ impl OperationToken {
             attach: self.attach_request_id.clone(),
             chain: self.chain_first_run_id.clone(),
             stream: TokenRef {
-                activity_id: (self.stream.owner_kind == StreamOwnerKind::Activity as i32)
+                activity_id: (self.stream.owner_kind != StreamOwnerKind::Workflow as i32
+                    && self.stream.owner_kind != StreamOwnerKind::Unspecified as i32)
                     .then(|| self.stream.activity_id.clone()),
                 chain_run_id: (!self.stream.run_id.is_empty()).then(|| self.stream.run_id.clone()),
                 kind: kind_name(self.stream.owner_kind).to_string(),
@@ -345,11 +362,24 @@ impl OperationToken {
                 }
                 StreamOwnerKind::Activity
             }
+            Some(StreamOwnerKind::WorkflowActivity) => {
+                let empty = |id: &Option<String>| id.as_deref().unwrap_or_default().is_empty();
+                if empty(&body.stream.activity_id)
+                    || empty(&body.stream.chain_run_id)
+                    || body.stream.workflow_id.is_empty()
+                {
+                    return Err(refuse(
+                        "a Workflow Activity's stream names its Workflow id, the run that \
+                         scheduled it and its Activity id",
+                    ));
+                }
+                StreamOwnerKind::WorkflowActivity
+            }
             Some(_) if body.stream.activity_id.is_none() => StreamOwnerKind::Workflow,
             Some(_) => return Err(refuse("a Workflow's stream names no Activity id")),
             None => {
                 return Err(refuse(
-                    "the stream's owner is neither a Workflow nor an Activity",
+                    "the stream's owner is no Workflow, standalone Activity or Workflow Activity",
                 ));
             }
         };
@@ -767,6 +797,48 @@ mod tests {
             stream: Some(StreamAddress {
                 workflow_id: "owner-1".to_string(),
                 ..activity
+            }),
+            ..attach_request("temporal://system")
+        };
+        assert_eq!(
+            attach(&setup.service, refused).await.unwrap_err().kind,
+            "BAD_REQUEST"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_workflow_activity_stream_start_attaches_on_its_scheduling_run() {
+        let setup = setup();
+        let tool = StreamAddress {
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            run_id: "run-7".to_string(),
+            activity_id: "1".to_string(),
+            ..stream("")
+        };
+        let start = AttachCallerRequest {
+            stream: Some(tool.clone()),
+            wake_after_counter: Some(0),
+            ..attach_request("temporal://system")
+        };
+        let token = attach(&setup.service, start).await.unwrap();
+        let run = ChainId {
+            namespace: "default".to_string(),
+            workflow_id: tool.workflow_id.clone(),
+            first_run_id: "run-7".to_string(),
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            activity_id: "1".to_string(),
+        };
+        assert_eq!(setup.notifier.attached.lock().unwrap()[0].chain, run);
+        let decoded = OperationToken::decode("default", &token).unwrap();
+        assert_eq!(decoded.stream, tool);
+        assert_eq!(decoded.chain(), run);
+        detach(&setup.service, &token).await.unwrap();
+        assert_eq!(setup.notifier.detached.lock().unwrap()[0].0, run);
+        // A Workflow Activity's address names its run.
+        let refused = AttachCallerRequest {
+            stream: Some(StreamAddress {
+                run_id: String::new(),
+                ..tool
             }),
             ..attach_request("temporal://system")
         };
@@ -1228,6 +1300,32 @@ mod tests {
             .unwrap()
             .contains("activity_id")
         );
+    }
+
+    #[test]
+    fn a_workflow_activity_token_names_its_scheduling_run_as_its_chain() {
+        let vectors = vectors();
+        let vector = vectors
+            .vectors
+            .iter()
+            .find(|vector| vector.stream.kind == "workflow_activity")
+            .unwrap();
+        let token = OperationToken::decode("ns", &vector.token).unwrap();
+        assert_eq!(
+            token.stream.owner_kind,
+            StreamOwnerKind::WorkflowActivity as i32
+        );
+        assert_eq!(
+            token.chain(),
+            ChainId {
+                namespace: "ns".to_string(),
+                workflow_id: vector.stream.workflow_id.clone(),
+                first_run_id: vector.stream.chain_run_id.clone().unwrap(),
+                owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+                activity_id: vector.stream.activity_id.clone().unwrap(),
+            }
+        );
+        assert_eq!(token.encode(), vector.token);
     }
 
     #[test]

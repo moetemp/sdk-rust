@@ -452,6 +452,16 @@ impl Streams {
         stream: &StreamAddress,
         first_run_id: &str,
     ) -> StreamResult<()> {
+        if stream.owner_kind == StreamOwnerKind::WorkflowActivity as i32 {
+            // The address names the run that keys the stream, so no describe is needed.
+            if first_run_id != stream.run_id {
+                return Err(StreamError::cursor(format!(
+                    "the read state names run {first_run_id:?}, which is not the run of {}",
+                    owner_key(stream).label()
+                )));
+            }
+            return Ok(());
+        }
         let key = OwnerKey {
             run_id: first_run_id.to_string(),
             ..owner_key(stream)

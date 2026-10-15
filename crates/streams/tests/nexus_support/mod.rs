@@ -199,6 +199,23 @@ pub(crate) fn activity_stream(activity_id: &str, topic: &str) -> Value {
     })
 }
 
+/// A stream reference to `topic` of Activity `activity_id` that run `run_id` of Workflow
+/// `workflow_id` scheduled.
+pub(crate) fn workflow_activity_stream(
+    workflow_id: &str,
+    run_id: &str,
+    activity_id: &str,
+    topic: &str,
+) -> Value {
+    serde_json::json!({
+        "kind": "workflow_activity",
+        "workflow_id": workflow_id,
+        "activity_id": activity_id,
+        "chain_run_id": run_id,
+        "topic": topic,
+    })
+}
+
 /// A stream reference to `topic` of Workflow `workflow_id`.
 pub(crate) fn stream(workflow_id: &str, topic: &str) -> Value {
     serde_json::json!({"kind": "workflow", "workflow_id": workflow_id, "topic": topic})

@@ -232,6 +232,30 @@ async fn an_activity_ref_matches_the_contract() {
     }
 }
 
+#[tokio::test]
+async fn a_workflow_activity_ref_matches_the_contract() {
+    let calls = service(memory(), NexusOptions::default());
+    let input = json!({
+        "stream": {
+            "kind": "workflow_activity",
+            "workflow_id": "agent",
+            "activity_id": "tool-42",
+            "chain_run_id": "run-1",
+            "topic": "out",
+        },
+    });
+    let step = calls.read(call(input)).await;
+    if let Err(failure) = drive(&calls, step, Codec::Sealing).await {
+        assert!(!is_contract_mistake(&failure), "{}", failure.message);
+    }
+    let contract = contract();
+    let kind = model(&contract, "StreamRef")["properties"]["kind"]["description"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(kind.contains("\"workflow_activity\""), "{kind}");
+}
+
 #[test]
 fn the_operation_token_model_is_closed_and_versioned() {
     // The generated token helpers refuse a token model that isn't closed or that lacks a

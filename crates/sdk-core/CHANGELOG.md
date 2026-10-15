@@ -222,6 +222,13 @@ relevant information.
   one Activity never wakes another Activity's reader on the same topic. `CodecWork` names the
   Activity, so lang's codec context is the namespace and the Activity id. A ref of kind
   `activity` with a Workflow id, or of kind `workflow` with an Activity id, is a bad request.
+* Experimental: the stream service contract and its Nexus calls serve Workflow Activity streams.
+  `StreamRef.kind` takes `"workflow_activity"`, with `workflow_id`, `activity_id` and the
+  scheduling run as `chain_run_id`, all required, and no new member. A stream operation token
+  carries the kind and the Activity id, keeps version 2, and its chain is the scheduling run.
+  Reads and replays keep the run, since it names the stream. A carried state must name that run.
+  A read's `wake_token` must also name the read's run for this kind. `CodecWork` names the
+  Workflow and the Activity. `operation_token_vectors.json` has Workflow Activity tokens.
 * Experimental: the Activity attempt key is `started_unix_ms << 11 | min(attempt, 2047)`, so it
   fits 53 bits and a JSON number holds it exactly. The Nexus contract's models and JavaScript
   refused the earlier 16-bit form. A start time from May 2109 on is refused. The vector file

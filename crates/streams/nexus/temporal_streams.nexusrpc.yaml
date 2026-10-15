@@ -80,16 +80,19 @@ $defs:
       kind:
         type: string
         description: >-
-          What owns the stream, "workflow" or "activity". A call with another
-          kind is refused.
+          What owns the stream: "workflow", "activity" for a standalone
+          Activity, or "workflow_activity" for an Activity that a Workflow
+          run scheduled. A call with another kind is refused.
       workflow_id:
         type: string
-        description: "The owning Workflow. Empty for kind activity."
+        description: >-
+          The owning Workflow, or for kind workflow_activity the Workflow that
+          scheduled the Activity. Empty for kind activity.
       activity_id:
         oneOf: [{ type: string }, { type: "null" }]
         description: >-
-          The owning standalone Activity, for kind activity. Absent or null
-          for kind workflow.
+          The owning Activity, for kinds activity and workflow_activity. Absent
+          or null for kind workflow.
       chain_run_id:
         oneOf: [{ type: string }, { type: "null" }]
         description: >-
@@ -97,7 +100,9 @@ $defs:
           or null names the Workflow id's newest chain. It never stops a read
           at this run: a read follows the chain across Continue-as-New and
           ends with the chain. For kind activity, the Activity run. Absent or
-          null names the Activity id's newest run when the read starts.
+          null names the Activity id's newest run when the read starts. For
+          kind workflow_activity, the run that scheduled the Activity, which is
+          required, since an Activity id repeats in each run.
       topic:
         type: string
         description: "The topic on the owner's stream."
@@ -427,6 +432,7 @@ $defs:
         description: >-
           The first run of the run chain the start attached to, so a cancel
           detaches from it even after the Workflow id moved on to a new chain.
-          For an Activity owner, the Activity run.
+          For an Activity owner, the Activity run. For a Workflow Activity
+          owner, the run that scheduled it.
     required: [v, ref, attach, chain]
     additionalProperties: false

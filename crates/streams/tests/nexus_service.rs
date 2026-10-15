@@ -692,6 +692,69 @@ mod cases {
         assert!(*after > 0);
     }
 
+    pub(crate) async fn a_workflow_activity_stream_reads_apart_from_its_workflow_and_other_runs(
+        store: Arc<dyn StreamStore>,
+    ) {
+        let calls = service(store, NexusOptions::default());
+        let id = workflow();
+        let tool = |run: &str| workflow_activity_stream(&id, run, "1", TOPIC);
+        let mut input = append_input(&id, "p", 1, 1, &["one", "two"]);
+        input["stream"] = tool("run-1");
+        append(&calls, input).await.unwrap();
+        write(&calls, &id, 1, &["workflow"]).await;
+        let answer = read(&calls, json!({"stream": tool("run-1")}))
+            .await
+            .unwrap();
+        assert_eq!(texts(&answer), ["one", "two"]);
+        assert_eq!(texts(&read_after(&calls, &id, "").await), ["workflow"]);
+        // Activity `1` of the next run is another stream, and its cursors are its own.
+        let next = read(&calls, json!({"stream": tool("run-2")}))
+            .await
+            .unwrap();
+        assert!(texts(&next).is_empty());
+        let refused = read(
+            &calls,
+            json!({"stream": tool("run-2"), "after_token": token(&answer)}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(kind_of(&refused).2, "StreamCursorError");
+        // The run is part of the owner, so another run's token wakes nothing here.
+        let other_run = OperationToken {
+            stream: StreamAddress {
+                namespace: NAMESPACE.to_string(),
+                owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+                workflow_id: id.clone(),
+                run_id: "run-2".to_string(),
+                topic: TOPIC.to_string(),
+                activity_id: "1".to_string(),
+            },
+            attach_request_id: "attach-1".to_string(),
+            chain_first_run_id: "run-2".to_string(),
+        }
+        .encode();
+        let refused = read(
+            &calls,
+            json!({"stream": tool("run-1"), "wake_token": other_run}),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(kind_of(&refused).0, "BAD_REQUEST");
+        // A Workflow Activity's ref names its Workflow, its run and its Activity.
+        for stream in [
+            json!({"kind": "workflow_activity", "workflow_id": id, "activity_id": "1", "topic": "t"}),
+            json!({"kind": "workflow_activity", "workflow_id": "", "activity_id": "1",
+                   "chain_run_id": "run-1", "topic": "t"}),
+            json!({"kind": "workflow_activity", "workflow_id": id, "chain_run_id": "run-1",
+                   "topic": "t"}),
+        ] {
+            let refused = read(&calls, json!({ "stream": stream.clone() }))
+                .await
+                .unwrap_err();
+            assert_eq!(kind_of(&refused).0, "BAD_REQUEST", "{stream}");
+        }
+    }
+
     pub(crate) async fn a_read_says_done_once_the_owner_ends(store: Arc<dyn StreamStore>) {
         let wf = workflow();
         write(
@@ -1065,6 +1128,7 @@ macro_rules! all_cases {
             an_activity_read_says_done_once_the_run_ends,
             a_wake_token_of_another_activity_is_refused,
             an_empty_activity_read_wakes_its_operation_on_the_activity_run,
+            a_workflow_activity_stream_reads_apart_from_its_workflow_and_other_runs,
         );
     };
 }
@@ -1579,5 +1643,56 @@ async fn an_activity_streams_codec_work_names_the_activity() {
             work.activity_id.as_str()
         ),
         (NAMESPACE, StreamOwnerKind::Activity as i32, "", "tool-1")
+    );
+}
+
+#[tokio::test]
+async fn a_workflow_activity_range_replays_and_names_only_its_run() {
+    let calls = service(memory(), NexusOptions::default());
+    let id = workflow();
+    let tool = workflow_activity_stream(&id, "run-3", "1", TOPIC);
+    let mut input = append_input(&id, "p", 1, 1, &["one", "two"]);
+    input["stream"] = tool.clone();
+    append(&calls, input).await.unwrap();
+    let answer = read(&calls, json!({"stream": tool, "floor_holder": HOLDER}))
+        .await
+        .unwrap();
+    assert_eq!(answer["replay"]["chain_first_run_id"], "run-3");
+    // A later call carries the state, which names the run.
+    let next = read(
+        &calls,
+        json!({"stream": tool, "after_token": answer["next_token"], "state": answer["state"]}),
+    )
+    .await
+    .unwrap();
+    assert!(texts(&next).is_empty());
+    let replay = replay_input(tool.clone(), &answer, Value::Null);
+    let replayed = read_range(&calls, replay.clone()).await.unwrap();
+    assert_eq!(replayed["records"], answer["records"]);
+    let mut other_run = replay;
+    other_run["chain_first_run_id"] = json!("run-9");
+    let refused = read_range(&calls, other_run).await.unwrap_err();
+    assert_eq!(
+        kind_of(&refused),
+        ("BAD_REQUEST", false, "StreamCursorError")
+    );
+}
+
+#[tokio::test]
+async fn a_workflow_activity_streams_codec_work_names_the_activity_and_its_workflow() {
+    let calls = service(memory(), NexusOptions::default());
+    let mut input = append_input("unused", "p", 1, 1, &["one"]);
+    input["stream"] = workflow_activity_stream("agent", "run-1", "tool-42", TOPIC);
+    let step = calls.append(call(input)).await;
+    let Some(temporalio_streams::proto::nexus_step::Step::Codec(work)) = step.step else {
+        panic!("an append asks for codec work first, not {step:?}");
+    };
+    assert_eq!(
+        (
+            work.owner_kind,
+            work.workflow_id.as_str(),
+            work.activity_id.as_str()
+        ),
+        (StreamOwnerKind::WorkflowActivity as i32, "agent", "tool-42")
     );
 }
