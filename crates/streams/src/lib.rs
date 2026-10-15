@@ -2,11 +2,12 @@
 
 //! Stream stores for Temporal Workflows.
 //!
-//! A stream is a topic of a Workflow, kept in a store outside Temporal and keyed by the
-//! Workflow's run chain. This crate holds what every store and every SDK share: the
-//! [StreamStore] trait a store implements, the cursor format, the record helpers that stamp
-//! records, and the error every call fails with. Lang reaches a store through Core's
-//! `StreamService`, and Core's Worker appends a Workflow's own output through the same trait.
+//! A stream is a topic of a Workflow or a standalone Activity, kept in a store outside Temporal
+//! and keyed by the owner's run chain. An Activity run is a chain of one run. This crate holds
+//! what every store and every SDK share: the [StreamStore] trait a store implements, the cursor
+//! format, the record helpers that stamp records, and the error every call fails with. Lang
+//! reaches a store through Core's `StreamService`, and Core's Worker appends a Workflow's own
+//! output through the same trait.
 
 mod cursor;
 mod driver;
@@ -38,12 +39,13 @@ pub use notify::{
     WorkflowAttachment, progress_counter,
 };
 pub use notifylog::{NotificationEntry, NotificationLog};
-pub use owner::{OwnerClient, OwnerDescription, OwnerError};
+pub use owner::{OwnerClient, OwnerDescription, OwnerError, OwnerId, OwnerStatus};
 pub use reader::{
     DEFAULT_MAX_RECORDS, MAX_STATE_BYTES, MAX_TRACKED_PRODUCERS, ReadTarget, read_page,
 };
 pub use record::{
-    WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, stored_append_record,
+    ACTIVITY_OWNER_KIND, MAX_KEYED_ACTIVITY_ATTEMPT, WORKFLOW_OWNER_KIND, activity_attempt,
+    activity_producer_id, chain_owner, check_append_digest, stored_append_record,
     workflow_batch_digest, workflow_producer_id,
 };
 pub use service::StreamService;
