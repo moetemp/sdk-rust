@@ -3,10 +3,12 @@
 mod conn;
 mod errors;
 mod keys;
+mod log;
 mod scripts;
+mod slots;
 
 use crate::{
-    StreamError, StreamResult, StreamStore,
+    NotificationLog, StreamError, StreamResult, StreamStore,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
@@ -18,7 +20,7 @@ use errors::{Call, Mapped};
 use keys::{ChainKeys, owner_pattern, session_field};
 use prost::Message;
 use redis::{Cmd, Value, streams::StreamReadReply};
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::time::Instant;
 
 const NAME: &str = "redis";
@@ -51,6 +53,10 @@ pub struct RedisStoreOptions {
     pub floor_lease: Option<Duration>,
     /// How long a hold lasts after its reader released it.
     pub floor_release_grace: Duration,
+    /// Each append also writes an entry to its slot's notification stream, which a driver reads.
+    pub notification_log: bool,
+    /// How many doorbells the notification log rings, each a stream that a driver blocks on.
+    pub notify_doorbells: u32,
 }
 
 impl RedisStoreOptions {
@@ -65,9 +71,14 @@ impl RedisStoreOptions {
             response_timeout: Duration::from_secs(5),
             floor_lease: None,
             floor_release_grace: Duration::from_secs(24 * 60 * 60),
+            notification_log: false,
+            notify_doorbells: DEFAULT_NOTIFY_DOORBELLS,
         }
     }
 }
+
+/// How many doorbells a notification log rings when the options don't say.
+pub const DEFAULT_NOTIFY_DOORBELLS: u32 = 16;
 
 /// A [StreamStore] on Redis.
 pub struct RedisStore {
@@ -78,6 +89,7 @@ pub struct RedisStore {
     grace_ms: u64,
     floor_lease_ms: u64,
     floor_release_grace_ms: u64,
+    log: Option<Arc<log::RedisLog>>,
 }
 
 impl std::fmt::Debug for RedisStore {
@@ -119,7 +131,26 @@ impl RedisStore {
             options.response_timeout,
         )
         .mapped(Call::Read)?;
+        let log = if options.notification_log {
+            // Doorbell reads block, so they get connections of their own.
+            let doorbell_reads = BlockingPool::new(
+                seed,
+                options.notify_doorbells.max(1) as usize,
+                options.cluster,
+                options.response_timeout,
+            )
+            .mapped(Call::Read)?;
+            Some(Arc::new(log::RedisLog::new(
+                shared.clone(),
+                doorbell_reads,
+                options.key_prefix.clone(),
+                options.notify_doorbells,
+            )))
+        } else {
+            None
+        };
         Ok(Self {
+            log,
             shared,
             blocking,
             prefix: options.key_prefix,
@@ -446,6 +477,10 @@ impl StreamStore for RedisStore {
         NAME
     }
 
+    fn notification_log(&self) -> Option<Arc<dyn NotificationLog>> {
+        self.log.clone().map(|log| log as Arc<dyn NotificationLog>)
+    }
+
     async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
         if request.records.is_empty() {
             return Err(StreamError::refused("an append needs at least one record"));
@@ -454,12 +489,19 @@ impl StreamStore for RedisStore {
             return Err(StreamError::refused("an append needs the batch's digest"));
         }
         let keys = self.keys(request.chain.as_ref())?;
-        let mut script = scripts::APPEND_SCRIPT.prepare_invoke();
+        let mut script = match self.log {
+            Some(_) => scripts::APPEND_LOGGED_SCRIPT.prepare_invoke(),
+            None => scripts::APPEND_SCRIPT.prepare_invoke(),
+        };
         script
             .key(keys.log(&request.topic))
             .key(keys.meta(&request.topic))
             .key(keys.chain())
-            .key(keys.floors(&request.topic))
+            .key(keys.floors(&request.topic));
+        if self.log.is_some() {
+            script.key(keys::notifications(&self.prefix, keys.slot()));
+        }
+        script
             .arg(self.retention_ms)
             .arg(self.grace_ms)
             .arg(session_field(&request.producer_id, request.attempt))
@@ -468,16 +510,28 @@ impl StreamStore for RedisStore {
         for record in &request.records {
             script.arg(record.as_slice());
         }
-        let appended: StreamResult<(String, String)> = script
+        let appended: StreamResult<Vec<String>> = script
             .invoke_async(&mut self.shared.clone())
             .await
             .mapped(Call::Append);
-        let (first_position, last_position) = match appended {
+        let answer = match appended {
             Err(error) if error.kind == StreamFailureKind::Closed => {
                 return Err(self.with_closed_by(error, &keys, &request.topic).await);
             }
             appended => appended?,
         };
+        let [first_position, last_position, rest @ ..] = answer.as_slice() else {
+            return Err(StreamError::storage(format!(
+                "Redis answered the append with {answer:?}"
+            )));
+        };
+        // The entry made a slot's stream non-empty, so a driver may be asleep on its doorbell.
+        if let (Some(log), [length]) = (&self.log, rest)
+            && length == "1"
+        {
+            log.ring(keys.slot()).await;
+        }
+        let (first_position, last_position) = (first_position.clone(), last_position.clone());
         Ok(StoreAppendResponse {
             first_position,
             last_position,
