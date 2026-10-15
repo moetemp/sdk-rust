@@ -1153,6 +1153,7 @@ async fn a_topic_closed_before_the_publish_drops_its_records_and_the_task_goes_o
         namespace: crate::test_help::NAMESPACE.to_string(),
         workflow_id: "fakeid".to_string(),
         first_run_id: String::new(),
+        ..Default::default()
     };
     let appended_at_completion: Arc<Mutex<Vec<usize>>> = Default::default();
     let history = timer_history();

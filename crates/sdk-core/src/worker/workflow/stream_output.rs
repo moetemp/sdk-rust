@@ -137,6 +137,7 @@ impl OutputStore {
             namespace: self.namespace.clone(),
             workflow_id: workflow_id.to_string(),
             first_run_id: first_run_id.to_string(),
+            ..Default::default()
         }
     }
 

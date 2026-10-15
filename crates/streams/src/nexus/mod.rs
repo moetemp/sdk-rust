@@ -480,6 +480,7 @@ impl NexusCalls {
                     namespace: address.namespace.clone(),
                     workflow_id: address.workflow_id.clone(),
                     first_run_id: token.chain_first_run_id.clone(),
+                    ..Default::default()
                 },
                 address.topic.clone(),
                 token.attach_request_id.clone(),
@@ -1111,6 +1112,7 @@ fn address(namespace: &str, stream: &StreamRef) -> Result<StreamAddress, Box<Nex
         workflow_id: stream.workflow_id.clone(),
         run_id: stream.chain_run_id.clone().unwrap_or_default(),
         topic: stream.topic.clone(),
+        ..Default::default()
     })
 }
 

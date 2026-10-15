@@ -17,7 +17,7 @@ use crate::{
 };
 use conn::{BlockingPool, Shared};
 use errors::{Call, Mapped};
-use keys::{ChainKeys, owner_pattern, session_field};
+use keys::{ChainKeys, activity_owner_pattern, owner_pattern, session_field};
 use prost::Message;
 use redis::{Cmd, Value, streams::StreamReadReply};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -757,15 +757,23 @@ impl StreamStore for RedisStore {
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
-        if request.owner_kind != StreamOwnerKind::Workflow as i32 {
-            return Err(StreamError::unsupported(format!(
-                "this release keeps streams of Workflows only, not owner kind {}",
-                request.owner_kind
-            )));
-        }
-        // A Workflow id's chains hash to different slots, so every primary is scanned. Some keys
+        let pattern = match StreamOwnerKind::try_from(request.owner_kind) {
+            Ok(StreamOwnerKind::Workflow) => {
+                owner_pattern(&self.prefix, &request.namespace, &request.workflow_id)
+            }
+            Ok(StreamOwnerKind::Activity) => {
+                activity_owner_pattern(&self.prefix, &request.namespace, &request.activity_id)
+            }
+            _ => {
+                return Err(StreamError::unsupported(format!(
+                    "this release keeps streams of Workflows and standalone Activities only, not \
+                     owner kind {}",
+                    request.owner_kind
+                )));
+            }
+        };
+        // An owner id's chains hash to different slots, so every primary is scanned. Some keys
         // may be gone when a later step fails, which is why a failure leaves the outcome unknown.
-        let pattern = owner_pattern(&self.prefix, &request.namespace, &request.workflow_id);
         let mut deleted = 0;
         for node in self.shared.primaries().await.mapped(Call::Write)? {
             let mut cursor = "0".to_string();
@@ -873,6 +881,7 @@ mod tests {
             namespace: "ns".to_string(),
             workflow_id: workflow_id.to_string(),
             first_run_id: "run-1".to_string(),
+            ..Default::default()
         }
     }
 
