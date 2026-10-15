@@ -263,6 +263,7 @@ fn records_on(topic: &str, values: &[&str]) -> Vec<OutputRecord> {
                 ..Default::default()
             }),
             content_hash: vec![value.as_bytes()[0]; 32],
+            ..Default::default()
         })
         .collect()
 }
@@ -423,7 +424,7 @@ async fn a_commit_is_in_the_store_before_its_completion_is_sent() {
             TOPIC,
             committed
                 .iter()
-                .map(|r| (r.kind, r.content_hash.as_slice()))
+                .map(|r| (r.kind, r.content_hash.as_slice(), r.link.as_ref()))
         ),
         "the digest never depends on the codec, so a repeat of the batch deduplicates"
     );
@@ -1632,4 +1633,66 @@ async fn a_try_cancel_closes_the_streams_at_once_with_the_canceled_failure() {
     let resolved = worker.poll_workflow_activation().await.unwrap();
     worker.complete_execution(&resolved.run_id).await;
     worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_commit_with_a_link_lands_at_activation_completion() {
+    use temporalio_common::protos::temporal::{
+        api::{enums::v1::StreamOwnerKind as Kind, stream::v1::StreamReference},
+        sdk::streams::v1::{StreamLink, stream_link},
+    };
+    let store = Arc::new(RecordingStore::default());
+    let appended_at_completion: Arc<Mutex<Vec<usize>>> = Default::default();
+    let worker = worker_appending_to(
+        timer_history(),
+        vec![1.into(), 2.into()],
+        store.clone(),
+        appended_at_completion.clone(),
+    );
+    let link = StreamLink {
+        event: stream_link::Event::Open as i32,
+        stream: Some(StreamReference {
+            owner_kind: Kind::WorkflowActivity as i32,
+            workflow_id: "fakeid".to_string(),
+            run_id: "run".to_string(),
+            topic: "tokens".to_string(),
+            activity_id: "tool-42".to_string(),
+        }),
+        name: "tool-42".to_string(),
+        ..Default::default()
+    };
+    let mut committed = records(&["a"]);
+    committed.push(OutputRecord {
+        topic: TOPIC.to_string(),
+        kind: StreamRecordKind::Link as i32,
+        link: Some(link.clone()),
+        ..Default::default()
+    });
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &activation.run_id,
+        vec![
+            output_commit_command(committed.clone()),
+            start_timer_cmd(1, Duration::from_secs(10)),
+        ],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    worker.complete_execution(&fired.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    assert_eq!(appended_at_completion.lock()[0], 1);
+    let [append] = store.appends().try_into().unwrap();
+    assert_eq!(
+        append.digest,
+        workflow_batch_digest(
+            TOPIC,
+            committed
+                .iter()
+                .map(|r| (r.kind, r.content_hash.as_slice(), r.link.as_ref()))
+        )
+    );
+    let stored = StreamRecord::decode(append.records[1].as_slice()).unwrap();
+    assert_eq!(stored.kind, StreamRecordKind::Link as i32);
+    assert_eq!(stored.link, Some(link));
 }

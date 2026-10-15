@@ -3,7 +3,8 @@
 use crate::{
     StreamError, StreamResult,
     proto::{
-        ActivityProducer, AppendRecord, ChainId, StreamOwnerKind, StreamRecord, StreamRecordKind,
+        ActivityProducer, AppendRecord, ChainId, StreamLink, StreamOwnerKind, StreamRecord,
+        StreamRecordKind,
     },
 };
 use std::borrow::Cow;
@@ -122,21 +123,35 @@ pub fn workflow_producer_id(run_id: &str) -> String {
 ///
 /// It is the SHA-256 over each record as its length in 8 bytes big-endian, then the record as its
 /// topic's length in 8 bytes big-endian, the topic's UTF-8 bytes, its kind in 4 bytes big-endian,
-/// its content hash's length in 8 bytes big-endian and the content hash.
+/// its content hash's length in 8 bytes big-endian and the content hash. A LINK record then adds
+/// each field of its link as its length in 8 bytes big-endian and its bytes: the event in 4 bytes
+/// big-endian, the stream's owner kind in 4 bytes big-endian, its Workflow id, run id, topic and
+/// Activity id, then the name, `after`, `until`, the namespace and the endpoint. A record with no
+/// link adds nothing, so its digest is as before links.
 pub fn workflow_batch_digest<'a>(
     topic: &str,
-    records: impl IntoIterator<Item = (i32, &'a [u8])>,
+    records: impl IntoIterator<Item = (i32, &'a [u8], Option<&'a StreamLink>)>,
 ) -> Vec<u8> {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
-    for (kind, content_hash) in records {
-        let length = 8 + topic.len() + 4 + 8 + content_hash.len();
+    for (kind, content_hash, link) in records {
+        let fields = link.map(link_fields).unwrap_or_default();
+        let length = 8
+            + topic.len()
+            + 4
+            + 8
+            + content_hash.len()
+            + fields.iter().map(|field| 8 + field.len()).sum::<usize>();
         digest.update((length as u64).to_be_bytes());
         digest.update((topic.len() as u64).to_be_bytes());
         digest.update(topic.as_bytes());
         digest.update(kind.to_be_bytes());
         digest.update((content_hash.len() as u64).to_be_bytes());
         digest.update(content_hash);
+        for field in fields {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field);
+        }
     }
     digest.finalize().to_vec()
 }
@@ -158,9 +173,9 @@ pub fn check_append_digest(digest: &[u8]) -> StreamResult<()> {
 
 /// The record a store keeps for one appended record of a producer.
 ///
-/// Fails as an invalid argument when the record is one no writer stores: a kind other than DATA
-/// or FINISH, a DATA record without a body or a 32-byte content hash, or a FINISH record with a
-/// body.
+/// Fails as an invalid argument when the record is one no writer stores: a kind other than DATA,
+/// FINISH or LINK, a DATA record without a body or a 32-byte content hash, a FINISH record with a
+/// body, a LINK record without a valid link, or a link on another kind.
 pub fn stored_append_record(
     topic: &str,
     producer_id: &str,
@@ -173,6 +188,7 @@ pub fn stored_append_record(
         record.kind,
         record.body.clone(),
         &record.content_hash,
+        record.link.as_ref(),
     )?;
     stored.producer_id = producer_id.to_string();
     stored.attempt = attempt;
@@ -185,10 +201,17 @@ fn stored_record(
     kind: i32,
     body: Option<Payload>,
     content_hash: &[u8],
+    link: Option<&StreamLink>,
 ) -> StreamResult<StreamRecord> {
     if topic.is_empty() {
         return Err(StreamError::invalid_argument(
             "a stream record needs a topic",
+        ));
+    }
+    let is_link = kind == StreamRecordKind::Link as i32;
+    if link.is_some() != is_link {
+        return Err(StreamError::invalid_argument(
+            "a LINK record needs its link, and no other kind carries one",
         ));
     }
     let mut stored = StreamRecord {
@@ -221,13 +244,52 @@ fn stored_record(
                 ));
             }
         }
+        Ok(StreamRecordKind::Link) => {
+            let link = link.expect("checked above");
+            temporalio_common::streams::check_link(link).map_err(StreamError::invalid_argument)?;
+            match (body, content_hash.len()) {
+                (None, 0) => {}
+                (Some(body), HASH_LENGTH) => {
+                    stored.metadata.insert(
+                        CONTENT_HASH_KEY.to_string(),
+                        metadata_payload(content_hash_text(content_hash).as_bytes()),
+                    );
+                    stored.body = Some(body);
+                }
+                (_, length) => {
+                    return Err(StreamError::invalid_argument(format!(
+                        "a LINK record's body needs the {HASH_LENGTH}-byte SHA-256 of its \
+                         plaintext, and no body takes no hash, not {length} bytes"
+                    )));
+                }
+            }
+            stored.link = Some(link.clone());
+        }
         _ => {
             return Err(StreamError::invalid_argument(format!(
-                "a writer stores DATA or FINISH records, not kind {kind}"
+                "a writer stores DATA, FINISH or LINK records, not kind {kind}"
             )));
         }
     }
     Ok(stored)
+}
+
+/// Each field of a link, as the digests take them, every one length-prefixed by its caller.
+pub(crate) fn link_fields(link: &StreamLink) -> Vec<Vec<u8>> {
+    let stream = link.stream.clone().unwrap_or_default();
+    vec![
+        link.event.to_be_bytes().to_vec(),
+        stream.owner_kind.to_be_bytes().to_vec(),
+        stream.workflow_id.into_bytes(),
+        stream.run_id.into_bytes(),
+        stream.topic.into_bytes(),
+        stream.activity_id.into_bytes(),
+        link.name.as_bytes().to_vec(),
+        link.after.as_bytes().to_vec(),
+        link.until.as_bytes().to_vec(),
+        link.namespace.as_bytes().to_vec(),
+        link.endpoint.as_bytes().to_vec(),
+    ]
 }
 
 fn metadata_payload(data: &[u8]) -> Payload {
@@ -256,6 +318,7 @@ mod tests {
             kind: StreamRecordKind::Data as i32,
             body: Some(body()),
             content_hash: vec![hash; HASH_LENGTH],
+            ..Default::default()
         }
     }
 
@@ -296,19 +359,20 @@ mod tests {
     fn a_workflow_batch_digest_sees_order_kind_and_hash() {
         let data = StreamRecordKind::Data as i32;
         let finish = StreamRecordKind::Finish as i32;
-        let base = workflow_batch_digest("t", [(data, &[1u8; 32][..]), (finish, &[][..])]);
+        let base =
+            workflow_batch_digest("t", [(data, &[1u8; 32][..], None), (finish, &[][..], None)]);
         assert_eq!(base.len(), HASH_LENGTH);
         assert_eq!(check_append_digest(&base), Ok(()));
         for other in [
-            workflow_batch_digest("t", [(finish, &[][..]), (data, &[1u8; 32][..])]),
-            workflow_batch_digest("t", [(data, &[2u8; 32][..]), (finish, &[][..])]),
-            workflow_batch_digest("u", [(data, &[1u8; 32][..]), (finish, &[][..])]),
-            workflow_batch_digest("t", [(data, &[1u8; 32][..])]),
+            workflow_batch_digest("t", [(finish, &[][..], None), (data, &[1u8; 32][..], None)]),
+            workflow_batch_digest("t", [(data, &[2u8; 32][..], None), (finish, &[][..], None)]),
+            workflow_batch_digest("u", [(data, &[1u8; 32][..], None), (finish, &[][..], None)]),
+            workflow_batch_digest("t", [(data, &[1u8; 32][..], None)]),
         ] {
             assert_ne!(other, base);
         }
         assert_eq!(
-            workflow_batch_digest("t", [(data, &[1u8; 32][..]), (finish, &[][..])]),
+            workflow_batch_digest("t", [(data, &[1u8; 32][..], None), (finish, &[][..], None)]),
             base
         );
     }
@@ -365,5 +429,152 @@ mod tests {
             assert_eq!(error.kind, StreamFailureKind::InvalidArgument);
             assert!(error.message.contains("32-byte digest"), "{error}");
         }
+    }
+
+    fn open_link() -> StreamLink {
+        use temporalio_common::protos::temporal::api::{
+            enums::v1::StreamOwnerKind as Kind, stream::v1::StreamReference,
+        };
+        StreamLink {
+            event: crate::proto::stream_link::Event::Open as i32,
+            stream: Some(StreamReference {
+                owner_kind: Kind::WorkflowActivity as i32,
+                workflow_id: "agent".to_string(),
+                run_id: "run-1".to_string(),
+                topic: "tokens".to_string(),
+                activity_id: "tool-42".to_string(),
+            }),
+            name: "tool-42".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn link(link: StreamLink) -> AppendRecord {
+        AppendRecord {
+            kind: StreamRecordKind::Link as i32,
+            link: Some(link),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_link_is_stored_with_its_reference_in_plaintext() {
+        let stored = stored_append_record("events", "p", 1, 1, &link(open_link())).unwrap();
+        assert_eq!(stored.kind, StreamRecordKind::Link as i32);
+        assert_eq!(stored.link, Some(open_link()));
+        assert!(stored.body.is_none() && stored.metadata.is_empty());
+        // A label may ride in the body, through the codec like any value.
+        let labeled = AppendRecord {
+            body: Some(body()),
+            content_hash: vec![7; HASH_LENGTH],
+            ..link(open_link())
+        };
+        let stored = stored_append_record("events", "p", 1, 2, &labeled).unwrap();
+        assert_eq!(stored.body, Some(body()));
+        assert!(stored.metadata.contains_key(CONTENT_HASH_KEY));
+        let join = StreamLink {
+            event: crate::proto::stream_link::Event::Join as i32,
+            name: "tool-42".to_string(),
+            until: "cursor".to_string(),
+            ..Default::default()
+        };
+        assert!(stored_append_record("events", "p", 1, 3, &link(join)).is_ok());
+    }
+
+    #[test]
+    fn a_link_no_follower_can_use_is_refused() {
+        use crate::proto::stream_link::Event;
+        let with = |change: fn(&mut StreamLink)| {
+            let mut link = open_link();
+            change(&mut link);
+            link
+        };
+        let cases: Vec<(AppendRecord, &str)> = vec![
+            (link(with(|l| l.name.clear())), "needs a name"),
+            (link(with(|l| l.name = "n".repeat(257))), "needs a name"),
+            (
+                link(with(|l| l.event = Event::Unspecified as i32)),
+                "OPEN or JOIN",
+            ),
+            (link(with(|l| l.stream = None)), "needs the stream"),
+            (link(with(|l| l.until = "c".to_string())), "names no until"),
+            (
+                link(with(|l| l.stream.as_mut().unwrap().run_id.clear())),
+                "don't fit the kind",
+            ),
+            (
+                link(with(|l| l.stream.as_mut().unwrap().topic.clear())),
+                "needs a topic",
+            ),
+            (
+                link(with(|l| l.after = "c".repeat(1025))),
+                "after is at most",
+            ),
+            (
+                link(with(|l| {
+                    l.event = Event::Join as i32;
+                })),
+                "only the OPEN it joins",
+            ),
+            (
+                AppendRecord {
+                    link: Some(open_link()),
+                    ..data(1)
+                },
+                "no other kind carries one",
+            ),
+            (
+                AppendRecord {
+                    link: None,
+                    ..link(open_link())
+                },
+                "needs its link",
+            ),
+            (
+                AppendRecord {
+                    body: Some(body()),
+                    ..link(open_link())
+                },
+                "not 0 bytes",
+            ),
+        ];
+        for (record, expected) in cases {
+            let error = stored_append_record("events", "p", 1, 1, &record).unwrap_err();
+            assert_eq!(error.kind, StreamFailureKind::InvalidArgument);
+            assert!(error.message.contains(expected), "{expected}: {error}");
+        }
+    }
+
+    #[test]
+    fn a_workflow_batch_digest_sees_every_link_field() {
+        let kind = StreamRecordKind::Link as i32;
+        let base_link = open_link();
+        let digest = |link: &StreamLink| workflow_batch_digest("t", [(kind, &[][..], Some(link))]);
+        let base = digest(&base_link);
+        // A record with no link keeps the digest it had before links.
+        assert_ne!(base, workflow_batch_digest("t", [(kind, &[][..], None)]));
+        let changes: [fn(&mut StreamLink); 11] = [
+            |l| l.event = crate::proto::stream_link::Event::Join as i32,
+            |l| l.stream.as_mut().unwrap().owner_kind = 1,
+            |l| l.stream.as_mut().unwrap().workflow_id.push('x'),
+            |l| l.stream.as_mut().unwrap().run_id.push('x'),
+            |l| l.stream.as_mut().unwrap().topic.push('x'),
+            |l| l.stream.as_mut().unwrap().activity_id.push('x'),
+            |l| l.name.push('x'),
+            |l| l.after.push('x'),
+            |l| l.until.push('x'),
+            |l| l.namespace.push('x'),
+            |l| l.endpoint.push('x'),
+        ];
+        for change in changes {
+            let mut other = base_link.clone();
+            change(&mut other);
+            assert_ne!(digest(&other), base, "{other:?}");
+        }
+        // Length prefixes keep a byte moved from one field to the next apart.
+        let mut moved = base_link.clone();
+        moved.name = "tool-4".to_string();
+        moved.after = "2".to_string();
+        assert_ne!(digest(&moved), base);
     }
 }

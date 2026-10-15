@@ -3100,6 +3100,7 @@ mod sdk_helpers {
                     producer_id: "p".to_string(),
                     attempt: 2,
                     sequence: 3,
+                    link: None,
                 }
             }
 

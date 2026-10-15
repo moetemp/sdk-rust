@@ -380,6 +380,11 @@ pub(crate) fn records_digest(records: &[ReadRecord]) -> Vec<u8> {
                         .get(temporalio_common::streams::CONTENT_HASH_KEY)
                         .map_or(&[][..], |hash| hash.data.as_slice()),
                 );
+                // A replay with another link fails as a mismatch. A record with no link adds
+                // nothing, so earlier digests hold.
+                for link_field in stored.link.iter().flat_map(crate::record::link_fields) {
+                    field(&link_field);
+                }
             }
             Some(read_record::Record::Superseded(superseded)) => {
                 field(b"superseded");
@@ -404,7 +409,7 @@ fn parse(bytes: &[u8]) -> Result<StreamRecord, String> {
     }
     let mut record = StreamRecord::decode(bytes).map_err(|error| error.to_string())?;
     match StreamRecordKind::try_from(record.kind) {
-        Ok(StreamRecordKind::Data | StreamRecordKind::Finish) => {}
+        Ok(StreamRecordKind::Data | StreamRecordKind::Finish | StreamRecordKind::Link) => {}
         Ok(StreamRecordKind::Unspecified) => record.kind = StreamRecordKind::Data as i32,
         Err(_) => return Err(format!("no writer stores a record of kind {}", record.kind)),
     }
@@ -956,6 +961,32 @@ mod tests {
         assert_eq!(error.cursor, Some(cursor(&empty)));
         let after = read(&log, &cursor(&empty), &first.state).await.unwrap();
         assert_eq!(shape(&after), [(cursor("3"), DATA, 1, false)]);
+    }
+
+    #[tokio::test]
+    async fn a_link_reads_back_and_its_fields_change_the_read_digest() {
+        let link = |name: &str| crate::proto::StreamLink {
+            event: crate::proto::stream_link::Event::Join as i32,
+            name: name.to_string(),
+            ..Default::default()
+        };
+        let digest_of = |name: &'static str| async move {
+            let log = Log::default();
+            let mut record = data_record("p", 1, b"1");
+            record.kind = StreamRecordKind::Link as i32;
+            record.body = None;
+            record.metadata.clear();
+            record.link = Some(link(name));
+            log.push(record.encode_to_vec());
+            let page = read(&log, BEGINNING, &[]).await.unwrap();
+            let Some(read_record::Record::Stored(stored)) = &page.records[0].record else {
+                panic!("a stored record");
+            };
+            assert_eq!(stored.link, Some(link(name)));
+            page.records_digest
+        };
+        assert_ne!(digest_of("a").await, digest_of("b").await);
+        assert_eq!(digest_of("a").await, digest_of("a").await);
     }
 
     #[tokio::test]

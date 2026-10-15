@@ -200,6 +200,18 @@ relevant information.
   that fails is logged and does not fail the Workflow Task. Unmarked Activities cost no store
   call. Notifier calls name a Workflow Activity stream by its Workflow, scheduling run and
   Activity id.
+* Experimental: streams store link records. `StreamRecordKind` gains `LINK = 4`, and
+  `StreamRecord.link` (field 8) holds a new `StreamLink`: an `OPEN` or `JOIN` event, the linked
+  `temporal.api.stream.v1.StreamReference`, a name of at most 256 bytes, the `after` and `until`
+  cursors, a namespace and an endpoint. The link stays out of the payload codec. An optional
+  body goes through it and needs its content hash, as on `DATA`. `AppendRecord.link` (field 4)
+  and `OutputRecord.link` (field 5) carry it on append and in a Workflow's commit. Core refuses a
+  link with no name, no event, an `OPEN` with no stream or with ids that don't fit its owner
+  kind, a `JOIN` with a stream, or a link on another kind. `workflow_batch_digest` takes each
+  record's link, and both it and the read digest add the link's fields with length prefixes, so
+  a replay with another link fails as `REPLAY_MISMATCH`. A record with no link keeps its digest.
+  `temporalio_common::streams::check_link` holds the rules. A reader before this release refuses
+  a link as a record of an unknown kind.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

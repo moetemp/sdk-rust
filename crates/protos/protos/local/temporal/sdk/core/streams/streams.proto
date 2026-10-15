@@ -191,6 +191,8 @@ message AppendRecord {
   // encrypts with a fresh nonce makes a retry's bytes differ, so a retry is recognized by this.
   // Empty when there is no body.
   bytes content_hash = 3;
+  // Set on LINK only. A LINK's body is optional.
+  temporal.sdk.streams.v1.StreamLink link = 4;
 }
 
 message AppendRequest {

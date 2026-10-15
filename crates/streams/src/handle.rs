@@ -1351,6 +1351,7 @@ mod tests {
                 ..Default::default()
             }),
             content_hash: Sha256::digest(value.as_bytes()).to_vec(),
+            ..Default::default()
         }
     }
 

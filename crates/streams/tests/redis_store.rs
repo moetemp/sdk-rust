@@ -1757,6 +1757,7 @@ async fn a_replay_read_on_redis_repeats_the_read_and_survives_retention_under_a_
                 ..Default::default()
             }),
             content_hash: Sha256::digest(value.as_bytes()).to_vec(),
+            ..Default::default()
         }],
         digest: Sha256::digest(value.as_bytes()).to_vec(),
     };
@@ -1844,6 +1845,7 @@ async fn a_replay_read_from_a_trimmed_start_on_redis_is_rec_01() {
                 ..Default::default()
             }),
             content_hash: Sha256::digest(sequence.to_be_bytes()).to_vec(),
+            ..Default::default()
         }],
         digest: Sha256::digest(sequence.to_be_bytes()).to_vec(),
     };

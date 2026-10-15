@@ -593,6 +593,7 @@ fn encoded(value: &str, ciphertext: &[u8]) -> AppendRecord {
             ..Default::default()
         }),
         content_hash: hash(value),
+        ..Default::default()
     }
 }
 
@@ -1532,6 +1533,47 @@ mod cases {
         );
     }
 
+    pub(crate) async fn a_link_record_reads_back_with_its_link(case: &dyn Case) {
+        use temporalio_common::protos::temporal::api::{
+            enums::v1::StreamOwnerKind as Kind, stream::v1::StreamReference,
+        };
+        let chain = case.chain();
+        let open = StreamLink {
+            event: stream_link::Event::Open as i32,
+            stream: Some(StreamReference {
+                owner_kind: Kind::Workflow as i32,
+                workflow_id: "child".to_string(),
+                topic: OUT.to_string(),
+                ..Default::default()
+            }),
+            name: "sub-3".to_string(),
+            after: "a cursor".to_string(),
+            ..Default::default()
+        };
+        let join = StreamLink {
+            event: stream_link::Event::Join as i32,
+            name: "sub-3".to_string(),
+            ..Default::default()
+        };
+        let link = |link: &StreamLink| AppendRecord {
+            kind: StreamRecordKind::Link as i32,
+            link: Some(link.clone()),
+            ..Default::default()
+        };
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer
+            .send(&[data("1"), link(&open), data("2"), link(&join)])
+            .await
+            .unwrap();
+        let page = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        let kinds: Vec<_> = page.records.iter().map(|r| stored(r).kind).collect();
+        let (data_kind, link_kind) = (StreamRecordKind::Data as i32, StreamRecordKind::Link as i32);
+        assert_eq!(kinds, [data_kind, link_kind, data_kind, link_kind]);
+        assert_eq!(stored(&page.records[1]).link, Some(open));
+        assert_eq!(stored(&page.records[3]).link, Some(join));
+        assert_eq!(stored(&page.records[2]).link, None);
+    }
+
     pub(crate) async fn a_workflow_activity_keeps_the_topics_it_wrote(case: &dyn Case) {
         let store = case.store();
         let chain = case.chain();
@@ -1844,6 +1886,7 @@ macro_rules! store_cases {
             a_close_with_no_outcome_is_the_first_close_too,
             a_chain_close_keeps_no_outcome,
             a_workflow_activity_keeps_the_topics_it_wrote,
+            a_link_record_reads_back_with_its_link,
         );
     };
 }

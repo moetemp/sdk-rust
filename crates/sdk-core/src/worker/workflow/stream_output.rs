@@ -11,7 +11,7 @@ use temporalio_common::{
         },
         temporal::{api::failure::v1::Failure, sdk::streams::v1::StreamRecordKind},
     },
-    streams::check_topic,
+    streams::{check_link, check_topic},
 };
 
 const CONTENT_HASH_BYTES: usize = 32;
@@ -128,6 +128,9 @@ fn check_record(record: &OutputRecord) -> Result<(), String> {
         return Err("has no topic".to_string());
     }
     check_topic(&record.topic)?;
+    if record.link.is_some() != (record.kind == StreamRecordKind::Link as i32) {
+        return Err("has a link and is not LINK, or is LINK without a link".to_string());
+    }
     match StreamRecordKind::try_from(record.kind) {
         Ok(StreamRecordKind::Data) => {
             if record.body.is_none() {
@@ -146,7 +149,27 @@ fn check_record(record: &OutputRecord) -> Result<(), String> {
                 return Err("is FINISH with a body".to_string());
             }
         }
-        _ => return Err(format!("has kind {}, not DATA or FINISH", record.kind)),
+        Ok(StreamRecordKind::Link) => {
+            check_link(record.link.as_ref().expect("checked above"))?;
+            let hash_fits = if record.body.is_some() {
+                record.content_hash.len() == CONTENT_HASH_BYTES
+            } else {
+                record.content_hash.is_empty()
+            };
+            if !hash_fits {
+                return Err(format!(
+                    "is LINK with a {}-byte content hash, which a body needs as the \
+                     {CONTENT_HASH_BYTES}-byte SHA-256 of its plaintext and no body leaves empty",
+                    record.content_hash.len()
+                ));
+            }
+        }
+        _ => {
+            return Err(format!(
+                "has kind {}, not DATA, FINISH or LINK",
+                record.kind
+            ));
+        }
     }
     Ok(())
 }
@@ -212,6 +235,7 @@ impl OutputStore {
                         kind: record.kind,
                         body: record.body.clone(),
                         content_hash: record.content_hash.clone(),
+                        link: record.link.clone(),
                     };
                     temporalio_streams::stored_append_record(
                         &topic.topic,
@@ -234,7 +258,7 @@ impl OutputStore {
                     topic
                         .records
                         .iter()
-                        .map(|r| (r.kind, r.content_hash.as_slice())),
+                        .map(|r| (r.kind, r.content_hash.as_slice(), r.link.as_ref())),
                 ),
                 records,
             };
@@ -388,7 +412,10 @@ fn fit_failure(failure: Failure, closed_by_bytes: usize) -> Failure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temporalio_common::protos::temporal::api::common::v1::Payload;
+    use temporalio_common::protos::temporal::{
+        api::common::v1::Payload,
+        sdk::streams::v1::{StreamLink, stream_link},
+    };
 
     fn data(topic: &str, hash: u8) -> OutputRecord {
         OutputRecord {
@@ -399,6 +426,7 @@ mod tests {
                 ..Default::default()
             }),
             content_hash: vec![hash; CONTENT_HASH_BYTES],
+            ..Default::default()
         }
     }
 
@@ -446,11 +474,57 @@ mod tests {
             (short_hash, "record 1 is DATA with a 3-byte content hash"),
             (finish_with_body, "record 1 is FINISH with a body"),
             (unspecified, "record 1 has kind 0"),
+            (
+                OutputRecord {
+                    link: Some(join("x")),
+                    ..data("t", 1)
+                },
+                "has a link and is not LINK",
+            ),
+            (
+                link_record("t", StreamLink::default()),
+                "a link needs a name",
+            ),
+            (
+                OutputRecord {
+                    content_hash: vec![1; 32],
+                    ..link_record("t", join("x"))
+                },
+                "is LINK with a 32-byte content hash",
+            ),
         ] {
             let message = output_by_topic(vec![data("t", 9), record], &mut HashMap::new())
                 .unwrap_err()
                 .to_string();
             assert!(message.contains(expected), "{expected}: {message}");
         }
+    }
+
+    fn join(name: &str) -> StreamLink {
+        StreamLink {
+            event: stream_link::Event::Join as i32,
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn link_record(topic: &str, link: StreamLink) -> OutputRecord {
+        OutputRecord {
+            topic: topic.to_string(),
+            kind: StreamRecordKind::Link as i32,
+            link: Some(link),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_link_is_a_record_of_its_topic_like_any_other() {
+        let topics = output_by_topic(
+            vec![data("t", 1), link_record("t", join("tool-1"))],
+            &mut HashMap::new(),
+        )
+        .unwrap();
+        assert_eq!(topics.len(), 1);
+        assert_eq!(topics[0].records[1].link, Some(join("tool-1")));
     }
 }

@@ -989,6 +989,7 @@ mod tests {
                         },
                     ),
                     content_hash: vec![7; 32],
+                    ..Default::default()
                 }],
                 // Any value names the batch, since this producer writes it once.
                 digest: vec![9; 32],
