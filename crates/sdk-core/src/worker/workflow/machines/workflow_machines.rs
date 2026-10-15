@@ -37,6 +37,7 @@ use crate::{
                 upsert_search_attributes_state_machine::upsert_search_attrs_internal,
             },
             nondeterminism,
+            stream_output::ActivityStreamClose,
         },
     },
 };
@@ -143,6 +144,9 @@ pub(crate) struct WorkflowMachines {
     pub(crate) last_processed_event: i64,
     /// True if the workflow is replaying from history
     pub(crate) replaying: bool,
+    /// The streams of Workflow Activities this run resolved live, to close once the activation
+    /// completes.
+    activity_stream_closes: Vec<ActivityStreamClose>,
     /// Workflow identifier
     pub(crate) workflow_id: String,
     /// Workflow type identifier. (Function name, class, etc)
@@ -320,6 +324,7 @@ impl WorkflowMachines {
             protocol_msgs: vec![],
             pending_stream_wakes: vec![],
             pending_nexus_progress: vec![],
+            activity_stream_closes: vec![],
             workflow_id: basics.workflow_id,
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
@@ -357,6 +362,11 @@ impl WorkflowMachines {
             have_seen_terminal_event: false,
             worker_config: basics.worker_config,
         }
+    }
+
+    /// Takes the stream closes of the Workflow Activities resolved since the last call.
+    pub(crate) fn take_activity_stream_closes(&mut self) -> Vec<ActivityStreamClose> {
+        std::mem::take(&mut self.activity_stream_closes)
     }
 
     /// Returns true if workflow has seen a terminal command
@@ -1333,6 +1343,22 @@ impl WorkflowMachines {
         for response in machine_responses {
             match response {
                 MachineResponse::PushWFJob(a) => {
+                    // Replay does no store calls, so only a live resolution closes the streams.
+                    if !self.replaying
+                        && let workflow_activation_job::Variant::ResolveActivity(resolved) =
+                            &a.variant
+                        && !resolved.is_local
+                        && let Machines::ActivityMachine(machine) = self.machine(smk)
+                        && let Some(activity_id) = machine.stream_owner_activity_id()
+                        && let Some(close) = ActivityStreamClose::of(
+                            &self.workflow_id,
+                            &self.run_id,
+                            activity_id,
+                            resolved.result.as_ref(),
+                        )
+                    {
+                        self.activity_stream_closes.push(close);
+                    }
                     // We don't need to notify lang about jobs created by core-internal machines
                     if !self.machine_is_core_created.contains_key(smk) {
                         self.drive_me.send_job(a);

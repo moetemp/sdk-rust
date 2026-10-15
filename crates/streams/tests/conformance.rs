@@ -167,6 +167,58 @@ impl<C: Case> Case for Activity<C> {
     }
 }
 
+/// Another case whose chains are Workflow Activities, each named by a Workflow, its scheduling
+/// run and an Activity id.
+struct WorkflowActivity<C>(C);
+
+async fn workflow_activity<C: Case>(
+    inner: impl std::future::Future<Output = Option<C>>,
+) -> Option<WorkflowActivity<C>> {
+    Some(WorkflowActivity(inner.await?))
+}
+
+/// The chain of Activity `activity_id` that run `run_id` of `workflow_id` scheduled.
+fn workflow_activity_chain(
+    namespace: &str,
+    workflow_id: &str,
+    run_id: &str,
+    activity_id: &str,
+) -> ChainId {
+    ChainId {
+        namespace: namespace.to_string(),
+        workflow_id: workflow_id.to_string(),
+        first_run_id: run_id.to_string(),
+        owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+        activity_id: activity_id.to_string(),
+    }
+}
+
+#[async_trait::async_trait]
+impl<C: Case> Case for WorkflowActivity<C> {
+    fn store(&self) -> Arc<dyn StreamStore> {
+        self.0.store()
+    }
+
+    fn chain(&self) -> ChainId {
+        let chain = self.0.chain();
+        // SDK default Activity ids repeat in every run, so each chain reuses `1`.
+        workflow_activity_chain(
+            &chain.namespace,
+            &chain.workflow_id,
+            &chain.first_run_id,
+            "1",
+        )
+    }
+
+    async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize) {
+        self.0.drop_oldest(chain, topic, keep).await;
+    }
+
+    async fn expire_log(&self, chain: &ChainId, topic: &str) {
+        self.0.expire_log(chain, topic).await;
+    }
+}
+
 #[cfg(feature = "redis")]
 mod on_redis {
     use super::*;
@@ -218,16 +270,20 @@ mod on_redis {
     }
 
     pub(crate) fn log_key(prefix: &str, chain: &ChainId, topic: &str) -> String {
-        let owner = if chain.owner_kind == StreamOwnerKind::Activity as i32 {
-            format!("!a:{}", part(&chain.activity_id))
-        } else {
-            part(&chain.workflow_id)
+        let run = part(&chain.first_run_id);
+        let owner = match StreamOwnerKind::try_from(chain.owner_kind) {
+            Ok(StreamOwnerKind::Activity) => format!("!a:{}:{run}", part(&chain.activity_id)),
+            Ok(StreamOwnerKind::WorkflowActivity) => format!(
+                "!wa:{}:{run}:{}",
+                part(&chain.workflow_id),
+                part(&chain.activity_id)
+            ),
+            _ => format!("{}:{run}", part(&chain.workflow_id)),
         };
         format!(
-            "{}:{{{}:{owner}:{}}}:t:{}",
+            "{}:{{{}:{owner}}}:t:{}",
             part(prefix),
             part(&chain.namespace),
-            part(&chain.first_run_id),
             part(topic)
         )
     }
@@ -537,6 +593,7 @@ fn encoded(value: &str, ciphertext: &[u8]) -> AppendRecord {
             ..Default::default()
         }),
         content_hash: hash(value),
+        ..Default::default()
     }
 }
 
@@ -570,7 +627,7 @@ fn target(chain: &ChainId, topic: &str) -> ReadTarget {
         topic: topic.to_string(),
         stream_hash: {
             let (kind, id) = chain_owner(chain);
-            stream_hash(&chain.namespace, kind, id, topic)
+            stream_hash(&chain.namespace, kind, &id, topic)
         },
     }
 }
@@ -1476,6 +1533,125 @@ mod cases {
         );
     }
 
+    pub(crate) async fn a_link_record_reads_back_with_its_link(case: &dyn Case) {
+        use temporalio_common::protos::temporal::api::{
+            enums::v1::StreamOwnerKind as Kind, stream::v1::StreamReference,
+        };
+        let chain = case.chain();
+        let open = StreamLink {
+            event: stream_link::Event::Open as i32,
+            stream: Some(StreamReference {
+                owner_kind: Kind::Workflow as i32,
+                workflow_id: "child".to_string(),
+                topic: OUT.to_string(),
+                ..Default::default()
+            }),
+            name: "sub-3".to_string(),
+            after: "a cursor".to_string(),
+            ..Default::default()
+        };
+        let join = StreamLink {
+            event: stream_link::Event::Join as i32,
+            name: "sub-3".to_string(),
+            ..Default::default()
+        };
+        let link = |link: &StreamLink| AppendRecord {
+            kind: StreamRecordKind::Link as i32,
+            link: Some(link.clone()),
+            ..Default::default()
+        };
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer
+            .send(&[data("1"), link(&open), data("2"), link(&join)])
+            .await
+            .unwrap();
+        let page = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        let kinds: Vec<_> = page.records.iter().map(|r| stored(r).kind).collect();
+        let (data_kind, link_kind) = (StreamRecordKind::Data as i32, StreamRecordKind::Link as i32);
+        assert_eq!(kinds, [data_kind, link_kind, data_kind, link_kind]);
+        assert_eq!(stored(&page.records[1]).link, Some(open));
+        assert_eq!(stored(&page.records[3]).link, Some(join));
+        assert_eq!(stored(&page.records[2]).link, None);
+    }
+
+    pub(crate) async fn a_workflow_activity_keeps_the_topics_it_wrote(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        let keeps = chain.owner_kind == StreamOwnerKind::WorkflowActivity as i32;
+        assert!(store.written_topics(&chain).await.unwrap().is_empty());
+        let mut first = Producer::new(case, &chain, OUT, "p", 1);
+        first.append(&["1"]).await;
+        first.append(&["2"]).await;
+        // A repeat of the newest batch adds nothing.
+        first.sequence = 2;
+        first.append(&["2"]).await;
+        Producer::new(case, &chain, OTHER, "q", 2)
+            .append(&["1"])
+            .await;
+        let written = store.written_topics(&chain).await.unwrap();
+        if keeps {
+            assert_eq!(written, [OTHER, OUT]);
+        } else {
+            assert!(written.is_empty());
+        }
+        // A refused batch adds nothing, and a closed topic stays in the set.
+        store.close_topic(&chain, OUT).await.unwrap();
+        let refused = Producer::new(case, &chain, OUT, "r", 1)
+            .send(&[data("3")])
+            .await;
+        assert_eq!(kind(refused), StreamFailureKind::Closed);
+        assert_eq!(store.written_topics(&chain).await.unwrap(), written);
+        // Another chain's set is its own.
+        assert!(
+            store
+                .written_topics(&case.chain())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    pub(crate) async fn deleting_a_workflow_drops_its_workflow_activities(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        let sibling = ChainId {
+            first_run_id: format!("{}-next", chain.first_run_id),
+            ..chain.clone()
+        };
+        let workflow = ChainId {
+            namespace: chain.namespace.clone(),
+            workflow_id: chain.workflow_id.clone(),
+            first_run_id: chain.first_run_id.clone(),
+            ..Default::default()
+        };
+        // A Workflow whose id only starts with this one keeps its Activities' streams.
+        let bystander = ChainId {
+            workflow_id: format!("{}2", chain.workflow_id),
+            ..chain.clone()
+        };
+        for written in [&chain, &sibling, &workflow, &bystander] {
+            Producer::new(case, written, OUT, "p", 1)
+                .append(&["1"])
+                .await;
+        }
+        let request = DeleteOwnerRequest {
+            namespace: chain.namespace.clone(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: chain.workflow_id.clone(),
+            ..Default::default()
+        };
+        assert!(store.delete_owner(request.clone()).await.unwrap().deleted > 0);
+        assert_eq!(store.delete_owner(request).await.unwrap().deleted, 0);
+        for gone in [&chain, &sibling, &workflow] {
+            assert_eq!(latest(case, gone, OUT).await, "");
+        }
+        assert!(store.written_topics(&chain).await.unwrap().is_empty());
+        assert_eq!(
+            values(&read(case, &bystander, OUT, BEGINNING).await.unwrap()),
+            ["1"]
+        );
+    }
+
     pub(crate) async fn deleting_an_owner_drops_every_chain_of_it(case: &dyn Case) {
         let store = case.store();
         let chain = case.chain();
@@ -1495,7 +1671,7 @@ mod cases {
                 ..Default::default()
             }
         } else {
-            activity_chain(&chain.namespace, id, &chain.first_run_id)
+            activity_chain(&chain.namespace, &id, &chain.first_run_id)
         };
         let landed = Producer::new(case, &chain, OUT, "p", 1)
             .append(&["1"])
@@ -1709,6 +1885,8 @@ macro_rules! store_cases {
             a_second_close_answers_the_first,
             a_close_with_no_outcome_is_the_first_close_too,
             a_chain_close_keeps_no_outcome,
+            a_workflow_activity_keeps_the_topics_it_wrote,
+            a_link_record_reads_back_with_its_link,
         );
     };
 }
@@ -1740,6 +1918,14 @@ mod activity_memory {
     store_cases!(super::activity(super::memory()));
     log_cases!(super::activity(super::memory_with_log()));
     conformance!(super::activity(super::memory()); deleting_an_owner_drops_every_chain_of_it);
+}
+
+mod workflow_activity_memory {
+    store_cases!(super::workflow_activity(super::memory()));
+    log_cases!(super::workflow_activity(super::memory_with_log()));
+    conformance!(super::workflow_activity(super::memory());
+        deleting_a_workflow_drops_its_workflow_activities,
+    );
 }
 
 mod notifying_memory {
@@ -1811,6 +1997,62 @@ mod activity_cluster_redis {
     )));
     conformance!(super::activity(super::on_redis::redis("STREAMS_REDIS_CLUSTER_URL", true));
         deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
+#[cfg(feature = "redis")]
+mod workflow_activity_standalone_redis {
+    store_cases!(super::workflow_activity(super::on_redis::redis(
+        "STREAMS_REDIS_URL",
+        false
+    )));
+    log_cases!(super::workflow_activity(super::on_redis::redis_with_log(
+        "STREAMS_REDIS_URL",
+        false
+    )));
+    conformance!(super::workflow_activity(super::on_redis::redis("STREAMS_REDIS_URL", false));
+        deleting_a_workflow_drops_its_workflow_activities,
+    );
+}
+
+#[cfg(feature = "redis")]
+mod workflow_activity_documented_acl_redis {
+    // The topic set needs `SADD` and `SMEMBERS`, which the page names.
+    store_cases!(super::workflow_activity(
+        super::on_redis::redis_as_documented_user("STREAMS_REDIS_URL", false, &[])
+    ));
+    conformance!(super::workflow_activity(super::on_redis::redis_as_documented_user(
+        "STREAMS_REDIS_URL",
+        false,
+        &["+scan"]
+    ));
+        deleting_a_workflow_drops_its_workflow_activities,
+    );
+}
+
+#[cfg(feature = "redis")]
+mod workflow_activity_documented_acl_cluster_redis_with_log {
+    store_cases!(super::workflow_activity(
+        super::on_redis::redis_as_documented_user_with_log("STREAMS_REDIS_CLUSTER_URL", true)
+    ));
+}
+
+#[cfg(feature = "redis")]
+mod workflow_activity_cluster_redis {
+    store_cases!(super::workflow_activity(super::on_redis::redis(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    )));
+    log_cases!(super::workflow_activity(super::on_redis::redis_with_log(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    )));
+    // Each Activity's chain hashes to its own slot, so the delete reaches every primary.
+    conformance!(super::workflow_activity(super::on_redis::redis(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    ));
+        deleting_a_workflow_drops_its_workflow_activities,
     );
 }
 

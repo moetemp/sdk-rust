@@ -7,15 +7,16 @@
 
 use crate::{
     ACTIVITY_OWNER_KIND, NotificationEntry, NotificationLog, StreamError, StreamResult,
-    StreamStore, WORKFLOW_OWNER_KIND, chain_owner,
+    StreamStore, WORKFLOW_ACTIVITY_OWNER_KIND, WORKFLOW_OWNER_KIND, chain_owner,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
         StoredRecord, StreamOwnerKind,
     },
+    record::part,
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeSet, HashMap, VecDeque},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -81,6 +82,8 @@ struct Chain {
     /// Per topic, the position each positions-only reader holds the records after. `None` holds
     /// the whole topic.
     floors: HashMap<String, HashMap<String, Option<u64>>>,
+    /// The topics producers wrote, for a Workflow Activity chain only.
+    written: BTreeSet<String>,
 }
 
 /// A [StreamStore] in process memory. For tests only.
@@ -356,10 +359,10 @@ impl StreamStore for MemoryStore {
         if request.digest.is_empty() {
             return Err(StreamError::refused("an append needs the batch's digest"));
         }
+        let id = chain_of(request.chain.as_ref())?;
+        let keeps_topics = id.owner_kind == StreamOwnerKind::WorkflowActivity as i32;
         let mut chains = self.chains.lock().unwrap();
-        let chain = chains
-            .entry(chain_key(chain_of(request.chain.as_ref())?))
-            .or_default();
+        let chain = chains.entry(chain_key(id)).or_default();
         let chain_closed = chain.closed;
         let session = (request.producer_id.clone(), request.attempt);
         let existing = chain.topics.get(&request.topic);
@@ -401,6 +404,9 @@ impl StreamStore for MemoryStore {
                 StreamError::closed("the Workflow that owns this stream has closed")
                     .with_closed_by(closed_by),
             );
+        }
+        if keeps_topics && request.sequence == 1 {
+            chain.written.insert(request.topic.clone());
         }
         let topic = chain.topics.entry(request.topic.clone()).or_default();
         let count = request.records.len() as i64;
@@ -594,6 +600,14 @@ impl StreamStore for MemoryStore {
         Ok(())
     }
 
+    async fn written_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        let chains = self.chains.lock().unwrap();
+        Ok(chains
+            .get(&chain_key(chain))
+            .map(|chain| chain.written.iter().cloned().collect())
+            .unwrap_or_default())
+    }
+
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
         let (owner_kind, owner_id) = match StreamOwnerKind::try_from(request.owner_kind) {
             Ok(StreamOwnerKind::Workflow) => (WORKFLOW_OWNER_KIND, &request.workflow_id),
@@ -606,10 +620,17 @@ impl StreamStore for MemoryStore {
                 )));
             }
         };
+        // A Workflow Activity's id starts with its Workflow's, so a Workflow's delete takes it too.
+        let scheduled = (owner_kind == WORKFLOW_OWNER_KIND).then(|| format!("{}/", part(owner_id)));
         let mut chains = self.chains.lock().unwrap();
         let mut deleted = 0;
         chains.retain(|(namespace, kind, id, _), chain| {
-            let owned = *namespace == request.namespace && *kind == owner_kind && id == owner_id;
+            let owned = *namespace == request.namespace
+                && ((*kind == owner_kind && id == owner_id)
+                    || (*kind == WORKFLOW_ACTIVITY_OWNER_KIND
+                        && scheduled
+                            .as_ref()
+                            .is_some_and(|prefix| id.starts_with(prefix))));
             if owned {
                 deleted += 1 + chain.topics.len() as u64;
             }

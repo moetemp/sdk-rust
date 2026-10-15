@@ -638,7 +638,7 @@ impl Workflows {
             );
         }
 
-        let completion_outcome = if let Ok(c) = rx.await {
+        let mut completion_outcome = if let Ok(c) = rx.await {
             c
         } else if is_empty_completion {
             // The stream may shut down after accepting the message but before processing
@@ -654,8 +654,12 @@ impl Workflows {
             );
             return Ok(());
         };
+        let activity_stream_closes = std::mem::take(&mut completion_outcome.activity_stream_closes);
         let (completion_outcome, output_appended) =
             self.append_output(&run_id, completion_outcome).await;
+        if output_appended {
+            self.close_activity_streams(activity_stream_closes);
+        }
         let replaying = completion_outcome.replaying;
 
         let mut wft_from_complete = None;
@@ -763,6 +767,18 @@ impl Workflows {
         Err(make_stream_output_failure(
             "This Worker has no stream store to append the Workflow Task's stream output to",
         ))
+    }
+
+    /// Closes the streams of the Workflow Activities a completion resolved, in the background.
+    fn close_activity_streams(&self, closes: Vec<stream_output::ActivityStreamClose>) {
+        #[cfg(feature = "streams")]
+        if let Some(store) = &self.output_store {
+            store.close_activity_streams(closes);
+            return;
+        }
+        if !closes.is_empty() {
+            debug!("This Worker has no stream store to close Workflow Activity streams in");
+        }
     }
 
     async fn retire_stream_sessions(&self, retired: &stream_output::RetiredSessions) {
@@ -1407,6 +1423,8 @@ struct ActivationCompleteResult {
     output: Option<Box<ActivationOutput>>,
     /// The store sessions to retire once the server accepts the reported task.
     retired: Option<Box<stream_output::RetiredSessions>>,
+    /// The streams of Workflow Activities resolved live, to close once the output is appended.
+    activity_stream_closes: Vec<stream_output::ActivityStreamClose>,
 }
 
 /// One activation's stream output, and what failing its Workflow Task takes.

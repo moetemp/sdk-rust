@@ -1247,7 +1247,7 @@ async fn an_evicting_primary_of_a_cluster_is_warned_about() {
 }
 
 #[tokio::test]
-async fn the_documented_acl_is_the_python_sdks() {
+async fn the_documented_acl_is_the_python_sdks_with_cores_additions() {
     // One rule set for every SDK, so an application's ACL keeps working across the move.
     let Ok(checkout) = std::env::var("STREAMS_BROOK_PY") else {
         eprintln!("set STREAMS_BROOK_PY to compare the documented ACL with the Python SDK's");
@@ -1266,8 +1266,13 @@ async fn the_documented_acl_is_the_python_sdks() {
     )
     .unwrap();
     // A cluster client asks the topology with `CLUSTER SLOTS`, which the Python SDK's page left
-    // out. It is the one rule Core adds.
+    // out. Core also adds the set calls of a Workflow Activity's topic set.
     let mut expected = rules(&python);
+    let hscan = expected.iter().position(|rule| rule == "+hscan").unwrap();
+    expected.splice(
+        hscan + 1..hscan + 1,
+        ["+sadd".to_string(), "+smembers".to_string()],
+    );
     expected.push("+cluster|slots".to_string());
     assert_eq!(rules(include_str!("../docs/redis.md")), expected);
 }
@@ -1752,6 +1757,7 @@ async fn a_replay_read_on_redis_repeats_the_read_and_survives_retention_under_a_
                 ..Default::default()
             }),
             content_hash: Sha256::digest(value.as_bytes()).to_vec(),
+            ..Default::default()
         }],
         digest: Sha256::digest(value.as_bytes()).to_vec(),
     };
@@ -1839,6 +1845,7 @@ async fn a_replay_read_from_a_trimmed_start_on_redis_is_rec_01() {
                 ..Default::default()
             }),
             content_hash: Sha256::digest(sequence.to_be_bytes()).to_vec(),
+            ..Default::default()
         }],
         digest: Sha256::digest(sequence.to_be_bytes()).to_vec(),
     };
