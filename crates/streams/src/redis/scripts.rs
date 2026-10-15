@@ -45,10 +45,15 @@ pub(crate) static APPEND_LOGGED_SCRIPT: LazyLock<Script> =
 
 /// What a store with an archive adds before the batch: the archive's hold on a topic's first
 /// write, from the topic's start, with the lease in `ARGV[6]`. So retention can't drop a record
-/// before the archive's first pass.
+/// before the archive's first pass. The holds hash lives at least as long as the lease, since a
+/// reader's hold only lengthens its life and a shorter one must not take the archive's hold away.
 const ARCHIVE_HOLD: &str = "if redis.call('EXISTS', KEYS[2]) == 0 and \
 redis.call('HEXISTS', KEYS[4], 'archive') == 0 then
-  redis.call('HSET', KEYS[4], 'archive', '0-1|' .. (now_ms() + tonumber(ARGV[6])))
+  local lease = tonumber(ARGV[6])
+  redis.call('HSET', KEYS[4], 'archive', '0-1|' .. (now_ms() + lease))
+  if redis.call('PTTL', KEYS[4]) < lease then
+    redis.call('PEXPIRE', KEYS[4], lease)
+  end
 end
 revive(KEYS[1], KEYS[2])
 ";
@@ -179,7 +184,7 @@ end
         assert_eq!(was, *APPEND_LOGGED);
         assert_eq!(
             APPEND_ARCHIVED_SCRIPT.get_hash(),
-            "66c29b5963bfaddab087c8eb153a97be4e12154d"
+            "b9976d6b00aba4a108bca0afcbd125367e567aee"
         );
     }
 
