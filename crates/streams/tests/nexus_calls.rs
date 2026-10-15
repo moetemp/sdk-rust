@@ -196,6 +196,7 @@ mod cases {
                 kind: StreamRecordKind::Data as i32,
                 body: Some(Default::default()),
                 content_hash: vec![1; 32],
+                ..Default::default()
             },
         )
         .unwrap();
@@ -739,6 +740,7 @@ fn unsealed(producer: &str, attempt: i64) -> StreamRecord {
             kind: StreamRecordKind::Data as i32,
             body: Some(Default::default()),
             content_hash: vec![1; 32],
+            ..Default::default()
         },
     )
     .unwrap()

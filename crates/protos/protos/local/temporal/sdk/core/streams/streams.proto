@@ -57,6 +57,13 @@ service StreamService {
   // Ends a positions-only reader's hold on a stream's records after a grace, so retention takes
   // them again.
   rpc ReleaseFloor(ReleaseFloorRequest) returns (ReleaseFloorResponse);
+  // Reads a stream and the streams it links, in one order. Order within each stream is kept. A
+  // linked stream's records come after its OPEN, and the linking stream's records after a JOIN
+  // come after the linked stream reached the JOIN's point. Lang passes `state` back to resume.
+  rpc Follow(FollowRequest) returns (FollowResponse);
+  // Reads again the exact ranges an earlier Follow answered, for a positions-only follower on
+  // replay, checks each against its digest, and gives the same records in the same order.
+  rpc FollowRange(FollowRangeRequest) returns (FollowResponse);
 }
 
 // Which store holds a process's streams, and how to reach it. Lang builds one store from it and
@@ -123,29 +130,36 @@ enum StreamOwnerKind {
   STREAM_OWNER_KIND_WORKFLOW = 1;
   // A standalone Activity run. It is a chain of one run, so its streams end with the run.
   STREAM_OWNER_KIND_ACTIVITY = 2;
+  // An Activity that a Workflow run scheduled. It is a chain of one, keyed by the scheduling run
+  // and the Activity id, so its streams end with the Activity.
+  STREAM_OWNER_KIND_WORKFLOW_ACTIVITY = 3;
 }
 
 // One stream, a topic of an owner in a namespace.
 message StreamAddress {
   string namespace = 1;
   StreamOwnerKind owner_kind = 2;
-  // The owning Workflow. Empty for an Activity owner.
+  // The owning Workflow, or the Workflow that scheduled a Workflow Activity. Empty for a
+  // standalone Activity owner.
   string workflow_id = 3;
   // Pins the stream to the run chain that holds this run. Empty follows the chain that holds the
   // Workflow id when the call starts. For an Activity owner, the Activity run, and empty names
-  // the newest run of the Activity id when the call starts.
+  // the newest run of the Activity id when the call starts. For a Workflow Activity owner, the
+  // run that scheduled the Activity. It is required, since an Activity id names nothing across
+  // runs.
   string run_id = 4;
   string topic = 5;
-  // The owning standalone Activity. Empty for a Workflow owner.
+  // The owning Activity. Empty for a Workflow owner.
   string activity_id = 6;
 }
 
 // A Workflow's run chain. Its streams are keyed by its first run, so they follow
 // Continue-as-New, and a new chain on the same Workflow id gets streams of its own. A standalone
-// Activity run is a chain of one run, with the run as `first_run_id`.
+// Activity run is a chain of one run, with the run as `first_run_id`. A Workflow Activity is a
+// chain of one, with the scheduling run as `first_run_id`.
 message ChainId {
   string namespace = 1;
-  // Empty for an Activity owner.
+  // Empty for a standalone Activity owner.
   string workflow_id = 2;
   string first_run_id = 3;
   // `UNSPECIFIED` is a Workflow owner, so a chain from before the Activity kind stays valid.
@@ -184,6 +198,8 @@ message AppendRecord {
   // encrypts with a fresh nonce makes a retry's bytes differ, so a retry is recognized by this.
   // Empty when there is no body.
   bytes content_hash = 3;
+  // Set on LINK only. A LINK's body is optional.
+  temporal.sdk.streams.v1.StreamLink link = 4;
 }
 
 message AppendRequest {
@@ -317,6 +333,144 @@ message ReleaseFloorRequest {
 
 message ReleaseFloorResponse {}
 
+message FollowRequest {
+  // The root stream.
+  StreamAddress stream = 1;
+  // The root cursor, on the first call. Later calls resume from `state` and ignore it.
+  string after = 2;
+  // The `state` of the previous answer. Empty on the first call.
+  bytes state = 3;
+  // How long to wait for a record when no source has one. Core waits at most 60 seconds.
+  google.protobuf.Duration wait = 4;
+  // How many stored records one answer holds at most, across all sources. Zero uses 100. Core
+  // answers with at most 1,000.
+  uint32 max_records = 5;
+  // How deep links are followed. The root is depth zero. Zero uses 4. The first call's limits
+  // hold for the whole follow, and `state` keeps them.
+  uint32 max_depth = 6;
+  // How many linked streams are open at once. Zero uses 16.
+  uint32 max_open = 7;
+  // For a positions-only follower: each source holds its records as `<floor_holder>/<source>`.
+  string floor_holder = 8;
+  // Set by a Workflow follower, so an empty answer attaches each idle source.
+  FollowSubscriber subscriber = 9;
+}
+
+// The Workflow that follows, so each idle source wakes it.
+message FollowSubscriber {
+  string workflow_id = 1;
+  string run_id = 2;
+  // Each source subscribes as `<subscription_prefix>.<source>`.
+  string subscription_prefix = 3;
+  uint32 generation = 4;
+}
+
+message FollowedRecord {
+  // The source the item belongs to. Zero is the root. A SKIPPED link names the source that holds
+  // the link.
+  uint32 source = 1;
+  oneof item {
+    ReadRecord record = 2;
+    LinkState link_state = 3;
+  }
+}
+
+// What happened to a link, as the follower saw it.
+message LinkState {
+  enum Kind {
+    KIND_UNSPECIFIED = 0;
+    // The linked stream is open, and its records follow.
+    KIND_OPENED = 1;
+    // The linked stream's segment ended: the stream closed, or it reached the JOIN's `until`. A
+    // closed stream gives its close outcome.
+    KIND_DONE = 2;
+    // The linked stream can't be read. `error` says why. The follow goes on without it.
+    KIND_UNAVAILABLE = 3;
+    // The link was not followed. `reason` says why.
+    KIND_SKIPPED = 4;
+  }
+  Kind kind = 1;
+  temporal.sdk.streams.v1.StreamLink link = 2;
+  temporal.api.common.v1.Payload close_result = 3;
+  temporal.api.failure.v1.Failure close_failure = 4;
+  // Set on UNAVAILABLE.
+  StreamFailure error = 5;
+  // Set on SKIPPED: `depth`, `limit`, `cycle`, `open` or `endpoint`.
+  string reason = 6;
+}
+
+// A source that an answer's records name.
+message FollowSource {
+  uint32 number = 1;
+  // The source that holds the source's link. Zero for the root and its links.
+  uint32 parent = 2;
+  uint32 depth = 3;
+  StreamAddress stream = 4;
+  // The link's name. Empty for the root.
+  string name = 5;
+}
+
+// One read of one source, as `ReadRange` reads it again.
+message SourceRange {
+  uint32 source = 1;
+  string chain_first_run_id = 2;
+  string start_cursor = 3;
+  string cursor = 4;
+  uint32 stored_records = 5;
+  bytes state_in = 6;
+  bytes records_digest = 7;
+  bool start_from_end = 8;
+  // The read ended the source's stream, with this outcome.
+  bool done = 9;
+  temporal.api.common.v1.Payload close_result = 10;
+  temporal.api.failure.v1.Failure close_failure = 11;
+  // The read failed, so the source is unavailable. No other field but `source` is set.
+  StreamFailure error = 12;
+}
+
+// An idle source that a Workflow follower waits on.
+message SourceWake {
+  uint32 source = 1;
+  string subscription_id = 2;
+  // The source's notification counter. A wake above it names a new record.
+  int64 wake_after = 3;
+}
+
+message FollowResponse {
+  repeated FollowedRecord records = 1;
+  // The composite position: every source's cursor and read state, and the gates. Opaque to lang.
+  bytes state = 2;
+  // The root ended and every linked segment ended. No later call returns a record.
+  bool done = 3;
+  // Each source that `records` names.
+  repeated FollowSource sources = 4;
+  // Each read of this answer, in read order.
+  repeated SourceRange ranges = 5;
+  // On an empty answer of a Workflow follower, each idle source.
+  repeated SourceWake wakes = 6;
+  // The root's close outcome, with `done`.
+  temporal.api.common.v1.Payload close_result = 7;
+  temporal.api.failure.v1.Failure close_failure = 8;
+  // SHA-256 over the order of `records`, as `FollowRange` checks it.
+  bytes follow_digest = 9;
+}
+
+message FollowRangeRequest {
+  // The root stream, as the Follow named it.
+  StreamAddress stream = 1;
+  // The `state` the Follow started from.
+  bytes state_in = 2;
+  // The Follow's `ranges`.
+  repeated SourceRange ranges = 3;
+  // The Follow's `follow_digest`.
+  bytes follow_digest = 4;
+  // As in `FollowRequest`.
+  string floor_holder = 5;
+  // The first Follow's limits, for a `state_in` that is empty. A non-empty `state_in` keeps them.
+  uint32 max_depth = 6;
+  uint32 max_open = 7;
+}
+
 message LatestRequest {
   StreamAddress stream = 1;
 }
@@ -435,7 +589,8 @@ message RunStreamDriverResponse {}
 message DeleteOwnerRequest {
   string namespace = 1;
   StreamOwnerKind owner_kind = 2;
-  // The Workflow whose streams go, for a Workflow owner.
+  // The Workflow whose streams go, for a Workflow owner. The streams of every Activity that the
+  // Workflow scheduled go too.
   string workflow_id = 3;
   // The standalone Activity whose streams go, across all its runs, for an Activity owner.
   string activity_id = 4;
