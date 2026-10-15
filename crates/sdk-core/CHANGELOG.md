@@ -226,6 +226,57 @@ relevant information.
   fits 53 bits and a JSON number holds it exactly. The Nexus contract's models and JavaScript
   refused the earlier 16-bit form. A start time from May 2109 on is refused. The vector file
   holds the new keys.
+* Experimental: the stream protos name a Workflow Activity owner. `StreamOwnerKind` gains
+  `WORKFLOW_ACTIVITY`, an Activity that a Workflow run scheduled. Its `StreamAddress` and
+  `ChainId` set `workflow_id`, the scheduling run and `activity_id`, with no new field. The
+  vendored API's owner kind gains `WORKFLOW_ACTIVITY`. Core still refuses the kind as
+  `UNSUPPORTED`.
+* Experimental: a Workflow Activity owns streams. Its `StreamAddress` names the Workflow, the
+  scheduling run and the Activity id, all required. It is a chain of one, keyed by that run, so
+  Activity `1` of the next run after Continue-as-New is another stream. Core describes the run
+  and looks up the Activity in `pending_activities`. A closed run ends reads at once. A running
+  run that no longer lists the Activity ends reads only after the owner start grace from the
+  first check that found it so, and refuses producers at once. Cursors hash under the kind
+  `workflow_activity` with the run in the owner id. The Redis keys have the hash tag
+  `{<namespace>:!wa:<workflow id>:<run id>:<activity id>}`, and the append script (hashes
+  `eec20388`, and `418b9d10` with the notification log) adds each log key to the chain's
+  `topics` set on a producer attempt's first batch. `StreamStore::written_topics` answers that
+  set, and every store and wrapper must implement it. A Workflow's `DeleteOwner` also deletes
+  its Activities' streams. `OwnerId` gains `WorkflowActivity` and `OwnerStatus` gains
+  `ActivityGone`. The documented Redis ACL gains `+sadd +smembers`.
+* Experimental: the scheduling Workflow's Core closes a Workflow Activity's streams when it
+  resolves the Activity. Workflow code marks the Activity with the `ScheduleActivity` header
+  `__temporal_stream_owner`. When a marked Activity resolves outside replay, Core closes each
+  topic in the Activity's topic set in the background, once the activation completed and its
+  stream output was appended. A completed Activity closes with a null result, and a failed,
+  timed-out or canceled one with the failure its resolution holds, cut to `MAX_CLOSE_BYTES`. The
+  close names `<activity id>@<run id>` as `closed_by` and reaches the stream's notifier. A close
+  that fails is logged and does not fail the Workflow Task. Unmarked Activities cost no store
+  call. Notifier calls name a Workflow Activity stream by its Workflow, scheduling run and
+  Activity id.
+* Experimental: streams store link records. `StreamRecordKind` gains `LINK = 4`, and
+  `StreamRecord.link` (field 8) holds a new `StreamLink`: an `OPEN` or `JOIN` event, the linked
+  `temporal.api.stream.v1.StreamReference`, a name of at most 256 bytes, the `after` and `until`
+  cursors, a namespace and an endpoint. The link stays out of the payload codec. An optional
+  body goes through it and needs its content hash, as on `DATA`. `AppendRecord.link` (field 4)
+  and `OutputRecord.link` (field 5) carry it on append and in a Workflow's commit. Core refuses a
+  link with no name, no event, an `OPEN` with no stream or with ids that don't fit its owner
+  kind, a `JOIN` with a stream, or a link on another kind. `workflow_batch_digest` takes each
+  record's link, and both it and the read digest add the link's fields with length prefixes, so
+  a replay with another link fails as `REPLAY_MISMATCH`. A record with no link keeps its digest.
+  `temporalio_common::streams::check_link` holds the rules. A reader before this release refuses
+  a link as a record of an unknown kind.
+* Experimental: `StreamService` gains `Follow` and `FollowRange`. `Follow` reads a root stream
+  and the streams its links open, in one order with no clock. Order within each stream is kept.
+  A linked stream's records come after its OPEN, and a JOIN holds the linking stream until the
+  linked stream reaches the JOIN's `until` or ends. Each item names its source, and a linked
+  stream's end, failure or skip comes as a `LinkState` (`OPENED`, `DONE` with the close outcome,
+  `UNAVAILABLE` with the error, `SKIPPED` with `depth`, `limit`, `cycle`, `open` or
+  `endpoint`). Only a `STORAGE` failure fails the call. The answer's `state` is the composite
+  position and resumes every open source. `max_depth` (4) and `max_open` (16) bound a follow. A
+  Workflow follower sets `subscriber`, so an empty answer attaches each idle source and lists
+  its wake. `FollowRange` reads an earlier answer's ranges again with `ReadRange` and checks the
+  `follow_digest`. The state machine is `links.rs`, with no I/O.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
