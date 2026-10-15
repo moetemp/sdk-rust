@@ -3788,7 +3788,7 @@ message PollStreamNotifierRequest {
     string namespace = 1;
     temporal.api.stream.v1.StreamReference stream_ref = 2;
     // The poll returns when the notifier's counter is above this value, or when the stream is
-    // closed. A reader passes the counter of the position where it armed its read, so a
+    // closed. A reader passes the counter of the position its last read reached, so a
     // notification that landed before the poll makes it return at once.
     //
     // (-- api-linter: core::0140::prepositions=disabled
@@ -3812,4 +3812,16 @@ message PollStreamNotifierResponse {
     temporal.api.common.v1.Payload close_result = 5;
     // The failure the stream closed with, when `closed` is set and it closed with one.
     temporal.api.failure.v1.Failure close_failure = 6;
+}
+
+message NotifyStreamsRequest {
+    string namespace = 1;
+    // One entry per stream. The server rejects a request with more than
+    // `streamnotifier.maxNotifyBatch` entries, or with two entries for one stream.
+    repeated temporal.api.stream.v1.StreamNotification notifications = 2;
+    // The identity of the caller, such as a stream driver.
+    string identity = 3;
+}
+
+message NotifyStreamsResponse {
 }
