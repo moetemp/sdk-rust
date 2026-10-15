@@ -144,6 +144,11 @@ relevant information.
   busy one costs no deliveries. `NotifierClient::wait_callback` sends the new
   `WaitStreamCallback`, and the C bridge takes it as a raw call. The API protos carry the
   `NexusHandler` progress fields and `nexus/notification-service.wit`.
+* Experimental: the Nexus `read` operation takes `wake_token`, the reader's stream operation
+  token. When a read answers no records and not done, Core asks the notifier to wake that
+  operation's idle callback once the stream moves past the answer, then reads once more and
+  answers what that finds. A reader that finds records on each call never waits. Reads through a
+  transport, positions-only ones too, take the same path.
 * Experimental: the Nexus `read` takes `floor_holder`. With it the read holds the floor and
   answers `replay`, the range of the records that crossed after the byte cut, with Core's digest
   over them. The new Nexus `read_range` operation, `NexusReadRange` for lang, reads that range
