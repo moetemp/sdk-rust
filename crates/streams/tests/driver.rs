@@ -16,8 +16,9 @@ use std::{
 };
 use temporalio_streams::{
     NotifierClient, NotifyError, RedisStore, RedisStoreOptions, StreamDriver, StreamDriverOptions,
-    StreamNotification, StreamStore, progress_counter,
-    proto::{ChainId, StoreAppendRequest},
+    StreamNotification, StreamStore, chain_owner, mint_cursor, progress_counter,
+    proto::{ChainId, StoreAppendRequest, StreamOwnerKind},
+    stream_hash,
 };
 
 static IDS: AtomicUsize = AtomicUsize::new(0);
@@ -34,10 +35,12 @@ fn unique(prefix: &str) -> String {
     )
 }
 
-/// What a notifier got: each stream's highest counter, and every call.
+/// What a notifier got: each stream's highest counter and its position, by owner id and topic,
+/// and every call.
 #[derive(Default)]
 struct Notifiers {
     newest: Mutex<HashMap<(String, String), i64>>,
+    positions: Mutex<HashMap<(String, String), String>>,
     calls: AtomicUsize,
     fail: AtomicBool,
 }
@@ -57,11 +60,17 @@ impl NotifierClient for Notifiers {
         }
         self.calls.fetch_add(1, Ordering::SeqCst);
         let mut newest = self.newest.lock().unwrap();
+        let mut positions = self.positions.lock().unwrap();
         for notification in notifications {
-            let counter = newest
-                .entry((notification.chain.workflow_id, notification.topic))
-                .or_default();
-            *counter = (*counter).max(notification.counter);
+            let key = (
+                chain_owner(&notification.chain).1.to_string(),
+                notification.topic,
+            );
+            let counter = newest.entry(key.clone()).or_default();
+            if notification.counter > *counter {
+                *counter = notification.counter;
+                positions.insert(key, notification.position);
+            }
         }
         Ok(())
     }
@@ -148,6 +157,84 @@ async fn write(
         );
     }
     expected
+}
+
+/// Appends one batch to the runs of `streams` standalone Activities, `act-<index>`, and answers
+/// each Activity stream's newest counter and its cursor.
+async fn write_activities(
+    store: &RedisStore,
+    streams: usize,
+) -> BTreeMap<(String, String), (i64, String)> {
+    let mut expected = BTreeMap::new();
+    for index in 0..streams {
+        let id = format!("act-{index}");
+        let append = |chain: ChainId| StoreAppendRequest {
+            chain: Some(chain),
+            topic: "out".to_string(),
+            producer_id: "p".to_string(),
+            attempt: 1,
+            sequence: 1,
+            digest: vec![1],
+            records: vec![b"record".to_vec()],
+        };
+        let landed = store
+            .append(append(ChainId {
+                namespace: "ns".to_string(),
+                first_run_id: "run-1".to_string(),
+                owner_kind: StreamOwnerKind::Activity as i32,
+                activity_id: id.clone(),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let position = mint_cursor(
+            store.name(),
+            &stream_hash("ns", "activity", &id, "out"),
+            &landed.last_position,
+        );
+        expected.insert(
+            (id, "out".to_string()),
+            (progress_counter(&landed.last_position).unwrap(), position),
+        );
+    }
+    expected
+}
+
+async fn activity_streams_reach_their_notifiers(url: &str, cluster: bool) {
+    let _shared = CLUSTER.read().await;
+    let prefix = unique("driver-activity");
+    let store = store(url, cluster, &prefix).await;
+    let notifiers = Arc::new(Notifiers::default());
+    let driver =
+        Arc::new(StreamDriver::new(store.clone(), notifiers.clone(), options("d1")).unwrap());
+    let running = tokio::spawn(driver.run());
+    let expected = write_activities(&store, 100).await;
+    let counters = expected
+        .iter()
+        .map(|(stream, (counter, _))| (stream.clone(), *counter))
+        .collect();
+    notifiers.reach(&counters, Duration::from_secs(20)).await;
+    running.abort();
+    let positions = notifiers.positions.lock().unwrap().clone();
+    for (stream, (_, position)) in &expected {
+        assert_eq!(positions.get(stream), Some(position), "{stream:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn activity_streams_on_a_server_reach_their_notifiers() {
+    let Some(url) = url("STREAMS_REDIS_URL") else {
+        return;
+    };
+    activity_streams_reach_their_notifiers(&url, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn activity_streams_in_a_cluster_reach_their_notifiers() {
+    let Some(url) = url("STREAMS_REDIS_CLUSTER_URL") else {
+        return;
+    };
+    activity_streams_reach_their_notifiers(&url, true).await;
 }
 
 fn url(variable: &str) -> Option<String> {

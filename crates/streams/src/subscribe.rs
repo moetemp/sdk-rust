@@ -9,7 +9,7 @@
 use crate::{
     NotifierClient, NotifyError, OWNER_RECHECK, StreamError, StreamResult, Streams, StreamsOptions,
     WorkflowAttachment,
-    handle::{Remembered, address},
+    handle::{Remembered, address, chain_of},
     proto::{
         ChainId, StreamAddress, SubscribeRequest, SubscribeResponse, UnsubscribeRequest,
         UnsubscribeResponse, WaitForNotificationRequest, WaitForNotificationResponse,
@@ -41,7 +41,9 @@ impl Default for Subscriptions {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SubscriptionKey {
     namespace: String,
+    owner_kind: i32,
     owner_workflow_id: String,
+    owner_activity_id: String,
     owner_run_id: String,
     topic: String,
     request_id: String,
@@ -51,7 +53,9 @@ impl SubscriptionKey {
     fn new(stream: &StreamAddress, request_id: &str) -> Self {
         Self {
             namespace: stream.namespace.clone(),
+            owner_kind: stream.owner_kind,
             owner_workflow_id: stream.workflow_id.clone(),
+            owner_activity_id: stream.activity_id.clone(),
             owner_run_id: stream.run_id.clone(),
             topic: stream.topic.clone(),
             request_id: request_id.to_string(),
@@ -179,12 +183,7 @@ impl Subscriptions {
         let client = self.client()?;
         let key = SubscriptionKey::new(stream, &request_id);
         let chain = match self.attached.get(&key) {
-            Some(attached) => crate::proto::ChainId {
-                namespace: stream.namespace.clone(),
-                workflow_id: stream.workflow_id.clone(),
-                first_run_id: attached.first_run_id,
-                ..Default::default()
-            },
+            Some(attached) => chain_of(stream, &attached.first_run_id),
             None => streams.chain_now(stream).await?,
         };
         client
@@ -610,6 +609,53 @@ mod tests {
             .unwrap();
         assert!(answer.attached, "a new subscription attaches again");
         assert_eq!(answer.chain_first_run_id, "chain-2");
+    }
+
+    #[tokio::test]
+    async fn a_workflow_reader_subscribes_to_a_stream_that_an_activity_owns() {
+        let setup = setup();
+        let activity = StreamAddress {
+            owner_kind: StreamOwnerKind::Activity as i32,
+            workflow_id: String::new(),
+            activity_id: "owner".to_string(),
+            ..stream()
+        };
+        let activity_chain = ChainId {
+            namespace: "ns".to_string(),
+            first_run_id: "chain-1".to_string(),
+            owner_kind: StreamOwnerKind::Activity as i32,
+            activity_id: "owner".to_string(),
+            ..Default::default()
+        };
+        let request = SubscribeRequest {
+            stream: Some(activity.clone()),
+            ..subscribe_request("1")
+        };
+        let answer = subscribe(&setup.service, request).await.unwrap();
+        assert!(answer.attached);
+        assert_eq!(answer.chain_first_run_id, "chain-1");
+        // A Workflow with the same id owns another stream, so its reader attaches apart.
+        assert!(
+            subscribe(&setup.service, subscribe_request("1"))
+                .await
+                .unwrap()
+                .attached
+        );
+        let attached = setup.server.attached.lock().unwrap().clone();
+        assert_eq!(attached[0].chain, activity_chain);
+        assert_eq!(attached[1].chain, chain("chain-1"));
+        let unsubscribe = UnsubscribeRequest {
+            stream: Some(activity),
+            run_id: "reader-run".to_string(),
+            subscription_id: "1".to_string(),
+            ..Default::default()
+        };
+        setup
+            .service
+            .call("Unsubscribe", &unsubscribe.encode_to_vec())
+            .await
+            .unwrap();
+        assert_eq!(setup.server.detached.lock().unwrap()[0].0, activity_chain);
     }
 
     async fn wait(

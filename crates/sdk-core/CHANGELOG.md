@@ -158,6 +158,10 @@ relevant information.
   `{<namespace>:!a:<activity id>:<run id>}`, which no Workflow id makes. `DeleteOwner` takes the
   Activity kind. `OwnerClient::describe` takes an `OwnerId`, and `OwnerDescription.status` is an
   `OwnerStatus`. A paused Workflow run now counts as running for a read pinned to it.
+* Experimental: notifier calls name an Activity-owned stream by its kind, its Activity id and its
+  run. Notifications, closes, Workflow reader attaches, detaches and `WaitForNotification` polls
+  all do, and a stream driver turns an Activity log key into that reference. Their cursors hash
+  under the kind `activity`.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

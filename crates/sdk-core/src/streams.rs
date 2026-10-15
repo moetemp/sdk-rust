@@ -140,8 +140,17 @@ fn poll_answer(response: PollStreamNotifierResponse) -> NotifierPoll {
 
 /// The notifier of `chain`'s stream on `topic`. The run chain's first run keys the notifier, so one
 /// notifier serves the stream across Continue-as-New and a new chain on the same Workflow id gets
-/// its own.
+/// its own. An Activity run is its own chain, so its notifier is keyed by the run.
 fn chain_reference(chain: &ChainId, topic: String) -> StreamReference {
+    if chain.owner_kind == proto::StreamOwnerKind::Activity as i32 {
+        return StreamReference {
+            owner_kind: StreamOwnerKind::Activity as i32,
+            activity_id: chain.activity_id.clone(),
+            run_id: chain.first_run_id.clone(),
+            topic,
+            ..Default::default()
+        };
+    }
     StreamReference {
         owner_kind: StreamOwnerKind::Workflow as i32,
         workflow_id: chain.workflow_id.clone(),
@@ -483,6 +492,34 @@ mod tests {
         assert_eq!((request.position.as_str(), request.counter), ("cursor", 7));
         assert!(!request.close);
         assert!(request.close_result.is_none());
+    }
+
+    #[test]
+    fn a_notification_of_an_activity_stream_names_the_activity_run() {
+        let request = notify_request(StreamNotification {
+            chain: proto::ChainId {
+                namespace: "ns".to_string(),
+                first_run_id: "act-run".to_string(),
+                owner_kind: proto::StreamOwnerKind::Activity as i32,
+                activity_id: "gen".to_string(),
+                ..Default::default()
+            },
+            topic: "tokens".to_string(),
+            position: "cursor".to_string(),
+            counter: 7,
+            close: Some(CloseOutcome::Failure(Default::default())),
+        });
+        assert_eq!(
+            request.stream_ref,
+            Some(StreamReference {
+                owner_kind: StreamOwnerKind::Activity as i32,
+                workflow_id: String::new(),
+                run_id: "act-run".to_string(),
+                topic: "tokens".to_string(),
+                activity_id: "gen".to_string(),
+            })
+        );
+        assert!(request.close && request.close_failure.is_some());
     }
 
     #[test]
