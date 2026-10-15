@@ -268,6 +268,16 @@ impl StreamService {
                 .read_range(decode::<NexusCall>(rpc, request)?)
                 .await
                 .encode_to_vec()),
+            "NexusFollow" => Ok(self
+                .nexus
+                .follow(decode::<NexusCall>(rpc, request)?)
+                .await
+                .encode_to_vec()),
+            "NexusFollowRange" => Ok(self
+                .nexus
+                .follow_range(decode::<NexusCall>(rpc, request)?)
+                .await
+                .encode_to_vec()),
             "NexusResume" => Ok(self
                 .nexus
                 .resume(decode::<NexusResumeRequest>(rpc, request)?)

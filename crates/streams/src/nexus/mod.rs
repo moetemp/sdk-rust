@@ -7,6 +7,7 @@
 //! the endpoint stateless, so a read goes on at any handler Worker.
 
 mod failure;
+mod follow;
 mod operation;
 mod wire;
 
@@ -153,6 +154,7 @@ enum Work {
         /// As for [Work::Read].
         bodies: Vec<usize>,
     },
+    Follow(Box<follow::FollowWork>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -687,6 +689,7 @@ impl NexusCalls {
                 limits,
                 bodies,
             } => finish_read_range(*response, limits, &bodies, results),
+            Work::Follow(work) => self.resume_follow(*work, results),
         }
     }
 

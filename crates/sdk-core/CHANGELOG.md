@@ -229,6 +229,14 @@ relevant information.
   Reads and replays keep the run, since it names the stream. A carried state must name that run.
   A read's `wake_token` must also name the read's run for this kind. `CodecWork` names the
   Workflow and the Activity. `operation_token_vectors.json` has Workflow Activity tokens.
+* Experimental: the stream service contract gains the `follow` and `follow_range` operations,
+  served in Core by `Follow` and `FollowRange` behind `NexusFollow` and `NexusFollowRange`. A
+  follow answers `FollowedWire` items, each a `RecordWire` or a `LinkStateWire` with its source,
+  the sources it names, and the composite state (at most 64 KiB). Each owner's bodies cross
+  decoded with that owner's codec context, so a follow may ask lang for codec work once per
+  owner. A follow with a `floor_holder` answers `replay`, opaque ranges and a digest that
+  `follow_range` reads again and checks. Links to another namespace or endpoint are skipped. A
+  `wake_token` wakes the caller's operation on the root's notifier.
 * Experimental: the Activity attempt key is `started_unix_ms << 11 | min(attempt, 2047)`, so it
   fits 53 bits and a JSON number holds it exactly. The Nexus contract's models and JavaScript
   refused the earlier 16-bit form. A start time from May 2109 on is refused. The vector file

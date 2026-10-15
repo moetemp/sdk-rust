@@ -51,14 +51,14 @@ fn optional_spec_integer<'de, D: Deserializer<'de>>(
         .transpose()
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StreamRef {
     pub(crate) kind: String,
     pub(crate) workflow_id: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) activity_id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) chain_run_id: Option<String>,
     pub(crate) topic: String,
 }
@@ -157,6 +157,89 @@ pub(crate) struct Supersession {
     pub(crate) producer_id: String,
     pub(crate) previous_attempt: i64,
     pub(crate) attempt: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FollowInput {
+    pub(crate) stream: StreamRef,
+    #[serde(default)]
+    pub(crate) after_token: Option<String>,
+    /// Left as base64, so an oversized state is refused before it is decoded.
+    #[serde(default)]
+    pub(crate) state: Option<String>,
+    #[serde(default, deserialize_with = "optional_spec_integer")]
+    pub(crate) max_records: Option<i64>,
+    #[serde(default, deserialize_with = "optional_spec_integer")]
+    pub(crate) wait_ms: Option<i64>,
+    #[serde(default, deserialize_with = "optional_spec_integer")]
+    pub(crate) max_depth: Option<i64>,
+    #[serde(default, deserialize_with = "optional_spec_integer")]
+    pub(crate) max_open: Option<i64>,
+    #[serde(default)]
+    pub(crate) floor_holder: Option<String>,
+    #[serde(default)]
+    pub(crate) wake_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FollowRangeInput {
+    pub(crate) stream: StreamRef,
+    #[serde(default)]
+    pub(crate) state: Option<String>,
+    pub(crate) ranges: Vec<Base64>,
+    pub(crate) follow_digest: Base64,
+    #[serde(default, deserialize_with = "optional_spec_integer")]
+    pub(crate) max_depth: Option<i64>,
+    #[serde(default, deserialize_with = "optional_spec_integer")]
+    pub(crate) max_open: Option<i64>,
+    #[serde(default)]
+    pub(crate) floor_holder: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct FollowOutput {
+    pub(crate) records: Vec<FollowedWire>,
+    pub(crate) done: bool,
+    pub(crate) state: Base64,
+    pub(crate) sources: Vec<FollowSourceWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) replay: Option<FollowReplay>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct FollowedWire {
+    pub(crate) source: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) record: Option<RecordWire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) link_state: Option<LinkStateWire>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct LinkStateWire {
+    pub(crate) kind: String,
+    pub(crate) link: Base64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct FollowSourceWire {
+    pub(crate) number: u32,
+    pub(crate) parent: u32,
+    pub(crate) depth: u32,
+    pub(crate) stream: StreamRef,
+    pub(crate) name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct FollowReplay {
+    pub(crate) ranges: Vec<Base64>,
+    pub(crate) follow_digest: Base64,
 }
 
 /// The bytes `size` record bytes take in a read answer, as base64.

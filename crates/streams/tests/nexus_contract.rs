@@ -61,6 +61,13 @@ fn full_input(contract: &Value, name: &str, workflow_id: &str) -> Value {
             ("ReadInput", "state") => Value::Null,
             ("ReadInput", "floor_holder") => json!("ns/run-1/reader"),
             ("ReadInput", "wake_token") => Value::Null,
+            ("FollowInput", "after_token") => json!(""),
+            ("FollowInput", "state" | "wake_token") => Value::Null,
+            ("FollowInput", "max_records") => json!(10),
+            ("FollowInput", "wait_ms") => json!(0),
+            ("FollowInput", "max_depth") => json!(4),
+            ("FollowInput", "max_open") => json!(16),
+            ("FollowInput", "floor_holder") => json!("ns/run-1/reader"),
             (model, member) => panic!("the contract added {model}.{member}; teach this test"),
         };
         out.insert(member, value);
@@ -276,15 +283,15 @@ fn the_operation_token_model_is_closed_and_versioned() {
 async fn every_declared_input_member_is_accepted_and_nothing_else() {
     let contract = contract();
     let calls = service(memory(), NexusOptions::default());
-    for name in ["AppendInput", "ReadInput"] {
+    for name in ["AppendInput", "ReadInput", "FollowInput"] {
         let full = full_input(&contract, name, &format!("contract-{name}"));
         let run = |input: Value| {
             let calls = &calls;
             async move {
-                let step = if name == "AppendInput" {
-                    calls.append(call(input)).await
-                } else {
-                    calls.read(call(input)).await
+                let step = match name {
+                    "AppendInput" => calls.append(call(input)).await,
+                    "ReadInput" => calls.read(call(input)).await,
+                    _ => calls.follow(call(input)).await,
                 };
                 drive(calls, step, Codec::Sealing).await
             }
@@ -477,4 +484,39 @@ async fn every_output_member_is_declared() {
     .await
     .unwrap();
     check_output(&contract, "ReadOutput", &latest);
+}
+
+#[tokio::test]
+async fn a_follow_answer_is_one_the_contract_declares() {
+    let contract = contract();
+    let operations = &contract["services"]["TemporalStreams"]["operations"];
+    assert_eq!(operations["follow"]["fqn"], "follow");
+    assert_eq!(operations["followRange"]["fqn"], "follow_range");
+    let calls = service(memory(), NexusOptions::default());
+    let input = json!({"stream": stream("contract-follow", "out")});
+    append(
+        &calls,
+        json!({"stream": input["stream"], "producer_id": "p", "attempt": 1, "sequence": 1,
+            "payloads": [body("one")]}),
+    )
+    .await
+    .unwrap();
+    let mut with_holder = input.clone();
+    with_holder["floor_holder"] = json!("ns/run-1/reader");
+    let answer = drive(
+        &calls,
+        calls.follow(call(with_holder)).await,
+        Codec::Sealing,
+    )
+    .await
+    .unwrap();
+    check_output(&contract, "FollowOutput", &answer);
+    check_output(&contract, "FollowReplay", &answer["replay"]);
+    for item in answer["records"].as_array().unwrap() {
+        check_output(&contract, "FollowedWire", item);
+        check_output(&contract, "RecordWire", &item["record"]);
+    }
+    for source in answer["sources"].as_array().unwrap() {
+        check_output(&contract, "FollowSourceWire", source);
+    }
 }
