@@ -6,7 +6,8 @@
 //! position keeps naming the same record after [MemoryStore::truncate] drops older ones.
 
 use crate::{
-    NotificationEntry, NotificationLog, StreamError, StreamResult, StreamStore,
+    ACTIVITY_OWNER_KIND, NotificationEntry, NotificationLog, StreamError, StreamResult,
+    StreamStore, WORKFLOW_OWNER_KIND, chain_owner,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
@@ -22,12 +23,15 @@ use tokio::{sync::watch, time::Instant};
 
 const NAME: &str = "memory";
 
-type ChainKey = (String, String, String);
+/// A chain's namespace, owner kind, owner id and first run.
+type ChainKey = (String, &'static str, String, String);
 
 fn chain_key(chain: &ChainId) -> ChainKey {
+    let (kind, id) = chain_owner(chain);
     (
         chain.namespace.clone(),
-        chain.workflow_id.clone(),
+        kind,
+        id.to_string(),
         chain.first_run_id.clone(),
     )
 }
@@ -591,16 +595,21 @@ impl StreamStore for MemoryStore {
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
-        if request.owner_kind != StreamOwnerKind::Workflow as i32 {
-            return Err(StreamError::unsupported(format!(
-                "this release keeps streams of Workflows only, not owner kind {}",
-                request.owner_kind
-            )));
-        }
+        let (owner_kind, owner_id) = match StreamOwnerKind::try_from(request.owner_kind) {
+            Ok(StreamOwnerKind::Workflow) => (WORKFLOW_OWNER_KIND, &request.workflow_id),
+            Ok(StreamOwnerKind::Activity) => (ACTIVITY_OWNER_KIND, &request.activity_id),
+            _ => {
+                return Err(StreamError::unsupported(format!(
+                    "this release keeps streams of Workflows and standalone Activities only, not \
+                     owner kind {}",
+                    request.owner_kind
+                )));
+            }
+        };
         let mut chains = self.chains.lock().unwrap();
         let mut deleted = 0;
-        chains.retain(|(namespace, workflow_id, _), chain| {
-            let owned = *namespace == request.namespace && *workflow_id == request.workflow_id;
+        chains.retain(|(namespace, kind, id, _), chain| {
+            let owned = *namespace == request.namespace && *kind == owner_kind && id == owner_id;
             if owned {
                 deleted += 1 + chain.topics.len() as u64;
             }
@@ -620,6 +629,7 @@ mod tests {
             namespace: "ns".to_string(),
             workflow_id: "wf".to_string(),
             first_run_id: "run-1".to_string(),
+            ..Default::default()
         }
     }
 
@@ -680,6 +690,7 @@ mod tests {
                 namespace: "ns".to_string(),
                 owner_kind: StreamOwnerKind::Unspecified as i32,
                 workflow_id: "wf".to_string(),
+                ..Default::default()
             })
             .await
             .unwrap_err();
