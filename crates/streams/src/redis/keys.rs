@@ -11,9 +11,19 @@
 //! <prefix>:{<namespace>:<workflow id>:<first run id>}:chain            the close flag
 //! ```
 //!
+//! The notification log lives apart from the chains, one stream per Cluster slot and a few
+//! doorbells, each under the hash tag of a slot (see `slots.rs`). A chain's appends go to the
+//! stream of the chain's own slot, so the append script writes both:
+//!
+//! ```text
+//! <prefix>:{<tag of slot s>}:n      slot s's notification entries
+//! <prefix>:{<tag of slot d>}:bell   doorbell d, which slots s with s % doorbells == d ring
+//! ```
+//!
 //! Each part, the prefix included, is percent-encoded, so a `:` or a brace in an id cannot make
 //! two streams share a key.
 
+use super::{conn::slot, slots};
 use crate::proto::ChainId;
 
 /// Percent-encodes every byte but the unreserved ones, as Python's `quote(text, safe="")` does.
@@ -64,6 +74,56 @@ impl ChainKeys {
     pub(crate) fn floors(&self, topic: &str) -> String {
         format!("{}:floors", self.log(topic))
     }
+
+    /// The Cluster slot every key of the chain lands in.
+    pub(crate) fn slot(&self) -> u16 {
+        slot(&self.base)
+    }
+}
+
+/// Slot `slot`'s notification stream.
+pub(crate) fn notifications(prefix: &str, slot: u16) -> String {
+    format!("{}:{{{}}}:n", part(prefix), slots::tag(slot))
+}
+
+/// Doorbell `doorbell`'s stream.
+pub(crate) fn doorbell(prefix: &str, doorbell: u32) -> String {
+    format!("{}:{{{}}}:bell", part(prefix), slots::tag(doorbell as u16))
+}
+
+/// The chain and topic of a log key that a notification entry names, or `None` when the key is
+/// not a log key under `prefix`.
+pub(crate) fn chain_of_log(prefix: &str, key: &str) -> Option<(ChainId, String)> {
+    let rest = key.strip_prefix(&format!("{}:{{", part(prefix)))?;
+    let (tag, topic) = rest.split_once("}:t:")?;
+    let mut parts = tag.split(':');
+    let (namespace, workflow_id, first_run_id) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((
+        ChainId {
+            namespace: unpart(namespace)?,
+            workflow_id: unpart(workflow_id)?,
+            first_run_id: unpart(first_run_id)?,
+        },
+        unpart(topic)?,
+    ))
+}
+
+/// Undoes [part].
+fn unpart(text: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut input = text.bytes();
+    while let Some(byte) = input.next() {
+        if byte == b'%' {
+            let hex = [input.next()?, input.next()?];
+            bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+        } else {
+            bytes.push(byte);
+        }
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// The meta field that holds one producer attempt's newest batch.
@@ -113,6 +173,31 @@ mod tests {
             assert_eq!(keys.meta(topic), text(case, "meta"));
             assert_eq!(keys.chain(), text(case, "chain"));
         }
+    }
+
+    #[test]
+    fn a_chains_notification_stream_shares_its_slot() {
+        let cases: Vec<Value> =
+            serde_json::from_str(include_str!("../../testdata/redis/keys.json")).unwrap();
+        for case in &cases {
+            let chain = ChainId {
+                namespace: text(case, "namespace").to_string(),
+                workflow_id: text(case, "workflow_id").to_string(),
+                first_run_id: text(case, "first_run_id").to_string(),
+            };
+            let prefix = text(case, "prefix");
+            let keys = ChainKeys::new(prefix, &chain);
+            let topic = text(case, "topic");
+            let notifications = notifications(prefix, keys.slot());
+            assert_eq!(slot(&notifications), slot(&keys.log(topic)));
+            assert_eq!(slot(&notifications), slot(&keys.meta(topic)));
+            assert_eq!(
+                chain_of_log(prefix, &keys.log(topic)),
+                Some((chain, topic.to_string()))
+            );
+        }
+        assert_eq!(chain_of_log("p", "q:{ns:wf:run}:t:out"), None);
+        assert_eq!(chain_of_log("p", "p:{ns:wf}:t:out"), None);
     }
 
     #[test]

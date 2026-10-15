@@ -15,6 +15,27 @@ pub(crate) const APPEND: &str = concat!(
 );
 
 pub(crate) static APPEND_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(APPEND));
+
+/// What a store with a notification log writes after the batch, in place of the append's last
+/// answer: an entry in the chain's notification stream (`KEYS[5]`), and the stream's length, so
+/// Core rings the doorbell when the entry is the stream's only one. A repeat writes no entry.
+const LOGGED_ANSWER: &str = "redis.call('XADD', KEYS[5], 'MAXLEN', '~', 10000, '*', \
+'k', KEYS[1], 'p', last)
+return {first, last, redis.call('XLEN', KEYS[5])}
+";
+
+/// [APPEND] with its last answer replaced by [LOGGED_ANSWER].
+pub(crate) static APPEND_LOGGED: LazyLock<String> = LazyLock::new(|| {
+    let (body, last) = APPEND
+        .trim_end()
+        .rsplit_once('\n')
+        .expect("the append script has a last line");
+    assert_eq!(last, "return {first, last}");
+    format!("{body}\n{LOGGED_ANSWER}")
+});
+
+pub(crate) static APPEND_LOGGED_SCRIPT: LazyLock<Script> =
+    LazyLock::new(|| Script::new(&APPEND_LOGGED));
 // Marks the topic closed and keeps its first close's outcome in one step, so two closes can't both
 // find no outcome and the second overwrite the first.
 pub(crate) static CLOSE_SCRIPT: LazyLock<Script> =
@@ -62,6 +83,19 @@ mod tests {
             "keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace)",
         ),
     ];
+
+    #[test]
+    fn the_logged_append_differs_in_its_last_answer_only() {
+        assert_eq!(
+            APPEND_LOGGED.replacen(LOGGED_ANSWER, "return {first, last}\n", 1),
+            APPEND
+        );
+        assert_eq!(APPEND_LOGGED.matches("XADD', KEYS[5]").count(), 1);
+        assert_eq!(
+            APPEND_LOGGED_SCRIPT.get_hash(),
+            "9fdc33e73ffb6a029ca92902dedbca3159279e3c"
+        );
+    }
 
     #[test]
     fn the_append_script_matches_the_sdks_with_the_topic_check_and_the_floor_only() {
