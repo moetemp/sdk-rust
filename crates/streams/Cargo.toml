@@ -16,12 +16,17 @@ default = []
 # The Redis store. Off by default, so a build that needs only the trait takes no Redis client.
 # TLS uses the rustls provider the process installs, the same one Core uses.
 redis = ["dep:redis", "dep:crc16"]
+# The archive on object storage: S3 and S3-compatible stores. The local-file archive needs no
+# feature.
+archive = ["dep:object_store", "dep:futures-util"]
 
 [dependencies]
 async-trait = "0.1"
 base64 = "0.23"
 crc16 = { version = "0.4", optional = true }
+futures-util = { version = "0.3", optional = true, default-features = false }
 lru = "0.18"
+object_store = { version = "0.14", optional = true, default-features = false, features = ["aws"] }
 prost = { workspace = true }
 redis = { version = "1.7", optional = true, default-features = false, features = [
     "cluster-async",

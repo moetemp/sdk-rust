@@ -69,6 +69,14 @@ relevant information.
   the newest record after the attach landed, so a reader whose read stopped below it reads once
   more before it sleeps. `WaitForNotification` reads the stream once more just after it sends the
   poll, and answers at once for a record that landed before the notifier existed.
+* Experimental: `StreamStoreConfig.archive` keeps streams in object storage after the store drops
+  them, so they stay readable for longer than the store's retention. `url` is
+  `s3://<bucket>/<prefix>` or `file:///<directory>`, and S3 settings come from the `AWS_*`
+  variables. The store holds records the archive doesn't hold yet for `stall_limit` (seven days).
+  The `RunStreamDriver` call writes the archive: it takes a stream's records in segments of about
+  `segment_bytes` (4 MiB), once the stream is closed or idle for `segment_idle` (five minutes), and
+  at least that often while it keeps taking writes. Reads move from the archive to the store with
+  the same cursors. An archive needs `notification_log`. The C bridge builds the S3 archive.
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with
