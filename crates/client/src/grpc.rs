@@ -1906,6 +1906,15 @@ proxier! {
         }
     );
     (
+        notify_streams,
+        NotifyStreamsRequest,
+        NotifyStreamsResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
         describe_stream_notifier,
         DescribeStreamNotifierRequest,
         DescribeStreamNotifierResponse,

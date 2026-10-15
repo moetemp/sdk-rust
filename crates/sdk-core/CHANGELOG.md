@@ -46,6 +46,29 @@ relevant information.
   and the reader waits for a counter above it. Notifications for one stream fold into one call in
   flight, a failed last notification is tried twice more, and a notification never fails the
   write. `max_notifiers` caps how many streams the process keeps a notifier for (1000 when zero).
+* Experimental: a stream store can keep a notification log, one entry per append written in the
+  same store step. With `StreamStoreConfig.notification_log`, producers send no notifications and
+  a driver reads the log through `StreamStore::notification_log`, a `NotificationLog` of
+  partitions, doorbells, consumer-group takes, claims after an idle time, acks and a sweep. The
+  memory store keeps one, and a store without one refuses the setting. `NotifierClient` gains
+  `notify_streams`, which Core's client sends as one `NotifyStreams` call per namespace, and the C
+  bridge takes `NotifyStreams` as a raw call.
+* Experimental: the Redis store keeps a notification log with `notification_log`. The append
+  script (hash `9fdc33e7`) also adds an entry to the stream of the chain's Cluster slot,
+  `<prefix>:{<slot tag>}:n`, and Core rings one of `notify_doorbells` (16 when zero) doorbell
+  streams when that stream takes its first entry. `testdata/redis/notify_slots.json` pins the slot
+  tags for other SDKs. Drivers read as the consumer group `streams-driver`.
+* Experimental: the new `RunStreamDriver` stream call runs a stream driver until the caller
+  cancels it. The driver blocks on each doorbell and sweeps every busy slot every
+  `sweep_interval` (30 seconds). It folds each drain to the newest counter per stream, sends one
+  `NotifyStreams` call per namespace, and acks the entries only once the call landed. It takes
+  entries another driver left unacked for `claim_idle` (60 seconds). Each driver needs its own
+  `consumer`. `StreamDriver` runs the same in Rust.
+* Experimental: a reader reads first and subscribes only when a read comes back empty, since a
+  notification for a stream with no notifier is dropped. `SubscribeResponse.newest_counter` names
+  the newest record after the attach landed, so a reader whose read stopped below it reads once
+  more before it sleeps. `WaitForNotification` reads the stream once more just after it sends the
+  poll, and answers at once for a record that landed before the notifier existed.
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with
