@@ -30,6 +30,16 @@ use tokio::time::Instant;
 /// The longest `floor_holder` a read takes.
 const MAX_FLOOR_HOLDER_BYTES: usize = 512;
 
+/// A reader that named itself as the archive could end the archive's hold.
+fn refuse_archive_holder(holder: &str) -> StreamResult<()> {
+    if holder == crate::ARCHIVE_HOLDER {
+        return Err(StreamError::invalid_argument(format!(
+            "the floor holder {holder:?} is the archive's"
+        )));
+    }
+    Ok(())
+}
+
 /// The longest `closed_by` a close takes.
 const MAX_CLOSED_BY_BYTES: usize = 256;
 
@@ -495,6 +505,7 @@ impl Streams {
                 holder.len()
             )));
         }
+        refuse_archive_holder(holder)?;
         let position = if after == END {
             self.store
                 .latest(StoreLatestRequest {
@@ -636,6 +647,7 @@ impl Streams {
                 "a release needs the chain and the floor holder",
             ));
         }
+        refuse_archive_holder(&request.floor_holder)?;
         self.store
             .release_floor(
                 &chain_of(stream, &request.chain_first_run_id),
