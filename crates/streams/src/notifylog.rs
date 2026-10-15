@@ -59,4 +59,23 @@ pub trait NotificationLog: Send + Sync {
 
     /// The partitions that hold entries now, acked or not.
     async fn busy(&self) -> StreamResult<Vec<u32>>;
+
+    /// The topics a store with an archive marked as holding records the archive doesn't hold
+    /// yet, at most `max` per partition. A log of a store with no archive answers none.
+    async fn archive_marks(&self, max: usize) -> StreamResult<Vec<ArchiveMark>> {
+        let _ = max;
+        Ok(vec![])
+    }
+}
+
+/// A topic with records to archive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArchiveMark {
+    /// The run chain that owns the topic.
+    pub chain: ChainId,
+    /// The topic.
+    pub topic: String,
+    /// When the topic last took a write, in milliseconds since the Unix epoch. `0` for a closed
+    /// topic, which the archive takes first.
+    pub written_ms: u64,
 }
