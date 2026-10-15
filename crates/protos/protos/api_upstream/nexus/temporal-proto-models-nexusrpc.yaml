@@ -47,6 +47,21 @@ services:
           $pythonRef: temporalio.api.workflowservice.v1.DetachStreamCallbackResponse
           $rubyRef: Temporalio::Api::WorkflowService::V1::DetachStreamCallbackResponse
           $typescriptRef: '@temporalio/api/workflowservice/v1.DetachStreamCallbackResponse'
+      WaitStreamCallback:
+        input:
+          $dotnetRef: Temporalio.Api.WorkflowService.V1.WaitStreamCallbackRequest
+          $goRef: go.temporal.io/api/workflowservice/v1.WaitStreamCallbackRequest
+          $javaRef: io.temporal.api.workflowservice.v1.WaitStreamCallbackRequest
+          $pythonRef: temporalio.api.workflowservice.v1.WaitStreamCallbackRequest
+          $rubyRef: Temporalio::Api::WorkflowService::V1::WaitStreamCallbackRequest
+          $typescriptRef: '@temporalio/api/workflowservice/v1.WaitStreamCallbackRequest'
+        output:
+          $dotnetRef: Temporalio.Api.WorkflowService.V1.WaitStreamCallbackResponse
+          $goRef: go.temporal.io/api/workflowservice/v1.WaitStreamCallbackResponse
+          $javaRef: io.temporal.api.workflowservice.v1.WaitStreamCallbackResponse
+          $pythonRef: temporalio.api.workflowservice.v1.WaitStreamCallbackResponse
+          $rubyRef: Temporalio::Api::WorkflowService::V1::WaitStreamCallbackResponse
+          $typescriptRef: '@temporalio/api/workflowservice/v1.WaitStreamCallbackResponse'
       NotifyStream:
         input:
           $dotnetRef: Temporalio.Api.WorkflowService.V1.NotifyStreamRequest

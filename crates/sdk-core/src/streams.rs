@@ -11,6 +11,7 @@ use temporalio_common::protos::temporal::api::{
         AttachStreamCallbackRequest, DescribeWorkflowExecutionRequest,
         DescribeWorkflowExecutionResponse, DetachStreamCallbackRequest, NotifyStreamRequest,
         NotifyStreamsRequest, PollStreamNotifierRequest, PollStreamNotifierResponse,
+        WaitStreamCallbackRequest,
     },
 };
 use temporalio_streams::{
@@ -80,6 +81,30 @@ impl NotifierClient for ConnectionNotifierClient {
         self.connection
             .workflow_service()
             .attach_stream_callback(caller_attach_request(attachment).into_request())
+            .await
+            .map(|_| ())
+            .map_err(notify_error)
+    }
+
+    async fn wait_callback(
+        &self,
+        chain: ChainId,
+        topic: String,
+        request_id: String,
+        after_counter: i64,
+    ) -> Result<(), NotifyError> {
+        self.connection
+            .workflow_service()
+            .wait_stream_callback(
+                WaitStreamCallbackRequest {
+                    namespace: chain.namespace.clone(),
+                    stream_ref: Some(chain_reference(&chain, topic)),
+                    request_id,
+                    after_counter,
+                    identity: self.connection.identity().to_string(),
+                }
+                .into_request(),
+            )
             .await
             .map(|_| ())
             .map_err(notify_error)
@@ -183,6 +208,7 @@ fn caller_attach_request(attachment: CallerAttachment) -> AttachStreamCallbackRe
         }),
         operation_token: attachment.operation_token,
         start_time: Some(attachment.start_time.into()),
+        idle: attachment.idle,
         ..Default::default()
     }
 }
@@ -436,6 +462,7 @@ mod tests {
             callback_headers: [("nexus-callback-token".to_string(), "abc".to_string())].into(),
             operation_token: "token".to_string(),
             start_time,
+            idle: true,
         });
         assert_eq!(request.namespace, "default");
         assert_eq!(
@@ -454,6 +481,10 @@ mod tests {
         assert_eq!(request.operation_token, "token");
         assert_eq!(request.start_time.unwrap().seconds, 1_700_000_000);
         assert!(request.workflow_target.is_none(), "exactly one target");
+        assert!(
+            request.idle,
+            "the reader wakes the callback when it is caught up"
+        );
     }
 
     #[test]

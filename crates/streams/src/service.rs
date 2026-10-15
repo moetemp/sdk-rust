@@ -35,7 +35,6 @@ pub struct StreamService {
     subscriptions: Subscriptions,
     nexus: NexusCalls,
     callers: Option<Arc<dyn NotifierClient>>,
-    attach_progress: Option<Arc<Notifier>>,
 }
 
 impl std::fmt::Debug for StreamService {
@@ -117,8 +116,7 @@ impl StreamService {
         Ok(match notifier {
             Some(client) => service
                 .with_subscriptions(client.clone())
-                .with_callers(client)
-                .with_attach_progress(folding.filter(|_| config.notify_on_append)),
+                .with_callers(client),
             None => service,
         })
     }
@@ -137,7 +135,6 @@ impl StreamService {
             subscriptions: Subscriptions::default(),
             nexus,
             callers: None,
-            attach_progress: None,
         }
     }
 
@@ -150,16 +147,6 @@ impl StreamService {
     /// Attaches and detaches stream operation callers through `client`.
     pub fn with_callers(mut self, client: Arc<dyn NotifierClient>) -> Self {
         self.callers = Some(client);
-        self
-    }
-
-    /// After a caller's attach, notifies the stream's newest record, so the new caller hears of
-    /// the records already there. A caller that only waits for progress would otherwise hear
-    /// nothing until the next append. It goes through `notifier`, the one that sends the appends'
-    /// notifications, so it is retried and flushed as they are. An empty stream needs nothing,
-    /// since every append notifies. `None` turns it off, as the config's progress setting does.
-    pub fn with_attach_progress(mut self, notifier: Option<Arc<Notifier>>) -> Self {
-        self.attach_progress = notifier;
         self
     }
 
@@ -274,7 +261,6 @@ impl StreamService {
             "AttachCaller" => Ok(crate::nexus::attach_caller(
                 &self.streams,
                 self.callers.as_ref(),
-                self.attach_progress.as_ref(),
                 decode::<AttachCallerRequest>(rpc, request)?,
             )
             .await

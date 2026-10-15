@@ -173,6 +173,7 @@ interface workflow-service {
     start-time: option<timestamp>,
     /// @nexus.omit
     workflow-target: placeholder,
+    idle: option<bool>,
   }
 
   /// @nexus.proto "temporal.api.workflowservice.v1.AttachStreamCallbackResponse"
@@ -235,4 +236,23 @@ interface workflow-service {
   use nexus:temporal-types/model@1.0.0.{
     failure,
   };
+  /// @nexus.proto "temporal.api.workflowservice.v1.WaitStreamCallbackRequest"
+  record wait-stream-callback-request {
+    /// @nexus.source python="workflow_namespace()" typescript="workflowNamespace()" go="workflow.GetInfo(ctx).Namespace" dotnet="TemporalWorkflowContext.WorkflowNamespace()"
+    /// @nexus.doc "Namespace of the stream."
+    namespace: string,
+    stream-ref: option<stream-reference>,
+    request-id: string,
+    after-counter: option<s64>,
+    /// @nexus.omit
+    identity: placeholder,
+  }
+
+  /// @nexus.proto "temporal.api.workflowservice.v1.WaitStreamCallbackResponse"
+  record wait-stream-callback-response {
+  }
+
+  wait-stream-callback: func(
+    request: wait-stream-callback-request,
+  ) -> wait-stream-callback-response;
 }

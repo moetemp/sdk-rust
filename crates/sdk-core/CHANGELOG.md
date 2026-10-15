@@ -139,9 +139,10 @@ relevant information.
   the Nexus calls, so lang's handler raises it as it is. A mistake in the stream, an empty callback
   URL or request id, and a token that names no stream are `BAD_REQUEST`. An attach for the latest
   run describes the Workflow fresh, so it never lands on a chain that already ended.
-* Experimental: with `notify_on_append`, `AttachCaller` tells the stream's notifier about the
-  newest record after the attach, so a caller that only waits for progress hears of the records
-  already there. An empty stream needs nothing, since every append notifies. The API protos carry the
+* Experimental: `AttachCaller` attaches the caller's callback as an idle one, which hears no
+  progress until a wait after a counter and still gets the completion. A reader reads first, so a
+  busy one costs no deliveries. `NotifierClient::wait_callback` sends the new
+  `WaitStreamCallback`, and the C bridge takes it as a raw call. The API protos carry the
   `NexusHandler` progress fields and `nexus/notification-service.wit`.
 * Experimental: the Nexus `read` takes `floor_holder`. With it the read holds the floor and
   answers `replay`, the range of the records that crossed after the byte cut, with Core's digest
