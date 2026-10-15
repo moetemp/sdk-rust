@@ -151,6 +151,7 @@ fn operation_token(wf: &str) -> String {
             workflow_id: wf.to_string(),
             run_id: String::new(),
             topic: TOPIC.to_string(),
+            ..Default::default()
         },
         attach_request_id: "attach-1".to_string(),
         chain_first_run_id: "run-1".to_string(),
@@ -169,11 +170,18 @@ struct Ended;
 
 #[async_trait::async_trait]
 impl OwnerClient for Ended {
-    async fn describe(&self, _: &str, _: &str, _: &str) -> Result<OwnerDescription, OwnerError> {
+    async fn describe(
+        &self,
+        _: &str,
+        _: temporalio_streams::OwnerId<'_>,
+        _: &str,
+    ) -> Result<OwnerDescription, OwnerError> {
         Ok(OwnerDescription {
             run_id: "run-1".to_string(),
             first_run_id: "run-1".to_string(),
-            status: WorkflowExecutionStatus::Completed,
+            status: temporalio_streams::OwnerStatus::of_workflow(
+                WorkflowExecutionStatus::Completed,
+            ),
         })
     }
 }
@@ -186,20 +194,24 @@ impl OwnerClient for Continued {
     async fn describe(
         &self,
         _: &str,
-        _: &str,
+        _: temporalio_streams::OwnerId<'_>,
         run_id: &str,
     ) -> Result<OwnerDescription, OwnerError> {
         Ok(if run_id == "run-1" {
             OwnerDescription {
                 run_id: "run-1".to_string(),
                 first_run_id: "run-1".to_string(),
-                status: WorkflowExecutionStatus::ContinuedAsNew,
+                status: temporalio_streams::OwnerStatus::of_workflow(
+                    WorkflowExecutionStatus::ContinuedAsNew,
+                ),
             }
         } else {
             OwnerDescription {
                 run_id: "run-2".to_string(),
                 first_run_id: "run-1".to_string(),
-                status: WorkflowExecutionStatus::Running,
+                status: temporalio_streams::OwnerStatus::of_workflow(
+                    WorkflowExecutionStatus::Running,
+                ),
             }
         })
     }
@@ -816,6 +828,7 @@ mod cases {
                     namespace: NAMESPACE.to_string(),
                     workflow_id: wf.clone(),
                     first_run_id: "run-1".to_string(),
+                    ..Default::default()
                 }),
                 topic: TOPIC.to_string(),
                 producer_id: "late".to_string(),
@@ -947,6 +960,7 @@ async fn an_expired_cursor_is_told_apart() {
         namespace: NAMESPACE.to_string(),
         workflow_id: wf.clone(),
         first_run_id: "run-1".to_string(),
+        ..Default::default()
     };
     memory.truncate(&chain, TOPIC, 0);
     let refused = read(&calls, read_input(&wf, &old)).await.unwrap_err();
@@ -969,6 +983,7 @@ fn chain_of(wf: &str) -> ChainId {
         namespace: NAMESPACE.to_string(),
         workflow_id: wf.to_string(),
         first_run_id: "run-1".to_string(),
+        ..Default::default()
     }
 }
 
@@ -994,6 +1009,7 @@ fn replay_of(wf: &str, answer: &Value, state: &[u8]) -> ReadRangeRequest {
             workflow_id: wf.to_string(),
             run_id: String::new(),
             topic: TOPIC.to_string(),
+            ..Default::default()
         }),
         chain_first_run_id: replay["chain_first_run_id"].as_str().unwrap().to_string(),
         after: replay["after_token"].as_str().unwrap().to_string(),

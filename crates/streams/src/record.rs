@@ -2,7 +2,9 @@
 
 use crate::{
     StreamError, StreamResult,
-    proto::{ActivityProducer, AppendRecord, StreamRecord, StreamRecordKind},
+    proto::{
+        ActivityProducer, AppendRecord, ChainId, StreamOwnerKind, StreamRecord, StreamRecordKind,
+    },
 };
 use temporalio_common::{
     protos::temporal::api::common::v1::Payload,
@@ -12,6 +14,18 @@ use temporalio_common::{
 /// The owner kind a Workflow's streams hash under in their cursors.
 pub const WORKFLOW_OWNER_KIND: &str = "workflow";
 
+/// The owner kind a standalone Activity's streams hash under in their cursors.
+pub const ACTIVITY_OWNER_KIND: &str = "activity";
+
+/// The owner kind a chain's streams hash under, and the owner's id.
+pub fn chain_owner(chain: &ChainId) -> (&'static str, &str) {
+    if chain.owner_kind == StreamOwnerKind::Activity as i32 {
+        (ACTIVITY_OWNER_KIND, &chain.activity_id)
+    } else {
+        (WORKFLOW_OWNER_KIND, &chain.workflow_id)
+    }
+}
+
 const HASH_LENGTH: usize = 32;
 
 /// The producer id an Activity attempt writes as.
@@ -20,6 +34,42 @@ const HASH_LENGTH: usize = 32;
 /// different producer, and a retry of the Activity keeps its id and raises the attempt.
 pub fn activity_producer_id(activity: &ActivityProducer) -> String {
     format!("{}@{}", activity.activity_id, activity.run_id)
+}
+
+/// The largest Temporal attempt an Activity attempt key holds. A higher attempt keeps this one.
+pub const MAX_KEYED_ACTIVITY_ATTEMPT: i64 = 0xFFFF;
+
+/// The attempt an Activity attempt writes as.
+///
+/// With `attempt_started_time`, it is `started_unix_ms << 16 | min(attempt, 65535)`. A retry and
+/// a reset attempt start later, so they write a higher attempt and supersede the earlier one, even
+/// though a reset sets the Temporal attempt back to 1. An attempt that writes on after a newer one
+/// started reads as stale. With no start time, it is the Temporal attempt, as a lang that sends
+/// none expects. Fails as an invalid argument for an attempt below one or a start time outside
+/// what the key holds.
+pub fn activity_attempt(activity: &ActivityProducer) -> StreamResult<i64> {
+    let attempt = i64::from(activity.attempt);
+    if attempt < 1 {
+        return Err(StreamError::invalid_argument(format!(
+            "a producer's attempt starts at one, not {attempt}"
+        )));
+    }
+    let Some(started) = &activity.attempt_started_time else {
+        return Ok(attempt);
+    };
+    let unix_ms = started
+        .seconds
+        .checked_mul(1000)
+        .and_then(|ms| ms.checked_add(i64::from(started.nanos.div_euclid(1_000_000))))
+        .filter(|ms| (1..1 << 47).contains(ms))
+        .ok_or_else(|| {
+            StreamError::invalid_argument(format!(
+                "an Activity attempt's start time must be after 1970 and before the year 6429, \
+                 not {}s {}ns",
+                started.seconds, started.nanos
+            ))
+        })?;
+    Ok(unix_ms << 16 | attempt.min(MAX_KEYED_ACTIVITY_ATTEMPT))
 }
 
 /// The producer id a Workflow run writes its own records as.
@@ -188,6 +238,7 @@ mod tests {
             run_id: "run-1".to_string(),
             activity_id: "fetch".to_string(),
             attempt: 3,
+            ..Default::default()
         };
         assert_eq!(activity_producer_id(&activity), "fetch@run-1");
     }
