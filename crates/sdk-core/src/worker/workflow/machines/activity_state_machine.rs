@@ -9,7 +9,7 @@ use crate::{
     internal_flags::CoreInternalFlags,
     worker::workflow::{
         CommandAnnotations, InternalFlagsRef, ProtoCommandExt, fatal, machines::HistEventData,
-        nondeterminism,
+        nondeterminism, stream_output::STREAM_OWNER_HEADER,
     },
 };
 use std::convert::{TryFrom, TryInto};
@@ -223,6 +223,15 @@ impl ActivityMachine {
 
     pub(super) fn was_cancelled_before_sent_to_server(&self) -> bool {
         self.shared_state().cancelled_before_sent
+    }
+
+    /// The Activity's id when Workflow code marked it as the owner of its own streams.
+    pub(super) fn stream_owner_activity_id(&self) -> Option<&str> {
+        let attrs = &self.shared_state.attrs;
+        attrs
+            .headers
+            .contains_key(STREAM_OWNER_HEADER)
+            .then_some(attrs.activity_id.as_str())
     }
 }
 
