@@ -72,7 +72,7 @@ message StreamWake {
     string subscription_id = 1;
     // The position that came with `counter`, in the producer's terms.
     string position = 2;
-    // The highest counter the notifier has seen. A reader that armed its read at a counter wakes
+    // The highest counter the notifier has seen. A reader that subscribed after a counter wakes
     // when this value is above it. Zero when the notifier has seen no notification.
     int64 counter = 3;
     // The metadata that came with `counter`.
@@ -90,4 +90,17 @@ message StreamWake {
     // Set when the notifier dropped this reader, for example at the notifier's idle timeout. The
     // reader attaches again under a new request ID.
     bool resubscribe = 9;
+}
+
+// One stream's entry in a NotifyStreams request: the same fields as a NotifyStream request that
+// does not close the stream.
+message StreamNotification {
+    StreamReference stream_ref = 1;
+    // Where the stream stands, in the producer's terms. At most 1 KiB of UTF-8.
+    string position = 2;
+    // The newest counter of the stream. Must be positive. The notifier ignores a counter at or
+    // below the one it holds.
+    int64 counter = 3;
+    // Small details passed on to the callbacks. At most 2 KiB in total, counted as UTF-8 bytes.
+    map<string, string> metadata = 4;
 }
