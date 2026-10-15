@@ -8,7 +8,8 @@
 //! it must stay byte for byte what `crates/streams/nexus/operation_token_vectors.json` holds.
 
 use crate::{
-    CallerAttachment, NotifierClient, NotifyError, StreamError, StreamResult, Streams,
+    CallerAttachment, NotifierClient, NotifyError, StreamError, StreamNotification, StreamResult,
+    Streams,
     proto::{
         AttachCallerRequest, AttachCallerResponse, ChainId, DetachCallerRequest,
         DetachCallerResponse, StreamAddress, StreamOwnerKind,
@@ -97,15 +98,64 @@ async fn attach(
     if let Some(after_counter) = wake_after_counter {
         client
             .wait_callback(
-                chain,
+                chain.clone(),
                 stream.topic.clone(),
                 attach_request_id,
                 after_counter,
             )
             .await
             .map_err(caller_error)?;
+        notify_newest(
+            streams,
+            client.as_ref(),
+            chain,
+            &stream.topic,
+            after_counter,
+        )
+        .await?;
     }
     Ok(operation_token)
+}
+
+/// Notifies the stream's newest record when it is above `after_counter`. A standalone start
+/// answers its caller before the handler runs, so a record can land before the attach. The
+/// server drops a notification for a stream with no notifier, and the new notifier would never
+/// pass the wait. Now that the notifier exists, the newest record wakes the wait at once.
+async fn notify_newest(
+    streams: &Streams,
+    client: &dyn NotifierClient,
+    chain: ChainId,
+    topic: &str,
+    after_counter: i64,
+) -> StreamResult<()> {
+    let latest = streams
+        .store()
+        .latest(crate::proto::StoreLatestRequest {
+            chain: Some(chain.clone()),
+            topic: topic.to_string(),
+        })
+        .await?;
+    if latest.position.is_empty() {
+        return Ok(());
+    }
+    let Some((position, counter)) =
+        crate::notify::notification_at(streams.store(), &chain, topic, &latest.position)
+    else {
+        return Ok(());
+    };
+    if counter <= after_counter {
+        return Ok(());
+    }
+    client
+        .notify(StreamNotification {
+            chain,
+            topic: topic.to_string(),
+            position,
+            counter,
+            close: None,
+        })
+        .await
+        .map_err(caller_error)
 }
 
 async fn detach(
@@ -568,6 +618,65 @@ mod tests {
             (topic.as_str(), request_id.as_str(), *after),
             ("tokens", "attach-2", 0)
         );
+    }
+
+    fn follower_request(after_counter: i64) -> AttachCallerRequest {
+        AttachCallerRequest {
+            wake_after_counter: Some(after_counter),
+            ..attach_request("temporal://system")
+        }
+    }
+
+    #[tokio::test]
+    async fn a_follower_start_notifies_the_records_that_landed_before_its_attach() {
+        let setup = setup();
+        setup
+            .service
+            .call("Append", &append(&["a", "b"]))
+            .await
+            .unwrap();
+        attach(&setup.service, follower_request(0)).await.unwrap();
+        let notified = setup.notifier.notified.lock().unwrap().clone();
+        let [notification] = notified.as_slice() else {
+            panic!("one notification after the wait, not {notified:?}");
+        };
+        assert_eq!(
+            notification.chain,
+            setup.notifier.attached.lock().unwrap()[0].chain
+        );
+        assert_eq!(notification.topic, "tokens");
+        // The memory store's second record is at offset 1, so its counter is 2.
+        assert_eq!(notification.counter, 2);
+        assert!(notification.close.is_none());
+        assert_eq!(setup.notifier.waits.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_follower_start_past_the_newest_record_or_on_an_empty_stream_notifies_nothing() {
+        let setup = setup();
+        attach(&setup.service, follower_request(0)).await.unwrap();
+        setup.service.call("Append", &append(&["a"])).await.unwrap();
+        let later = AttachCallerRequest {
+            request_id: "attach-2".to_string(),
+            ..follower_request(1)
+        };
+        attach(&setup.service, later).await.unwrap();
+        assert!(setup.notifier.notified.lock().unwrap().is_empty());
+        assert_eq!(setup.notifier.waits.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_notification_of_the_newest_record_fails_the_start_for_a_retry() {
+        let setup = setup();
+        setup.service.call("Append", &append(&["a"])).await.unwrap();
+        setup
+            .notifier
+            .notify_failures
+            .store(1, std::sync::atomic::Ordering::SeqCst);
+        let raised = attach(&setup.service, follower_request(0))
+            .await
+            .unwrap_err();
+        assert!(raised.retryable, "{raised:?}");
     }
 
     #[tokio::test]
