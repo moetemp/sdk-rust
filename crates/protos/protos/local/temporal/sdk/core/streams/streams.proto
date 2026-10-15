@@ -40,8 +40,11 @@ service StreamService {
   rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
   // Waits on the stream's notifier, for a client reader whose read came back empty. Returns when
   // the notifier's counter is above `after_counter`, when the stream closed, or at the server's
-  // wait limit (`streamnotifier.pollMaxWait`). The reader then reads again. After the wait limit,
-  // that read finds records whose notification was lost, or comes back empty again.
+  // wait limit (`streamnotifier.pollMaxWait`). The poll starts the notifier, and Core reads the
+  // stream once more just after it sends the poll, since a record that landed before the notifier
+  // existed woke no one. A newer record there answers at once. The reader then reads again.
+  // After the wait limit, that read finds records whose notification was lost, or comes back
+  // empty again.
   rpc WaitForNotification(WaitForNotificationRequest) returns (WaitForNotificationResponse);
   // Runs a stream driver over the store's notification log until the caller cancels the call.
   // It answers only when the server takes no stream notifications, or when the store keeps no
@@ -358,6 +361,10 @@ message SubscribeResponse {
   string chain_first_run_id = 1;
   // Whether this call sent the attach. False when this process attached the reader before.
   bool attached = 2;
+  // The notification counter of the stream's newest record, read after the attach landed, zero
+  // for an empty stream. A record that landed before the notifier existed woke no one, so a
+  // reader whose last read stopped below this counter reads once more before it sleeps.
+  int64 newest_counter = 3;
 }
 
 message UnsubscribeRequest {

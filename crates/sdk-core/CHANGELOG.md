@@ -64,6 +64,11 @@ relevant information.
   `NotifyStreams` call per namespace, and acks the entries only once the call landed. It takes
   entries another driver left unacked for `claim_idle` (60 seconds). Each driver needs its own
   `consumer`. `StreamDriver` runs the same in Rust.
+* Experimental: a reader reads first and subscribes only when a read comes back empty, since a
+  notification for a stream with no notifier is dropped. `SubscribeResponse.newest_counter` names
+  the newest record after the attach landed, so a reader whose read stopped below it reads once
+  more before it sleeps. `WaitForNotification` reads the stream once more just after it sends the
+  poll, and answers at once for a record that landed before the notifier existed.
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with

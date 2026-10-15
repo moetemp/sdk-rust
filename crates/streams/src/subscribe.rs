@@ -11,11 +11,15 @@ use crate::{
     WorkflowAttachment,
     handle::{Remembered, address},
     proto::{
-        StreamAddress, SubscribeRequest, SubscribeResponse, UnsubscribeRequest,
+        ChainId, StreamAddress, SubscribeRequest, SubscribeResponse, UnsubscribeRequest,
         UnsubscribeResponse, WaitForNotificationRequest, WaitForNotificationResponse,
     },
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
+
+/// How long after it sends a poll Core reads the stream once more. The poll starts the stream's
+/// notifier, and a record that lands later notifies it.
+const REREAD_AFTER: Duration = Duration::from_millis(200);
 
 /// The longest subscription id the server takes.
 const MAX_SUBSCRIPTION_ID_BYTES: usize = 256;
@@ -123,7 +127,12 @@ impl Subscriptions {
         );
         let key = SubscriptionKey::new(stream, &request_id);
         if let Some(attached) = self.attached.get(&key) {
+            let chain = ChainId {
+                first_run_id: attached.first_run_id.clone(),
+                ..streams.chain(stream).await?
+            };
             return Ok(SubscribeResponse {
+                newest_counter: streams.newest(stream, &chain).await?.0,
                 chain_first_run_id: attached.first_run_id,
                 attached: false,
             });
@@ -144,9 +153,12 @@ impl Subscriptions {
             .await
             .map_err(subscribe_error)?;
         self.attached.put(key, &chain.first_run_id, OWNER_RECHECK);
+        // Read after the attach landed, so a record after this one notifies the reader.
+        let newest_counter = streams.newest(stream, &chain).await?.0;
         Ok(SubscribeResponse {
             chain_first_run_id: chain.first_run_id,
             attached: true,
+            newest_counter,
         })
     }
 
@@ -193,10 +205,28 @@ impl Subscriptions {
         let stream = address(request.stream.as_ref())?;
         let client = self.client()?;
         let chain = streams.chain(stream).await?;
-        let polled = client
-            .poll(chain, stream.topic.clone(), request.after_counter)
-            .await
-            .map_err(subscribe_error)?;
+        let poll = client.poll(chain.clone(), stream.topic.clone(), request.after_counter);
+        tokio::pin!(poll);
+        // The poll starts the notifier, so a record from before it woke no one. One more read
+        // once the poll is out finds it.
+        let reread = async {
+            tokio::time::sleep(REREAD_AFTER).await;
+            streams.newest(stream, &chain).await
+        };
+        let polled = tokio::select! {
+            polled = &mut poll => polled,
+            newest = reread => match newest {
+                Ok((counter, position)) if counter > request.after_counter => {
+                    return Ok(WaitForNotificationResponse {
+                        counter,
+                        position,
+                        ..Default::default()
+                    });
+                }
+                _ => poll.await,
+            },
+        }
+        .map_err(subscribe_error)?;
         let Some(polled) = polled else {
             return Ok(WaitForNotificationResponse {
                 timed_out: true,
@@ -254,6 +284,8 @@ mod tests {
         answer: Mutex<Option<NotifyError>>,
         polled: Mutex<Vec<(ChainId, String, i64)>>,
         poll_answer: Mutex<Option<Result<Option<NotifierPoll>, NotifyError>>>,
+        /// How long the poll takes before it answers.
+        poll_delay: Mutex<Duration>,
     }
 
     #[async_trait::async_trait]
@@ -293,6 +325,8 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push((chain, topic, after_counter));
+            let delay = *self.poll_delay.lock().unwrap();
+            tokio::time::sleep(delay).await;
             self.poll_answer
                 .lock()
                 .unwrap()
@@ -594,6 +628,82 @@ mod tests {
             )
             .await
             .map(|answer| WaitForNotificationResponse::decode(answer.as_slice()).unwrap())
+    }
+
+    /// Appends `count` records to the chain the owner names now.
+    async fn append_records(setup: &Setup, count: i64) {
+        use crate::StreamStore;
+        let first_run_id = setup.owner.0.lock().unwrap().clone();
+        setup
+            .store
+            .append(crate::proto::StoreAppendRequest {
+                chain: Some(ChainId {
+                    namespace: "ns".to_string(),
+                    workflow_id: "owner".to_string(),
+                    first_run_id,
+                }),
+                topic: "tokens".to_string(),
+                producer_id: "p".to_string(),
+                attempt: 1,
+                sequence: 1,
+                digest: vec![1],
+                records: (0..count).map(|_| b"record".to_vec()).collect(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_subscription_names_the_newest_counter_it_found_after_the_attach() {
+        let setup = setup();
+        let empty = subscribe(&setup.service, subscribe_request("1"))
+            .await
+            .unwrap();
+        assert_eq!(empty.newest_counter, 0, "an empty stream");
+        append_records(&setup, 2).await;
+        // A record from before the attach woke no one, so the reader reads once more.
+        let again = subscribe(&setup.service, subscribe_request("1"))
+            .await
+            .unwrap();
+        assert!(!again.attached);
+        assert_eq!(again.newest_counter, 2);
+        let fresh = subscribe(&setup.service, subscribe_request("2"))
+            .await
+            .unwrap();
+        assert!(fresh.attached);
+        assert_eq!(fresh.newest_counter, 2);
+    }
+
+    #[tokio::test]
+    async fn a_wait_answers_at_once_for_a_record_from_before_the_poll() {
+        let setup = setup();
+        append_records(&setup, 1).await;
+        *setup.server.poll_delay.lock().unwrap() = Duration::from_secs(30);
+        let started = tokio::time::Instant::now();
+        let answer = wait(&setup, 0, Ok(None)).await.unwrap();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(!answer.timed_out && !answer.closed);
+        assert_eq!(answer.counter, 1);
+        assert!(answer.position.starts_with("memory:"), "{answer:?}");
+    }
+
+    #[tokio::test]
+    async fn a_wait_with_nothing_newer_waits_for_the_poll() {
+        let setup = setup();
+        append_records(&setup, 1).await;
+        *setup.server.poll_delay.lock().unwrap() = Duration::from_millis(400);
+        let answer = wait(
+            &setup,
+            1,
+            Ok(Some(NotifierPoll {
+                counter: 2,
+                position: "cursor-2".to_string(),
+                ..Default::default()
+            })),
+        )
+        .await
+        .unwrap();
+        assert_eq!((answer.counter, answer.position.as_str()), (2, "cursor-2"));
     }
 
     #[tokio::test]
