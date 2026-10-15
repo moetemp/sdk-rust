@@ -98,6 +98,8 @@ pub(crate) struct ReadInput {
     pub(crate) state: Option<String>,
     #[serde(default)]
     pub(crate) floor_holder: Option<String>,
+    #[serde(default)]
+    pub(crate) wake_token: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]

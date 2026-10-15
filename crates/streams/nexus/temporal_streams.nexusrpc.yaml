@@ -215,6 +215,16 @@ $defs:
           and read_range of the holder renews the hold, which lapses the
           store's floor lease after the last one. At most 512 bytes. Refused
           beside latest_only, which answers no records.
+      wake_token:
+        type: string
+        description: >-
+          The operation token of the reader's stream operation. When the call
+          answers no records and not done, the endpoint asks the stream's
+          notifier to wake that operation's callback once the stream moves
+          past the answer, then reads once more, so a record that landed
+          meanwhile is in the answer. A reader that finds records on each
+          call never waits, and its operation hears nothing. Refused when the
+          token names another stream.
     required: [stream]
     additionalProperties: false
 

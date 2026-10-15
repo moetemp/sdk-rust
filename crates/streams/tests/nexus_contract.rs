@@ -59,6 +59,7 @@ fn full_input(contract: &Value, name: &str, workflow_id: &str) -> Value {
             ("ReadInput", "latest_only") => json!(false),
             ("ReadInput", "state") => Value::Null,
             ("ReadInput", "floor_holder") => json!("ns/run-1/reader"),
+            ("ReadInput", "wake_token") => Value::Null,
             (model, member) => panic!("the contract added {model}.{member}; teach this test"),
         };
         out.insert(member, value);

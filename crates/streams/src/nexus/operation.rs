@@ -144,7 +144,7 @@ fn bad_input(message: &str) -> StreamError {
     StreamError::invalid_argument(message)
 }
 
-fn caller_error(error: NotifyError) -> StreamError {
+pub(super) fn caller_error(error: NotifyError) -> StreamError {
     match error {
         NotifyError::Refused(message) => StreamError::refused(message),
         NotifyError::Unsupported(message) => StreamError::unsupported(message),

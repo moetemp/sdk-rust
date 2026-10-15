@@ -20,8 +20,9 @@ use temporalio_common::protos::temporal::api::{
     common::v1::Payload, enums::v1::WorkflowExecutionStatus,
 };
 use temporalio_streams::{
-    MemoryStore, OwnerClient, OwnerDescription, OwnerError, StreamStore, Streams, StreamsOptions,
-    nexus::{NexusCalls, NexusOptions},
+    MemoryStore, NotifierClient, NotifyError, OwnerClient, OwnerDescription, OwnerError,
+    StreamNotification, StreamStore, Streams, StreamsOptions,
+    nexus::{NexusCalls, NexusOptions, OperationToken},
     proto::{
         ChainId, NexusFailure, ReadRangeRequest, ReadRequest, StoreAppendRequest, StreamAddress,
         StreamOwnerKind, StreamRecord, StreamRecordKind,
@@ -106,6 +107,61 @@ fn kind_of(failure: &NexusFailure) -> (&str, bool, &str) {
 
 fn token(answer: &Value) -> &str {
     answer["next_token"].as_str().unwrap()
+}
+
+/// The server's side of a caught-up reader's wait: each wait it took, and a record that lands
+/// as the wait goes out, as one that the notifier would not have seen.
+#[derive(Default)]
+struct Waker {
+    waits: std::sync::Mutex<Vec<(ChainId, String, String, i64)>>,
+    late: std::sync::Mutex<Option<(Arc<dyn StreamStore>, StoreAppendRequest)>>,
+}
+
+#[async_trait::async_trait]
+impl NotifierClient for Waker {
+    async fn notify(&self, _: StreamNotification) -> Result<(), NotifyError> {
+        Ok(())
+    }
+
+    async fn wait_callback(
+        &self,
+        chain: ChainId,
+        topic: String,
+        request_id: String,
+        after_counter: i64,
+    ) -> Result<(), NotifyError> {
+        self.waits
+            .lock()
+            .unwrap()
+            .push((chain, topic, request_id, after_counter));
+        let late = self.late.lock().unwrap().take();
+        if let Some((store, request)) = late {
+            store.append(request).await.unwrap();
+        }
+        Ok(())
+    }
+}
+
+/// The token of `wf`'s stream operation, attached as `attach-1` on the chain of `run-1`.
+fn operation_token(wf: &str) -> String {
+    OperationToken {
+        stream: StreamAddress {
+            namespace: NAMESPACE.to_string(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: wf.to_string(),
+            run_id: String::new(),
+            topic: TOPIC.to_string(),
+        },
+        attach_request_id: "attach-1".to_string(),
+        chain_first_run_id: "run-1".to_string(),
+    }
+    .encode()
+}
+
+fn waking(wf: &str, after: &str) -> Value {
+    let mut input = read_input(wf, after);
+    input["wake_token"] = json!(operation_token(wf));
+    input
 }
 
 /// Temporal where every Workflow's first run `run-1` has completed.
@@ -699,6 +755,108 @@ mod cases {
         let refused = read(&calls, input).await.unwrap_err();
         assert_eq!(kind_of(&refused).0, "BAD_REQUEST");
     }
+
+    pub(crate) async fn a_busy_reader_never_waits(store: Arc<dyn StreamStore>) {
+        let waker = Arc::new(Waker::default());
+        let calls = service(store, NexusOptions::default()).with_callers(waker.clone());
+        let wf = workflow();
+        write(&calls, &wf, 1, &["one", "two"]).await;
+        let answer = read(&calls, waking(&wf, "")).await.unwrap();
+        assert_eq!(texts(&answer), ["one", "two"]);
+        assert!(
+            waker.waits.lock().unwrap().is_empty(),
+            "a reader with records needs no wake"
+        );
+    }
+
+    pub(crate) async fn an_empty_read_wakes_its_operation_after_its_position(
+        store: Arc<dyn StreamStore>,
+    ) {
+        let waker = Arc::new(Waker::default());
+        let calls = service(store, NexusOptions::default()).with_callers(waker.clone());
+        let wf = workflow();
+        let last = write(&calls, &wf, 1, &["one", "two"]).await;
+        let caught_up = read(&calls, waking(&wf, &last)).await.unwrap();
+        assert!(records(&caught_up).is_empty());
+        assert_eq!(caught_up["done"], false);
+        let waits = waker.waits.lock().unwrap().clone();
+        let [(chain, topic, request_id, after)] = waits.as_slice() else {
+            panic!("one wait, not {waits:?}");
+        };
+        assert_eq!(
+            (chain.workflow_id.as_str(), chain.first_run_id.as_str()),
+            (wf.as_str(), "run-1")
+        );
+        assert_eq!((topic.as_str(), request_id.as_str()), (TOPIC, "attach-1"));
+        assert!(*after > 0, "the counter of the read's position");
+    }
+
+    pub(crate) async fn a_record_that_lands_before_the_wait_is_in_the_answer(
+        store: Arc<dyn StreamStore>,
+    ) {
+        let waker = Arc::new(Waker::default());
+        let calls = service(store.clone(), NexusOptions::default()).with_callers(waker.clone());
+        let wf = workflow();
+        let last = write(&calls, &wf, 1, &["one"]).await;
+        let finish = temporalio_streams::stored_append_record(
+            TOPIC,
+            "late",
+            1,
+            1,
+            &temporalio_streams::proto::AppendRecord {
+                kind: StreamRecordKind::Finish as i32,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        *waker.late.lock().unwrap() = Some((
+            store,
+            StoreAppendRequest {
+                chain: Some(ChainId {
+                    namespace: NAMESPACE.to_string(),
+                    workflow_id: wf.clone(),
+                    first_run_id: "run-1".to_string(),
+                }),
+                topic: TOPIC.to_string(),
+                producer_id: "late".to_string(),
+                attempt: 1,
+                sequence: 1,
+                digest: vec![7; 32],
+                records: vec![finish.encode_to_vec()],
+            },
+        ));
+        let answer = read(&calls, waking(&wf, &last)).await.unwrap();
+        let stored = stored(&answer);
+        assert_eq!(stored.len(), 1, "the reread found the record: {answer}");
+        assert_eq!(stored[0].kind, StreamRecordKind::Finish as i32);
+        assert_eq!(waker.waits.lock().unwrap().len(), 1);
+    }
+
+    pub(crate) async fn a_positions_reader_waits_and_rereads_too(store: Arc<dyn StreamStore>) {
+        // The direct read path: a Workflow reader that keeps positions and reads through a
+        // transport.
+        let waker = Arc::new(Waker::default());
+        let calls = service(store, NexusOptions::default()).with_callers(waker.clone());
+        let wf = workflow();
+        let last = write(&calls, &wf, 1, &["one"]).await;
+        let mut input = waking(&wf, &last);
+        input["floor_holder"] = json!("ns/run-9/reader");
+        let caught_up = read(&calls, input).await.unwrap();
+        assert!(records(&caught_up).is_empty());
+        assert!(caught_up.get("replay").is_some(), "{caught_up}");
+        assert_eq!(waker.waits.lock().unwrap().len(), 1);
+    }
+
+    pub(crate) async fn a_wake_token_of_another_stream_is_refused(store: Arc<dyn StreamStore>) {
+        let waker = Arc::new(Waker::default());
+        let calls = service(store, NexusOptions::default()).with_callers(waker.clone());
+        let wf = workflow();
+        let mut input = read_input(&wf, "");
+        input["wake_token"] = json!(operation_token("other-workflow"));
+        let refused = read(&calls, input).await.unwrap_err();
+        assert_eq!(kind_of(&refused).0, "BAD_REQUEST");
+        assert!(waker.waits.lock().unwrap().is_empty());
+    }
 }
 
 macro_rules! lanes {
@@ -739,6 +897,11 @@ macro_rules! all_cases {
             an_append_above_the_record_limit_is_refused,
             a_stored_record_above_the_limit_crosses_as_an_error,
             a_read_that_asks_to_arm_is_refused,
+            a_busy_reader_never_waits,
+            an_empty_read_wakes_its_operation_after_its_position,
+            a_record_that_lands_before_the_wait_is_in_the_answer,
+            a_positions_reader_waits_and_rereads_too,
+            a_wake_token_of_another_stream_is_refused,
         );
     };
 }

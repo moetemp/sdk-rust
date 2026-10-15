@@ -14,7 +14,7 @@ pub use operation::{OPERATION_TOKEN_VERSION, OperationToken};
 pub(crate) use operation::{attach_caller, detach_caller};
 
 use crate::{
-    StreamError, Streams,
+    NotifierClient, StreamError, StreamResult, Streams,
     handle::CarriedRead,
     proto::{
         AppendRecord, AppendRequest, CodecResult, CodecWork, LatestRequest, NamedProducer,
@@ -92,6 +92,8 @@ impl Default for NexusOptions {
 pub struct NexusCalls {
     streams: Arc<Streams>,
     options: NexusOptions,
+    /// Wakes a caught-up reader's operation callback.
+    callers: Option<Arc<dyn NotifierClient>>,
     waiting: Arc<Mutex<Waiting>>,
     next: AtomicU64,
 }
@@ -180,9 +182,16 @@ impl NexusCalls {
         Self {
             streams,
             options,
+            callers: None,
             waiting: Arc::default(),
             next: AtomicU64::new(1),
         }
+    }
+
+    /// Wakes the operation callbacks of caught-up readers through `client`.
+    pub fn with_callers(mut self, client: Arc<dyn NotifierClient>) -> Self {
+        self.callers = Some(client);
+        self
     }
 
     /// How many calls wait for lang's codec now.
@@ -304,6 +313,23 @@ impl NexusCalls {
         }
         let after = input.after_token.unwrap_or_default();
         let floor_holder = input.floor_holder.unwrap_or_default();
+        let wake = match &input.wake_token {
+            Some(token) => match OperationToken::decode(&call.namespace, token) {
+                Ok(token)
+                    if token.stream.workflow_id == address.workflow_id
+                        && token.stream.topic == address.topic =>
+                {
+                    Some(token)
+                }
+                Ok(_) => {
+                    return failed(failure::input_mistake(
+                        "wake_token names another stream's operation",
+                    ));
+                }
+                Err(error) => return failed(failure::of_stream(&error)),
+            },
+            None => None,
+        };
         if input.latest_only.unwrap_or(false) {
             if !after.is_empty() {
                 return failed(failure::input_mistake(
@@ -371,6 +397,19 @@ impl NexusCalls {
                 return read_failure(error, state, positions);
             }
         };
+        if let Some(token) = &wake
+            && read.response.records.is_empty()
+            && !read.response.done
+        {
+            match self
+                .wake_when_moved(token, &address, &read, &floor_holder, max_records)
+                .await
+            {
+                Ok(Some(reread)) => read = reread,
+                Ok(None) => {}
+                Err(error) => return failed(failure::of_stream(&error)),
+            }
+        }
         // Cut by the stored bodies first, so the codec decodes only what can cross. A codec that
         // grows a body is caught by the cut after the decode.
         let mut budget = Budget::new(limits, &read);
@@ -418,6 +457,48 @@ impl NexusCalls {
             &input.stream.workflow_id,
             payloads,
         )
+    }
+
+    /// Asks the notifier to wake the operation callback that `token` names once the stream moves
+    /// past the empty answer `read`, then reads once more. A record that landed before the wait
+    /// reached the notifier woke no one, so that read finds it. Answers the second read when it
+    /// found records or the end.
+    async fn wake_when_moved(
+        &self,
+        token: &OperationToken,
+        address: &StreamAddress,
+        read: &CarriedRead,
+        floor_holder: &str,
+        max_records: i64,
+    ) -> StreamResult<Option<CarriedRead>> {
+        let client = self.callers.as_ref().ok_or_else(|| {
+            StreamError::unsupported("waking a caller needs a client connected to the server")
+        })?;
+        client
+            .wait_callback(
+                crate::proto::ChainId {
+                    namespace: address.namespace.clone(),
+                    workflow_id: address.workflow_id.clone(),
+                    first_run_id: token.chain_first_run_id.clone(),
+                },
+                address.topic.clone(),
+                token.attach_request_id.clone(),
+                read.response.wake_after,
+            )
+            .await
+            .map_err(operation::caller_error)?;
+        let reread = self
+            .streams
+            .read_carried(ReadRequest {
+                stream: Some(address.clone()),
+                after: read.response.cursor.clone(),
+                wait: None,
+                max_records: max_records as u32,
+                state: read.state.encode_to_vec(),
+                floor_holder: floor_holder.to_string(),
+            })
+            .await?;
+        Ok((!reread.response.records.is_empty() || reread.response.done).then_some(reread))
     }
 
     /// Serves the `read_range` operation: the records of an earlier read that named a floor

@@ -144,8 +144,10 @@ impl StreamService {
         self
     }
 
-    /// Attaches and detaches stream operation callers through `client`.
+    /// Attaches and detaches stream operation callers through `client`, and wakes the callback
+    /// of a caught-up Nexus reader through it.
     pub fn with_callers(mut self, client: Arc<dyn NotifierClient>) -> Self {
+        self.nexus = self.nexus.with_callers(client.clone());
         self.callers = Some(client);
         self
     }
