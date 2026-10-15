@@ -559,6 +559,7 @@ fn test_stream_store_appends_and_reads_through_the_c_bridge() {
                             ..Default::default()
                         }),
                         content_hash: vec![7; 32],
+                        ..Default::default()
                     }],
                 }
                 .encode_to_vec(),

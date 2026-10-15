@@ -150,8 +150,18 @@ fn poll_answer(response: PollStreamNotifierResponse) -> NotifierPoll {
 
 /// The notifier of `chain`'s stream on `topic`. The run chain's first run keys the notifier, so one
 /// notifier serves the stream across Continue-as-New and a new chain on the same Workflow id gets
-/// its own. An Activity run is its own chain, so its notifier is keyed by the run.
+/// its own. An Activity run is its own chain, so its notifier is keyed by the run. A Workflow
+/// Activity's notifier is keyed by its Workflow, its scheduling run and its Activity id.
 fn chain_reference(chain: &ChainId, topic: String) -> StreamReference {
+    if chain.owner_kind == proto::StreamOwnerKind::WorkflowActivity as i32 {
+        return StreamReference {
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            workflow_id: chain.workflow_id.clone(),
+            run_id: chain.first_run_id.clone(),
+            topic,
+            activity_id: chain.activity_id.clone(),
+        };
+    }
     if chain.owner_kind == proto::StreamOwnerKind::Activity as i32 {
         return StreamReference {
             owner_kind: StreamOwnerKind::Activity as i32,
@@ -326,6 +336,27 @@ impl OwnerClient for ConnectionOwnerClient {
                     .map_err(owner_error)?;
                 activity_owner_description(response.into_inner())
             }
+            OwnerId::WorkflowActivity {
+                workflow_id,
+                activity_id,
+            } => {
+                let response = self
+                    .connection
+                    .workflow_service()
+                    .describe_workflow_execution(
+                        DescribeWorkflowExecutionRequest {
+                            namespace: namespace.to_string(),
+                            execution: Some(WorkflowExecution {
+                                workflow_id: workflow_id.to_string(),
+                                run_id: run_id.to_string(),
+                            }),
+                        }
+                        .into_request(),
+                    )
+                    .await
+                    .map_err(owner_error)?;
+                workflow_activity_owner_description(response.into_inner(), activity_id)
+            }
         }
     }
 }
@@ -359,6 +390,26 @@ fn owner_description(
         status: OwnerStatus::of_workflow(info.status()),
         run_id,
         first_run_id,
+    })
+}
+
+/// A Workflow Activity is pending while its scheduling run lists it, through retries and backoff.
+fn workflow_activity_owner_description(
+    response: DescribeWorkflowExecutionResponse,
+    activity_id: &str,
+) -> Result<OwnerDescription, OwnerError> {
+    let pending = response
+        .pending_activities
+        .iter()
+        .any(|activity| activity.activity_id == activity_id);
+    let status = response
+        .workflow_execution_info
+        .as_ref()
+        .map(|info| info.status())
+        .unwrap_or_default();
+    Ok(OwnerDescription {
+        status: OwnerStatus::of_workflow_activity(status, pending),
+        ..owner_description(response)?
     })
 }
 
@@ -464,6 +515,37 @@ mod tests {
     }
 
     #[test]
+    fn a_workflow_activity_runs_while_its_running_run_lists_it_as_pending() {
+        use temporalio_common::protos::temporal::api::workflow::v1::PendingActivityInfo;
+        let described = |status: WorkflowExecutionStatus, pending: &[&str]| {
+            let mut response = described("run-1", "run-1");
+            if let Some(info) = &mut response.workflow_execution_info {
+                info.status = status as i32;
+            }
+            response.pending_activities = pending
+                .iter()
+                .map(|id| PendingActivityInfo {
+                    activity_id: id.to_string(),
+                    ..Default::default()
+                })
+                .collect();
+            response
+        };
+        let status = |status, pending: &[&str]| {
+            workflow_activity_owner_description(described(status, pending), "tool")
+                .unwrap()
+                .status
+        };
+        use WorkflowExecutionStatus::*;
+        assert_eq!(status(Running, &["other", "tool"]), OwnerStatus::Running);
+        assert_eq!(status(Paused, &["tool"]), OwnerStatus::Running);
+        assert_eq!(status(Running, &["other"]), OwnerStatus::ActivityGone);
+        for closed in [Completed, Failed, ContinuedAsNew, Terminated, TimedOut] {
+            assert_eq!(status(closed, &["tool"]), OwnerStatus::Ended, "{closed:?}");
+        }
+    }
+
+    #[test]
     fn a_run_without_a_first_run_id_starts_its_chain() {
         assert_eq!(
             owner_description(described("run-1", ""))
@@ -558,6 +640,33 @@ mod tests {
         assert_eq!(request.operation_token, "token");
         assert_eq!(request.start_time.unwrap().seconds, 1_700_000_000);
         assert!(request.workflow_target.is_none(), "exactly one target");
+    }
+
+    #[test]
+    fn a_notification_of_a_workflow_activity_stream_names_its_scheduling_run() {
+        let request = notify_request(StreamNotification {
+            chain: proto::ChainId {
+                namespace: "ns".to_string(),
+                workflow_id: "agent".to_string(),
+                first_run_id: "run-2".to_string(),
+                owner_kind: proto::StreamOwnerKind::WorkflowActivity as i32,
+                activity_id: "tool-42".to_string(),
+            },
+            topic: "tokens".to_string(),
+            position: "cursor".to_string(),
+            counter: 3,
+            close: None,
+        });
+        assert_eq!(
+            request.stream_ref,
+            Some(StreamReference {
+                owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+                workflow_id: "agent".to_string(),
+                run_id: "run-2".to_string(),
+                topic: "tokens".to_string(),
+                activity_id: "tool-42".to_string(),
+            })
+        );
     }
 
     #[test]
@@ -944,6 +1053,7 @@ mod tests {
                         },
                     ),
                     content_hash: vec![7; 32],
+                    ..Default::default()
                 }],
                 // Any value names the batch, since this producer writes it once.
                 digest: vec![9; 32],
