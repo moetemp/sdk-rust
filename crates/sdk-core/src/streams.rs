@@ -853,6 +853,7 @@ mod tests {
         run_id: String,
         /// The chain the caller's operation token names.
         token_first_run_id: String,
+        operation_token: String,
         // The live tests share the callback listener's address.
         _turn: tokio::sync::MutexGuard<'static, ()>,
     }
@@ -863,6 +864,12 @@ mod tests {
     /// (such as `http://127.0.0.1:7861`), whose `callback.allowedAddresses` takes
     /// `127.0.0.1:7899`. Answers `None` without one.
     async fn live() -> Option<Live> {
+        live_after(0).await
+    }
+
+    /// `live()`, with `appends` records written before the caller attaches. The server keeps no
+    /// notifier before an attach, so it drops the notifications of these records.
+    async fn live_after(appends: i64) -> Option<Live> {
         use temporalio_common::protos::temporal::api::{
             common::v1::WorkflowType, taskqueue::v1::TaskQueue,
             workflowservice::v1::StartWorkflowExecutionRequest,
@@ -923,6 +930,12 @@ mod tests {
             ..Default::default()
         };
         use prost::Message;
+        for sequence in 1..=appends {
+            service
+                .call("Append", &one_append(&stream, sequence).encode_to_vec())
+                .await
+                .unwrap();
+        }
         let attached = proto::AttachCallerResponse::decode(
             service
                 .call(
@@ -931,6 +944,9 @@ mod tests {
                         stream: Some(stream.clone()),
                         request_id: "caller".to_string(),
                         callback_url: "http://127.0.0.1:7899/callback".to_string(),
+                        // The caller reads nothing, so only a first wait from the start gets
+                        // its idle callback the first append's progress.
+                        wake_after_counter: Some(0),
                         ..Default::default()
                     }
                     .encode_to_vec(),
@@ -950,37 +966,42 @@ mod tests {
             workflow_id,
             run_id: started.run_id,
             token_first_run_id: token.chain_first_run_id,
+            operation_token: attached.operation_token,
             _turn: turn,
         })
+    }
+
+    /// One record from one producer, as its batch at `sequence`.
+    fn one_append(stream: &proto::StreamAddress, sequence: i64) -> proto::AppendRequest {
+        proto::AppendRequest {
+            stream: Some(stream.clone()),
+            producer: Some(proto::append_request::Producer::Named(
+                proto::NamedProducer {
+                    producer_id: "producer".to_string(),
+                    attempt: 1,
+                },
+            )),
+            sequence,
+            records: vec![proto::AppendRecord {
+                kind: proto::StreamRecordKind::Data as i32,
+                body: Some(
+                    temporalio_common::protos::temporal::api::common::v1::Payload {
+                        data: b"token".to_vec(),
+                        ..Default::default()
+                    },
+                ),
+                content_hash: vec![7; 32],
+            }],
+            // Any value names the batch, since the producer writes each batch once.
+            digest: vec![sequence as u8; 32],
+        }
     }
 
     impl Live {
         async fn append_one(&self) {
             use prost::Message;
-            let append = proto::AppendRequest {
-                stream: Some(self.stream.clone()),
-                producer: Some(proto::append_request::Producer::Named(
-                    proto::NamedProducer {
-                        producer_id: "producer".to_string(),
-                        attempt: 1,
-                    },
-                )),
-                sequence: 1,
-                records: vec![proto::AppendRecord {
-                    kind: proto::StreamRecordKind::Data as i32,
-                    body: Some(
-                        temporalio_common::protos::temporal::api::common::v1::Payload {
-                            data: b"token".to_vec(),
-                            ..Default::default()
-                        },
-                    ),
-                    content_hash: vec![7; 32],
-                }],
-                // Any value names the batch, since this producer writes it once.
-                digest: vec![9; 32],
-            };
             self.service
-                .call("Append", &append.encode_to_vec())
+                .call("Append", &one_append(&self.stream, 1).encode_to_vec())
                 .await
                 .unwrap();
             let (state, body) = next_delivery();
@@ -1004,7 +1025,23 @@ mod tests {
         }
 
         async fn end(self) {
+            use prost::Message;
             use temporalio_common::protos::temporal::api::workflowservice::v1 as service;
+            // The owner check closes a terminated owner's stream after the test ended. Its
+            // completion to a closed listener fails, and enough such failures open the server's
+            // circuit breaker for the address the next run listens on. A detached caller gets
+            // no completion, and a caller already completed is not found, which is fine.
+            self.service
+                .call(
+                    "DetachCaller",
+                    &proto::DetachCallerRequest {
+                        namespace: "default".to_string(),
+                        operation_token: self.operation_token.clone(),
+                    }
+                    .encode_to_vec(),
+                )
+                .await
+                .unwrap();
             self.connection
                 .workflow_service()
                 .terminate_workflow_execution(
@@ -1043,6 +1080,17 @@ mod tests {
             .await;
         assert_eq!(state, "succeeded", "{body}");
         assert!(body.contains("summary"), "{body}");
+        live.end().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_caller_hears_the_records_that_landed_before_its_attach() {
+        let Some(live) = live_after(2).await else {
+            return;
+        };
+        let (state, body) = next_delivery();
+        assert_eq!(state, "running", "{body}");
+        assert!(body.contains(r#""counter":"2""#), "{body}");
         live.end().await;
     }
 
