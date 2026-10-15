@@ -710,6 +710,100 @@ mod tests {
         );
     }
 
+    async fn follow(service: &StreamService, request: crate::proto::FollowRequest) -> FollowAnswer {
+        FollowAnswer::decode(
+            service
+                .call("Follow", &request.encode_to_vec())
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap()
+    }
+
+    type FollowAnswer = crate::proto::FollowResponse;
+
+    fn append_one(value: &str) -> crate::proto::AppendRequest {
+        crate::proto::AppendRequest {
+            stream: Some(stream()),
+            producer: Some(crate::proto::append_request::Producer::Named(
+                crate::proto::NamedProducer {
+                    producer_id: "p".to_string(),
+                    attempt: 1,
+                },
+            )),
+            sequence: 1,
+            digest: vec![1; 32],
+            records: vec![crate::proto::AppendRecord {
+                kind: crate::proto::StreamRecordKind::Data as i32,
+                body: Some(Default::default()),
+                content_hash: vec![value.as_bytes()[0]; 32],
+                link: None,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_workflow_follower_attaches_each_idle_source_and_answers_its_wake() {
+        let setup = setup();
+        let request = crate::proto::FollowRequest {
+            stream: Some(stream()),
+            subscriber: Some(crate::proto::FollowSubscriber {
+                workflow_id: "reader".to_string(),
+                run_id: "reader-run".to_string(),
+                subscription_prefix: "7".to_string(),
+                generation: 0,
+            }),
+            ..Default::default()
+        };
+        let idle = follow(&setup.service, request.clone()).await;
+        assert!(idle.records.is_empty());
+        assert_eq!(idle.wakes.len(), 1);
+        assert_eq!(idle.wakes[0].source, 0);
+        assert_eq!(idle.wakes[0].subscription_id, "7.0");
+        let attached = setup.server.attached.lock().unwrap().clone();
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].subscription_id, "7.0");
+        // A record that lands later wakes the run, and the next step reads it.
+        setup
+            .service
+            .call("Append", &append_one("a").encode_to_vec())
+            .await
+            .unwrap();
+        let next = follow(
+            &setup.service,
+            crate::proto::FollowRequest {
+                state: idle.state,
+                ..request
+            },
+        )
+        .await;
+        assert_eq!(next.records.len(), 1);
+        assert!(next.wakes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_client_follower_waits_for_the_first_record_of_any_source() {
+        let setup = setup();
+        let append = async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            setup
+                .service
+                .call("Append", &append_one("a").encode_to_vec())
+                .await
+                .unwrap();
+        };
+        let request = crate::proto::FollowRequest {
+            stream: Some(stream()),
+            wait: Duration::from_secs(10).try_into().ok(),
+            ..Default::default()
+        };
+        let started = std::time::Instant::now();
+        let (answer, ()) = tokio::join!(follow(&setup.service, request), append);
+        assert_eq!(answer.records.len(), 1);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
     async fn wait(
         setup: &Setup,
         after_counter: i64,

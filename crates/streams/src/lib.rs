@@ -12,7 +12,9 @@
 mod cursor;
 mod driver;
 mod error;
+mod follow;
 mod handle;
+mod links;
 mod memory;
 mod notify;
 mod notifylog;

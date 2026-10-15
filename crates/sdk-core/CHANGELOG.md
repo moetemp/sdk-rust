@@ -212,6 +212,17 @@ relevant information.
   a replay with another link fails as `REPLAY_MISMATCH`. A record with no link keeps its digest.
   `temporalio_common::streams::check_link` holds the rules. A reader before this release refuses
   a link as a record of an unknown kind.
+* Experimental: `StreamService` gains `Follow` and `FollowRange`. `Follow` reads a root stream
+  and the streams its links open, in one order with no clock. Order within each stream is kept.
+  A linked stream's records come after its OPEN, and a JOIN holds the linking stream until the
+  linked stream reaches the JOIN's `until` or ends. Each item names its source, and a linked
+  stream's end, failure or skip comes as a `LinkState` (`OPENED`, `DONE` with the close outcome,
+  `UNAVAILABLE` with the error, `SKIPPED` with `depth`, `limit`, `cycle`, `open` or
+  `endpoint`). Only a `STORAGE` failure fails the call. The answer's `state` is the composite
+  position and resumes every open source. `max_depth` (4) and `max_open` (16) bound a follow. A
+  Workflow follower sets `subscriber`, so an empty answer attaches each idle source and lists
+  its wake. `FollowRange` reads an earlier answer's ranges again with `ReadRange` and checks the
+  `follow_digest`. The state machine is `links.rs`, with no I/O.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
