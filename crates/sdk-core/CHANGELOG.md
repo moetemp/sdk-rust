@@ -190,6 +190,16 @@ relevant information.
   set, and every store and wrapper must implement it. A Workflow's `DeleteOwner` also deletes
   its Activities' streams. `OwnerId` gains `WorkflowActivity` and `OwnerStatus` gains
   `ActivityGone`. The documented Redis ACL gains `+sadd +smembers`.
+* Experimental: the scheduling Workflow's Core closes a Workflow Activity's streams when it
+  resolves the Activity. Workflow code marks the Activity with the `ScheduleActivity` header
+  `__temporal_stream_owner`. When a marked Activity resolves outside replay, Core closes each
+  topic in the Activity's topic set in the background, once the activation completed and its
+  stream output was appended. A completed Activity closes with a null result, and a failed,
+  timed-out or canceled one with the failure its resolution holds, cut to `MAX_CLOSE_BYTES`. The
+  close names `<activity id>@<run id>` as `closed_by` and reaches the stream's notifier. A close
+  that fails is logged and does not fail the Workflow Task. Unmarked Activities cost no store
+  call. Notifier calls name a Workflow Activity stream by its Workflow, scheduling run and
+  Activity id.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

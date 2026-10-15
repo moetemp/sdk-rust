@@ -140,8 +140,18 @@ fn poll_answer(response: PollStreamNotifierResponse) -> NotifierPoll {
 
 /// The notifier of `chain`'s stream on `topic`. The run chain's first run keys the notifier, so one
 /// notifier serves the stream across Continue-as-New and a new chain on the same Workflow id gets
-/// its own. An Activity run is its own chain, so its notifier is keyed by the run.
+/// its own. An Activity run is its own chain, so its notifier is keyed by the run. A Workflow
+/// Activity's notifier is keyed by its Workflow, its scheduling run and its Activity id.
 fn chain_reference(chain: &ChainId, topic: String) -> StreamReference {
+    if chain.owner_kind == proto::StreamOwnerKind::WorkflowActivity as i32 {
+        return StreamReference {
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            workflow_id: chain.workflow_id.clone(),
+            run_id: chain.first_run_id.clone(),
+            topic,
+            activity_id: chain.activity_id.clone(),
+        };
+    }
     if chain.owner_kind == proto::StreamOwnerKind::Activity as i32 {
         return StreamReference {
             owner_kind: StreamOwnerKind::Activity as i32,
@@ -564,6 +574,33 @@ mod tests {
         assert_eq!((request.position.as_str(), request.counter), ("cursor", 7));
         assert!(!request.close);
         assert!(request.close_result.is_none());
+    }
+
+    #[test]
+    fn a_notification_of_a_workflow_activity_stream_names_its_scheduling_run() {
+        let request = notify_request(StreamNotification {
+            chain: proto::ChainId {
+                namespace: "ns".to_string(),
+                workflow_id: "agent".to_string(),
+                first_run_id: "run-2".to_string(),
+                owner_kind: proto::StreamOwnerKind::WorkflowActivity as i32,
+                activity_id: "tool-42".to_string(),
+            },
+            topic: "tokens".to_string(),
+            position: "cursor".to_string(),
+            counter: 3,
+            close: None,
+        });
+        assert_eq!(
+            request.stream_ref,
+            Some(StreamReference {
+                owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+                workflow_id: "agent".to_string(),
+                run_id: "run-2".to_string(),
+                topic: "tokens".to_string(),
+                activity_id: "tool-42".to_string(),
+            })
+        );
     }
 
     #[test]

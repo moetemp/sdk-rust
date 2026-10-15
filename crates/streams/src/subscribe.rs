@@ -658,6 +658,58 @@ mod tests {
         assert_eq!(setup.server.detached.lock().unwrap()[0].0, activity_chain);
     }
 
+    #[tokio::test]
+    async fn a_workflow_reader_subscribes_to_a_stream_that_a_workflow_activity_owns() {
+        let setup = setup();
+        let tool = |run_id: &str| StreamAddress {
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            run_id: run_id.to_string(),
+            activity_id: "1".to_string(),
+            ..stream()
+        };
+        let tool_chain = |run_id: &str| ChainId {
+            namespace: "ns".to_string(),
+            workflow_id: "owner".to_string(),
+            first_run_id: run_id.to_string(),
+            owner_kind: StreamOwnerKind::WorkflowActivity as i32,
+            activity_id: "1".to_string(),
+        };
+        // Activity `1` of two runs, and the Workflow's own stream, are three streams.
+        for (address, id) in [(tool("run-a"), "1"), (tool("run-b"), "2")] {
+            let request = SubscribeRequest {
+                stream: Some(address),
+                ..subscribe_request(id)
+            };
+            let answer = subscribe(&setup.service, request).await.unwrap();
+            assert!(answer.attached);
+        }
+        assert!(
+            subscribe(&setup.service, subscribe_request("3"))
+                .await
+                .unwrap()
+                .attached
+        );
+        let attached = setup.server.attached.lock().unwrap().clone();
+        assert_eq!(attached[0].chain, tool_chain("run-a"));
+        assert_eq!(attached[1].chain, tool_chain("run-b"));
+        assert_eq!(attached[2].chain, chain("chain-1"));
+        let unsubscribe = UnsubscribeRequest {
+            stream: Some(tool("run-b")),
+            run_id: "reader-run".to_string(),
+            subscription_id: "2".to_string(),
+            ..Default::default()
+        };
+        setup
+            .service
+            .call("Unsubscribe", &unsubscribe.encode_to_vec())
+            .await
+            .unwrap();
+        assert_eq!(
+            setup.server.detached.lock().unwrap()[0].0,
+            tool_chain("run-b")
+        );
+    }
+
     async fn wait(
         setup: &Setup,
         after_counter: i64,
