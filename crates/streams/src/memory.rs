@@ -506,14 +506,16 @@ impl StreamStore for MemoryStore {
     ) -> StreamResult<()> {
         let position = parse_position(position)?;
         let mut chains = self.chains.lock().unwrap();
-        let held = chains
+        let holders = chains
             .entry(chain_key(chain))
             .or_default()
             .floors
             .entry(topic.to_string())
-            .or_default()
-            .entry(holder.to_string())
-            .or_insert(position);
+            .or_default();
+        if holders.len() >= crate::MAX_FLOOR_HOLDERS && !holders.contains_key(holder) {
+            return Err(StreamError::refused(too_many_holders(topic)));
+        }
+        let held = holders.entry(holder.to_string()).or_insert(position);
         *held = match (*held, position) {
             (Some(held), Some(position)) => Some(held.min(position)),
             _ => None,
@@ -610,6 +612,15 @@ impl StreamStore for MemoryStore {
     }
 }
 
+/// Why a new floor holder is refused.
+fn too_many_holders(topic: &str) -> String {
+    format!(
+        "topic {topic:?} already has {} floor holders, so a positions-only reader can't start \
+         on it; let readers finish or Continue-as-New",
+        crate::MAX_FLOOR_HOLDERS
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -684,5 +695,22 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.kind, StreamFailureKind::Unsupported);
+    }
+
+    #[tokio::test]
+    async fn a_topic_refuses_a_floor_holder_past_the_cap() {
+        let store = MemoryStore::new();
+        for holder in 0..crate::MAX_FLOOR_HOLDERS {
+            store
+                .hold_floor(&chain(), "out", &holder.to_string(), "")
+                .await
+                .unwrap();
+        }
+        let error = store
+            .hold_floor(&chain(), "out", "one-more", "")
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Refused);
+        store.hold_floor(&chain(), "out", "0", "").await.unwrap();
     }
 }
