@@ -1,7 +1,7 @@
 //! Building the records a store keeps, and naming who wrote them.
 
 use crate::{
-    StreamError, StreamResult,
+    Capabilities, StreamError, StreamResult,
     proto::{ActivityProducer, AppendRecord, StreamRecord, StreamRecordKind},
 };
 use temporalio_common::{
@@ -143,6 +143,57 @@ fn stored_record(
         }
     }
     Ok(stored)
+}
+
+/// Refuses a batch of serialized records with a record above the store's record limit.
+pub fn check_record_limit(records: &[Vec<u8>], capabilities: &Capabilities) -> StreamResult<()> {
+    let limit = capabilities.max_record_bytes;
+    if let Some((index, record)) = records.iter().enumerate().find(|(_, r)| r.len() > limit) {
+        return Err(StreamError::invalid_argument(format!(
+            "record {index} takes {} bytes in the store, above the store's record limit of \
+             {limit} bytes",
+            record.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a batch above the store's record or batch limit. Core doesn't split a producer's
+/// batch, since lang numbered its records as one sequence range.
+pub fn check_store_limits(records: &[Vec<u8>], capabilities: &Capabilities) -> StreamResult<()> {
+    check_record_limit(records, capabilities)?;
+    let bytes: usize = records.iter().map(Vec::len).sum();
+    let limit = capabilities.max_batch_bytes;
+    if bytes > limit {
+        return Err(StreamError::invalid_argument(format!(
+            "the batch takes {bytes} bytes in the store, above the store's batch limit of {limit} \
+             bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// A `CLOSE` record that `producer_id` at `attempt` writes to end `topic` for every reader.
+pub fn close_record(topic: &str, producer_id: &str, attempt: i64) -> StreamRecord {
+    StreamRecord {
+        topic: topic.to_string(),
+        kind: StreamRecordKind::Close as i32,
+        producer_id: producer_id.to_string(),
+        attempt,
+        ..Default::default()
+    }
+}
+
+/// A `TOPIC` record that `producer_id` at `attempt` writes to the chain's control log before its
+/// first record on `topic`.
+pub fn topic_record(topic: &str, producer_id: &str, attempt: i64) -> StreamRecord {
+    StreamRecord {
+        topic: topic.to_string(),
+        kind: StreamRecordKind::Topic as i32,
+        producer_id: producer_id.to_string(),
+        attempt,
+        ..Default::default()
+    }
 }
 
 fn metadata_payload(data: &[u8]) -> Payload {

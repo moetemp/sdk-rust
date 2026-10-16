@@ -43,6 +43,8 @@ service StreamService {
   // wait limit (`streamnotifier.pollMaxWait`). The reader then reads again with `arm`. After the
   // wait limit, that read finds records whose notification was lost, or arms again.
   rpc WaitForNotification(WaitForNotificationRequest) returns (WaitForNotificationResponse);
+  // What the store can do beyond the log every store gives, and its limits.
+  rpc DescribeStore(DescribeStoreRequest) returns (DescribeStoreResponse);
 }
 
 // Which store holds a process's streams, and how to reach it. Lang builds one store from it and
@@ -88,11 +90,18 @@ message RedisStoreConfig {
   uint32 blocking_reads_per_node = 5;
   // How long a short call waits for its reply. Unset uses the default.
   google.protobuf.Duration response_timeout = 6;
+  // Runs with no Lua, so the store keeps no producer state and no last position, and Core takes
+  // their fallbacks. For tests of the fallbacks on a real store.
+  bool plain = 10;
 }
 
 // Streams in this process's memory, for tests and local development. Nothing survives the
 // process, and each connect makes a store of its own that shares no streams with another.
-message MemoryStoreConfig {}
+message MemoryStoreConfig {
+  // A mask. Only the capabilities it sets stay, and its nonzero limits replace the store's.
+  // Unset keeps every capability, so tests and users can try the weaker guarantees.
+  StoreCapabilities capabilities = 1;
+}
 
 // What owns a stream. The owner decides when the stream closes.
 enum StreamOwnerKind {
@@ -361,6 +370,47 @@ message RetireProducerRequest {
 
 // A producer attempt with no dedupe state left, or a stream that holds nothing, answers the same.
 message RetireProducerResponse {}
+
+message DescribeStoreRequest {}
+
+message DescribeStoreResponse {
+  // The short name the store mints into its cursors, such as `redis` or `memory`.
+  string name = 1;
+  StoreCapabilities capabilities = 2;
+}
+
+// What a store can do beyond the log every store gives. Core takes a fallback for each
+// capability the store lacks, with the weaker guarantee the fallback names.
+message StoreCapabilities {
+  // The append checks the producer attempt's dedupe entry and the close flags in the same step.
+  bool producer_state = 1;
+  // The append can fail unless the log's next position is the expected one.
+  bool conditional_tail = 2;
+  // The append can fail unless the stream's fence token is the expected one.
+  bool conditional_fence = 3;
+  // The store knows a topic's newest position after retention dropped every record.
+  bool kept_last = 4;
+  // A holder can keep records from retention.
+  bool holds = 5;
+  // One consumer can read every append in order.
+  bool change_feed = 6;
+  // A log per topic of each chain costs nothing much.
+  bool cheap_logs = 7;
+  // The store deletes every stream of one owner.
+  bool delete_owner = 8;
+  // The store lists the topics of one chain.
+  bool topic_listing = 9;
+  // A read can wait for the next record.
+  bool long_poll = 10;
+  // The next record's position is always the last one plus one.
+  bool dense_positions = 11;
+  // How long the store keeps records with no hold, when a positions-only reader can count on it.
+  google.protobuf.Duration replay_horizon = 12;
+  // The largest record the store takes, with its envelope.
+  uint64 max_record_bytes = 13;
+  // The most record bytes one append takes.
+  uint64 max_batch_bytes = 14;
+}
 
 // One class per way a stream call can fail, so every lang maps the same failure to the same
 // error.

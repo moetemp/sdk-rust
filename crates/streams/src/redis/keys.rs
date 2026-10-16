@@ -28,6 +28,23 @@ pub(crate) fn part(text: &str) -> String {
     out
 }
 
+/// Reverses [part], or `None` for text that [part] never makes.
+pub(crate) fn unpart(text: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(text.len());
+    let mut rest = text.as_bytes();
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte == b'%' {
+            let hex = std::str::from_utf8(tail.get(..2)?).ok()?;
+            bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            rest = &tail[2..];
+        } else {
+            bytes.push(byte);
+            rest = tail;
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
 /// The keys of one run chain's streams.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ChainKeys {
@@ -58,6 +75,21 @@ impl ChainKeys {
     pub(crate) fn chain(&self) -> String {
         format!("{}:chain", self.base)
     }
+
+    /// The pattern that matches every topic key of the chain, logs and metas.
+    pub(crate) fn topics_pattern(&self) -> String {
+        format!("{}:t:*", self.base)
+    }
+
+    /// The topic whose log `key` is, or `None` for a meta or another key.
+    pub(crate) fn topic_of(&self, key: &str) -> Option<String> {
+        let part = key.strip_prefix(&self.base)?.strip_prefix(":t:")?;
+        // A topic's own `:` is encoded, so a raw one only starts the meta's suffix.
+        if part.contains(':') {
+            return None;
+        }
+        unpart(part)
+    }
 }
 
 /// The meta field that holds one producer attempt's newest batch.
@@ -82,6 +114,22 @@ pub(crate) fn owner_pattern(prefix: &str, namespace: &str, workflow_id: &str) ->
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn a_topic_reads_back_from_its_log_key_only() {
+        let chain = ChainId {
+            namespace: "ns".to_string(),
+            workflow_id: "w:f".to_string(),
+            first_run_id: "run".to_string(),
+        };
+        let keys = ChainKeys::new("p", &chain);
+        for topic in ["out", "a:b", "é {x}%"] {
+            assert_eq!(keys.topic_of(&keys.log(topic)).as_deref(), Some(topic));
+            assert_eq!(keys.topic_of(&keys.meta(topic)), None);
+        }
+        assert_eq!(keys.topic_of(&keys.chain()), None);
+        assert_eq!(unpart("%zz"), None);
+    }
 
     fn text<'a>(case: &'a Value, field: &str) -> &'a str {
         case[field].as_str().unwrap()
