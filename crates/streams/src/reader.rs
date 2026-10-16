@@ -315,10 +315,20 @@ pub(crate) async fn read_with(
             },
         })
         .await?;
-    let (closed, close) = (page.closed, page.close);
+    let (mut closed, mut close) = (page.closed, page.close);
     let mut records = Vec::with_capacity(page.records.len());
     let mut previous = start.clone();
+    let max_bytes = usize::try_from(request.max_bytes).unwrap_or(usize::MAX);
+    let (mut bytes, mut kept) = (0usize, 0usize);
     for stored in page.records {
+        // The first record always goes, so a record above the budget still reads.
+        if max_bytes > 0 && kept > 0 && bytes + stored.record.len() > max_bytes {
+            // The records left come first, so the close waits for the next answer.
+            (closed, close) = (false, None);
+            break;
+        }
+        bytes += stored.record.len();
+        kept += 1;
         let cursor = mint_cursor(store.name(), &target.stream_hash, &stored.position);
         let record = match parse(&stored.record) {
             Ok(record) => record,
@@ -1048,6 +1058,35 @@ mod tests {
         }
         let read = read(&log, BEGINNING, &[]).await.unwrap();
         assert_eq!(read.records.len(), DEFAULT_MAX_RECORDS as usize);
+    }
+
+    #[tokio::test]
+    async fn an_answer_holds_at_most_max_bytes_past_its_first_record() {
+        let log = Log::default();
+        for data in [b"a".as_slice(), b"b", b"c"] {
+            log.write("p", 1, data);
+        }
+        let size = log.entries.lock().unwrap()[0].len() as u64;
+        let mut after = BEGINNING.to_string();
+        let mut sizes = Vec::new();
+        for max_bytes in [2 * size, 1] {
+            let page = read_page(
+                &log,
+                &target(),
+                &ReadRequest {
+                    after: after.clone(),
+                    max_bytes,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            sizes.push(page.records.len());
+            after = page.cursor;
+        }
+        // A budget below one record still reads that record.
+        assert_eq!(sizes, [2, 1]);
+        assert_eq!(after, cursor("3"));
     }
 
     #[tokio::test]
