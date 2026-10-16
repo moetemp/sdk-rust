@@ -10,6 +10,10 @@ use crate::{
 /// with the stream as it keeps a record, so it gets the bound one record gets.
 pub const MAX_CLOSE_BYTES: usize = 1536 * 1024;
 
+/// The most live floor holders one topic keeps. Every append reads them all, and each pins
+/// records against retention, so one topic's readers can't fill the store.
+pub const MAX_FLOOR_HOLDERS: usize = 1_000;
+
 /// The result a stream closes with when its owner gave none: a `binary/null` payload, which every
 /// SDK's converter reads as no value. A payload with no encoding fails a caller that expects a
 /// typed result.
@@ -163,8 +167,8 @@ pub trait StreamStore: Send + Sync {
     ) -> StreamResult<()>;
 
     /// The topics that producers wrote on a Workflow Activity's chain, so the scheduling
-    /// Workflow's Core can close each one when the Activity ends. A topic enters the set with the
-    /// first batch of a producer attempt, and a topic that no producer wrote is not in it. Other
+    /// Workflow's Core can close each one when the Activity ends. A topic enters the set with
+    /// every batch, and a topic that no producer wrote is not in it. Other
     /// chains keep no set and answer empty.
     async fn written_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>>;
 
@@ -176,7 +180,7 @@ pub trait StreamStore: Send + Sync {
     /// positions-only reader that must find them again on replay. The store keeps the lowest
     /// position a holder held, and renews the holder's lease. An empty position holds the whole
     /// topic. A store that can't hold refuses, so a positions-only read fails at once and not
-    /// at replay.
+    /// at replay. A new holder past [MAX_FLOOR_HOLDERS] live ones on the topic is refused.
     async fn hold_floor(
         &self,
         chain: &ChainId,

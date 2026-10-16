@@ -30,7 +30,8 @@
 //!
 //! ```text
 //! <prefix>:{<tag of slot s>}:n      slot s's notification entries
-//! <prefix>:{<tag of slot d>}:bell   doorbell d, which slots s with s % doorbells == d ring
+//! <prefix>:{<tag of slot d * 16384 / doorbells>}:bell
+//!                                    doorbell d, which slots s with s % doorbells == d ring
 //! ```
 //!
 //! Each part, the prefix included, is percent-encoded, so a `:` or a brace in an id cannot make
@@ -110,9 +111,11 @@ pub(crate) fn notifications(prefix: &str, slot: u16) -> String {
     format!("{}:{{{}}}:n", part(prefix), slots::tag(slot))
 }
 
-/// Doorbell `doorbell`'s stream.
-pub(crate) fn doorbell(prefix: &str, doorbell: u32) -> String {
-    format!("{}:{{{}}}:bell", part(prefix), slots::tag(doorbell as u16))
+/// Doorbell `doorbell`'s stream, of `doorbells`. The doorbells spread over the slot range, so
+/// a cluster's primaries share them.
+pub(crate) fn doorbell(prefix: &str, doorbell: u32, doorbells: u32) -> String {
+    let slot = u64::from(doorbell) * slots::SLOTS as u64 / u64::from(doorbells.max(1));
+    format!("{}:{{{}}}:bell", part(prefix), slots::tag(slot as u16))
 }
 
 /// The chain and topic of a log key that a notification entry names, or `None` when the key is
@@ -417,5 +420,13 @@ mod tests {
             workflow_activity_pattern("p", "ns", "a*b"),
             "p:{ns:!wa:a%2Ab:*"
         );
+    }
+
+    #[test]
+    fn the_doorbells_spread_over_the_slot_range() {
+        let slots: Vec<u16> = (0..16)
+            .map(|d| super::super::conn::slot(&doorbell("p", d, 16)))
+            .collect();
+        assert_eq!(slots, (0..16).map(|d| d * 1024).collect::<Vec<u16>>());
     }
 }
