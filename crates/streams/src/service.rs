@@ -813,7 +813,11 @@ mod tests {
         assert_eq!(full.name, "memory");
         let capabilities = full.capabilities.unwrap();
         assert!(capabilities.producer_state && capabilities.kept_last);
-        assert!(capabilities.dense_positions && !capabilities.holds);
+        assert!(capabilities.dense_positions && capabilities.holds);
+        assert!(
+            !capabilities.change_feed,
+            "a store with no notification log has no change feed"
+        );
         assert_eq!(capabilities.max_record_bytes, 1536 * 1024);
         assert_eq!(capabilities.max_batch_bytes, 4 << 20);
         let masked = StreamService::connect(

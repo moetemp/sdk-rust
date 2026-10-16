@@ -35,8 +35,8 @@ const FULL: Capabilities = Capabilities {
         fence: false,
     },
     kept_last: true,
-    holds: false,
-    change_feed: false,
+    holds: true,
+    change_feed: true,
     cheap_logs: true,
     delete_owner: true,
     topic_listing: true,
@@ -321,15 +321,16 @@ impl MemoryStore {
         }
     }
 
-    /// An empty store with only the capabilities both it and `mask` have, and the limits of
-    /// `mask`. Without producer state it keeps no dedupe entries and no close flags, without a
-    /// kept last position its reads never fail as expired or not found, and without a long poll
-    /// its reads never wait.
+    /// An empty store with only the capabilities both it and `mask` have, and the limits and
+    /// the replay horizon of `mask`. Without producer state it keeps no dedupe entries and no
+    /// close flags, without a kept last position its reads never fail as expired or not found,
+    /// and without a long poll its reads never wait.
     pub fn with_capabilities(mask: Capabilities) -> Self {
         Self {
             capabilities: Capabilities {
                 max_record_bytes: mask.max_record_bytes,
                 max_batch_bytes: mask.max_batch_bytes,
+                replay_horizon: mask.replay_horizon,
                 ..FULL.masked(&mask)
             },
             ..Self::default()
@@ -356,6 +357,15 @@ impl MemoryStore {
         }
         topic.records.drain(..drop);
         topic.base += drop as u64;
+    }
+
+    fn holds(&self) -> StreamResult<()> {
+        if self.capabilities.holds {
+            return Ok(());
+        }
+        Err(StreamError::unsupported(
+            "this store can't hold records for a positions-only reader",
+        ))
     }
 
     fn producer_state(&self) -> StreamResult<()> {
@@ -467,7 +477,10 @@ impl StreamStore for MemoryStore {
     }
 
     fn capabilities(&self) -> Capabilities {
-        self.capabilities
+        Capabilities {
+            change_feed: self.capabilities.change_feed && self.log.is_some(),
+            ..self.capabilities
+        }
     }
 
     async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
@@ -657,6 +670,7 @@ impl StreamStore for MemoryStore {
         holder: &str,
         position: &str,
     ) -> StreamResult<()> {
+        self.holds()?;
         let position = parse_position(position)?;
         let mut chains = self.chains.lock().unwrap();
         let holders = chains
@@ -678,6 +692,7 @@ impl StreamStore for MemoryStore {
 
     /// The memory store has no clock for retention, so a release ends the hold at once.
     async fn release_floor(&self, chain: &ChainId, topic: &str, holder: &str) -> StreamResult<()> {
+        self.holds()?;
         if let Some(holders) = self
             .chains
             .lock()
@@ -699,6 +714,7 @@ impl StreamStore for MemoryStore {
         topic: &str,
         position: &str,
     ) -> StreamResult<()> {
+        self.holds()?;
         if !self.archive_hold {
             return Err(StreamError::unsupported("this store keeps no archive hold"));
         }
@@ -761,7 +777,10 @@ impl StreamStore for MemoryStore {
         topic: &str,
         close: StoredClose,
     ) -> StreamResult<StoredClose> {
-        self.producer_state()?;
+        if !self.capabilities.producer_state {
+            crate::close::write_close(self, chain, topic, &close).await?;
+            return Ok(close);
+        }
         let stored = {
             let mut chains = self.chains.lock().unwrap();
             let topic = chains
@@ -941,22 +960,23 @@ mod tests {
 
     #[test]
     fn a_mask_only_takes_capabilities_away() {
-        assert_eq!(MemoryStore::new().capabilities(), FULL);
+        // The change feed comes with a notification log.
+        let no_log = Capabilities {
+            change_feed: false,
+            ..FULL
+        };
+        assert_eq!(MemoryStore::new().capabilities(), no_log);
+        assert_eq!(MemoryStore::with_notification_log().capabilities(), FULL);
         let masked = log_only().capabilities();
         assert!(!masked.producer_state && !masked.kept_last && !masked.long_poll);
         // Positions stay offsets whatever the mask, and the limits stay the store's.
         assert!(masked.dense_positions);
         assert_eq!(masked.max_record_bytes, MAX_RECORD_BYTES);
-        let all = Capabilities {
-            holds: true,
-            change_feed: true,
-            ..FULL
-        };
-        assert_eq!(MemoryStore::with_capabilities(all).capabilities(), FULL);
+        assert_eq!(MemoryStore::with_capabilities(FULL).capabilities(), no_log);
     }
 
     #[tokio::test]
-    async fn without_producer_state_a_repeat_lands_again_and_closes_are_unsupported() {
+    async fn without_producer_state_a_repeat_lands_again_and_a_close_is_a_record() {
         let store = log_only();
         let first = store.append(append(1, &[b"a"])).await.unwrap();
         let again = store.append(append(1, &[b"a"])).await.unwrap();
@@ -964,7 +984,6 @@ mod tests {
         assert_eq!(store.read(read_after("")).await.unwrap().records.len(), 2);
         for error in [
             store.close_chain(&chain()).await.unwrap_err(),
-            store.close_topic(&chain(), "out").await.unwrap_err(),
             store
                 .retire_producer(&chain(), "out", "p", 1)
                 .await
@@ -972,6 +991,10 @@ mod tests {
         ] {
             assert_eq!(error.kind, StreamFailureKind::Unsupported);
         }
+        store.close_topic(&chain(), "out").await.unwrap();
+        let read = store.read(read_after("")).await.unwrap();
+        assert_eq!(read.records.len(), 3);
+        assert!(!read.closed);
     }
 
     #[tokio::test]

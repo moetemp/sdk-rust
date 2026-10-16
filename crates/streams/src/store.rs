@@ -320,22 +320,28 @@ pub trait StreamStore: Send + Sync {
     }
 
     /// Marks one topic of a chain closed, like [StreamStore::close_chain] for that topic alone.
+    /// A store without producer state appends a `CLOSE` record instead, which ends every read
+    /// there but refuses no append.
     async fn close_topic(&self, chain: &ChainId, topic: &str) -> StreamResult<()> {
-        let _ = (chain, topic);
-        unsupported("keep close flags")
+        crate::close::write_close(self, chain, topic, &StoredClose::default()).await
     }
 
     /// Like [StreamStore::close_topic], with the close's outcome and who closed it. A store that
     /// keeps the outcome keeps the topic's first close only, and a read of the closed topic
     /// answers it. Answers the close the store keeps, so a wrapper tells the stream's notifier the
-    /// same close a reader sees. A store that keeps none answers `close`.
+    /// same close a reader sees. A store that keeps none answers `close`. Without producer state
+    /// the `CLOSE` record carries the outcome, and the first record wins for every reader.
     async fn close_topic_with(
         &self,
         chain: &ChainId,
         topic: &str,
         close: StoredClose,
     ) -> StreamResult<StoredClose> {
-        self.close_topic(chain, topic).await?;
+        if self.capabilities().producer_state {
+            self.close_topic(chain, topic).await?;
+        } else {
+            crate::close::write_close(self, chain, topic, &close).await?;
+        }
         Ok(close)
     }
 

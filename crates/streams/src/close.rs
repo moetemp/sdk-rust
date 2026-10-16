@@ -7,8 +7,8 @@
 use crate::{
     StreamResult, StreamStore, close_record,
     proto::{
-        ChainId, StoreAppendRequest, StoreAppendResponse, StoreReadRequest, StreamRecord,
-        StreamRecordKind,
+        ChainId, StoreAppendRequest, StoreAppendResponse, StoreReadRequest, StoredClose,
+        StreamRecord, StreamRecordKind,
     },
     topic_record,
 };
@@ -108,9 +108,24 @@ async fn chain_topics(store: &dyn StreamStore, chain: &ChainId) -> StreamResult<
     Ok(topics)
 }
 
+/// Appends a `CLOSE` record for `topic` that carries `close`'s outcome and names who closed it.
+pub(crate) async fn write_close<S: StreamStore + ?Sized>(
+    store: &S,
+    chain: &ChainId,
+    topic: &str,
+    close: &StoredClose,
+) -> StreamResult<()> {
+    let record = StreamRecord {
+        close_result: close.result.clone(),
+        close_failure: close.failure.clone(),
+        ..close_record(topic, &close.closed_by, 0)
+    };
+    write_one(store, chain, topic, record).await
+}
+
 /// Appends one control record. Its sequence is zero, so no reader takes it for a copy.
-async fn write_one(
-    store: &dyn StreamStore,
+async fn write_one<S: StreamStore + ?Sized>(
+    store: &S,
     chain: &ChainId,
     topic: &str,
     record: StreamRecord,

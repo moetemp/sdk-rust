@@ -285,13 +285,18 @@ pub(crate) async fn read_with(
     request: &ReadRequest,
     state: &mut ReadState,
 ) -> StreamResult<(ReadResponse, bool, Option<StoredClose>)> {
-    if state.closed {
-        let response = ReadResponse {
-            cursor: request.after.clone(),
-            ..Default::default()
-        };
-        return Ok((response, true, None));
-    }
+    read_bounded(store, target, request, state, None).await
+}
+
+/// [read_with] that stops once it reached the cursor `until`, so a replay read takes the records
+/// up to the recorded end and its state sees nothing past it.
+pub(crate) async fn read_bounded(
+    store: &dyn StreamStore,
+    target: &ReadTarget,
+    request: &ReadRequest,
+    state: &mut ReadState,
+    until: Option<&str>,
+) -> StreamResult<(ReadResponse, bool, Option<StoredClose>)> {
     let from_end = request.after == END;
     let position = if from_end {
         store
@@ -383,6 +388,9 @@ pub(crate) async fn read_with(
     let max_bytes = usize::try_from(request.max_bytes).unwrap_or(usize::MAX);
     let (mut bytes, mut kept) = (0usize, 0usize);
     for stored in page.records {
+        if until.is_some_and(|until| previous == until) {
+            break;
+        }
         // The first record always goes, so a record above the budget still reads.
         if max_bytes > 0 && kept > 0 && bytes + stored.record.len() > max_bytes {
             // The records left come first, so the close waits for the next answer.
@@ -404,11 +412,20 @@ pub(crate) async fn read_with(
         };
         match StreamRecordKind::try_from(record.kind) {
             // The cursor stays before the close, so a read that resumes there ends at it too.
+            // A later call reads the close again, so it answers the outcome too.
             Ok(StreamRecordKind::Close)
                 if record.topic.is_empty() || record.topic == target.topic =>
             {
                 state.closed = true;
                 closed = true;
+                // A chain close keeps no outcome.
+                if !record.topic.is_empty() {
+                    close = Some(StoredClose {
+                        result: record.close_result,
+                        failure: record.close_failure,
+                        closed_by: record.producer_id,
+                    });
+                }
                 break;
             }
             Ok(StreamRecordKind::Close | StreamRecordKind::Topic) => {

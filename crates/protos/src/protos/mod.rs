@@ -3103,6 +3103,8 @@ mod sdk_helpers {
                     link: None,
                     task_started_event_id: 0,
                     completed_tasks: vec![],
+                    close_result: None,
+                    close_failure: None,
                 }
             }
 

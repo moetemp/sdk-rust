@@ -139,7 +139,9 @@ write, and `+xreadgroup +xautoclaim +xack +xdel +xgroup|create +xlen +xadd +clus
 kept. So the store declares neither producer state nor a kept last position, and Core takes
 their fallbacks: readers drop copies and end at the first `CLOSE` record, and a read decides
 expiry from the record at its cursor. It exists so tests run those fallbacks on a real store.
-Listing a chain's topics scans every primary, as a delete does, and needs `+scan`.
+Listing a chain's topics scans every primary, as a delete does, and needs `+scan`. With no script
+there is no notification log, no floor hold and no archive hold, so plain mode declares neither
+holds nor a change feed, and a config that asks for a log or an archive is refused.
 
 **Tests.** The Redis tests run when `STREAMS_REDIS_URL` names a standalone server and
 `STREAMS_REDIS_CLUSTER_URL` a cluster seed. `scripts/redis-test-servers.sh` starts both, the

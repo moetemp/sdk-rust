@@ -16,7 +16,7 @@ use crate::{
         StoredClose, StreamAddress, StreamFailureKind, StreamOwnerKind, append_request,
         read_record, retire_producer_request,
     },
-    reader::{ReadState, read_with},
+    reader::{ReadState, read_bounded, read_with},
     stored_append_record, stream_hash,
 };
 use prost::Message;
@@ -434,7 +434,19 @@ impl Streams {
     }
 
     /// Holds the records after `after` against retention for `holder`, a positions-only reader.
+    /// A store that can't hold serves the reader only when it declares a replay horizon, and
+    /// refuses it otherwise, so the read fails at once and not at replay.
     async fn hold_floor(&self, target: &ReadTarget, after: &str, holder: &str) -> StreamResult<()> {
+        let capabilities = self.store.capabilities();
+        if !capabilities.holds {
+            if capabilities.replay_horizon.is_some() {
+                return Ok(());
+            }
+            return Err(StreamError::unsupported(
+                "a positions-only read needs a store that holds records for a replay or declares \
+                 a replay horizon, and this store does neither",
+            ));
+        }
         if holder.len() > MAX_FLOOR_HOLDER_BYTES {
             return Err(StreamError::invalid_argument(format!(
                 "a floor holder is at most {MAX_FLOOR_HOLDER_BYTES} bytes, not {}",
@@ -511,23 +523,57 @@ impl Streams {
                 ..Default::default()
             }
         } else {
-            let page_request = ReadRequest {
-                stream: Some(stream.clone()),
-                after: request.after.clone(),
-                max_records: request.stored_records,
-                ..Default::default()
-            };
-            match read_with(&*self.store, &target, &page_request, &mut state).await {
-                Ok((page, _, _)) => page,
-                Err(error)
-                    if matches!(
-                        error.kind,
-                        StreamFailureKind::Expired | StreamFailureKind::NotFound
-                    ) =>
+            // Up to the recorded end, not a record count, since copies and control records the
+            // read dropped can put the store's page edges elsewhere.
+            let mut records = vec![];
+            let mut after = request.after.clone();
+            let mut start_cursor = None;
+            loop {
+                let page_request = ReadRequest {
+                    stream: Some(stream.clone()),
+                    after: after.clone(),
+                    max_records: request.stored_records.max(1),
+                    ..Default::default()
+                };
+                let page = match read_bounded(
+                    &*self.store,
+                    &target,
+                    &page_request,
+                    &mut state,
+                    Some(&request.to),
+                )
+                .await
                 {
-                    return Err(lost(error.message));
+                    Ok((page, _, _)) => page,
+                    Err(error)
+                        if matches!(
+                            error.kind,
+                            StreamFailureKind::Expired | StreamFailureKind::NotFound
+                        ) =>
+                    {
+                        return Err(lost(error.message));
+                    }
+                    Err(error) => return Err(error),
+                };
+                start_cursor.get_or_insert(page.start_cursor);
+                let moved = page.cursor != after;
+                records.extend(page.records);
+                after = page.cursor;
+                let stored = records
+                    .iter()
+                    .filter(|record| matches!(record.record, Some(read_record::Record::Stored(_))))
+                    .count();
+                if after == request.to || !moved || stored > expected {
+                    break;
                 }
-                Err(error) => return Err(error),
+            }
+            ReadResponse {
+                cursor: after,
+                records_digest: crate::reader::records_digest(&records),
+                records,
+                chain_first_run_id: request.chain_first_run_id.clone(),
+                start_cursor: start_cursor.unwrap_or_default(),
+                ..Default::default()
             }
         };
         let stored = page
@@ -539,6 +585,13 @@ impl Streams {
             return Err(lost(format!(
                 "the store holds {stored} of the {expected} records after {:?} that the read got",
                 request.after
+            )));
+        }
+        if stored > expected {
+            return Err(mismatch(format!(
+                "the replayed read holds {stored} records up to {:?}, not the {expected} the read \
+                 got",
+                request.to
             )));
         }
         if page.cursor != request.to || page.records_digest != request.records_digest {
@@ -2389,6 +2442,93 @@ mod tests {
             floor_holder: String::new(),
             start_from_end: request.after == crate::END,
         }
+    }
+
+    #[tokio::test]
+    async fn a_replay_reads_to_the_recorded_end_past_dropped_copies() {
+        let setup = setup_on(without_producer_state(), StreamsOptions::default());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        // The answer was lost, so the producer sent the batch again.
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup.streams.append(append("p", 2, "2")).await.unwrap();
+        let request = ReadRequest {
+            stream: Some(stream("out")),
+            max_records: 3,
+            ..Default::default()
+        };
+        let page = setup.streams.read(request.clone()).await.unwrap();
+        assert_eq!(page.records.len(), 2);
+        let replayed = setup
+            .streams
+            .read_range(replay_of(&request, &page))
+            .await
+            .unwrap();
+        assert_eq!(replayed.cursor, page.cursor);
+        assert_eq!(replayed.records_digest, page.records_digest);
+        assert_eq!(replayed.records, page.records);
+    }
+
+    #[tokio::test]
+    async fn a_positions_only_read_needs_holds_or_a_replay_horizon() {
+        let no_holds = crate::Capabilities {
+            holds: false,
+            ..MemoryStore::new().capabilities()
+        };
+        let request = ReadRequest {
+            stream: Some(stream("out")),
+            floor_holder: "reader-run/1".to_string(),
+            ..Default::default()
+        };
+        let setup = setup_on(
+            MemoryStore::with_capabilities(no_holds),
+            StreamsOptions::default(),
+        );
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        let error = setup.streams.read(request.clone()).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Unsupported);
+        let with_horizon = crate::Capabilities {
+            replay_horizon: Some(Duration::from_secs(30 * 24 * 60 * 60)),
+            ..no_holds
+        };
+        let setup = setup_on(
+            MemoryStore::with_capabilities(with_horizon),
+            StreamsOptions::default(),
+        );
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        let page = setup.streams.read(request).await.unwrap();
+        assert_eq!(page.records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn without_close_flags_a_close_record_carries_its_outcome_to_readers() {
+        let setup = setup_on(without_producer_state(), quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        let result = Payload {
+            data: b"done".to_vec(),
+            ..Default::default()
+        };
+        setup
+            .streams
+            .close(CloseRequest {
+                stream: Some(stream("out")),
+                result: Some(result.clone()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // A second close lands too, and readers keep the first.
+        setup
+            .streams
+            .close(CloseRequest {
+                stream: Some(stream("out")),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (delivered, end) = read_to_end(&setup.streams, Duration::from_secs(5)).await;
+        assert_eq!(delivered, 1);
+        assert!(end.done);
+        assert_eq!(end.close_result, Some(result));
     }
 
     fn attempt(producer: &str, attempt: i64, sequence: i64, value: &str) -> AppendRequest {

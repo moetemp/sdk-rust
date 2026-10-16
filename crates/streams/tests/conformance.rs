@@ -2532,10 +2532,8 @@ mod cases {
             unsupported(store.close_chain(&chain).await),
             !declared.producer_state
         );
-        assert_eq!(
-            unsupported(store.close_topic(&chain, OUT).await),
-            !declared.producer_state
-        );
+        // Without close flags a topic close is a `CLOSE` record, which every store can append.
+        store.close_topic(&chain, OUT).await.unwrap();
         assert_eq!(
             unsupported(store.retire_producer(&chain, OUT, "p", 1).await),
             !declared.producer_state
@@ -2558,6 +2556,11 @@ mod cases {
             .await;
         assert_eq!(unsupported(delete.map(drop)), !declared.delete_owner);
         assert!(declared.max_record_bytes > 0 && declared.max_batch_bytes > 0);
+        assert_eq!(
+            unsupported(store.hold_floor(&chain, OTHER, "reader", "").await),
+            !declared.holds
+        );
+        assert_eq!(store.notification_log().is_some(), declared.change_feed);
     }
 
     /// Without producer state a repeat after a lost answer lands again, and readers drop it.

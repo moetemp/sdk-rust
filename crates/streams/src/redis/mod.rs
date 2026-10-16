@@ -47,8 +47,8 @@ const CAPABILITIES: Capabilities = Capabilities {
         fence: false,
     },
     kept_last: true,
-    holds: false,
-    change_feed: false,
+    holds: true,
+    change_feed: true,
     cheap_logs: true,
     delete_owner: true,
     topic_listing: true,
@@ -161,6 +161,12 @@ impl RedisStore {
                 "the retention must be at least a millisecond, not {:?}",
                 options.retention
             )));
+        }
+        if options.plain && (options.notification_log || options.archive_lease.is_some()) {
+            return Err(StreamError::refused(
+                "the Redis store in plain mode runs no script, so it keeps no notification log \
+                 and no archive hold",
+            ));
         }
         if options.archive_lease.is_some() && !options.notification_log {
             return Err(StreamError::refused(
@@ -342,6 +348,15 @@ impl RedisStore {
             records: found,
             ..Default::default()
         })
+    }
+
+    fn holds(&self) -> StreamResult<()> {
+        if self.plain {
+            return Err(StreamError::unsupported(
+                "the Redis store in plain mode can't hold records for a positions-only reader",
+            ));
+        }
+        Ok(())
     }
 
     fn producer_state(&self) -> StreamResult<()> {
@@ -678,10 +693,15 @@ impl StreamStore for RedisStore {
             return Capabilities {
                 producer_state: false,
                 kept_last: false,
+                holds: false,
+                change_feed: false,
                 ..CAPABILITIES
             };
         }
-        CAPABILITIES
+        Capabilities {
+            change_feed: self.log.is_some(),
+            ..CAPABILITIES
+        }
     }
 
     async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
@@ -905,6 +925,7 @@ impl StreamStore for RedisStore {
         holder: &str,
         position: &str,
     ) -> StreamResult<()> {
+        self.holds()?;
         let keys = ChainKeys::new(&self.prefix, chain);
         // Redis never stores `0-0`, so `0-1` holds every record, and the trim's exclusive range
         // below it stays valid. Below it, a crafted `0-0` would fail every later append.
@@ -929,6 +950,7 @@ impl StreamStore for RedisStore {
     }
 
     async fn release_floor(&self, chain: &ChainId, topic: &str, holder: &str) -> StreamResult<()> {
+        self.holds()?;
         let keys = ChainKeys::new(&self.prefix, chain);
         let mut script = scripts::RELEASE_SCRIPT.key(keys.floors(topic));
         // The archive releases once it holds a closed topic to its end, so the topic leaves the
@@ -952,6 +974,7 @@ impl StreamStore for RedisStore {
         topic: &str,
         position: &str,
     ) -> StreamResult<()> {
+        self.holds()?;
         let Some(lease) = self.archive_lease_ms else {
             return Err(StreamError::unsupported("this store keeps no archive hold"));
         };
@@ -1013,7 +1036,10 @@ impl StreamStore for RedisStore {
         close: StoredClose,
     ) -> StreamResult<StoredClose> {
         let keys = ChainKeys::new(&self.prefix, chain);
-        self.producer_state()?;
+        if self.plain {
+            crate::close::write_close(self, chain, topic, &close).await?;
+            return Ok(close);
+        }
         // The meta is the topic's tombstone, so the mark and the outcome live as long as the topic
         // is known.
         let mut script = scripts::CLOSE_SCRIPT.key(keys.meta(topic));
