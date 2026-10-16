@@ -71,8 +71,8 @@ with score `0`, so the archive takes closed topics first. `advance.lua` takes it
 archive holds the meta's `last`, and the archive's release takes it out after a closed topic's
 end. The archive needs the notification log. The archived append script has its own hash. With an
 archive, an application also needs `~temporal-streams:{*}:a +zadd +hexists`, and a driver also
-needs `+zrange +zrem` on those keys. A delete takes a deleted topic's mark out of the set, so it also
-needs `+zrem` there.
+needs `+zrange +zrem` on those keys. A delete takes a deleted topic's mark out of the set, so it
+also needs `+zrem` there.
 
 **Retired producers.** A field stays until a write's trim finds it older than the retention, so
 a topic written by many short-lived producers holds one field per producer attempt of the last

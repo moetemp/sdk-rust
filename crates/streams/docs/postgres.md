@@ -69,9 +69,9 @@ lost ring too. The listener sets TCP keepalive to notice a dead connection withi
 
 **Retention.** PostgreSQL has no key expiry, so each store runs a janitor every
 `janitor_interval` (one minute). A transaction advisory lock around each step lets one janitor
-work at a time across processes, also through PgBouncer in transaction mode. A pass trims the topics that are due, at most 10,000 records per topic per
-transaction, and keeps what a hold holds. It moves the topic's newest dropped position in the same
-transaction. A topic whose records are all gone keeps its row as the tombstone for the retention
+work at a time across processes, also through PgBouncer in transaction mode. A pass trims the
+topics that are due, at most 10,000 records per topic per transaction, and keeps what a hold
+holds. It moves the topic's newest dropped position in the same transaction. A topic whose records are all gone keeps its row as the tombstone for the retention
 plus 30 days after its last write, as Redis keeps a topic's meta. Then the janitor deletes it, and
 a chain row with no topics that nothing touched for as long. `PostgresStore::run_janitor` runs a
 pass at once.
