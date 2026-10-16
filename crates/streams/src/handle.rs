@@ -203,11 +203,7 @@ impl Streams {
         }
         check_append_digest(&request.digest)?;
         let chain = self
-            .producer_chain(ProducerKey {
-                owner: owner_key(stream),
-                producer_id: producer_id.clone(),
-                attempt,
-            })
+            .producer_chain(producer_key(owner_key(stream), &producer_id, attempt))
             .await?;
         let records = request
             .records
@@ -399,11 +395,7 @@ impl Streams {
                 return Err(StreamError::invalid_argument("a retire needs its producer"));
             }
         };
-        let key = ProducerKey {
-            owner: owner_key(stream),
-            producer_id,
-            attempt,
-        };
+        let key = producer_key(owner_key(stream), &producer_id, attempt);
         // The chain the attempt's appends resolved, even when a newer chain took the Workflow
         // id since, so the state goes from where it was written.
         let chain = match self.producers.get(&key) {
@@ -650,6 +642,27 @@ fn producer(
         )));
     }
     Ok((producer_id, attempt))
+}
+
+/// The key a producer attempt's chain is remembered by. A Workflow writes through a new local
+/// producer per flush, `__temporal_<kind>_<n>@<run id>`, and every flush of a run shares the
+/// run's chain. So they share one entry, and a busy run can't push the long-lived producers out.
+fn producer_key(owner: OwnerKey, producer_id: &str, attempt: i64) -> ProducerKey {
+    match producer_id
+        .strip_prefix("__temporal_")
+        .and_then(|rest| rest.rsplit_once('@'))
+    {
+        Some((_, run_id)) => ProducerKey {
+            owner,
+            producer_id: format!("__temporal_@{run_id}"),
+            attempt: 0,
+        },
+        None => ProducerKey {
+            owner,
+            producer_id: producer_id.to_string(),
+            attempt,
+        },
+    }
 }
 
 fn check_topic(topic: &str) -> StreamResult<()> {
@@ -1170,6 +1183,29 @@ mod tests {
         assert_eq!(error.kind, StreamFailureKind::Closed);
         assert!(error.message.contains("gone from History"), "{error}");
         assert!(chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test]
+    async fn a_workflows_local_producers_share_one_memory_entry() {
+        let setup = setup(StreamsOptions {
+            remembered: 2,
+            ..StreamsOptions::default()
+        });
+        setup
+            .streams
+            .append(append("long-lived", 1, "1"))
+            .await
+            .unwrap();
+        for flush in 1..=20 {
+            let producer = format!("__temporal_local_{flush}@run-1");
+            setup
+                .streams
+                .append(append(&producer, 1, "x"))
+                .await
+                .unwrap();
+        }
+        let key = producer_key(owner_key(&stream("out")), "long-lived", 1);
+        assert!(setup.streams.producers.get(&key).is_some());
     }
 
     #[tokio::test]
