@@ -115,6 +115,8 @@ fn token(answer: &Value) -> &str {
 struct Waker {
     waits: std::sync::Mutex<Vec<(ChainId, String, String, i64)>>,
     late: std::sync::Mutex<Option<(Arc<dyn StreamStore>, StoreAppendRequest)>>,
+    /// Refuses every wait, as a notifier that lost the callback does.
+    refuse: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -134,6 +136,9 @@ impl NotifierClient for Waker {
             .lock()
             .unwrap()
             .push((chain, topic, request_id, after_counter));
+        if self.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(NotifyError::Refused("no such callback".to_string()));
+        }
         let late = self.late.lock().unwrap().take();
         if let Some((store, request)) = late {
             store.append(request).await.unwrap();
@@ -1069,6 +1074,33 @@ mod cases {
         assert_eq!(waker.waits.lock().unwrap().len(), 1);
     }
 
+    pub(crate) async fn a_wake_token_of_another_chain_is_refused(store: Arc<dyn StreamStore>) {
+        let waker = Arc::new(Waker::default());
+        let calls = service(store, NexusOptions::default()).with_callers(waker.clone());
+        let wf = workflow();
+        let last = write(&calls, &wf, 1, &["one"]).await;
+        let mut token = OperationToken::decode(NAMESPACE, &operation_token(&wf)).unwrap();
+        token.chain_first_run_id = "run-0".to_string();
+        let mut input = read_input(&wf, &last);
+        input["wake_token"] = json!(token.encode());
+        let refused = read(&calls, input).await.unwrap_err();
+        assert_eq!(kind_of(&refused).0, "BAD_REQUEST");
+        assert!(waker.waits.lock().unwrap().is_empty());
+    }
+
+    pub(crate) async fn a_refused_wait_answers_empty(store: Arc<dyn StreamStore>) {
+        let waker = Arc::new(Waker::default());
+        waker
+            .refuse
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let calls = service(store, NexusOptions::default()).with_callers(waker.clone());
+        let wf = workflow();
+        let last = write(&calls, &wf, 1, &["one"]).await;
+        let caught_up = read(&calls, waking(&wf, &last)).await.unwrap();
+        assert!(records(&caught_up).is_empty());
+        assert_eq!(waker.waits.lock().unwrap().len(), 1);
+    }
+
     pub(crate) async fn a_wake_token_of_another_stream_is_refused(store: Arc<dyn StreamStore>) {
         let waker = Arc::new(Waker::default());
         let calls = service(store, NexusOptions::default()).with_callers(waker.clone());
@@ -1129,6 +1161,8 @@ macro_rules! all_cases {
             a_wake_token_of_another_activity_is_refused,
             an_empty_activity_read_wakes_its_operation_on_the_activity_run,
             a_workflow_activity_stream_reads_apart_from_its_workflow_and_other_runs,
+            a_wake_token_of_another_chain_is_refused,
+            a_refused_wait_answers_empty,
         );
     };
 }
@@ -1362,6 +1396,31 @@ fn base64_of(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
+async fn a_holding_read_from_the_end_starts_at_latest_only_and_replays() {
+    let (streams, calls) = layered(memory());
+    let wf = workflow();
+    write(&calls, &wf, 1, &["one"]).await;
+    let mut latest = read_input(&wf, "");
+    latest.as_object_mut().unwrap().remove("after_token");
+    latest["latest_only"] = json!(true);
+    let end = read(&calls, latest).await.unwrap();
+    append(&calls, append_input(&wf, "p", 2, 1, &["two"]))
+        .await
+        .unwrap();
+    let live = read(&calls, holding(&wf, token(&end))).await.unwrap();
+    assert_eq!(values(&live), ["SUPERSEDED p 1->2", "p@2 two"]);
+    let replayed = streams
+        .read_range(replay_of(&wf, &live, &[]))
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed.records.len(),
+        2,
+        "the replay sees what the live read saw"
+    );
+}
+
+#[tokio::test]
 async fn a_range_replays_with_the_state_the_read_sent() {
     let (streams, calls) = layered(memory());
     let wf = workflow();
@@ -1425,14 +1484,38 @@ async fn a_record_the_reader_cannot_parse_has_an_empty_range_at_its_cursor() {
 }
 
 #[tokio::test]
+async fn a_floor_holder_names_the_caller_and_starts_at_a_cursor() {
+    let calls = service(memory(), NexusOptions::default());
+    let wf = workflow();
+    write(&calls, &wf, 1, &["one"]).await;
+    for holder in ["reader-run/1", "ns//1", "archive"] {
+        let mut input = read_input(&wf, "");
+        input["floor_holder"] = json!(holder);
+        let refused = read(&calls, input).await.unwrap_err();
+        assert_eq!(
+            kind_of(&refused),
+            ("BAD_REQUEST", false, "ValueError"),
+            "{holder}"
+        );
+    }
+    let refused = read(&calls, holding(&wf, "$end")).await.unwrap_err();
+    assert_eq!(kind_of(&refused), ("BAD_REQUEST", false, "ValueError"));
+    assert!(
+        refused.message.contains("latest_only"),
+        "{}",
+        refused.message
+    );
+}
+
+#[tokio::test]
 async fn a_floor_holder_is_at_most_512_bytes_and_never_beside_latest_only() {
     let calls = service(memory(), NexusOptions::default());
     let wf = workflow();
     write(&calls, &wf, 1, &["one"]).await;
     let mut input = read_input(&wf, "");
-    input["floor_holder"] = json!("h".repeat(512));
+    input["floor_holder"] = json!(format!("ns/run/{}", "h".repeat(505)));
     read(&calls, input.clone()).await.unwrap();
-    input["floor_holder"] = json!("h".repeat(513));
+    input["floor_holder"] = json!(format!("ns/run/{}", "h".repeat(506)));
     let refused = read(&calls, input).await.unwrap_err();
     assert_eq!(kind_of(&refused), ("BAD_REQUEST", false, "ValueError"));
     assert!(refused.message.contains("512"), "{}", refused.message);

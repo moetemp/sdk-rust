@@ -46,9 +46,9 @@ pub use handle::{OWNER_RECHECK, OWNER_START_GRACE, Streams, StreamsOptions};
 pub use memory::MemoryStore;
 pub use nexus::{OPERATION_TOKEN_VERSION, OperationToken};
 pub use notify::{
-    CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, CallerAttachment, DEFAULT_MAX_NOTIFIERS, FLUSH_LIMIT,
-    Notifier, NotifierClient, NotifierPoll, NotifyError, NotifyingStore, StreamNotification,
-    WorkflowAttachment, progress_counter,
+    CLOSE_RETRY_CAP, CLOSE_RETRY_FIRST, CLOSE_RETRY_LIMIT, CallerAttachment, DEFAULT_MAX_NOTIFIERS,
+    FLUSH_LIMIT, Notifier, NotifierClient, NotifierPoll, NotifyError, NotifyingStore,
+    StreamNotification, WorkflowAttachment, progress_counter,
 };
 pub use notifylog::{ArchiveMark, NotificationEntry, NotificationLog};
 pub use owner::{OwnerClient, OwnerDescription, OwnerError, OwnerId, OwnerStatus};
@@ -61,7 +61,10 @@ pub use record::{
     stored_append_record, workflow_batch_digest, workflow_producer_id,
 };
 pub use service::StreamService;
-pub use store::{ARCHIVE_HOLDER, CloseOutcome, MAX_CLOSE_BYTES, StreamStore, empty_close_result};
+pub use store::{
+    ARCHIVE_HOLDER, CloseOutcome, MAX_CLOSE_BYTES, MAX_FLOOR_HOLDERS, StreamStore,
+    empty_close_result,
+};
 pub use tiered::TieredStore;
 
 /// The protos stores and lang exchange.
