@@ -100,6 +100,9 @@ pub(crate) struct ReadState {
     /// found one. The owner start grace counts from it.
     #[prost(uint64, tag = "11")]
     pub(crate) owner_missing_since_ms: u64,
+    /// Set once the read reached the first `CLOSE` record, so it ends there.
+    #[prost(bool, tag = "12")]
+    closed: bool,
 }
 
 /// What a read knows of one producer.
@@ -253,6 +256,10 @@ impl ReadState {
 /// copy. A read that starts from a cursor without state knows only the cursor record's sequence,
 /// so it can deliver a copy whose first copy came before the cursor.
 ///
+/// The first `CLOSE` record of the topic, or of the chain, ends the read on every store. The read
+/// answers the records before it, and later calls answer none. A `TOPIC` record is not the topic
+/// reader's, so the read skips it. The read writes nothing.
+///
 /// A record that does not parse fails the call as `RECORD` with its cursor, so the caller resumes
 /// past it on purpose. Skipping it would lose data no one hears of. The records before it in the
 /// same page are returned first, and the next call fails.
@@ -268,13 +275,21 @@ pub async fn read_page(
 }
 
 /// [read_page] with the state already decoded, for a caller that keeps fields of its own in it.
-/// The answer's `state` is left empty. Also answers whether the store marked the stream closed.
+/// The answer's `state` is left empty. Also answers whether the store marked the stream closed,
+/// or the read reached a `CLOSE` record.
 pub(crate) async fn read_with(
     store: &dyn StreamStore,
     target: &ReadTarget,
     request: &ReadRequest,
     state: &mut ReadState,
 ) -> StreamResult<(ReadResponse, bool)> {
+    if state.closed {
+        let response = ReadResponse {
+            cursor: request.after.clone(),
+            ..Default::default()
+        };
+        return Ok((response, true));
+    }
     let from_end = request.after == END;
     let position = if from_end {
         store
@@ -332,7 +347,7 @@ pub(crate) async fn read_with(
             },
         })
         .await?;
-    let closed = page.closed;
+    let mut closed = page.closed;
     let mut records = Vec::with_capacity(page.records.len());
     let mut previous = start;
     for stored in page.records {
@@ -347,6 +362,21 @@ pub(crate) async fn read_with(
             }
             Err(_) => break,
         };
+        match StreamRecordKind::try_from(record.kind) {
+            // The cursor stays before the close, so a read that resumes there ends at it too.
+            Ok(StreamRecordKind::Close)
+                if record.topic.is_empty() || record.topic == target.topic =>
+            {
+                state.closed = true;
+                closed = true;
+                break;
+            }
+            Ok(StreamRecordKind::Close | StreamRecordKind::Topic) => {
+                previous = cursor;
+                continue;
+            }
+            _ => {}
+        }
         let stale = match state.observe(&record) {
             Observed::Copy => {
                 previous = cursor;
@@ -387,7 +417,7 @@ pub(crate) async fn read_with(
     ))
 }
 
-/// A stored record as a reader delivers it. Fails on bytes that are no record, and on a kind no
+/// A stored record as the read takes it. Fails on bytes that are no record, and on a kind no
 /// writer stores, such as the `SUPERSEDED` that only readers synthesize.
 ///
 /// Empty bytes are no record either. Every stored record names its topic, so it is never empty,
@@ -398,7 +428,12 @@ fn parse(bytes: &[u8]) -> Result<StreamRecord, String> {
     }
     let mut record = StreamRecord::decode(bytes).map_err(|error| error.to_string())?;
     match StreamRecordKind::try_from(record.kind) {
-        Ok(StreamRecordKind::Data | StreamRecordKind::Finish) => {}
+        Ok(
+            StreamRecordKind::Data
+            | StreamRecordKind::Finish
+            | StreamRecordKind::Close
+            | StreamRecordKind::Topic,
+        ) => {}
         Ok(StreamRecordKind::Unspecified) => record.kind = StreamRecordKind::Data as i32,
         Err(_) => return Err(format!("no writer stores a record of kind {}", record.kind)),
     }
@@ -692,6 +727,64 @@ mod tests {
         assert_eq!(values(&earlier), ["2"]);
     }
 
+    fn control(kind: StreamRecordKind, topic: &str) -> Vec<u8> {
+        StreamRecord {
+            topic: topic.to_string(),
+            kind: kind as i32,
+            producer_id: "closer".to_string(),
+            attempt: 1,
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    #[tokio::test]
+    async fn the_first_close_ends_the_read_and_every_later_call() {
+        let log = Log::default();
+        log.write("p", 1, b"1");
+        log.push(control(StreamRecordKind::Topic, "out"));
+        log.write("p", 1, b"2");
+        log.push(control(StreamRecordKind::Close, "out"));
+        log.write("p", 1, b"3");
+        log.push(control(StreamRecordKind::Close, "out"));
+        let mut state = ReadState::default();
+        let request = ReadRequest {
+            after: BEGINNING.to_string(),
+            ..Default::default()
+        };
+        let (page, closed) = read_with(&log, &target(), &request, &mut state)
+            .await
+            .unwrap();
+        assert!(closed);
+        assert_eq!(values(&page), ["1", "2"]);
+        // The cursor stays before the close, so a read that resumes there ends at it too.
+        assert_eq!(page.cursor, cursor("3"));
+        let lookups = log.lookups.load(Ordering::Relaxed);
+        let next = ReadRequest {
+            after: page.cursor.clone(),
+            ..Default::default()
+        };
+        let (again, closed) = read_with(&log, &target(), &next, &mut state).await.unwrap();
+        assert!(closed && again.records.is_empty());
+        assert_eq!(log.lookups.load(Ordering::Relaxed), lookups);
+        let resumed = read(&log, &page.cursor, &[]).await.unwrap();
+        assert!(resumed.records.is_empty());
+        let state = ReadState::decode_from(&resumed.state).unwrap();
+        assert!(state.closed);
+    }
+
+    #[tokio::test]
+    async fn a_chain_close_ends_the_read_and_another_topics_close_does_not() {
+        let log = Log::default();
+        log.write("p", 1, b"1");
+        log.push(control(StreamRecordKind::Close, "other"));
+        log.write("p", 1, b"2");
+        log.push(control(StreamRecordKind::Close, ""));
+        log.write("p", 1, b"3");
+        let read = read(&log, BEGINNING, &[]).await.unwrap();
+        assert_eq!(values(&read), ["1", "2"]);
+    }
+
     fn values(response: &ReadResponse) -> Vec<String> {
         response
             .records
@@ -732,7 +825,15 @@ mod tests {
                 Some(index) => cursor(&(index + 1).to_string()),
                 None => BEGINNING.to_string(),
             };
-            let page = read(&log, &after, &[]).await.unwrap();
+            let mut state = ReadState::default();
+            let request = ReadRequest {
+                after,
+                ..Default::default()
+            };
+            let (page, closed) = read_with(&log, &target(), &request, &mut state)
+                .await
+                .unwrap();
+            assert_eq!(closed, case["closed"].as_bool().unwrap_or(false), "{label}");
             let delivered: Vec<u64> = page
                 .records
                 .iter()

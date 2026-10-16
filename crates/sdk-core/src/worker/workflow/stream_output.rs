@@ -46,6 +46,9 @@ pub(crate) struct RetiredSessions {
     pub(crate) run_id: String,
     pub(crate) first_run_id: String,
     pub(crate) sessions: BTreeMap<i64, BTreeSet<String>>,
+    /// The run's attempt, when the task ends the run's chain. The chain closes once the server
+    /// accepts the task, since a command the server doesn't take can still keep the run open.
+    pub(crate) chain_end: Option<i64>,
 }
 
 /// The most record bytes one append carries. A larger commit goes as several appends per topic, so
@@ -239,7 +242,7 @@ impl OutputStore {
             let mut delay = APPEND_RETRY_FIRST;
             let mut tries = 1;
             loop {
-                match self.store.append(request.clone()).await {
+                match temporalio_streams::append_batch(&*self.store, request.clone()).await {
                     Ok(_) => break,
                     Err(error) if error.kind == StreamFailureKind::Closed => {
                         if !dropped.contains(&topic.topic) {
@@ -268,7 +271,9 @@ impl OutputStore {
 
     /// Drops the store's dedupe sessions of attempts that will not write again, in the
     /// background, so the next activation doesn't wait a store round trip per session. A
-    /// failure only leaves a session in the store until retention, so it is logged.
+    /// failure only leaves a session in the store until retention, so it is logged. Then closes
+    /// the chain when the run ended it. A failed close leaves each reader to end on the owner's
+    /// status and each producer at its owner check.
     pub(crate) fn retire(&self, retired: RetiredSessions) {
         let chain = self.chain(&retired.workflow_id, &retired.first_run_id);
         let producer_id = temporalio_streams::workflow_producer_id(&retired.run_id);
@@ -283,6 +288,12 @@ impl OutputStore {
                         debug!(%topic, attempt, %error, "Could not retire a stream output session");
                     }
                 }
+            }
+            if let Some(attempt) = retired.chain_end
+                && let Err(error) =
+                    temporalio_streams::close_chain(&*store, &chain, &producer_id, attempt).await
+            {
+                warn!(%error, "Could not close the streams of a run that ended its chain");
             }
         });
     }

@@ -145,6 +145,29 @@ fn stored_record(
     Ok(stored)
 }
 
+/// A `CLOSE` record that `producer_id` at `attempt` writes to end `topic` for every reader.
+pub fn close_record(topic: &str, producer_id: &str, attempt: i64) -> StreamRecord {
+    StreamRecord {
+        topic: topic.to_string(),
+        kind: StreamRecordKind::Close as i32,
+        producer_id: producer_id.to_string(),
+        attempt,
+        ..Default::default()
+    }
+}
+
+/// A `TOPIC` record that `producer_id` at `attempt` writes to the chain's control log before its
+/// first record on `topic`.
+pub fn topic_record(topic: &str, producer_id: &str, attempt: i64) -> StreamRecord {
+    StreamRecord {
+        topic: topic.to_string(),
+        kind: StreamRecordKind::Topic as i32,
+        producer_id: producer_id.to_string(),
+        attempt,
+        ..Default::default()
+    }
+}
+
 fn metadata_payload(data: &[u8]) -> Payload {
     Payload {
         metadata: [("encoding".to_string(), METADATA_ENCODING.to_vec())].into(),

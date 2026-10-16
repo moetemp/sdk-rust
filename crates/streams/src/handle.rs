@@ -5,7 +5,7 @@
 
 use crate::{
     BEGINNING, END, ReadTarget, StreamError, StreamResult, StreamStore, WORKFLOW_OWNER_KIND,
-    activity_producer_id, check_append_digest, mint_cursor,
+    activity_producer_id, append_batch, check_append_digest, close_topic, mint_cursor,
     owner::{OwnerClient, OwnerDescription, OwnerError},
     proto::{
         ActivityProducer, AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse,
@@ -138,6 +138,15 @@ impl<K: std::hash::Hash + Eq + Clone> Remembered<K> {
     }
 }
 
+/// The producer attempt a call writes as, and the topic it writes, so a close at its owner check
+/// reaches the topic on a store without close flags.
+#[derive(Debug, Clone, Copy)]
+struct Writer<'a> {
+    topic: &'a str,
+    producer_id: &'a str,
+    attempt: i64,
+}
+
 /// The stream layer over one store.
 pub struct Streams {
     store: Arc<dyn StreamStore>,
@@ -183,9 +192,10 @@ impl Streams {
     /// Appends one batch for one producer attempt.
     ///
     /// The first batch for an owner, and the first after [StreamsOptions::owner_recheck], asks
-    /// whether the owner's chain ended. All producers of the owner share that check. If it did, or Temporal no longer holds the owner,
-    /// or a new chain took the Workflow id, the chain is marked closed and the batch is refused
-    /// as closed.
+    /// whether the owner's chain ended. All producers of the owner share that check. If it did,
+    /// or Temporal no longer holds the owner, or a new chain took the Workflow id, the producer
+    /// closes the chain, or its own topic on a store without close flags, and the batch is
+    /// refused as closed.
     pub async fn append(&self, request: AppendRequest) -> StreamResult<AppendResponse> {
         let stream = address(request.stream.as_ref())?;
         let (producer_id, attempt) = match &request.producer {
@@ -209,8 +219,16 @@ impl Streams {
             ));
         }
         check_append_digest(&request.digest)?;
+        let writer = Writer {
+            topic: &stream.topic,
+            producer_id: &producer_id,
+            attempt,
+        };
         let chain = self
-            .producer_chain(producer_key(owner_key(stream), &producer_id, attempt))
+            .producer_chain(
+                producer_key(owner_key(stream), &producer_id, attempt),
+                writer,
+            )
             .await?;
         let records = request
             .records
@@ -227,9 +245,9 @@ impl Streams {
                 .map(|stored| stored.encode_to_vec())
             })
             .collect::<StreamResult<Vec<_>>>()?;
-        let landed = self
-            .store
-            .append(StoreAppendRequest {
+        let landed = append_batch(
+            &*self.store,
+            StoreAppendRequest {
                 chain: Some(chain),
                 topic: stream.topic.clone(),
                 producer_id,
@@ -239,8 +257,9 @@ impl Streams {
                 // store keeps it as given.
                 digest: request.digest.clone(),
                 records,
-            })
-            .await?;
+            },
+        )
+        .await?;
         Ok(AppendResponse {
             first_cursor: self.cursor(stream, &landed.first_position),
             last_cursor: self.cursor(stream, &landed.last_position),
@@ -377,25 +396,19 @@ impl Streams {
     }
 
     /// Whether the owner a read follows ended. Following the chain, a run that continued as
-    /// new is not the end, and a new chain on the Workflow id is.
+    /// new is not the end, and a new chain on the Workflow id is. A reader only ends its own read,
+    /// so it needs no write access. Producers and the owner's Core close the chain.
     async fn owner_ended(&self, stream: &StreamAddress, chain: &ChainId) -> StreamResult<bool> {
         let key = owner_key(stream);
         match self.describe(&key, &key.run_id).await {
             // The chain came from this Workflow, so History has since dropped it, or a failover
-            // hides it for a while. A reader only ends its own read, and producers close the
-            // chain.
+            // hides it for a while.
             Err(OwnerError::NotFound(_)) => Ok(self.gone_for_good(chain)),
             Err(error) => Err(describe_failed(&error)),
             Ok(described) if !key.run_id.is_empty() => {
                 Ok(described.status != WorkflowExecutionStatus::Running)
             }
-            Ok(latest) if !latest.chain_ended() && latest.first_run_id == chain.first_run_id => {
-                Ok(false)
-            }
-            Ok(_) => {
-                self.store.close_chain(chain).await?;
-                Ok(true)
-            }
+            Ok(latest) => Ok(latest.chain_ended() || latest.first_run_id != chain.first_run_id),
         }
     }
 
@@ -419,11 +432,12 @@ impl Streams {
         })
     }
 
-    /// Closes one stream, so producers' new batches are refused and reads end.
+    /// Closes one stream, so reads end. With close flags, producers' new batches are refused.
+    /// Without them, a batch that lands after the close is one no reader delivers.
     pub async fn close(&self, request: CloseRequest) -> StreamResult<CloseResponse> {
         let stream = address(request.stream.as_ref())?;
         let chain = self.chain(stream).await?;
-        self.store.close_topic(&chain, &stream.topic).await?;
+        close_topic(&*self.store, &chain, &stream.topic, "", 0).await?;
         Ok(CloseResponse {})
     }
 
@@ -484,13 +498,13 @@ impl Streams {
 
     /// The chain a producer writes on. A producer attempt stays on the chain it began on, and
     /// is refused once a new chain took the Workflow id.
-    async fn producer_chain(&self, key: ProducerKey) -> StreamResult<ChainId> {
-        let chain = self.owner_chain(&key.owner).await?;
+    async fn producer_chain(&self, key: ProducerKey, writer: Writer<'_>) -> StreamResult<ChainId> {
+        let chain = self.owner_chain(&key.owner, writer).await?;
         if let Some(began) = self.producers.get(&key)
             && began.first_run_id != chain.first_run_id
         {
             let began = chain_of_key(&key.owner, &began.first_run_id);
-            return Err(self.closed(&began, "has closed").await);
+            return Err(self.closed(&began, "has closed", writer).await);
         }
         self.producers
             .put(key, &chain.first_run_id, self.options.owner_recheck);
@@ -499,7 +513,7 @@ impl Streams {
 
     /// The chain an owner writes on now, asking about the owner when no producer of it asked
     /// within the recheck interval.
-    async fn owner_chain(&self, owner: &OwnerKey) -> StreamResult<ChainId> {
+    async fn owner_chain(&self, owner: &OwnerKey, writer: Writer<'_>) -> StreamResult<ChainId> {
         let recheck = self.options.owner_recheck;
         let known = self.owners.get(owner);
         if let Some(checked) = &known
@@ -513,18 +527,18 @@ impl Streams {
             if let (Err(OwnerError::NotFound(_)), Some(checked)) = (&latest, &known) {
                 // The chain came from this Workflow, so History has since dropped it.
                 let gone = chain_of_key(owner, &checked.first_run_id);
-                return Err(self.gone(&gone).await);
+                return Err(self.gone(&gone, writer).await);
             }
             let latest = latest.map_err(not_found)?;
             let chain = chain_of_key(owner, &first_run_id(owner, &latest)?);
             if latest.chain_ended() {
-                return Err(self.closed(&chain, "has closed").await);
+                return Err(self.closed(&chain, "has closed", writer).await);
             }
             chain
         } else if let Some(checked) = known {
             // A pinned run's chain never changes, so only its end is left to check.
             let chain = chain_of_key(owner, &checked.first_run_id);
-            self.refuse_if_ended(&chain).await?;
+            self.refuse_if_ended(&chain, writer).await?;
             chain
         } else {
             let pinned = self
@@ -534,7 +548,7 @@ impl Streams {
             let chain = chain_of_key(owner, &first_run_id(owner, &pinned)?);
             // A running run is its chain's latest, so it answers the end check too.
             if pinned.status != WorkflowExecutionStatus::Running {
-                self.refuse_if_ended(&chain).await?;
+                self.refuse_if_ended(&chain, writer).await?;
             }
             chain
         };
@@ -542,9 +556,9 @@ impl Streams {
         Ok(chain)
     }
 
-    /// Marks the chain closed and refuses when its latest run ended, when Temporal no longer
-    /// holds it, or when a new chain took its Workflow id.
-    async fn refuse_if_ended(&self, chain: &ChainId) -> StreamResult<()> {
+    /// Closes the chain and refuses when its latest run ended, when Temporal no longer holds it,
+    /// or when a new chain took its Workflow id.
+    async fn refuse_if_ended(&self, chain: &ChainId, writer: Writer<'_>) -> StreamResult<()> {
         let key = OwnerKey {
             namespace: chain.namespace.clone(),
             workflow_id: chain.workflow_id.clone(),
@@ -552,10 +566,10 @@ impl Streams {
         };
         match self.describe(&key, "").await {
             // The chain came from this Workflow, so History has since dropped it.
-            Err(OwnerError::NotFound(_)) => Err(self.gone(chain).await),
+            Err(OwnerError::NotFound(_)) => Err(self.gone(chain, writer).await),
             Err(error) => Err(describe_failed(&error)),
             Ok(latest) if latest.chain_ended() || latest.first_run_id != chain.first_run_id => {
-                Err(self.closed(chain, "has closed").await)
+                Err(self.closed(chain, "has closed", writer).await)
             }
             Ok(_) => Ok(()),
         }
@@ -564,9 +578,9 @@ impl Streams {
     /// Closes a chain whose owner Temporal answered is gone, but only on the second such answer
     /// at least [StreamsOptions::owner_recheck] after the first. The first answer fails the call
     /// as a storage failure, which the caller retries.
-    async fn gone(&self, chain: &ChainId) -> StreamError {
+    async fn gone(&self, chain: &ChainId, writer: Writer<'_>) -> StreamError {
         if self.gone_for_good(chain) {
-            self.closed(chain, "is gone from History").await
+            self.closed(chain, "is gone from History", writer).await
         } else {
             missing(chain)
         }
@@ -590,8 +604,16 @@ impl Streams {
         }
     }
 
-    async fn closed(&self, chain: &ChainId, how: &str) -> StreamError {
-        if let Err(error) = self.store.close_chain(chain).await {
+    /// Closes what a producer that learned its owner ended can reach: the chain with close
+    /// flags, else its own topic.
+    async fn closed(&self, chain: &ChainId, how: &str, writer: Writer<'_>) -> StreamError {
+        let closed = if self.store.capabilities().producer_state {
+            self.store.close_chain(chain).await
+        } else {
+            let (topic, producer_id) = (writer.topic, writer.producer_id);
+            close_topic(&*self.store, chain, topic, producer_id, writer.attempt).await
+        };
+        if let Err(error) = closed {
             return error;
         }
         StreamError::closed(format!(
@@ -804,7 +826,7 @@ mod tests {
         MemoryStore,
         proto::{
             ActivityProducer, AppendRecord, NamedProducer, StoreReadRequest, StreamFailureKind,
-            StreamRecordKind, append_request::Producer,
+            StreamRecord, StreamRecordKind, append_request::Producer,
         },
     };
     use sha2::{Digest, Sha256};
@@ -890,7 +912,19 @@ mod tests {
     }
 
     fn setup(options: StreamsOptions) -> Setup {
-        let store = Arc::new(MemoryStore::new());
+        setup_on(MemoryStore::new(), options)
+    }
+
+    /// A store with no close flags and no dedupe entries.
+    fn without_producer_state() -> MemoryStore {
+        MemoryStore::with_capabilities(crate::Capabilities {
+            producer_state: false,
+            ..MemoryStore::new().capabilities()
+        })
+    }
+
+    fn setup_on(store: MemoryStore, options: StreamsOptions) -> Setup {
+        let store = Arc::new(store);
         let owners = Arc::new(Owners::default());
         owners.run("wf", "run-1", "run-1");
         let streams = Streams::new(store.clone(), owners.clone(), options);
@@ -1431,6 +1465,61 @@ mod tests {
         setup.streams.append(other).await.unwrap();
     }
 
+    async fn last_kind(store: &MemoryStore, topic: &str) -> (i32, String) {
+        let page = store
+            .read(StoreReadRequest {
+                chain: Some(chain("run-1")),
+                topic: topic.to_string(),
+                max_records: 100,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let record = StreamRecord::decode(&*page.records.last().unwrap().record).unwrap();
+        (record.kind, record.producer_id)
+    }
+
+    #[tokio::test]
+    async fn without_close_flags_a_close_is_a_record_that_ends_every_read() {
+        let setup = setup_on(without_producer_state(), quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup
+            .streams
+            .close(CloseRequest {
+                stream: Some(stream("out")),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            last_kind(&setup.store, "out").await,
+            (StreamRecordKind::Close as i32, String::new())
+        );
+        // The store can't refuse it, so it lands where no reader delivers it, and so does a
+        // repeat of the batch that landed before the close.
+        setup.streams.append(append("p", 2, "2")).await.unwrap();
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        let before = setup.owners.describes();
+        let (delivered, _) = read_to_end(&setup.streams, Duration::from_secs(5)).await;
+        assert_eq!(delivered, 1);
+        assert_eq!(setup.owners.describes(), before);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn without_close_flags_a_producer_that_sees_its_owner_end_closes_its_topic() {
+        let setup = setup_on(without_producer_state(), StreamsOptions::default());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup.owners.end("wf", WorkflowExecutionStatus::Terminated);
+        tokio::time::advance(OWNER_RECHECK + Duration::from_secs(1)).await;
+        assert_eq!(
+            kind(setup.streams.append(append("p", 2, "2")).await),
+            StreamFailureKind::Closed
+        );
+        assert_eq!(
+            last_kind(&setup.store, "out").await,
+            (StreamRecordKind::Close as i32, "p".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn a_retire_drops_the_attempts_state_on_the_chain_it_wrote() {
         let setup = setup(StreamsOptions::default());
@@ -1604,15 +1693,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_read_ends_when_its_owner_chain_ends_and_marks_it_closed() {
+    async fn a_read_ends_when_its_owner_chain_ends_and_writes_nothing() {
         let setup = setup(quick());
         setup.streams.append(append("p", 1, "1")).await.unwrap();
         setup.owners.end("wf", WorkflowExecutionStatus::Completed);
         let (delivered, end) = read_to_end(&setup.streams, Duration::from_secs(5)).await;
         assert_eq!(delivered, 1);
         assert!(end.records.is_empty());
-        // The read saw the chain end, and says so to later producers.
-        assert!(chain_closed(&setup.store, "run-1").await);
+        // A reader needs no write access, so the producers' owner check closes the chain.
+        assert!(!chain_closed(&setup.store, "run-1").await);
     }
 
     #[tokio::test]
@@ -1694,7 +1783,7 @@ mod tests {
             request = read_after(&page.cursor, &page.state, Duration::from_secs(5));
         }
         assert!(done);
-        assert!(chain_closed(&setup.store, "run-1").await);
+        assert!(!chain_closed(&setup.store, "run-1").await);
     }
 
     #[tokio::test]
