@@ -35,6 +35,15 @@ message StreamRecord {
     // Set on LINK only. It stays out of the payload codec, as ids in History
     // do, so Core can follow it.
     StreamLink link = 8;
+    // Set by a Workflow run's own producer only: the WorkflowTaskStarted
+    // event id of the task attempt that wrote the record.
+    int64 task_started_event_id = 9;
+    // Set by a Workflow run's own producer, on the first record of each
+    // batch: the WorkflowTaskStarted event ids of the run's last completed
+    // tasks, newest first, at most eight. The first is the attempt's prefix.
+    // A trailing zero means the list goes back to the run's start. A reader
+    // learns from it whether an earlier attempt it delivered completed.
+    repeated int64 completed_tasks = 10;
 }
 
 // What a record means to a reader.
