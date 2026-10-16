@@ -327,6 +327,9 @@ impl NexusCalls {
             },
             None => None,
         };
+        if let Err(failure) = check_holder(&floor_holder, &after) {
+            return failed(*failure);
+        }
         if input.latest_only.unwrap_or(false) {
             if !after.is_empty() {
                 return failed(failure::input_mistake(
@@ -465,7 +468,14 @@ impl NexusCalls {
         let client = self.callers.as_ref().ok_or_else(|| {
             StreamError::unsupported("waking a caller needs a client connected to the server")
         })?;
-        client
+        // The wait counts after the read's position, which only means something on the chain
+        // the read read.
+        if token.chain_first_run_id != read.response.chain_first_run_id {
+            return Err(StreamError::invalid_argument(
+                "wake_token names another chain than the read's",
+            ));
+        }
+        match client
             .wait_callback(
                 crate::handle::chain_of(address, &token.chain_first_run_id),
                 address.topic.clone(),
@@ -473,7 +483,21 @@ impl NexusCalls {
                 read.response.wake_after,
             )
             .await
-            .map_err(operation::caller_error)?;
+        {
+            Ok(()) => {}
+            // The empty answer stands, and the caller reads again on its own. Failing the read
+            // would fail the caller for a wake it can live without.
+            Err(crate::NotifyError::Refused(error) | crate::NotifyError::Unsupported(error)) => {
+                tracing::warn!(
+                    workflow_id = %address.workflow_id,
+                    topic = %address.topic,
+                    error,
+                    "The notifier took no wait for a caught-up Nexus reader"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(operation::caller_error(error)),
+        }
         let reread = self
             .streams
             .read_carried(ReadRequest {
@@ -526,6 +550,11 @@ impl NexusCalls {
         {
             return failed(failure::of_stream(&error));
         }
+        if let Some(holder) = &input.floor_holder
+            && let Err(failure) = check_holder(holder, &input.after_token)
+        {
+            return failed(*failure);
+        }
         let request = ReadRangeRequest {
             stream: Some(address),
             chain_first_run_id: input.chain_first_run_id,
@@ -535,8 +564,8 @@ impl NexusCalls {
             state,
             records_digest: input.records_digest.0,
             floor_holder: input.floor_holder.unwrap_or_default(),
-            // A read that names a floor holder never starts at the end, since only latest_only
-            // does, and it refuses a holder.
+            // A read that names a floor holder never starts at `$end`, since the read refuses it.
+            // The caller reads latest_only first and starts at its cursor.
             start_from_end: false,
         };
         let mut response = match self.streams.read_range(request).await {
@@ -1072,6 +1101,29 @@ fn carried_state(state: Option<String>) -> Result<Vec<u8>, Box<NexusFailure>> {
 
 /// The stream address a call names. An owner kind this release can't open is refused before any
 /// codec work.
+/// Checks a caller's floor holder. A Nexus caller holds as `<caller namespace>/<run id>/<reader
+/// id>`, so callers in other namespaces can't share or release a holder. A positions-only read
+/// can't start at `$end`, since its replay would look up the record there, which the live read
+/// did not. The caller reads `latest_only` first and starts at the cursor it answers.
+fn check_holder(floor_holder: &str, after: &str) -> Result<(), Box<NexusFailure>> {
+    if floor_holder.is_empty() {
+        return Ok(());
+    }
+    let parts: Vec<&str> = floor_holder.splitn(3, '/').collect();
+    if parts.len() != 3 || parts.iter().any(|part| part.is_empty()) {
+        return Err(Box::new(failure::input_mistake(
+            "a floor holder is <caller namespace>/<run id>/<reader id>",
+        )));
+    }
+    if after == crate::END {
+        return Err(Box::new(failure::input_mistake(
+            "a read that holds a floor starts at a cursor, not at $end; read latest_only first \
+             and start at the cursor it answers",
+        )));
+    }
+    Ok(())
+}
+
 fn address(namespace: &str, stream: &StreamRef) -> Result<StreamAddress, Box<NexusFailure>> {
     let Some(owner_kind) = operation::owner_kind(&stream.kind) else {
         return Err(Box::new(failure::of_stream(&StreamError::unsupported(

@@ -36,10 +36,12 @@ pub(super) fn kind(call: Call, sqlstate: Option<&str>) -> StreamFailureKind {
             Call::Append | Call::Write => OutcomeUnknown,
         };
     };
+    // Class 53 is a lack of resources, and `54000` covers a full NOTIFY queue. Both clear up.
     let transient = matches!(
         code,
-        "40001" | "40P01" | "57014" | "57P01" | "57P02" | "57P03" | "25006" | "53300"
-    ) || code.starts_with("08");
+        "40001" | "40P01" | "57014" | "57P01" | "57P02" | "57P03" | "25006" | "54000"
+    ) || code.starts_with("08")
+        || code.starts_with("53");
     match (call, transient) {
         (Call::Read, _) => Storage,
         (Call::Append, true) => OutcomeUnknown,
@@ -95,6 +97,9 @@ mod tests {
             (Some("57P03"), OutcomeUnknown, Storage),
             (Some("25006"), OutcomeUnknown, Storage),
             (Some("53300"), OutcomeUnknown, Storage),
+            (Some("53100"), OutcomeUnknown, Storage),
+            (Some("53200"), OutcomeUnknown, Storage),
+            (Some("54000"), OutcomeUnknown, Storage),
             (Some("23505"), Refused, Refused),
             (Some("42883"), Refused, Refused),
             (Some("P0001"), Refused, Refused),
