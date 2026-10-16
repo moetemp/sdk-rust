@@ -146,16 +146,23 @@ impl BlockingPool {
         deadline: Instant,
     ) -> RedisResult<Option<Value>> {
         let slot = self.cluster.then(|| slot(key));
-        let mut node = slot
-            .and_then(|slot| self.slots.lock().unwrap().get(&slot).cloned())
-            .unwrap_or_else(|| address(&self.seed));
+        let cached = slot.and_then(|slot| self.slots.lock().unwrap().get(&slot).cloned());
+        let mut from_cache = cached.is_some();
+        let mut node = cached.unwrap_or_else(|| address(&self.seed));
         // One redirect is expected when the slot was unknown or moved. A second means the
         // cluster is resharding, and the caller's next read tries again.
         let mut redirected = false;
         let mut fresh = false;
         loop {
-            let Some(mut lease) = self.lease(&node, deadline, fresh).await? else {
-                return Ok(None);
+            let mut lease = match self.lease(&node, deadline, fresh).await {
+                Ok(Some(lease)) => lease,
+                Ok(None) => return Ok(None),
+                Err(error) if from_cache && unreachable(&error) => {
+                    node = self.forget(slot, &node);
+                    from_cache = false;
+                    continue;
+                }
+                Err(error) => return Err(error),
             };
             let conn = lease.conn.as_mut().expect("a lease holds its connection");
             let answer = tokio::time::timeout_at(
@@ -184,6 +191,10 @@ impl BlockingPool {
                 {
                     fresh = true;
                 }
+                Err(error) if from_cache && unreachable(&error) => {
+                    node = self.forget(slot, &node);
+                    from_cache = false;
+                }
                 Err(error) => match (slot, redirect(&error)) {
                     (Some(slot), Some(target)) if !redirected => {
                         lease.release();
@@ -201,6 +212,18 @@ impl BlockingPool {
                 },
             }
         }
+    }
+
+    /// Drops a slot's cached node and answers the seed. A failover can replace a node's
+    /// address for good, and only a redirect would ever update the entry otherwise.
+    fn forget(&self, slot: Option<u16>, node: &Node) -> Node {
+        if let Some(slot) = slot {
+            let mut slots = self.slots.lock().unwrap();
+            if slots.get(&slot) == Some(node) {
+                slots.remove(&slot);
+            }
+        }
+        address(&self.seed)
     }
 
     async fn lease(
@@ -295,6 +318,10 @@ fn at(seed: &ConnectionInfo, (host, port): &Node) -> ConnectionInfo {
     seed.clone().set_addr(addr)
 }
 
+fn unreachable(error: &RedisError) -> bool {
+    error.is_io_error() || error.is_connection_refusal() || error.is_connection_dropped()
+}
+
 fn redirect(error: &RedisError) -> Option<Node> {
     if error.kind() != redis::ErrorKind::Server(redis::ServerErrorKind::Moved) {
         return None;
@@ -344,6 +371,32 @@ mod tests {
         );
         // An `ASK` target holds the slot only for one command sent after `ASKING`.
         assert_eq!(redirect(&reply("ASK 3999 127.0.0.1:7102")), None);
+    }
+
+    #[tokio::test]
+    async fn a_cached_slot_on_a_dead_node_goes_back_to_the_seed() {
+        let Ok(url) = std::env::var("STREAMS_REDIS_URL") else {
+            eprintln!("set STREAMS_REDIS_URL to run this test");
+            return;
+        };
+        // A standalone server answers every slot, so the seed serves the read once the dead
+        // node is dropped.
+        let pool = BlockingPool::new(&url, 1, true, Duration::from_secs(1)).unwrap();
+        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = dead.local_addr().unwrap().port();
+        drop(dead);
+        let key = "x-core:{dead-node}:log";
+        pool.slots
+            .lock()
+            .unwrap()
+            .insert(slot(key), ("127.0.0.1".to_string(), port));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let answer = pool.query(key, &redis::cmd("PING"), deadline).await;
+        assert_eq!(
+            answer.unwrap(),
+            Some(Value::SimpleString("PONG".to_string()))
+        );
+        assert!(pool.slots.lock().unwrap().is_empty());
     }
 
     #[test]

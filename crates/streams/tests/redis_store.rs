@@ -321,6 +321,16 @@ async fn a_reply_that_refuses_a_write_arrives_as_refused() {
     assert!(error.message.contains("WRONGTYPE"), "{error}");
 }
 
+#[tokio::test]
+async fn a_retention_past_the_epoch_is_refused_at_connect() {
+    // The check runs before any connection, so no server is needed.
+    let mut options = RedisStoreOptions::new("redis://127.0.0.1:1");
+    options.retention = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+    let error = RedisStore::connect(options).await.unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Refused);
+    assert!(error.message.contains("retention"), "{error}");
+}
+
 /// Passes bytes between the store and Redis, and fails one connection on purpose when asked.
 struct Faults {
     port: u16,

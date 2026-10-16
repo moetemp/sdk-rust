@@ -33,7 +33,10 @@ use conn::{BlockingPool, Shared};
 use errors::{Call, Mapped};
 use keys::{ChainKeys, session_field};
 use redis::{Cmd, Value, streams::StreamReadReply};
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::time::Instant;
 
 const NAME: &str = "redis";
@@ -108,6 +111,16 @@ impl RedisStore {
         if retention_ms == 0 {
             return Err(StreamError::refused(format!(
                 "the retention must be at least a millisecond, not {:?}",
+                options.retention
+            )));
+        }
+        // The scripts trim below `now - retention` as a stream id, which can't be negative.
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        if retention_ms >= now_ms {
+            return Err(StreamError::refused(format!(
+                "the retention must be shorter than the time since 1970, not {:?}",
                 options.retention
             )));
         }
