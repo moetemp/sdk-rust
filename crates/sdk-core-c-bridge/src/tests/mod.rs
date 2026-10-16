@@ -507,7 +507,9 @@ fn memory_store_config() -> Vec<u8> {
         MemoryStoreConfig, StreamStoreConfig, stream_store_config,
     };
     StreamStoreConfig {
-        store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+        store: Some(stream_store_config::Store::Memory(
+            MemoryStoreConfig::default(),
+        )),
         ..Default::default()
     }
     .encode_to_vec()
@@ -517,9 +519,9 @@ fn memory_store_config() -> Vec<u8> {
 fn test_stream_store_appends_and_reads_through_the_c_bridge() {
     use temporalio_common::protos::temporal::api::common::v1::Payload;
     use temporalio_sdk_core::streams::proto::{
-        AppendRecord, AppendRequest, AppendResponse, NamedProducer, ReadRequest, ReadResponse,
-        RetireProducerRequest, StreamAddress, StreamOwnerKind, StreamRecordKind, append_request,
-        read_record, retire_producer_request,
+        AppendRecord, AppendRequest, AppendResponse, DescribeStoreResponse, NamedProducer,
+        ReadRequest, ReadResponse, RetireProducerRequest, StreamAddress, StreamOwnerKind,
+        StreamRecordKind, append_request, read_record, retire_producer_request,
     };
     Context::with(|context| {
         context.runtime_new().unwrap();
@@ -606,6 +608,14 @@ fn test_stream_store_appends_and_reads_through_the_c_bridge() {
             .unwrap()
             .unwrap();
         assert!(retired.is_empty());
+
+        let described = context
+            .stream_store_call(&store, "DescribeStore", Vec::new())
+            .unwrap()
+            .unwrap();
+        let described = DescribeStoreResponse::decode(described.as_slice()).unwrap();
+        assert_eq!(described.name, "memory");
+        assert!(described.capabilities.unwrap().producer_state);
     });
 }
 

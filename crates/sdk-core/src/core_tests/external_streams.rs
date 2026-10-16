@@ -156,6 +156,10 @@ impl StreamStore for RecordingStore {
         "recording"
     }
 
+    fn capabilities(&self) -> temporalio_streams::Capabilities {
+        self.inner.capabilities()
+    }
+
     async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
         self.calls.lock().push("append");
         if let Some(error) = &self.refuse {
@@ -242,6 +246,11 @@ impl StreamStore for RecordingStore {
     async fn written_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
         self.calls.lock().push("written_topics");
         self.inner.written_topics(chain).await
+    }
+
+    async fn list_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        self.calls.lock().push("list_topics");
+        self.inner.list_topics(chain).await
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
@@ -476,7 +485,13 @@ async fn an_append_that_may_not_have_landed_is_sent_again() {
     commit_in_two_tasks(worker, &["a"], &[]).await;
     assert_eq!(
         store.calls(),
-        ["append", "append", "append", "retire_producer"]
+        [
+            "append",
+            "append",
+            "append",
+            "retire_producer",
+            "close_chain"
+        ]
     );
     assert_eq!(store.read(TOPIC).await, ["encrypted a"]);
 }
@@ -502,6 +517,32 @@ async fn a_store_that_refuses_the_append_fails_the_task_and_sends_no_completion(
     worker.shutdown().await;
     worker.finalize_shutdown().await;
     assert_eq!(store.calls(), ["append"], "a refusal is not sent again");
+}
+
+#[tokio::test]
+async fn a_record_above_the_stores_record_limit_fails_the_task() {
+    let store = Arc::new(RecordingStore {
+        inner: MemoryStore::with_capabilities(temporalio_streams::Capabilities {
+            max_record_bytes: 64,
+            ..MemoryStore::new().capabilities()
+        }),
+        ..Default::default()
+    });
+    let (worker, failed) = worker_failing_with(Some(store.clone()), &["record limit of 64"]);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first.run_id,
+        vec![
+            output_commit_command(records(&["a"])),
+            start_timer_cmd(1, Duration::from_secs(10)),
+        ],
+    )
+    .await;
+    failed_within_deadline(&failed).await;
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+    assert!(store.appends().is_empty());
 }
 
 #[tokio::test]
@@ -673,7 +714,71 @@ async fn replay_makes_no_store_call() {
     let fired = worker.poll_workflow_activation().await.unwrap();
     worker.complete_execution(&fired.run_id).await;
     worker.drain_pollers_and_shutdown().await;
-    assert!(store.calls().is_empty(), "{:?}", store.calls());
+    // The live task that completes the run closes its chain, and nothing else reaches the store.
+    assert_eq!(store.calls(), ["close_chain"]);
+}
+
+/// The owner's Core closes the chain once the server accepts a task that ends it, and leaves a
+/// chain that can go on to the producers' owner checks.
+#[rstest::rstest]
+#[case::completed(CompleteWorkflowExecution::default().into(), false, false, true)]
+#[case::failed(fail_workflow(), false, false, true)]
+#[case::canceled(cancel_workflow(), false, false, true)]
+#[case::failed_with_retries(fail_workflow(), true, false, false)]
+#[case::completed_with_cron(CompleteWorkflowExecution::default().into(), false, true, false)]
+#[case::continued_as_new(continue_as_new(), false, false, false)]
+#[tokio::test]
+async fn the_owners_core_closes_a_chain_the_run_ended(
+    #[case] command: workflow_command::Variant,
+    #[case] retries: bool,
+    #[case] cron: bool,
+    #[case] closes: bool,
+) {
+    use temporalio_common::protos::temporal::api::common::v1::RetryPolicy;
+    let store = Arc::new(RecordingStore::default());
+    let mut t = TestHistoryBuilder::default();
+    t.add(WorkflowExecutionStartedEventAttributes {
+        retry_policy: retries.then(RetryPolicy::default),
+        cron_schedule: if cron {
+            "@hourly".to_string()
+        } else {
+            String::new()
+        },
+        ..default_wes_attribs()
+    });
+    t.add_workflow_task_scheduled_and_started();
+    let worker = worker_appending_to(
+        t,
+        vec![ResponseType::AllHistory],
+        store.clone(),
+        Default::default(),
+    );
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &activation.run_id, vec![command]).await;
+    worker.drain_pollers_and_shutdown().await;
+    let expected: &[&str] = if closes { &["close_chain"] } else { &[] };
+    assert_eq!(store.calls(), expected);
+}
+
+fn fail_workflow() -> workflow_command::Variant {
+    workflow_command::Variant::FailWorkflowExecution(
+        temporalio_common::protos::coresdk::workflow_commands::FailWorkflowExecution {
+            failure: Some(Failure::default()),
+        },
+    )
+}
+
+fn cancel_workflow() -> workflow_command::Variant {
+    workflow_command::Variant::CancelWorkflowExecution(Default::default())
+}
+
+fn continue_as_new() -> workflow_command::Variant {
+    workflow_command::Variant::ContinueAsNewWorkflowExecution(
+        temporalio_common::protos::coresdk::workflow_commands::ContinueAsNewWorkflowExecution {
+            workflow_type: "next".to_string(),
+            ..Default::default()
+        },
+    )
 }
 
 #[tokio::test]
