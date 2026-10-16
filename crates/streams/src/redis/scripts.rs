@@ -2,7 +2,9 @@
 //!
 //! The append script is the one the SDKs sent, with one more check, the topic's close flag, so a
 //! batch can't land after the topic's close returned (DD-16), and its trim keeps what
-//! positions-only readers hold. `keep.lua` is the prelude of every script that writes a log, and
+//! positions-only readers hold. Its trim also finds the newest record to drop by reading forward
+//! from the oldest, since `XREVRANGE` from the floor read the whole retained log when no record
+//! was older than the floor. `keep.lua` is the prelude of every script that writes a log, and
 //! `floor.lua` of every script that reads or writes the holds.
 
 use redis::Script;
@@ -130,6 +132,30 @@ if topics then
 end
 ";
 
+    /// How the trim finds the newest record to drop, and what it replaces.
+    const TRIM_SCAN: (&str, &str) = (
+        "  local doomed
+  local from = '-'
+  repeat
+    local older = redis.call('XRANGE', log, from, '(' .. floor, 'COUNT', 1000)
+    if #older > 0 then
+      doomed = older[#older][1]
+      from = '(' .. doomed
+    end
+  until #older < 1000
+  if doomed then
+    redis.call('XTRIM', log, 'MINID', floor)
+    redis.call('HSET', meta, 'trimmed', doomed)
+  end
+",
+        "  local doomed = redis.call('XREVRANGE', log, '(' .. floor, '-', 'COUNT', 1)
+  if #doomed > 0 then
+    redis.call('XTRIM', log, 'MINID', floor)
+    redis.call('HSET', meta, 'trimmed', doomed[1][1])
+  end
+",
+    );
+
     /// What the floor adds to the append script, each with what it replaces.
     const FLOOR_EDITS: [(&str, &str); 5] = [
         (
@@ -165,7 +191,7 @@ end
         assert_eq!(APPEND_LOGGED.matches("XADD', KEYS[5]").count(), 1);
         assert_eq!(
             APPEND_LOGGED_SCRIPT.get_hash(),
-            "418b9d100738aa50bc1ee5c1b7e61e62c8f9c434"
+            "eeed648a51793f36d1ed5f89c735dc8032d5fe7f"
         );
     }
 
@@ -184,20 +210,23 @@ end
         assert_eq!(was, *APPEND_LOGGED);
         assert_eq!(
             APPEND_ARCHIVED_SCRIPT.get_hash(),
-            "b9976d6b00aba4a108bca0afcbd125367e567aee"
+            "337494c09860e9e0bd9dbdf4a6db81a57719bd4c"
         );
     }
 
     #[test]
-    fn the_append_script_matches_the_sdks_with_the_topic_check_floor_and_topic_set_only() {
+    fn the_append_script_matches_the_sdks_with_the_topic_check_floor_topic_set_and_scan_only() {
         assert_eq!(
             APPEND_SCRIPT.get_hash(),
-            "eec20388c2d5655389344177b25a640e1ba3f625"
+            "188afac5fc0de85f8a3f1ae86129a8e19b861cec"
         );
         let mut before_floor = APPEND
             .strip_prefix(include_str!("../../lua/floor.lua"))
             .unwrap()
             .to_string();
+        let (scan, was) = TRIM_SCAN;
+        assert_eq!(before_floor.matches(scan).count(), 1);
+        before_floor = before_floor.replacen(scan, was, 1);
         assert_eq!(before_floor.matches(TOPIC_SET).count(), 1);
         before_floor = before_floor.replacen(TOPIC_SET, "", 1);
         for (added, was) in FLOOR_EDITS {
