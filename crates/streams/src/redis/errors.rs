@@ -14,8 +14,10 @@ pub(crate) enum Call {
 }
 
 /// Replies that clear up on their own: a primary demoted in a failover, a server loading its
-/// data, a busy script, a slot in migration, a cluster or primary that is down.
-const TRANSIENT: [&str; 6] = [
+/// data, a busy script, a slot in migration, a cluster or primary that is down, a server out of
+/// memory. Under `noeviction` an `OOM` ends when retention trims the logs, so it isn't final.
+const TRANSIENT: [&str; 7] = [
+    "OOM",
     "READONLY",
     "LOADING",
     "BUSY",
@@ -116,6 +118,7 @@ mod tests {
     fn rule_8_1_a_reply_that_clears_up_on_its_own_is_a_storage_failure() {
         // A failover, a load or a busy script ends by itself, so the caller retries, not gives up.
         for code in [
+            "OOM",
             "READONLY",
             "LOADING",
             "BUSY",
@@ -132,7 +135,7 @@ mod tests {
             assert_eq!(append.kind, StreamFailureKind::OutcomeUnknown, "{code}");
         }
         // A reply that won't change on a retry still refuses the write.
-        for code in ["NOPERM", "WRONGTYPE", "OOM"] {
+        for code in ["NOPERM", "WRONGTYPE"] {
             for call in [Call::Write, Call::Append] {
                 let error = stream_error(&server(code, "no"), call);
                 assert_eq!(error.kind, StreamFailureKind::Refused, "{code} {call:?}");

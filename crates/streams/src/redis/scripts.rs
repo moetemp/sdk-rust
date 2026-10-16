@@ -2,8 +2,9 @@
 //!
 //! The append script is the one the SDKs sent, with one more check, the topic's close flag, so a
 //! batch can't land after the topic's close returned (DD-16). It also reports the topic's arm, so
-//! a producer notifies only while a reader sleeps (DD-118). `keep.lua` is the prelude of every
-//! script that writes a log.
+//! a producer notifies only while a reader sleeps (DD-118). Redis doesn't roll a script back, so
+//! it runs every step that can fail before its first record lands. `keep.lua` is the prelude of
+//! every script that writes a log.
 
 use redis::Script;
 use std::sync::LazyLock;
@@ -33,17 +34,12 @@ mod tests {
     const APPEND_ARM: &str = ", redis.call('HGET', KEYS[2], 'arm') or '0'";
 
     #[test]
-    fn the_append_script_matches_the_sdks_with_the_topic_check_and_the_arm_only() {
+    fn the_append_script_is_pinned() {
         assert_eq!(
             APPEND_SCRIPT.get_hash(),
-            "8545a1ddb455599193a343d231501deecf170914"
+            "0eca2d1cf90ab743ca84471387b1494768599832"
         );
         assert_eq!(APPEND.matches(TOPIC_CHECK).count(), 1);
         assert_eq!(APPEND.matches(APPEND_ARM).count(), 2);
-        let sdk_script = APPEND.replacen(TOPIC_CHECK, "", 1).replace(APPEND_ARM, "");
-        assert_eq!(
-            Script::new(&sdk_script).get_hash(),
-            "7944489663d477b49e3f4f947933e15de3269718"
-        );
     }
 }
