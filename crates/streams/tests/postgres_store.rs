@@ -333,6 +333,54 @@ async fn the_janitor_keeps_holds_and_deletes_ended_holds_and_tombstones() {
     assert!(again.first_position.parse::<i64>().unwrap() > last);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn janitors_on_many_connections_leave_no_lock_behind() {
+    // Through PgBouncer in transaction mode, a session lock taken on one server connection and
+    // released on another stays, and every later pass skips. Set `STREAMS_POSTGRES_DIRECT_URL` to
+    // the server behind it to check the locks.
+    let Some(url) = url() else { return };
+    let direct = std::env::var("STREAMS_POSTGRES_DIRECT_URL").unwrap_or_else(|_| url.clone());
+    let options = options(&url);
+    let schema = options.schema.clone();
+    let mut stores = vec![Arc::new(
+        PostgresStore::connect(options.clone()).await.unwrap(),
+    )];
+    for _ in 0..3 {
+        let mut options = options.clone();
+        options.skip_migrations = true;
+        stores.push(Arc::new(PostgresStore::connect(options).await.unwrap()));
+    }
+    let raw = raw(&direct).await;
+    for round in 0..5 {
+        let chain = chain(&format!("janitors-{round}"));
+        stores[0]
+            .append(append(&chain, "out", "p", 1, 2))
+            .await
+            .unwrap();
+        age(&raw, &schema, 8).await;
+        let passes: Vec<_> = stores
+            .iter()
+            .flat_map(|store| [store.clone(), store.clone()])
+            .map(|store| tokio::spawn(async move { store.run_janitor().await.unwrap() }))
+            .collect();
+        let mut deleted = 0;
+        for pass in passes {
+            deleted += pass.await.unwrap();
+        }
+        assert_eq!(deleted, 2, "round {round}");
+    }
+    let held: i64 = raw
+        .query_one(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid::int = \
+             hashtext($1)",
+            &[&format!("{schema}:janitor")],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(held, 0, "a janitor lock stayed behind");
+}
+
 #[tokio::test]
 async fn an_owner_delete_purges_every_row() {
     let Some(url) = url() else { return };

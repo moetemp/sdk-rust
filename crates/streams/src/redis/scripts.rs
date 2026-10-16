@@ -2,8 +2,9 @@
 //!
 //! The append script is the one the SDKs sent, with one more check, the topic's close flag, so a
 //! batch can't land after the topic's close returned (DD-16), and its trim keeps what
-//! positions-only readers hold. `keep.lua` is the prelude of every script that writes a log, and
-//! `floor.lua` of every script that reads or writes the holds.
+//! positions-only readers hold. Redis doesn't roll a script back, so it runs every step that can
+//! fail before its first record lands. `keep.lua` is the prelude of every script that writes a
+//! log, and `floor.lua` of every script that reads or writes the holds.
 
 use redis::Script;
 use std::sync::LazyLock;
@@ -123,22 +124,26 @@ mod tests {
     /// What the append script adds for a Workflow Activity's topic set.
     const TOPIC_SET: &str = "local topics = KEYS[5]
 if topics then
-  if sequence == 1 then
-    redis.call('SADD', topics, KEYS[1])
-  end
+  -- On every batch, since the first one can be lost and the close must still find the topic.
+  redis.call('SADD', topics, KEYS[1])
   redis.call('PEXPIRE', topics, retention + grace)
 end
 ";
 
     /// What the floor adds to the append script, each with what it replaces.
-    const FLOOR_EDITS: [(&str, &str); 5] = [
+    const FLOOR_EDITS: [(&str, &str); 8] = [
         (
-            "local function keep(log, meta, added, last, retention, grace, floors)",
-            "local function keep(log, meta, added, last, retention, grace)",
+            "local function trim(log, meta, retention, floors)",
+            "local function trim(log, meta, retention)",
         ),
         (
             "  local life\n  floor, life = held(floors, floor, retention)\n",
             "",
+        ),
+        ("  return floor_ms, life\n", "  return floor_ms\n"),
+        (
+            "local function keep(log, meta, added, last, grace, floor_ms, life)",
+            "local function keep(log, meta, added, last, retention, grace, floor_ms)",
         ),
         (
             "redis.call('PEXPIRE', log, life)",
@@ -149,8 +154,12 @@ end
             "redis.call('PEXPIRE', meta, retention + grace)",
         ),
         (
-            "keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace, KEYS[4])",
-            "keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace)",
+            "local floor_ms, life = trim(KEYS[1], KEYS[2], retention, KEYS[4])",
+            "local floor_ms = trim(KEYS[1], KEYS[2], retention)",
+        ),
+        (
+            "keep(KEYS[1], KEYS[2], #ARGV - 5, last, grace, floor_ms, life)",
+            "keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace, floor_ms)",
         ),
     ];
 
@@ -165,7 +174,7 @@ end
         assert_eq!(APPEND_LOGGED.matches("XADD', KEYS[5]").count(), 1);
         assert_eq!(
             APPEND_LOGGED_SCRIPT.get_hash(),
-            "418b9d100738aa50bc1ee5c1b7e61e62c8f9c434"
+            "e20b57d34060cd9498c9189e7cf1c2a7ae01190c"
         );
     }
 
@@ -184,15 +193,15 @@ end
         assert_eq!(was, *APPEND_LOGGED);
         assert_eq!(
             APPEND_ARCHIVED_SCRIPT.get_hash(),
-            "b9976d6b00aba4a108bca0afcbd125367e567aee"
+            "bb8e042129e393c24f89efa5b81339d87090e8c1"
         );
     }
 
     #[test]
-    fn the_append_script_matches_the_sdks_with_the_topic_check_floor_and_topic_set_only() {
+    fn the_append_script_is_the_one_before_the_floor_with_the_floor_edits_only() {
         assert_eq!(
             APPEND_SCRIPT.get_hash(),
-            "eec20388c2d5655389344177b25a640e1ba3f625"
+            "792ae093a9c09ea8da9078a724eced11ddf5935d"
         );
         let mut before_floor = APPEND
             .strip_prefix(include_str!("../../lua/floor.lua"))
@@ -206,13 +215,8 @@ end
         }
         assert_eq!(
             Script::new(&before_floor).get_hash(),
-            "96d2eb81ddf241103a1ed5495a015285d7bd37f0"
+            "806e20d928e761eff5467386c0ffe78372e48bec"
         );
         assert_eq!(before_floor.matches(TOPIC_CHECK).count(), 1);
-        let sdk_script = before_floor.replacen(TOPIC_CHECK, "", 1);
-        assert_eq!(
-            Script::new(&sdk_script).get_hash(),
-            "7944489663d477b49e3f4f947933e15de3269718"
-        );
     }
 }

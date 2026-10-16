@@ -32,6 +32,9 @@ pub const FLUSH_LIMIT: Duration = Duration::from_secs(10);
 pub const CLOSE_RETRY_FIRST: Duration = Duration::from_secs(1);
 /// The longest wait between two tries of a notifier close.
 pub const CLOSE_RETRY_CAP: Duration = Duration::from_secs(60);
+/// How long a failed notifier close is tried again in all. Past it the close is dropped, and
+/// readers learn of the end from their owner checks.
+pub const CLOSE_RETRY_LIMIT: Duration = Duration::from_secs(10 * 60);
 
 // A stream that goes quiet after a failed notification leaves its reader parked until the next
 // write, so the last one is tried again a few times. A newer one replaces the retry.
@@ -423,7 +426,8 @@ impl Notifier {
 
     /// Runs `attempt`, a close of `chain`'s stream on `topic`, in the background, trying again
     /// until it lands or the server refuses it. The wait between tries starts at
-    /// [CLOSE_RETRY_FIRST] and doubles up to [CLOSE_RETRY_CAP]. [Notifier::flush] waits for it.
+    /// [CLOSE_RETRY_FIRST] and doubles up to [CLOSE_RETRY_CAP], for at most [CLOSE_RETRY_LIMIT].
+    /// [Notifier::flush] waits for it.
     ///
     /// The close completes every attached callback, and it lives only in this process, so one
     /// error must not drop it. Closing is idempotent on the server.
@@ -436,6 +440,7 @@ impl Notifier {
         let notifier = self.clone();
         tokio::spawn(async move {
             let mut delay = CLOSE_RETRY_FIRST;
+            let started = tokio::time::Instant::now();
             loop {
                 match attempt().await {
                     Ok(()) => break,
@@ -446,6 +451,18 @@ impl Notifier {
                             topic,
                             error,
                             "The server refused the close of a stream's notifier"
+                        );
+                        break;
+                    }
+                    Err(NotifyError::Failed(error))
+                        if started.elapsed() + delay > CLOSE_RETRY_LIMIT =>
+                    {
+                        tracing::warn!(
+                            workflow_id = %chain.workflow_id,
+                            topic,
+                            error,
+                            "Could not close a stream's notifier within {CLOSE_RETRY_LIMIT:?}, so \
+                             the close is dropped"
                         );
                         break;
                     }
@@ -1594,6 +1611,18 @@ mod tests {
         let at = client.at.lock().unwrap().clone();
         let longest = at.windows(2).map(|pair| pair[1] - pair[0]).max().unwrap();
         assert_eq!(longest, CLOSE_RETRY_CAP);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_notifier_close_that_keeps_failing_is_dropped_after_the_limit() {
+        let client = flaky(usize::MAX, false);
+        let store = closing_through(client.clone()).await;
+        store.close_topic(&chain("run-1"), "t").await.unwrap();
+        store.flush_notifications().await;
+        let at = client.at.lock().unwrap().clone();
+        let span = *at.last().unwrap() - at[0];
+        assert!(span <= CLOSE_RETRY_LIMIT, "{span:?}");
+        assert!(span > CLOSE_RETRY_LIMIT - CLOSE_RETRY_CAP, "{span:?}");
     }
 
     #[tokio::test(start_paused = true)]
