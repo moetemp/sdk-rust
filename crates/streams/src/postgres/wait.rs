@@ -62,13 +62,20 @@ impl Waiters {
         }
     }
 
-    /// Wakes the waiters of the topic a `NOTIFY` named, and those of topics with no row yet,
-    /// which a `NOTIFY` can't name.
+    /// Wakes the waiters of the topic a `NOTIFY` named. Waiters of a topic with no row yet are
+    /// left to the poll, since one `NOTIFY` per append would wake them all.
     pub(super) fn wake_topic(&self, topic_id: i64) {
         for waiting in self.streams.lock().unwrap().values() {
-            if waiting.topic_id.is_none_or(|id| id == topic_id) {
+            if waiting.topic_id == Some(topic_id) {
                 waiting.wake.send_modify(|n| *n += 1);
             }
+        }
+    }
+
+    /// Notes the row a read found for a stream whose waiters had none.
+    pub(super) fn learn(&self, key: &StreamKey, topic_id: Option<i64>) {
+        if let Some(waiting) = self.streams.lock().unwrap().get_mut(key) {
+            waiting.topic_id = waiting.topic_id.or(topic_id);
         }
     }
 
@@ -125,6 +132,22 @@ mod tests {
     }
 
     #[test]
+    fn a_notify_wakes_only_the_topic_it_names() {
+        let waiters = Waiters::default();
+        let with_row = waiters.register(key("a"), (Some(1), false), Some(7));
+        let no_row = waiters.register(key("b"), (None, false), None);
+        waiters.wake_topic(9);
+        assert!(!with_row.has_changed().unwrap());
+        assert!(!no_row.has_changed().unwrap());
+        waiters.wake_topic(7);
+        assert!(with_row.has_changed().unwrap());
+        assert!(!no_row.has_changed().unwrap());
+        waiters.learn(&key("b"), Some(8));
+        waiters.wake_topic(8);
+        assert!(no_row.has_changed().unwrap());
+    }
+
+    #[test]
     fn a_poll_wakes_only_on_a_change() {
         let waiters = Waiters::default();
         let mut rx = waiters.register(key("out"), (Some(1), false), Some(7));
@@ -149,18 +172,6 @@ mod tests {
         assert!(out.has_changed().unwrap());
         assert!(other.has_changed().unwrap());
         assert!(!far.has_changed().unwrap());
-    }
-
-    #[test]
-    fn a_notify_wakes_its_topic_and_topics_with_no_row() {
-        let waiters = Waiters::default();
-        let seven = waiters.register(key("seven"), (Some(1), false), Some(7));
-        let eight = waiters.register(key("eight"), (Some(1), false), Some(8));
-        let new = waiters.register(key("new"), (None, false), None);
-        waiters.wake_topic(7);
-        assert!(seven.has_changed().unwrap());
-        assert!(!eight.has_changed().unwrap());
-        assert!(new.has_changed().unwrap());
     }
 
     #[test]

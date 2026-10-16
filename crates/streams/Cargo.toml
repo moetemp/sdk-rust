@@ -34,6 +34,7 @@ base64 = "0.23"
 crc16 = { version = "0.4", optional = true }
 deadpool-postgres = { version = "0.14", optional = true }
 futures-util = { version = "0.3", optional = true, default-features = false }
+gethostname = "1.0.2"
 lru = "0.18"
 object_store = { version = "0.14", optional = true, default-features = false, features = ["aws"] }
 prost = { workspace = true }
