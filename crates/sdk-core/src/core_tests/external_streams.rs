@@ -1788,7 +1788,8 @@ async fn an_unmarked_activity_costs_no_store_call() {
     )
     .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(store.calls().is_empty(), "{:?}", store.calls());
+    // Completing the run closes its own chain, and nothing else reaches the store.
+    assert_eq!(store.calls(), ["close_chain"]);
 }
 
 #[tokio::test]
@@ -1867,7 +1868,8 @@ async fn replay_of_a_resolution_makes_no_close() {
     worker.complete_execution(&fired.run_id).await;
     worker.drain_pollers_and_shutdown().await;
     tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(store.calls().is_empty(), "{:?}", store.calls());
+    // Completing the run closes its own chain, and nothing else reaches the store.
+    assert_eq!(store.calls(), ["close_chain"]);
 }
 
 #[tokio::test]
