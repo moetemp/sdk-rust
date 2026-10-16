@@ -364,6 +364,7 @@ impl NexusCalls {
             max_records: max_records as u32,
             state: state.clone(),
             floor_holder: floor_holder.clone(),
+            subscriber: None,
         };
         let positions = !floor_holder.is_empty();
         let mut read = match self.streams.read_carried(request).await {

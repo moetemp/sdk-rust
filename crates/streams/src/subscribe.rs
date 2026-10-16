@@ -1,9 +1,11 @@
 //! Readers that sleep on a stream's notifier.
 //!
-//! A Workflow's reader attaches to the stream's notifier before its first read, so the notifier
-//! wakes the Workflow on its next Workflow Task when the stream moves. The attach names the reader
-//! by its run and its subscription id, which replay gives back, so a rerun attaches as the same
-//! reader and the server keeps one callback. A client reader has no task to wake, so it waits on
+//! A Workflow's reader attaches to the stream's notifier as an idle callback at its first read
+//! that finds nothing. Each read that finds nothing asks the notifier for one wake after the
+//! read's counter, which reaches the Workflow on its next Workflow Task. A read that finds records
+//! asks for nothing, so a reader that keeps up costs the notifier nothing. The attach names the
+//! reader by its run and its subscription id, which replay gives back, so a rerun attaches as the
+//! same reader and the server keeps one callback. A client reader has no task to wake, so it waits on
 //! the notifier with a long poll.
 
 use crate::{
@@ -11,11 +13,18 @@ use crate::{
     WorkflowAttachment,
     handle::{Remembered, address, chain_of},
     proto::{
-        ChainId, StreamAddress, SubscribeRequest, SubscribeResponse, UnsubscribeRequest,
-        UnsubscribeResponse, WaitForNotificationRequest, WaitForNotificationResponse,
+        ChainId, ReadRequest, ReadResponse, StreamAddress, SubscribeRequest, SubscribeResponse,
+        UnsubscribeRequest, UnsubscribeResponse, WaitForNotificationRequest,
+        WaitForNotificationResponse,
     },
 };
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 /// How long after it sends a poll Core reads the stream once more. The poll starts the stream's
 /// notifier, and a record that lands later notifies it.
@@ -30,6 +39,9 @@ const MAX_SUBSCRIPTION_ID_BYTES: usize = 256;
 pub(crate) struct Subscriptions {
     client: Option<Arc<dyn NotifierClient>>,
     attached: Remembered<SubscriptionKey>,
+    /// The server keeps every reader standing, as one from before idle callbacks does, so this
+    /// process attaches readers that way and sends no waits.
+    standing: AtomicBool,
 }
 
 impl Default for Subscriptions {
@@ -73,6 +85,14 @@ fn request_id(run_id: &str, subscription_id: &str, generation: u32) -> String {
     }
 }
 
+/// Where a reader is attached, and whether this call sent the attach.
+struct Attach {
+    chain: ChainId,
+    request_id: String,
+    key: SubscriptionKey,
+    attached: bool,
+}
+
 fn check_subscription(run_id: &str, subscription_id: &str) -> StreamResult<()> {
     if run_id.is_empty() || subscription_id.is_empty() {
         return Err(StreamError::invalid_argument(
@@ -101,6 +121,7 @@ impl Subscriptions {
         Self {
             client,
             attached: Remembered::new(StreamsOptions::default().remembered),
+            standing: AtomicBool::new(false),
         }
     }
 
@@ -110,13 +131,138 @@ impl Subscriptions {
         })
     }
 
-    /// Attaches the reader once per process. The attach only announces the reader. Every append
-    /// notifies, so the first one wakes the Workflow.
+    /// Attaches the reader idle once per process. An idle reader hears nothing until a wait.
     pub(crate) async fn subscribe(
         &self,
         streams: &Streams,
         request: SubscribeRequest,
     ) -> StreamResult<SubscribeResponse> {
+        let stream = address(request.stream.as_ref())?.clone();
+        let attach = self.attach(streams, request).await?;
+        Ok(SubscribeResponse {
+            newest_counter: streams.newest(&stream, &attach.chain).await?.0,
+            chain_first_run_id: attach.chain.first_run_id,
+            attached: attach.attached,
+        })
+    }
+
+    /// Attaches the reader idle when this process has not, and asks the notifier for one wake
+    /// once its counter is above `after_counter`. Answers the newest counter after a fresh
+    /// attach, since a record that landed before the notifier existed woke no one, and `None`
+    /// after a wait on a reader attached before.
+    pub(crate) async fn wait_idle(
+        &self,
+        streams: &Streams,
+        request: SubscribeRequest,
+        after_counter: i64,
+    ) -> StreamResult<Option<i64>> {
+        let stream = address(request.stream.as_ref())?.clone();
+        let client = self.client()?;
+        let mut attach = self.attach(streams, request.clone()).await?;
+        match self
+            .send_wait(client, &stream, &attach, after_counter)
+            .await
+        {
+            Err(NotifyError::Refused(error)) if !attach.attached => {
+                // The notifier lost the callback this process remembers, so it attaches again.
+                tracing::debug!(%error, "The notifier refused a reader's wait, so it attaches again");
+                self.attached.forget(&attach.key);
+                attach = self.attach(streams, request).await?;
+                self.send_wait(client, &stream, &attach, after_counter)
+                    .await
+                    .map_err(subscribe_error)?;
+            }
+            other => other.map_err(subscribe_error)?,
+        }
+        if !attach.attached {
+            return Ok(None);
+        }
+        // Read after the wait landed, so a record after this one passes the wait.
+        Ok(Some(streams.newest(&stream, &attach.chain).await?.0))
+    }
+
+    /// Sends the reader's wait, unless the server keeps readers standing.
+    async fn send_wait(
+        &self,
+        client: &Arc<dyn NotifierClient>,
+        stream: &StreamAddress,
+        attach: &Attach,
+        after_counter: i64,
+    ) -> Result<(), NotifyError> {
+        if self.standing.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        match client
+            .wait_callback(
+                attach.chain.clone(),
+                stream.topic.clone(),
+                attach.request_id.clone(),
+                after_counter,
+            )
+            .await
+        {
+            Err(NotifyError::Unsupported(error)) => {
+                // The attach landed, so the server has a notifier but no waits. It took the
+                // reader as a standing one, which every notification wakes.
+                self.keep_standing(&error);
+                Ok(())
+            }
+            other => other,
+        }
+    }
+
+    fn keep_standing(&self, error: &str) {
+        if !self.standing.swap(true, Ordering::Relaxed) {
+            tracing::debug!(
+                error,
+                "The server keeps stream readers standing, so this process sends no waits"
+            );
+        }
+    }
+
+    /// Reads, and when the answer has no records and is not done, waits as `wait_idle` does for
+    /// the read's `subscriber`. Reads once more when a record landed before a fresh attach.
+    pub(crate) async fn read(
+        &self,
+        streams: &Streams,
+        mut request: ReadRequest,
+    ) -> StreamResult<ReadResponse> {
+        let Some(subscriber) = request.subscriber.take() else {
+            return streams.read(request).await;
+        };
+        check_subscription(&subscriber.run_id, &subscriber.subscription_id)?;
+        let answer = streams.read(request.clone()).await?;
+        if !answer.records.is_empty() || answer.done {
+            return Ok(answer);
+        }
+        let newest = self
+            .wait_idle(
+                streams,
+                SubscribeRequest {
+                    stream: request.stream.clone(),
+                    workflow_id: subscriber.workflow_id,
+                    run_id: subscriber.run_id,
+                    subscription_id: subscriber.subscription_id,
+                    generation: subscriber.generation,
+                },
+                answer.wake_after,
+            )
+            .await?;
+        if newest.is_none_or(|newest| newest <= answer.wake_after) {
+            return Ok(answer);
+        }
+        streams
+            .read(ReadRequest {
+                after: answer.cursor,
+                wait: None,
+                state: answer.state,
+                ..request
+            })
+            .await
+    }
+
+    /// Attaches the reader idle once per process.
+    async fn attach(&self, streams: &Streams, request: SubscribeRequest) -> StreamResult<Attach> {
         let stream = address(request.stream.as_ref())?;
         if request.workflow_id.is_empty() {
             return Err(StreamError::invalid_argument(
@@ -131,13 +277,13 @@ impl Subscriptions {
         );
         let key = SubscriptionKey::new(stream, &request_id);
         if let Some(attached) = self.attached.get(&key) {
-            let chain = ChainId {
-                first_run_id: attached.first_run_id.clone(),
-                ..streams.chain(stream).await?
-            };
-            return Ok(SubscribeResponse {
-                newest_counter: streams.newest(stream, &chain).await?.0,
-                chain_first_run_id: attached.first_run_id,
+            return Ok(Attach {
+                chain: ChainId {
+                    first_run_id: attached.first_run_id,
+                    ..streams.chain(stream).await?
+                },
+                request_id,
+                key,
                 attached: false,
             });
         }
@@ -145,24 +291,37 @@ impl Subscriptions {
         // Fresh for the latest run, since the Workflow id may have moved on to a new chain since a
         // read warmed the cache, and an attach to the ended chain would never wake the reader.
         let chain = streams.chain_now(stream).await?;
-        client
-            .attach_workflow(WorkflowAttachment {
-                chain: chain.clone(),
-                topic: stream.topic.clone(),
-                request_id,
-                workflow_id: request.workflow_id,
-                run_id: request.run_id,
-                subscription_id: request.subscription_id,
-            })
-            .await
-            .map_err(subscribe_error)?;
-        self.attached.put(key, &chain.first_run_id, OWNER_RECHECK);
-        // Read after the attach landed, so a record after this one notifies the reader.
-        let newest_counter = streams.newest(stream, &chain).await?.0;
-        Ok(SubscribeResponse {
-            chain_first_run_id: chain.first_run_id,
+        let attachment = WorkflowAttachment {
+            chain: chain.clone(),
+            topic: stream.topic.clone(),
+            request_id: request_id.clone(),
+            workflow_id: request.workflow_id,
+            run_id: request.run_id,
+            subscription_id: request.subscription_id,
+            idle: !self.standing.load(Ordering::Relaxed),
+        };
+        match client.attach_workflow(attachment.clone()).await {
+            Err(NotifyError::Refused(error)) if attachment.idle => {
+                // A server that refuses idle Workflow targets keeps readers standing. A refusal
+                // for another cause fails the standing attach too, and the process keeps waits.
+                client
+                    .attach_workflow(WorkflowAttachment {
+                        idle: false,
+                        ..attachment
+                    })
+                    .await
+                    .map_err(|_| subscribe_error(NotifyError::Refused(error.clone())))?;
+                self.keep_standing(&error);
+            }
+            other => other.map_err(subscribe_error)?,
+        }
+        self.attached
+            .put(key.clone(), &chain.first_run_id, OWNER_RECHECK);
+        Ok(Attach {
+            chain,
+            request_id,
+            key,
             attached: true,
-            newest_counter,
         })
     }
 
@@ -285,6 +444,15 @@ mod tests {
         poll_answer: Mutex<Option<Result<Option<NotifierPoll>, NotifyError>>>,
         /// How long the poll takes before it answers.
         poll_delay: Mutex<Duration>,
+        waits: Mutex<Vec<(ChainId, String, String, i64)>>,
+        /// The answers of the next waits, in order. A wait past them lands.
+        wait_answers: Mutex<Vec<NotifyError>>,
+        /// Refuses idle attaches, as a server that keeps readers standing.
+        refuse_idle: Mutex<bool>,
+        /// Appends a record to this store as the attach lands, as a producer racing the attach.
+        append_on_attach: Mutex<Option<Arc<MemoryStore>>>,
+        /// The same as the wait lands.
+        append_on_wait: Mutex<Option<Arc<MemoryStore>>>,
     }
 
     #[async_trait::async_trait]
@@ -297,7 +465,40 @@ mod tests {
             if let Some(error) = self.answer.lock().unwrap().clone() {
                 return Err(error);
             }
+            if attachment.idle && *self.refuse_idle.lock().unwrap() {
+                return Err(NotifyError::Refused(
+                    "idle is only allowed with a Nexus callback".to_string(),
+                ));
+            }
+            let store = self.append_on_attach.lock().unwrap().take();
+            if let Some(store) = store {
+                append_to(&store, &attachment.chain.first_run_id, 1).await;
+            }
             self.attached.lock().unwrap().push(attachment);
+            Ok(())
+        }
+
+        async fn wait_callback(
+            &self,
+            chain: ChainId,
+            topic: String,
+            request_id: String,
+            after_counter: i64,
+        ) -> Result<(), NotifyError> {
+            {
+                let mut answers = self.wait_answers.lock().unwrap();
+                if !answers.is_empty() {
+                    return Err(answers.remove(0));
+                }
+            }
+            let store = self.append_on_wait.lock().unwrap().take();
+            if let Some(store) = store {
+                append_to(&store, &chain.first_run_id, 1).await;
+            }
+            self.waits
+                .lock()
+                .unwrap()
+                .push((chain, topic, request_id, after_counter));
             Ok(())
         }
 
@@ -401,6 +602,7 @@ mod tests {
         let subscriptions = Subscriptions {
             client: Some(setup.server.clone()),
             attached: Remembered::new(2),
+            standing: AtomicBool::new(false),
         };
         let streams = Streams::new(
             setup.store.clone(),
@@ -442,6 +644,7 @@ mod tests {
                 workflow_id: "reader".to_string(),
                 run_id: "reader-run".to_string(),
                 subscription_id: "1".to_string(),
+                idle: true,
             }]
         );
     }
@@ -764,6 +967,16 @@ mod tests {
         let attached = setup.server.attached.lock().unwrap().clone();
         assert_eq!(attached.len(), 1);
         assert_eq!(attached[0].subscription_id, "7.0");
+        assert_eq!(
+            setup.server.waits.lock().unwrap().clone(),
+            [(
+                chain("chain-1"),
+                "tokens".to_string(),
+                "jetty/reader-run/7.0".to_string(),
+                0
+            )],
+            "the idle source asks for one wake after its counter"
+        );
         // A record that lands later wakes the run, and the next step reads it.
         setup
             .service
@@ -780,6 +993,285 @@ mod tests {
         .await;
         assert_eq!(next.records.len(), 1);
         assert!(next.wakes.is_empty());
+        assert_eq!(
+            setup.server.waits.lock().unwrap().len(),
+            1,
+            "a step with records asks for no wake"
+        );
+    }
+
+    fn reader() -> crate::proto::ReadSubscriber {
+        crate::proto::ReadSubscriber {
+            workflow_id: "reader".to_string(),
+            run_id: "reader-run".to_string(),
+            subscription_id: "1".to_string(),
+            generation: 0,
+        }
+    }
+
+    fn idle_read(after: &str, state: Vec<u8>) -> ReadRequest {
+        ReadRequest {
+            stream: Some(stream()),
+            after: after.to_string(),
+            state,
+            subscriber: Some(reader()),
+            ..Default::default()
+        }
+    }
+
+    async fn read(service: &StreamService, request: ReadRequest) -> ReadResponse {
+        ReadResponse::decode(
+            service
+                .call("Read", &request.encode_to_vec())
+                .await
+                .unwrap()
+                .as_slice(),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_idle_read_attaches_once_and_asks_for_one_wake_after_each_empty_answer() {
+        let setup = setup();
+        let empty = read(&setup.service, idle_read("", vec![])).await;
+        assert!(empty.records.is_empty() && !empty.done);
+        assert_eq!(empty.wake_after, 0);
+        append_records(&setup, 2).await;
+        let busy = read(&setup.service, idle_read(&empty.cursor, empty.state)).await;
+        assert_eq!(busy.records.len(), 2);
+        let idle = read(&setup.service, idle_read(&busy.cursor, busy.state)).await;
+        assert!(idle.records.is_empty());
+        assert_eq!(idle.wake_after, 2);
+        let attached = setup.server.attached.lock().unwrap().clone();
+        assert_eq!(attached.len(), 1, "one attach per process");
+        assert_eq!(attached[0].request_id, "jetty/reader-run/1");
+        let request_id = "jetty/reader-run/1".to_string();
+        assert_eq!(
+            setup.server.waits.lock().unwrap().clone(),
+            [
+                (
+                    chain("chain-1"),
+                    "tokens".to_string(),
+                    request_id.clone(),
+                    0
+                ),
+                (chain("chain-1"), "tokens".to_string(), request_id, 2),
+            ],
+            "one wait per idle answer, none for the answer with records"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_read_without_a_subscriber_or_with_records_asks_for_nothing() {
+        let setup = setup();
+        let plain = read(
+            &setup.service,
+            ReadRequest {
+                subscriber: None,
+                ..idle_read("", vec![])
+            },
+        )
+        .await;
+        assert!(plain.records.is_empty());
+        append_records(&setup, 1).await;
+        read(&setup.service, idle_read("", vec![])).await;
+        assert!(setup.server.attached.lock().unwrap().is_empty());
+        assert!(setup.server.waits.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_record_that_lands_before_the_first_attach_is_read_at_once() {
+        let setup = setup();
+        *setup.server.append_on_attach.lock().unwrap() = Some(setup.store.clone());
+        let answer = read(&setup.service, idle_read("", vec![])).await;
+        assert_eq!(
+            answer.records.len(),
+            1,
+            "the notifier did not exist, so the record woke no one"
+        );
+        assert_eq!(setup.server.waits.lock().unwrap()[0].3, 0);
+    }
+
+    #[tokio::test]
+    async fn a_later_idle_read_leaves_a_racing_record_to_the_wait() {
+        let setup = setup();
+        let first = read(&setup.service, idle_read("", vec![])).await;
+        *setup.server.append_on_wait.lock().unwrap() = Some(setup.store.clone());
+        // The notifier exists since the attach, so it heard the record, and the wait after
+        // counter 0 wakes the Workflow at once.
+        let again = read(&setup.service, idle_read(&first.cursor, first.state)).await;
+        assert!(again.records.is_empty());
+        assert_eq!(setup.server.waits.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failed_wait_fails_the_read_and_a_retry_waits_again() {
+        let setup = setup();
+        setup
+            .server
+            .wait_answers
+            .lock()
+            .unwrap()
+            .push(NotifyError::Failed("down".to_string()));
+        let error = setup
+            .service
+            .call("Read", &idle_read("", vec![]).encode_to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Storage as i32);
+        read(&setup.service, idle_read("", vec![])).await;
+        assert_eq!(setup.server.attached.lock().unwrap().len(), 1);
+        assert_eq!(setup.server.waits.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_lost_wait_attaches_the_reader_again_and_waits_once_more() {
+        let setup = setup();
+        let first = read(&setup.service, idle_read("", vec![])).await;
+        setup
+            .server
+            .wait_answers
+            .lock()
+            .unwrap()
+            .push(NotifyError::Refused("no such callback".to_string()));
+        read(&setup.service, idle_read(&first.cursor, first.state)).await;
+        assert_eq!(setup.server.attached.lock().unwrap().len(), 2);
+        assert_eq!(
+            setup.server.waits.lock().unwrap().len(),
+            2,
+            "the refused wait is not counted, the one after the attach is"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_without_waits_keeps_the_reader_standing_and_gets_no_more_waits() {
+        let setup = setup();
+        setup
+            .server
+            .wait_answers
+            .lock()
+            .unwrap()
+            .push(NotifyError::Unsupported("unimplemented".to_string()));
+        let first = read(&setup.service, idle_read("", vec![])).await;
+        assert!(first.records.is_empty(), "the read still answers");
+        read(&setup.service, idle_read(&first.cursor, first.state)).await;
+        let fresh = ReadRequest {
+            subscriber: Some(crate::proto::ReadSubscriber {
+                subscription_id: "2".to_string(),
+                ..reader()
+            }),
+            ..idle_read("", vec![])
+        };
+        read(&setup.service, fresh).await;
+        assert!(setup.server.waits.lock().unwrap().is_empty());
+        let attached = setup.server.attached.lock().unwrap().clone();
+        assert_eq!(
+            attached.iter().map(|a| a.idle).collect::<Vec<_>>(),
+            [true, false],
+            "later attaches are standing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_that_refuses_idle_readers_gets_a_standing_attach_and_no_waits() {
+        let setup = setup();
+        *setup.server.refuse_idle.lock().unwrap() = true;
+        let first = read(&setup.service, idle_read("", vec![])).await;
+        read(&setup.service, idle_read(&first.cursor, first.state)).await;
+        let attached = setup.server.attached.lock().unwrap().clone();
+        assert_eq!(attached.len(), 1);
+        assert!(!attached[0].idle);
+        assert!(setup.server.waits.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_reader_refused_for_another_cause_fails_and_the_process_keeps_waits() {
+        let setup = setup();
+        *setup.server.answer.lock().unwrap() = Some(NotifyError::Refused(
+            "the execution has 32 stream wake sources".to_string(),
+        ));
+        let error = setup
+            .service
+            .call("Read", &idle_read("", vec![]).encode_to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Refused as i32);
+        assert!(
+            error.message.contains("32 stream wake sources"),
+            "{error:?}"
+        );
+        *setup.server.answer.lock().unwrap() = None;
+        read(&setup.service, idle_read("", vec![])).await;
+        assert!(setup.server.attached.lock().unwrap()[0].idle);
+        assert_eq!(setup.server.waits.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_idle_read_names_its_reader() {
+        let setup = setup();
+        for subscriber in [
+            crate::proto::ReadSubscriber {
+                workflow_id: String::new(),
+                ..reader()
+            },
+            crate::proto::ReadSubscriber {
+                run_id: String::new(),
+                ..reader()
+            },
+            crate::proto::ReadSubscriber {
+                subscription_id: String::new(),
+                ..reader()
+            },
+        ] {
+            let request = ReadRequest {
+                subscriber: Some(subscriber),
+                ..idle_read("", vec![])
+            };
+            let error = setup
+                .service
+                .call("Read", &request.encode_to_vec())
+                .await
+                .unwrap_err();
+            assert_eq!(error.kind, StreamFailureKind::InvalidArgument as i32);
+        }
+        assert!(setup.server.attached.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_idle_read_without_a_client_is_unsupported() {
+        let service = StreamService::new(
+            Arc::new(MemoryStore::new()),
+            Arc::new(Owner(Mutex::new("chain-1".to_string()))),
+            StreamsOptions::default(),
+        );
+        let error = service
+            .call("Read", &idle_read("", vec![]).encode_to_vec())
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Unsupported as i32);
+    }
+
+    #[tokio::test]
+    async fn a_new_generation_attaches_again_and_waits_on_the_new_attach() {
+        let setup = setup();
+        read(&setup.service, idle_read("", vec![])).await;
+        let request = ReadRequest {
+            subscriber: Some(crate::proto::ReadSubscriber {
+                generation: 1,
+                ..reader()
+            }),
+            ..idle_read("", vec![])
+        };
+        read(&setup.service, request).await;
+        let waits: Vec<String> = setup
+            .server
+            .waits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|wait| wait.2.clone())
+            .collect();
+        assert_eq!(waits, ["jetty/reader-run/1", "jetty/reader-run/1/1"]);
     }
 
     #[tokio::test]
@@ -826,10 +1318,15 @@ mod tests {
 
     /// Appends `count` records to the chain the owner names now.
     async fn append_records(setup: &Setup, count: i64) {
-        use crate::StreamStore;
         let first_run_id = setup.owner.0.lock().unwrap().clone();
-        setup
-            .store
+        append_to(&setup.store, &first_run_id, count).await;
+    }
+
+    /// Appends `count` records to the stream on the chain that `first_run_id` starts.
+    async fn append_to(store: &MemoryStore, first_run_id: &str, count: i64) {
+        use crate::StreamStore;
+        let first_run_id = first_run_id.to_string();
+        store
             .append(crate::proto::StoreAppendRequest {
                 chain: Some(ChainId {
                     namespace: "ns".to_string(),
@@ -842,7 +1339,19 @@ mod tests {
                 attempt: 1,
                 sequence: 1,
                 digest: vec![1],
-                records: (0..count).map(|_| b"record".to_vec()).collect(),
+                records: (0..count)
+                    .map(|_| {
+                        crate::proto::StreamRecord {
+                            topic: "tokens".to_string(),
+                            kind: crate::proto::StreamRecordKind::Data as i32,
+                            producer_id: "p".to_string(),
+                            attempt: 1,
+                            sequence: 1,
+                            ..Default::default()
+                        }
+                        .encode_to_vec()
+                    })
+                    .collect(),
             })
             .await
             .unwrap();
