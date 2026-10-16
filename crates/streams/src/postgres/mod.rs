@@ -505,7 +505,11 @@ impl Inner {
                 Ok(Ok(rows)) => return Ok(rows),
                 Ok(Err(error)) if retryable(&error) && tries < 3 => tries += 1,
                 Ok(Err(error)) => {
-                    if error.as_db_error().is_none() {
+                    // A connection the error ended never goes back to the pool.
+                    let fatal = error
+                        .as_db_error()
+                        .is_none_or(|db| matches!(db.severity(), "FATAL" | "PANIC"));
+                    if fatal || client.is_closed() {
                         drop(deadpool_postgres::Object::take(client));
                     }
                     return Err(mapped(call, &error));
