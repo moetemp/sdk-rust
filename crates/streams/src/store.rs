@@ -167,8 +167,8 @@ pub trait StreamStore: Send + Sync {
     ) -> StreamResult<()>;
 
     /// The topics that producers wrote on a Workflow Activity's chain, so the scheduling
-    /// Workflow's Core can close each one when the Activity ends. A topic enters the set with the
-    /// first batch of a producer attempt, and a topic that no producer wrote is not in it. Other
+    /// Workflow's Core can close each one when the Activity ends. A topic enters the set with
+    /// every batch, and a topic that no producer wrote is not in it. Other
     /// chains keep no set and answer empty.
     async fn written_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>>;
 
