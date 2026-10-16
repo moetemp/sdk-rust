@@ -4,10 +4,11 @@ use crate::{
     DEFAULT_MAX_NOTIFIERS, Notifier, NotifierClient, NotifyingStore, OwnerClient, StreamError,
     StreamResult, StreamStore, Streams, StreamsOptions,
     proto::{
-        AppendRequest, CloseRequest, DeleteOwnerRequest, FlushNotificationsRequest,
-        FlushNotificationsResponse, LatestRequest, ReadRangeRequest, ReadRequest,
-        ReleaseFloorRequest, RetireProducerRequest, StreamFailure, StreamStoreConfig,
-        SubscribeRequest, UnsubscribeRequest, WaitForNotificationRequest, stream_store_config,
+        AppendRequest, CloseRequest, DeleteOwnerRequest, DescribeStoreRequest,
+        DescribeStoreResponse, FlushNotificationsRequest, FlushNotificationsResponse,
+        LatestRequest, ReadRangeRequest, ReadRequest, ReleaseFloorRequest, RetireProducerRequest,
+        StreamFailure, StreamStoreConfig, SubscribeRequest, UnsubscribeRequest,
+        WaitForNotificationRequest, stream_store_config,
     },
     subscribe::Subscriptions,
 };
@@ -59,8 +60,12 @@ impl StreamService {
         notifier: Option<Arc<dyn NotifierClient>>,
     ) -> StreamResult<Self> {
         let (store, retention): (Arc<dyn StreamStore>, Duration) = match config.store {
-            Some(stream_store_config::Store::Memory(_)) => {
-                (Arc::new(crate::MemoryStore::new()), DEFAULT_RETENTION)
+            Some(stream_store_config::Store::Memory(memory)) => {
+                let store = match &memory.capabilities {
+                    Some(mask) => crate::MemoryStore::with_capabilities(mask.into()),
+                    None => crate::MemoryStore::new(),
+                };
+                (Arc::new(store), DEFAULT_RETENTION)
             }
             Some(stream_store_config::Store::Redis(redis)) => connect_redis(redis).await?,
             None => {
@@ -195,6 +200,14 @@ impl StreamService {
                 )
                 .await
                 .map(|r| r.encode_to_vec()),
+            "DescribeStore" => {
+                decode::<DescribeStoreRequest>(rpc, request)?;
+                Ok(DescribeStoreResponse {
+                    name: self.store.name().to_string(),
+                    capabilities: Some(self.store.capabilities().into()),
+                }
+                .encode_to_vec())
+            }
             other => Err(StreamError::unsupported(format!(
                 "the stream service has no call {other:?}"
             ))),
@@ -247,6 +260,7 @@ async fn connect_redis(
     if let Some(grace) = config.floor_release_grace {
         options.floor_release_grace = duration(grace.seconds, grace.nanos, "floor release grace")?;
     }
+    options.plain = config.plain;
     let retention = options.retention;
     let store = crate::RedisStore::connect(options).await?;
     Ok((Arc::new(store), retention))
@@ -308,7 +322,9 @@ mod tests {
     async fn service() -> StreamService {
         StreamService::connect(
             StreamStoreConfig {
-                store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+                store: Some(stream_store_config::Store::Memory(
+                    MemoryStoreConfig::default(),
+                )),
                 ..Default::default()
             },
             Arc::new(Running),
@@ -546,6 +562,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn describe_answers_the_stores_capabilities_and_limits() {
+        use crate::proto::StoreCapabilities;
+        let describe = async |service: &StreamService| {
+            let answer = service
+                .call("DescribeStore", &DescribeStoreRequest {}.encode_to_vec())
+                .await
+                .unwrap();
+            DescribeStoreResponse::decode(answer.as_slice()).unwrap()
+        };
+        let full = describe(&service().await).await;
+        assert_eq!(full.name, "memory");
+        let capabilities = full.capabilities.unwrap();
+        assert!(capabilities.producer_state && capabilities.kept_last);
+        assert!(capabilities.dense_positions && !capabilities.holds);
+        assert_eq!(capabilities.max_record_bytes, 1536 * 1024);
+        assert_eq!(capabilities.max_batch_bytes, 4 << 20);
+        let masked = StreamService::connect(
+            StreamStoreConfig {
+                store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {
+                    capabilities: Some(StoreCapabilities {
+                        long_poll: true,
+                        max_record_bytes: 1024,
+                        ..Default::default()
+                    }),
+                })),
+                ..Default::default()
+            },
+            Arc::new(Running),
+        )
+        .await
+        .unwrap();
+        let capabilities = describe(&masked).await.capabilities.unwrap();
+        assert!(!capabilities.producer_state && !capabilities.kept_last);
+        assert!(capabilities.long_poll);
+        assert_eq!(capabilities.max_record_bytes, 1024);
+        assert_eq!(capabilities.max_batch_bytes, 4 << 20);
+    }
+
+    #[tokio::test]
     async fn a_config_that_names_no_store_is_refused() {
         let error = StreamService::connect(StreamStoreConfig::default(), Arc::new(Running))
             .await
@@ -556,7 +611,9 @@ mod tests {
     #[tokio::test]
     async fn a_negative_owner_start_grace_is_refused() {
         let mut config = StreamStoreConfig {
-            store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+            store: Some(stream_store_config::Store::Memory(
+                MemoryStoreConfig::default(),
+            )),
             owner_start_grace: Some(Default::default()),
             ..Default::default()
         };
@@ -601,7 +658,9 @@ mod tests {
     async fn service_notifying(notify_on_append: bool, recorder: Arc<Recorder>) -> StreamService {
         StreamService::connect_with_notifier(
             StreamStoreConfig {
-                store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+                store: Some(stream_store_config::Store::Memory(
+                    MemoryStoreConfig::default(),
+                )),
                 notify_on_append,
                 ..Default::default()
             },
@@ -677,7 +736,9 @@ mod tests {
     async fn notifications_without_a_client_are_refused() {
         let error = StreamService::connect(
             StreamStoreConfig {
-                store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+                store: Some(stream_store_config::Store::Memory(
+                    MemoryStoreConfig::default(),
+                )),
                 notify_on_append: true,
                 ..Default::default()
             },
@@ -733,7 +794,9 @@ mod tests {
         let stock = Arc::new(Stock::default());
         let service = StreamService::connect_with_notifier(
             StreamStoreConfig {
-                store: Some(stream_store_config::Store::Memory(MemoryStoreConfig {})),
+                store: Some(stream_store_config::Store::Memory(
+                    MemoryStoreConfig::default(),
+                )),
                 notify_on_append: true,
                 ..Default::default()
             },
