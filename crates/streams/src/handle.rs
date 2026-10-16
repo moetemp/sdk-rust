@@ -106,8 +106,13 @@ impl<K: std::hash::Hash + Eq + Clone> Remembered<K> {
         let mut entries = self.entries.lock().unwrap();
         if entries.len() >= self.limit && !entries.contains_key(&key) {
             entries.retain(|_, checked| checked.at.elapsed() < fresh_for);
-            if entries.len() >= self.limit {
-                entries.clear();
+            if entries.len() >= self.limit
+                && let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, checked)| checked.at)
+                    .map(|(key, _)| key.clone())
+            {
+                entries.remove(&oldest);
             }
         }
         entries.insert(
@@ -117,6 +122,10 @@ impl<K: std::hash::Hash + Eq + Clone> Remembered<K> {
                 at: Instant::now(),
             },
         );
+    }
+
+    fn forget(&self, key: &K) {
+        self.entries.lock().unwrap().remove(key);
     }
 }
 
@@ -130,6 +139,9 @@ pub struct Streams {
     /// The chain each producer attempt began on.
     producers: Remembered<ProducerKey>,
     chains: Remembered<OwnerKey>,
+    /// When Temporal first answered that an owner is gone, per Workflow id. A failover can
+    /// answer `NotFound` until replication catches up, so one answer doesn't close a chain.
+    missing: Remembered<OwnerKey>,
 }
 
 impl std::fmt::Debug for Streams {
@@ -154,6 +166,7 @@ impl Streams {
             owners: Remembered::new(options.remembered),
             producers: Remembered::new(options.remembered),
             chains: Remembered::new(options.remembered),
+            missing: Remembered::new(options.remembered),
             options,
         }
     }
@@ -406,7 +419,7 @@ impl Streams {
             if let (Err(OwnerError::NotFound(_)), Some(checked)) = (&latest, &known) {
                 // The chain came from this Workflow, so History has since dropped it.
                 let gone = chain_of_key(owner, &checked.first_run_id);
-                return Err(self.closed(&gone, "is gone from History").await);
+                return Err(self.gone(&gone).await);
             }
             let latest = latest.map_err(not_found)?;
             let chain = chain_of_key(owner, &first_run_id(owner, &latest)?);
@@ -445,12 +458,36 @@ impl Streams {
         };
         match self.describe(&key, "").await {
             // The chain came from this Workflow, so History has since dropped it.
-            Err(OwnerError::NotFound(_)) => Err(self.closed(chain, "is gone from History").await),
+            Err(OwnerError::NotFound(_)) => Err(self.gone(chain).await),
             Err(error) => Err(describe_failed(&error)),
             Ok(latest) if latest.chain_ended() || latest.first_run_id != chain.first_run_id => {
                 Err(self.closed(chain, "has closed").await)
             }
             Ok(_) => Ok(()),
+        }
+    }
+
+    /// Closes a chain whose owner Temporal answered is gone, but only on the second such answer
+    /// at least [StreamsOptions::owner_recheck] after the first. The first answer fails the call
+    /// as a storage failure, which the caller retries.
+    async fn gone(&self, chain: &ChainId) -> StreamError {
+        let key = OwnerKey {
+            namespace: chain.namespace.clone(),
+            workflow_id: chain.workflow_id.clone(),
+            run_id: String::new(),
+        };
+        let recheck = self.options.owner_recheck;
+        match self.missing.get(&key) {
+            Some(seen)
+                if seen.first_run_id == chain.first_run_id && seen.at.elapsed() >= recheck =>
+            {
+                self.closed(chain, "is gone from History").await
+            }
+            Some(seen) if seen.first_run_id == chain.first_run_id => missing(chain),
+            _ => {
+                self.missing.put(key, &chain.first_run_id, recheck * 2);
+                missing(chain)
+            }
         }
     }
 
@@ -486,9 +523,18 @@ impl Streams {
         owner: &OwnerKey,
         run_id: &str,
     ) -> Result<OwnerDescription, OwnerError> {
-        self.owner
+        let described = self
+            .owner
             .describe(&owner.namespace, &owner.workflow_id, run_id)
-            .await
+            .await;
+        if described.is_ok() {
+            self.missing.forget(&OwnerKey {
+                namespace: owner.namespace.clone(),
+                workflow_id: owner.workflow_id.clone(),
+                run_id: String::new(),
+            });
+        }
+        described
     }
 
     fn hash(&self, stream: &StreamAddress) -> String {
@@ -582,6 +628,14 @@ fn not_found(error: OwnerError) -> StreamError {
         )),
         error => describe_failed(&error),
     }
+}
+
+fn missing(chain: &ChainId) -> StreamError {
+    StreamError::storage(format!(
+        "Temporal doesn't hold the Workflow {:?} that owns this stream for now, so the call \
+         fails until it holds it again or answers the same after a recheck",
+        chain.workflow_id
+    ))
 }
 
 fn describe_failed(error: &OwnerError) -> StreamError {
@@ -1026,10 +1080,52 @@ mod tests {
             .owners
             .fail("wf", OwnerError::NotFound("workflow not found".to_string()));
         tokio::time::advance(OWNER_RECHECK + Duration::from_secs(1)).await;
+        // The first answer may be replication lag after a failover, so it closes nothing.
+        let error = setup.streams.append(append("p", 2, "2")).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Storage);
+        assert!(!chain_closed(&setup.store, "run-1").await);
+        tokio::time::advance(OWNER_RECHECK).await;
         let error = setup.streams.append(append("p", 2, "2")).await.unwrap_err();
         assert_eq!(error.kind, StreamFailureKind::Closed);
         assert!(error.message.contains("gone from History"), "{error}");
         assert!(chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn one_not_found_from_the_owner_check_closes_nothing() {
+        let setup = setup(StreamsOptions::default());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup
+            .owners
+            .fail("wf", OwnerError::NotFound("workflow not found".to_string()));
+        tokio::time::advance(OWNER_RECHECK + Duration::from_secs(1)).await;
+        let error = setup.streams.append(append("p", 2, "2")).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Storage);
+        // Replication caught up, and the owner is back.
+        setup.owners.run("wf", "run-1", "run-1");
+        setup.streams.append(append("p", 2, "2")).await.unwrap();
+        assert!(!chain_closed(&setup.store, "run-1").await);
+        // A later lone `NotFound` starts the grace over.
+        setup
+            .owners
+            .fail("wf", OwnerError::NotFound("workflow not found".to_string()));
+        tokio::time::advance(OWNER_RECHECK + Duration::from_secs(1)).await;
+        let error = setup.streams.append(append("p", 3, "3")).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Storage);
+        assert!(!chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_memory_forgets_its_oldest_entry_only() {
+        let remembered = Remembered::new(3);
+        for key in 0..4 {
+            remembered.put(key, "run-1", Duration::from_secs(3600));
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert!(remembered.get(&0).is_none());
+        for key in 1..4 {
+            assert!(remembered.get(&key).is_some(), "{key}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
