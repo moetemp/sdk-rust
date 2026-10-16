@@ -598,7 +598,7 @@ async fn replay_local_activity_heartbeat(progress_on_heartbeat: bool) -> Vec<Vec
     seen
 }
 
-/// Pins the server rule this replay depends on (DD-52): the server never puts progress on a
+/// Pins the server rule this replay depends on: the server never puts progress on a
 /// Workflow Task created by a local activity heartbeat. A history that keeps that rule replays in
 /// the activations the run had live. A history that breaks it hands lang the progress together
 /// with the activity result, which the live run never did. Core's own split at a task with
@@ -633,7 +633,7 @@ async fn a_history_with_no_progress_on_heartbeat_tasks_replays_as_it_ran_live() 
     );
 }
 
-/// A task scheduled only to carry progress lang already has (DD-55's follow-up can repeat it),
+/// A task scheduled only to carry progress lang already has (DD-34's follow-up can repeat it),
 /// then a timer's task. The repeated progress gives the first task no jobs.
 fn stale_progress_only_task() -> TestHistoryBuilder {
     let mut t = TestHistoryBuilder::default();
