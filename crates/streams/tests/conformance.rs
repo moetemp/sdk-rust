@@ -808,6 +808,16 @@ mod on_postgres {
         .await
     }
 
+    /// [postgres_with_log] with an archive hold, for a tiered store.
+    pub(crate) async fn postgres_with_archive(variable: &str) -> Option<Postgres> {
+        postgres_with(variable, |options| {
+            options.notification_log = true;
+            options.notify_doorbells = 4;
+            options.archive_lease = Some(Duration::from_secs(60));
+        })
+        .await
+    }
+
     /// [postgres] with a `NOTIFY` per append for waiting reads.
     pub(crate) async fn postgres_notifying_reads(variable: &str) -> Option<Postgres> {
         postgres_with(variable, |options| options.notify_reads = true).await
@@ -3216,6 +3226,63 @@ mod archive_workflow_activity_cluster_redis {
     archive_cases!(super::tiered(super::workflow_activity(
         super::on_redis::redis_with_archive("STREAMS_REDIS_CLUSTER_URL", true)
     )));
+}
+
+#[cfg(feature = "postgres")]
+mod archive_postgres {
+    archive_cases!(super::tiered(super::on_postgres::postgres_with_archive(
+        "STREAMS_POSTGRES_URL"
+    )));
+    // The test trim keeps what a hold holds, as the janitor does.
+    archive_conformance!(super::tiered(super::on_postgres::postgres_with_archive(
+        "STREAMS_POSTGRES_URL"
+    ));
+        the_trim_keeps_what_the_archive_does_not_hold,
+    );
+    log_cases!(super::tiered(super::on_postgres::postgres_with_archive(
+        "STREAMS_POSTGRES_URL"
+    )));
+}
+
+#[cfg(feature = "postgres")]
+mod tiered_postgres {
+    // The test trim keeps what the archive's hold holds, so the store cases that trim run with no
+    // hold, as on memory.
+    store_cases!(super::tiered(super::on_postgres::postgres_with_log(
+        "STREAMS_POSTGRES_URL"
+    )));
+    log_cases!(super::tiered(super::on_postgres::postgres_with_log(
+        "STREAMS_POSTGRES_URL"
+    )));
+    conformance!(super::tiered(super::on_postgres::postgres("STREAMS_POSTGRES_URL"));
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
+#[cfg(feature = "postgres")]
+mod archive_activity_postgres {
+    archive_cases!(super::tiered(super::activity(
+        super::on_postgres::postgres_with_archive("STREAMS_POSTGRES_URL")
+    )));
+}
+
+#[cfg(feature = "postgres")]
+mod archive_workflow_activity_postgres {
+    archive_cases!(super::tiered(super::workflow_activity(
+        super::on_postgres::postgres_with_archive("STREAMS_POSTGRES_URL")
+    )));
+}
+
+#[cfg(all(feature = "archive", feature = "postgres"))]
+mod archive_s3_postgres {
+    archive_cases!(super::tiered_on_s3(
+        super::on_postgres::postgres_with_archive("STREAMS_POSTGRES_URL")
+    ));
+    archive_conformance!(super::tiered_on_s3(super::on_postgres::postgres_with_archive(
+        "STREAMS_POSTGRES_URL"
+    ));
+        the_trim_keeps_what_the_archive_does_not_hold,
+    );
 }
 
 #[cfg(feature = "archive")]

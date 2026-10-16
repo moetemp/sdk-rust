@@ -89,6 +89,9 @@ relevant information.
   first entry. `listen_url` names a direct connection for the listener and the migrations when
   `url` goes through PgBouncer in transaction mode. `notify_reads` sends a `NOTIFY` per append, so
   waiting reads in other processes wake at once.
+* Experimental: `StreamStoreConfig.archive` works with the PostgreSQL store. A topic's first record
+  makes the archive's hold as a `floors` row, and the janitor drops only what the archive holds
+  while the driver keeps up. The archive is off unless the config sets it.
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with

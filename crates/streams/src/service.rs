@@ -439,10 +439,11 @@ async fn connect_redis(
 async fn connect_postgres(
     config: crate::proto::PostgresStoreConfig,
     notification_log: bool,
-    _archive_lease: Option<Duration>,
+    archive_lease: Option<Duration>,
 ) -> StreamResult<(Arc<dyn StreamStore>, Duration)> {
     let mut options = crate::PostgresStoreOptions::new(config.url);
     options.notification_log = notification_log;
+    options.archive_lease = archive_lease;
     if config.notify_doorbells > 0 {
         options.notify_doorbells = config.notify_doorbells;
     }

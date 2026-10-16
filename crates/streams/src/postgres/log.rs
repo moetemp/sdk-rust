@@ -2,7 +2,7 @@
 
 use super::{Inner, PARTITIONS, errors::Call, listen::Rings};
 use crate::{
-    NotificationEntry, NotificationLog, StreamResult,
+    ArchiveMark, NotificationEntry, NotificationLog, StreamResult,
     proto::{ChainId, StreamOwnerKind},
 };
 use std::{sync::Arc, time::Duration};
@@ -11,6 +11,8 @@ pub(super) struct PostgresLog {
     pub(super) inner: Arc<Inner>,
     pub(super) rings: Arc<Rings>,
     pub(super) doorbells: u32,
+    /// Whether the store keeps an archive hold, so it has topics to archive.
+    pub(super) archive: bool,
 }
 
 /// The chain of a `chains` row. A Workflow chain keeps no owner kind, as the Redis store's keys
@@ -111,6 +113,25 @@ impl NotificationLog for PostgresLog {
             .query(Call::Write, &inner.sql.ack, &[&partition, &ids])
             .await
             .map(drop)
+    }
+
+    async fn archive_marks(&self, max: usize) -> StreamResult<Vec<ArchiveMark>> {
+        if !self.archive || max == 0 {
+            return Ok(vec![]);
+        }
+        let inner = &self.inner;
+        let max = i64::try_from(max).unwrap_or(i64::MAX);
+        let rows = inner
+            .query(Call::Read, &inner.sql.archive_marks, &[&max])
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ArchiveMark {
+                chain: chain(row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)),
+                topic: row.get(5),
+                written_ms: row.get::<_, i64>(6).max(0) as u64,
+            })
+            .collect())
     }
 
     async fn busy(&self) -> StreamResult<Vec<u32>> {

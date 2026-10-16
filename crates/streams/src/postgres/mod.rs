@@ -82,6 +82,10 @@ pub struct PostgresStoreOptions {
     /// Each append also sends `NOTIFY`, so waiting reads in other processes wake in milliseconds.
     /// Costs append throughput when many producers write at once.
     pub notify_reads: bool,
+    /// With an archive, how long the archive's hold on a topic lasts after the archive last moved
+    /// it. Each topic's first record makes the hold, so retention drops only what the archive
+    /// holds while the archive keeps up. Needs `notification_log`, since a driver archives.
+    pub archive_lease: Option<Duration>,
 }
 
 impl PostgresStoreOptions {
@@ -102,6 +106,7 @@ impl PostgresStoreOptions {
             notify_doorbells: DEFAULT_POSTGRES_DOORBELLS,
             listen_url: None,
             notify_reads: false,
+            archive_lease: None,
         }
     }
 }
@@ -205,6 +210,8 @@ struct Sql {
     ack: String,
     busy: String,
     cap_log: String,
+    advance: String,
+    archive_marks: String,
 }
 
 /// The chain key, as `$1` to `$5`.
@@ -291,6 +298,19 @@ impl Sql {
                  WHERE EXISTS (SELECT 1 FROM {s}.notifications n WHERE n.partition = p)"
             ),
             cap_log: format!("SELECT {s}.cap_log_v1($1)"),
+            advance: format!("SELECT {s}.advance_archive_v1($1, $2, $3, $4, $5, $6, $7, $8)"),
+            archive_marks: format!(
+                "SELECT x.namespace, x.owner_kind, x.owner_id, x.first_run_id, x.activity_id, \
+                   x.topic, x.written_ms FROM ( \
+                   SELECT c.namespace, c.owner_kind, c.owner_id, c.first_run_id, c.activity_id, \
+                     t.topic, CASE WHEN t.closed THEN 0 \
+                       ELSE (extract(epoch FROM t.written_at) * 1000)::bigint END AS written_ms, \
+                     row_number() OVER (PARTITION BY t.partition \
+                       ORDER BY t.closed DESC, t.written_at) AS n \
+                   FROM {s}.topics t JOIN {s}.chains c ON c.chain_id = t.chain_id \
+                   WHERE t.archive_pending) x \
+                 WHERE x.n <= $1"
+            ),
         }
     }
 }
@@ -311,6 +331,8 @@ struct Inner {
     log: bool,
     doorbells: i32,
     notify_reads: bool,
+    /// The archive's lease in milliseconds, with an archive.
+    archive_lease_ms: Option<i64>,
 }
 
 impl PostgresStore {
@@ -326,6 +348,11 @@ impl PostgresStore {
                 MAX_SCHEMA - 1,
                 options.schema
             )));
+        }
+        if options.archive_lease.is_some() && !options.notification_log {
+            return Err(StreamError::refused(
+                "an archive needs the notification log, since a driver archives",
+            ));
         }
         if !(1..=PARTITIONS).contains(&options.notify_doorbells) {
             return Err(StreamError::refused(format!(
@@ -381,6 +408,7 @@ impl PostgresStore {
             log: options.notification_log,
             doorbells: options.notify_doorbells as i32,
             notify_reads: options.notify_reads,
+            archive_lease_ms: options.archive_lease.map(|lease| millis(lease).max(1)),
         });
         let mut tasks = vec![
             tokio::spawn(poll(Arc::downgrade(&inner), options.poll_interval)),
@@ -401,6 +429,7 @@ impl PostgresStore {
                 inner: inner.clone(),
                 rings,
                 doorbells: options.notify_doorbells,
+                archive: options.archive_lease.is_some(),
             })
         });
         Ok(Self { inner, log, tasks })
@@ -693,7 +722,6 @@ impl StreamStore for PostgresStore {
         }
         let inner = &self.inner;
         let chain = chain_of(request.chain.as_ref())?;
-        let no_lease: Option<i64> = None;
         let rows = inner
             .query(
                 Call::Append,
@@ -714,7 +742,7 @@ impl StreamStore for PostgresStore {
                     &chain.keeps_topics(),
                     &inner.log,
                     &inner.doorbells,
-                    &no_lease,
+                    &inner.archive_lease_ms,
                     &inner.retention_ms,
                     &inner.notify_reads,
                 ],
@@ -971,7 +999,7 @@ impl StreamStore for PostgresStore {
                     &topic,
                     &chain.partition(),
                     &close.encode_to_vec(),
-                    &false,
+                    &inner.archive_lease_ms.is_some(),
                 ],
             )
             .await?;
@@ -1031,6 +1059,48 @@ impl StreamStore for PostgresStore {
         Ok(rows.iter().map(|row| row.get(0)).collect())
     }
 
+    async fn advance_archive(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+        position: &str,
+    ) -> StreamResult<()> {
+        let inner = &self.inner;
+        let Some(lease) = inner.archive_lease_ms else {
+            return Err(StreamError::unsupported("this store keeps no archive hold"));
+        };
+        let position = parse_position(position)?.unwrap_or(0);
+        let chain = Chain::of(chain);
+        inner
+            .query(
+                Call::Write,
+                &inner.sql.advance,
+                &[
+                    &chain.namespace,
+                    &chain.kind,
+                    &chain.owner,
+                    &chain.run,
+                    &chain.activity,
+                    &topic,
+                    &position,
+                    &lease,
+                ],
+            )
+            .await
+            .map(drop)
+    }
+
+    async fn archived(&self, chain: &ChainId, topic: &str) -> StreamResult<Option<String>> {
+        if self.inner.archive_lease_ms.is_none() {
+            return Ok(None);
+        }
+        Ok(self
+            .inner
+            .topic_row(chain, topic)
+            .await?
+            .map(|(_, _, archived)| archived.map(|p| p.to_string()).unwrap_or_default()))
+    }
+
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
         let (kind, owner): (i16, &str) = match StreamOwnerKind::try_from(request.owner_kind) {
             Ok(StreamOwnerKind::Workflow) => (1, &request.workflow_id),
@@ -1071,6 +1141,18 @@ impl Inner {
         chain: &ChainId,
         topic: &str,
     ) -> StreamResult<(Option<i64>, Option<i64>, Option<i64>)> {
+        Ok(self
+            .topic_row(chain, topic)
+            .await?
+            .unwrap_or((None, None, None)))
+    }
+
+    /// [Inner::topic_state], or `None` when the topic has no row.
+    async fn topic_row(
+        &self,
+        chain: &ChainId,
+        topic: &str,
+    ) -> StreamResult<Option<(Option<i64>, Option<i64>, Option<i64>)>> {
         let chain = Chain::of(chain);
         let rows = self
             .query(
@@ -1086,9 +1168,7 @@ impl Inner {
                 ],
             )
             .await?;
-        Ok(rows.first().map_or((None, None, None), |row| {
-            (row.get(0), row.get(1), row.get(2))
-        }))
+        Ok(rows.first().map(|row| (row.get(0), row.get(1), row.get(2))))
     }
 }
 

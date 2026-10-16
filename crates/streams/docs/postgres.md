@@ -90,6 +90,19 @@ sequence, and the dedupe answers it. Another error reply means the server rolled
 so it reports `REFUSED`. A read reports `STORAGE`. A server below PostgreSQL 14 is refused as
 `UNSUPPORTED` at connect.
 
+**Archive hold.** With `archive_lease` set, a driver copies each topic into an archive, and the
+store holds what the archive doesn't hold yet. A topic's first record makes the `floors` row
+`archive` at position `0`, in the append's transaction, so it holds the whole topic until the
+archive's first pass. `advance_archive` moves it to the archive's newest position with no minimum,
+renews its lease and sets the topic's `archived`. The janitor reads it as any other hold. When the
+driver stops for longer than the lease, the hold ends and retention goes on. `archive_pending`
+marks the topics with records to archive, set by appends and closes, and cleared by an advance to
+the topic's newest position and by the archive's release. `archive_marks` reads it, closed topics
+first. A topic made again after its tombstone starts above every archived position, so an archive
+segment name never stands for two records. The archive is optional on PostgreSQL, since records
+already live on disk. It helps above about 1 TB of records, for retention in years, and to keep
+backups small. An archive needs `notification_log`.
+
 ## Migrations
 
 The store embeds its migrations and applies the missing ones at connect, each in its own
