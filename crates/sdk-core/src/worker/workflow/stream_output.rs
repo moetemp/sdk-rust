@@ -44,8 +44,13 @@ pub(crate) struct RetiredSessions {
     pub(crate) sessions: BTreeMap<i64, BTreeSet<String>>,
 }
 
-/// Splits `records` into one append per topic, in order of first publish, and counts them into
-/// `committed`, the records the attempt committed to each topic so far.
+/// The most record bytes one append carries. A larger commit goes as several appends per topic, so
+/// no activation is too large to append and lang never fails a task for its size.
+pub(crate) const MAX_APPEND_BYTES: usize = 4 << 20;
+
+/// Splits `records` into appends per topic, in order of first publish, each of at most
+/// [MAX_APPEND_BYTES] past its first record, and counts them into `committed`, the records the
+/// attempt committed to each topic so far.
 ///
 /// Fails the Workflow Task when a record is one no writer stores. Each failure names what to
 /// fix, since the task fails the same way on every retry.
@@ -71,12 +76,33 @@ pub(super) fn output_by_topic(
             }),
         }
     }
-    for topic in &mut topics {
-        let count = committed.entry(topic.topic.clone()).or_default();
-        topic.sequence = *count + 1;
-        *count += topic.records.len() as i64;
+    let mut appends = vec![];
+    for topic in topics {
+        let mut bytes = 0;
+        for record in topic.records {
+            let size = record.body.as_ref().map_or(0, prost::Message::encoded_len)
+                + record.content_hash.len();
+            let full = appends.last().is_some_and(|last: &TopicOutput| {
+                last.topic == topic.topic && bytes + size > MAX_APPEND_BYTES
+            });
+            if full || appends.last().is_none_or(|last| last.topic != topic.topic) {
+                appends.push(TopicOutput {
+                    topic: topic.topic.clone(),
+                    sequence: 0,
+                    records: vec![],
+                });
+                bytes = 0;
+            }
+            bytes += size;
+            appends.last_mut().unwrap().records.push(record);
+        }
     }
-    Ok(topics)
+    for append in &mut appends {
+        let count = committed.entry(append.topic.clone()).or_default();
+        append.sequence = *count + 1;
+        *count += append.records.len() as i64;
+    }
+    Ok(appends)
 }
 
 fn check_record(record: &OutputRecord) -> Result<(), String> {
@@ -205,7 +231,9 @@ impl OutputStore {
                 match self.store.append(request.clone()).await {
                     Ok(_) => break,
                     Err(error) if error.kind == StreamFailureKind::Closed => {
-                        dropped.push(topic.topic.clone());
+                        if !dropped.contains(&topic.topic) {
+                            dropped.push(topic.topic.clone());
+                        }
                         break;
                     }
                     Err(error)
@@ -278,6 +306,29 @@ mod tests {
             kind: StreamRecordKind::Finish as i32,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_large_commit_goes_as_several_appends_per_topic() {
+        let big = |topic: &str, hash: u8| OutputRecord {
+            body: Some(Payload {
+                data: vec![7; 3 << 20],
+                ..Default::default()
+            }),
+            ..data(topic, hash)
+        };
+        let mut committed = HashMap::new();
+        let appends = output_by_topic(
+            vec![big("a", 1), big("a", 2), big("a", 3), data("b", 4)],
+            &mut committed,
+        )
+        .unwrap();
+        let shape: Vec<(&str, i64, usize)> = appends
+            .iter()
+            .map(|append| (append.topic.as_str(), append.sequence, append.records.len()))
+            .collect();
+        assert_eq!(shape, [("a", 1, 1), ("a", 2, 1), ("a", 3, 1), ("b", 1, 1)]);
+        assert_eq!(committed["a"], 3);
     }
 
     #[test]
