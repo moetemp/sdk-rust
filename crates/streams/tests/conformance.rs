@@ -438,6 +438,19 @@ mod on_redis {
         )
     }
 
+    fn now_ms() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+    }
+
+    /// A stream id as its two numbers, so ids compare in log order.
+    fn stream_id(id: &str) -> (u64, u64) {
+        let (ms, seq) = id.split_once('-').unwrap_or((id, "0"));
+        (ms.parse().unwrap(), seq.parse().unwrap())
+    }
+
     pub(crate) struct Redis {
         pub(crate) store: Arc<RedisStore>,
         pub(crate) raw: Raw,
@@ -737,17 +750,38 @@ mod on_redis {
         }
 
         async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize) {
-            // Trims as the append script does, watermark included.
+            // Trims as the append script does, watermark included, and keeps what a live hold
+            // holds, as `keep.lua` does.
             let mut raw = self.raw.clone();
             let log = log_key(&self.prefix, chain, topic);
             let entries: Vec<(String, Value)> = raw
                 .query(redis::cmd("XRANGE").arg(&log).arg("-").arg("+"))
                 .await;
-            let Some(doomed) = entries.len().checked_sub(keep).filter(|&n| n > 0) else {
+            let floors: Vec<String> = raw
+                .query(redis::cmd("HVALS").arg(format!("{log}:floors")))
+                .await;
+            let held = floors
+                .iter()
+                .filter_map(|floor| {
+                    let (id, until) = floor.split_once('|')?;
+                    (until.parse::<u128>().ok()? > now_ms()).then(|| stream_id(id))
+                })
+                .min();
+            let below_hold = entries
+                .iter()
+                .take_while(|(id, _)| held.is_none_or(|held| stream_id(id) < held))
+                .count();
+            let doomed = entries.len().saturating_sub(keep).min(below_hold);
+            if doomed == 0 {
                 return;
-            };
+            }
             let _: i64 = raw
-                .query(redis::cmd("XTRIM").arg(&log).arg("MAXLEN").arg(keep))
+                .query(
+                    redis::cmd("XTRIM")
+                        .arg(&log)
+                        .arg("MAXLEN")
+                        .arg(entries.len() - doomed),
+                )
                 .await;
             raw.hset(&format!("{log}:meta"), "trimmed", &entries[doomed - 1].0)
                 .await;
@@ -2717,8 +2751,8 @@ macro_rules! archive_conformance {
     };
 }
 
-/// The archive cases. A hot store whose test trim ignores holds skips
-/// `the_trim_keeps_what_the_archive_does_not_hold`.
+/// The archive cases. `the_trim_keeps_what_the_archive_does_not_hold` runs on its own, since it
+/// needs a test trim that keeps what a hold holds.
 macro_rules! archive_cases {
     ($case:expr) => {
         archive_conformance!($case;
@@ -3198,8 +3232,15 @@ mod archive_standalone_redis {
         "STREAMS_REDIS_URL",
         false
     )));
-    // The archive hold doesn't change the store contract.
-    store_cases!(super::tiered(super::on_redis::redis_with_archive(
+    archive_conformance!(super::tiered(super::on_redis::redis_with_archive(
+        "STREAMS_REDIS_URL",
+        false
+    ));
+        the_trim_keeps_what_the_archive_does_not_hold,
+    );
+    // The test trim keeps what the archive's hold holds, so the store cases that trim run with no
+    // hold, as on memory and PostgreSQL.
+    store_cases!(super::tiered(super::on_redis::redis_with_log(
         "STREAMS_REDIS_URL",
         false
     )));
@@ -3215,7 +3256,13 @@ mod archive_cluster_redis {
         "STREAMS_REDIS_CLUSTER_URL",
         true
     )));
-    store_cases!(super::tiered(super::on_redis::redis_with_archive(
+    archive_conformance!(super::tiered(super::on_redis::redis_with_archive(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    ));
+        the_trim_keeps_what_the_archive_does_not_hold,
+    );
+    store_cases!(super::tiered(super::on_redis::redis_with_log(
         "STREAMS_REDIS_CLUSTER_URL",
         true
     )));
