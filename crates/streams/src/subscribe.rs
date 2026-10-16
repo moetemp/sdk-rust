@@ -13,8 +13,8 @@ use crate::{
     WorkflowAttachment,
     handle::{Remembered, address, chain_of},
     proto::{
-        ChainId, ReadRequest, ReadResponse, StreamAddress, SubscribeRequest, SubscribeResponse,
-        UnsubscribeRequest, UnsubscribeResponse, WaitForNotificationRequest,
+        ChainId, ReadRequest, ReadResponse, StreamAddress, StreamFailureKind, SubscribeRequest,
+        SubscribeResponse, UnsubscribeRequest, UnsubscribeResponse, WaitForNotificationRequest,
         WaitForNotificationResponse,
     },
 };
@@ -138,7 +138,7 @@ impl Subscriptions {
         request: SubscribeRequest,
     ) -> StreamResult<SubscribeResponse> {
         let stream = address(request.stream.as_ref())?.clone();
-        let attach = self.attach(streams, request).await?;
+        let attach = self.attach(streams, request, None).await?;
         Ok(SubscribeResponse {
             newest_counter: streams.newest(&stream, &attach.chain).await?.0,
             chain_first_run_id: attach.chain.first_run_id,
@@ -149,16 +149,21 @@ impl Subscriptions {
     /// Attaches the reader idle when this process has not, and asks the notifier for one wake
     /// once its counter is above `after_counter`. Answers the newest counter after a fresh
     /// attach, since a record that landed before the notifier existed woke no one, and `None`
-    /// after a wait on a reader attached before.
+    /// after a wait on a reader attached before. `chain_first_run_id` names the chain a read
+    /// answered from, which the wait must be on. Without it, the wait is on the chain the stream
+    /// names now.
     pub(crate) async fn wait_idle(
         &self,
         streams: &Streams,
         request: SubscribeRequest,
         after_counter: i64,
+        chain_first_run_id: Option<&str>,
     ) -> StreamResult<Option<i64>> {
         let stream = address(request.stream.as_ref())?.clone();
         let client = self.client()?;
-        let mut attach = self.attach(streams, request.clone()).await?;
+        let mut attach = self
+            .attach(streams, request.clone(), chain_first_run_id)
+            .await?;
         match self
             .send_wait(client, &stream, &attach, after_counter)
             .await
@@ -167,7 +172,7 @@ impl Subscriptions {
                 // The notifier lost the callback this process remembers, so it attaches again.
                 tracing::debug!(%error, "The notifier refused a reader's wait, so it attaches again");
                 self.attached.forget(&attach.key);
-                attach = self.attach(streams, request).await?;
+                attach = self.attach(streams, request, chain_first_run_id).await?;
                 self.send_wait(client, &stream, &attach, after_counter)
                     .await
                     .map_err(subscribe_error)?;
@@ -232,10 +237,12 @@ impl Subscriptions {
         };
         check_subscription(&subscriber.run_id, &subscriber.subscription_id)?;
         let answer = streams.read(request.clone()).await?;
-        if !answer.records.is_empty() || answer.done {
+        // A read inside the owner's start grace has no chain yet, so there is no notifier to wait
+        // on. Lang reads again on its timer.
+        if !answer.records.is_empty() || answer.done || answer.chain_first_run_id.is_empty() {
             return Ok(answer);
         }
-        let newest = self
+        let waited = self
             .wait_idle(
                 streams,
                 SubscribeRequest {
@@ -246,8 +253,27 @@ impl Subscriptions {
                     generation: subscriber.generation,
                 },
                 answer.wake_after,
+                Some(&answer.chain_first_run_id),
             )
-            .await?;
+            .await;
+        let newest = match waited {
+            // The read's chain ended and a new one took the stream's owner id, so the ended
+            // chain's notifier is gone. The read is over, as for any ended owner.
+            Err(error)
+                if error.kind == StreamFailureKind::Refused
+                    && streams
+                        .chain_now(address(request.stream.as_ref())?)
+                        .await?
+                        .first_run_id
+                        != answer.chain_first_run_id =>
+            {
+                return Ok(ReadResponse {
+                    done: true,
+                    ..answer
+                });
+            }
+            waited => waited?,
+        };
         if newest.is_none_or(|newest| newest <= answer.wake_after) {
             return Ok(answer);
         }
@@ -261,8 +287,13 @@ impl Subscriptions {
             .await
     }
 
-    /// Attaches the reader idle once per process.
-    async fn attach(&self, streams: &Streams, request: SubscribeRequest) -> StreamResult<Attach> {
+    /// Attaches the reader idle once per process, on chain `chain_first_run_id` when given.
+    async fn attach(
+        &self,
+        streams: &Streams,
+        request: SubscribeRequest,
+        chain_first_run_id: Option<&str>,
+    ) -> StreamResult<Attach> {
         let stream = address(request.stream.as_ref())?;
         if request.workflow_id.is_empty() {
             return Err(StreamError::invalid_argument(
@@ -276,7 +307,9 @@ impl Subscriptions {
             request.generation,
         );
         let key = SubscriptionKey::new(stream, &request_id);
-        if let Some(attached) = self.attached.get(&key) {
+        if let Some(attached) = self.attached.get(&key)
+            && chain_first_run_id.is_none_or(|first| first == attached.first_run_id)
+        {
             return Ok(Attach {
                 chain: ChainId {
                     first_run_id: attached.first_run_id,
@@ -288,9 +321,13 @@ impl Subscriptions {
             });
         }
         let client = self.client()?;
-        // Fresh for the latest run, since the Workflow id may have moved on to a new chain since a
-        // read warmed the cache, and an attach to the ended chain would never wake the reader.
-        let chain = streams.chain_now(stream).await?;
+        // A read's own chain, so the wait lands where the read's counters come from. Otherwise
+        // fresh for the latest run, since the Workflow id may have moved on to a new chain since
+        // a read warmed the cache, and an attach to the ended chain would never wake the reader.
+        let chain = match chain_first_run_id {
+            Some(first) => chain_of(stream, first),
+            None => streams.chain_now(stream).await?,
+        };
         let attachment = WorkflowAttachment {
             chain: chain.clone(),
             topic: stream.topic.clone(),
@@ -1059,6 +1096,58 @@ mod tests {
             ],
             "one wait per idle answer, none for the answer with records"
         );
+    }
+
+    /// Temporal, before the owner started.
+    struct NotStarted;
+
+    #[async_trait::async_trait]
+    impl OwnerClient for NotStarted {
+        async fn describe(
+            &self,
+            _: &str,
+            _: OwnerId<'_>,
+            _: &str,
+        ) -> Result<OwnerDescription, OwnerError> {
+            Err(OwnerError::NotFound("workflow not found".to_string()))
+        }
+    }
+
+    #[tokio::test]
+    async fn an_idle_read_before_the_owner_starts_answers_empty_and_attaches_nothing() {
+        let server = Arc::new(Server::default());
+        let service = StreamService::new(
+            Arc::new(MemoryStore::new()),
+            Arc::new(NotStarted),
+            StreamsOptions::default(),
+        )
+        .with_subscriptions(server.clone());
+        let mut request = idle_read("", vec![]);
+        request.wait = Some(std::time::Duration::from_millis(50).try_into().unwrap());
+        let answer = read(&service, request).await;
+        assert!(answer.records.is_empty() && !answer.done);
+        assert!(server.attached.lock().unwrap().is_empty());
+        assert!(server.waits.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_idle_read_of_an_ended_chain_waits_on_that_chain() {
+        let setup = setup();
+        append_records(&setup, 2).await;
+        let busy = read(&setup.service, idle_read("", vec![])).await;
+        assert_eq!(busy.chain_first_run_id, "chain-1");
+        // The owner's id moves to a new chain before the reader goes idle.
+        *setup.owner.0.lock().unwrap() = "chain-2".to_string();
+        let idle = read(&setup.service, idle_read(&busy.cursor, busy.state)).await;
+        let attached = setup.server.attached.lock().unwrap().clone();
+        let waits = setup.server.waits.lock().unwrap().clone();
+        assert!(!attached.is_empty() || idle.done);
+        for attachment in attached {
+            assert_eq!(attachment.chain.first_run_id, idle.chain_first_run_id);
+        }
+        for (chain, ..) in waits {
+            assert_eq!(chain.first_run_id, idle.chain_first_run_id);
+        }
     }
 
     #[tokio::test]
