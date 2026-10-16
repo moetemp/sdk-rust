@@ -119,20 +119,23 @@ pub async fn archive_topic(
                     && segment.records.is_empty() =>
             {
                 // The hold lapsed and retention dropped records the archive never took. The
-                // segment starts at what is left, and says so, so a read before it fails as
-                // expired.
+                // segment starts after the newest dropped one, and says so, so a read before it
+                // fails as expired and a read at it goes on.
                 tracing::warn!(topic, %error, "The archive lost records that retention dropped");
+                let Some(dropped) = hot.dropped_after(chain, topic, &progress.archived).await?
+                else {
+                    return Err(error);
+                };
                 let page = hot
                     .read(StoreReadRequest {
                         chain: Some(chain.clone()),
                         topic: topic.to_string(),
+                        after_position: dropped.clone(),
                         max_records: READ_PAGE.min(limits.records.max(1)),
                         ..Default::default()
                     })
                     .await?;
-                if let Some(first) = page.records.first() {
-                    segment.after_position = first.position.clone();
-                }
+                segment.after_position = dropped;
                 page
             }
             Err(error) => return Err(error),
