@@ -109,14 +109,22 @@ pub(crate) struct RetiredSessions {
     pub(crate) run_id: String,
     pub(crate) first_run_id: String,
     pub(crate) sessions: BTreeMap<i64, BTreeSet<String>>,
+    /// The run's attempt, when the task ends the run's chain. The chain closes once the server
+    /// accepts the task, since a command the server doesn't take can still keep the run open.
+    pub(crate) chain_end: Option<i64>,
 }
 
-/// The most record bytes one append carries. A larger commit goes as several appends per topic, so
-/// no activation is too large to append and lang never fails a task for its size.
+/// The most record bytes one append carries when the store declares no limit. A larger commit goes
+/// as several appends per topic, so no activation is too large to append and lang never fails a
+/// task for its size.
 pub(crate) const MAX_APPEND_BYTES: usize = 4 << 20;
 
+/// What the store adds to each record besides its body, topic and hash, counted high: the
+/// producer id, the attempt, the sequence, the hash's metadata entry and the completed tasks.
+const ENVELOPE_BYTES: usize = 256;
+
 /// Splits `records` into appends per topic, in order of first publish, each of at most
-/// [MAX_APPEND_BYTES] past its first record, and counts them into `committed`, the records the
+/// `max_batch_bytes` past its first record, and counts them into `committed`, the records the
 /// attempt committed to each topic so far.
 ///
 /// Fails the Workflow Task when a record is one no writer stores. Each failure names what to
@@ -124,6 +132,7 @@ pub(crate) const MAX_APPEND_BYTES: usize = 4 << 20;
 pub(super) fn output_by_topic(
     records: Vec<OutputRecord>,
     committed: &mut HashMap<String, i64>,
+    max_batch_bytes: usize,
 ) -> Result<Vec<TopicOutput>, WFMachinesError> {
     for (index, record) in records.iter().enumerate() {
         check_record(record).map_err(|reason| {
@@ -147,10 +156,9 @@ pub(super) fn output_by_topic(
     for topic in topics {
         let mut bytes = 0;
         for record in topic.records {
-            let size = record.body.as_ref().map_or(0, prost::Message::encoded_len)
-                + record.content_hash.len();
+            let size = prost::Message::encoded_len(&record) + ENVELOPE_BYTES;
             let full = appends.last().is_some_and(|last: &TopicOutput| {
-                last.topic == topic.topic && bytes + size > MAX_APPEND_BYTES
+                last.topic == topic.topic && bytes + size > max_batch_bytes
             });
             if full || appends.last().is_none_or(|last| last.topic != topic.topic) {
                 appends.push(TopicOutput {
@@ -309,6 +317,7 @@ impl OutputStore {
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
+            temporalio_streams::check_record_limit(&records, &self.store.capabilities())?;
             let request = StoreAppendRequest {
                 chain: Some(self.chain(&batch.workflow_id, &batch.first_run_id)),
                 topic: topic.topic.clone(),
@@ -327,7 +336,7 @@ impl OutputStore {
             let mut delay = APPEND_RETRY_FIRST;
             let mut tries = 1;
             loop {
-                match self.store.append(request.clone()).await {
+                match temporalio_streams::append_batch(&*self.store, request.clone()).await {
                     Ok(_) => break,
                     Err(error) if error.kind == StreamFailureKind::Closed => {
                         if !dropped.contains(&topic.topic) {
@@ -373,13 +382,21 @@ impl OutputStore {
 
     /// Drops the store's dedupe sessions of attempts that will not write again, in the
     /// background, so the next activation doesn't wait a store round trip per session. A
-    /// failure only leaves a session in the store until retention, so it is logged.
+    /// failure only leaves a session in the store until retention, so it is logged. Then closes
+    /// the chain when the run ended it. A failed close leaves each reader to end on the owner's
+    /// status and each producer at its owner check.
     pub(crate) fn retire(&self, retired: RetiredSessions) {
         let chain = self.chain(&retired.workflow_id, &retired.first_run_id);
         let producer_id = temporalio_streams::workflow_producer_id(&retired.run_id);
         let store = self.store.clone();
+        // A store without producer state keeps no sessions to drop.
+        let sessions = if store.capabilities().producer_state {
+            retired.sessions
+        } else {
+            Default::default()
+        };
         self.tasks.spawn(async move {
-            for (attempt, topics) in &retired.sessions {
+            for (attempt, topics) in &sessions {
                 for topic in topics {
                     if let Err(error) = store
                         .retire_producer(&chain, topic, &producer_id, *attempt)
@@ -388,6 +405,12 @@ impl OutputStore {
                         debug!(%topic, attempt, %error, "Could not retire a stream output session");
                     }
                 }
+            }
+            if let Some(attempt) = retired.chain_end
+                && let Err(error) =
+                    temporalio_streams::close_chain(&*store, &chain, &producer_id, attempt).await
+            {
+                warn!(%error, "Could not close the streams of a run that ended its chain");
             }
         });
     }
@@ -545,6 +568,7 @@ mod tests {
         let appends = output_by_topic(
             vec![big("a", 1), big("a", 2), big("a", 3), data("b", 4)],
             &mut committed,
+            MAX_APPEND_BYTES,
         )
         .unwrap();
         let shape: Vec<(&str, i64, usize)> = appends
@@ -556,11 +580,22 @@ mod tests {
     }
 
     #[test]
+    fn a_commit_splits_by_the_stores_batch_limit() {
+        let mut committed = HashMap::new();
+        let records = (0..4).map(|n| data("a", n)).collect();
+        let appends = output_by_topic(records, &mut committed, 700).unwrap();
+        let sizes: Vec<usize> = appends.iter().map(|append| append.records.len()).collect();
+        assert_eq!(sizes, [2, 2]);
+        assert_eq!((appends[1].sequence, committed["a"]), (3, 4));
+    }
+
+    #[test]
     fn topics_keep_their_order_of_first_publish_and_sequences_go_on() {
         let mut committed = HashMap::new();
         let first = output_by_topic(
             vec![data("b", 1), data("a", 2), finish("b")],
             &mut committed,
+            MAX_APPEND_BYTES,
         )
         .unwrap();
         let shape: Vec<_> = first
@@ -568,7 +603,7 @@ mod tests {
             .map(|t| (t.topic.as_str(), t.sequence, t.records.len()))
             .collect();
         assert_eq!(shape, [("b", 1, 2), ("a", 1, 1)]);
-        let second = output_by_topic(vec![data("a", 3)], &mut committed).unwrap();
+        let second = output_by_topic(vec![data("a", 3)], &mut committed, MAX_APPEND_BYTES).unwrap();
         assert_eq!((second[0].topic.as_str(), second[0].sequence), ("a", 2));
     }
 
@@ -610,9 +645,13 @@ mod tests {
                 "is LINK with a 32-byte content hash",
             ),
         ] {
-            let message = output_by_topic(vec![data("t", 9), record], &mut HashMap::new())
-                .unwrap_err()
-                .to_string();
+            let message = output_by_topic(
+                vec![data("t", 9), record],
+                &mut HashMap::new(),
+                MAX_APPEND_BYTES,
+            )
+            .unwrap_err()
+            .to_string();
             assert!(message.contains(expected), "{expected}: {message}");
         }
     }
@@ -639,6 +678,7 @@ mod tests {
         let topics = output_by_topic(
             vec![data("t", 1), link_record("t", join("tool-1"))],
             &mut HashMap::new(),
+            MAX_APPEND_BYTES,
         )
         .unwrap();
         assert_eq!(topics.len(), 1);
