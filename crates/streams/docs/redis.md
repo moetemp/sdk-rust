@@ -92,8 +92,16 @@ so on a cluster the user must exist on every node. Deleting an owner's streams a
 `+scan`. `+config|get` only reads
 `maxmemory-policy`, and the store goes on when a server refuses it.
 
+**Plain mode.** `RedisStoreOptions::plain` runs the store with no Lua. An append is a
+`MULTI` of `XADD`s that trim by age, a read is `XREAD` alone, and no meta and no close flag is
+kept. So the store declares neither producer state nor a kept last position, and Core takes
+their fallbacks: readers drop copies and end at the first `CLOSE` record, and a read decides
+expiry from the record at its cursor. It exists so tests run those fallbacks on a real store.
+Listing a chain's topics scans every primary, as a delete does, and needs `+scan`.
+
 **Tests.** The Redis tests run when `STREAMS_REDIS_URL` names a standalone server and
 `STREAMS_REDIS_CLUSTER_URL` a cluster seed. `scripts/redis-test-servers.sh` starts both. The
-conformance suite runs on each, and once more as a user with exactly the ACL above. The
-cross-implementation test also needs `STREAMS_BROOK_PY`, a Python SDK checkout whose provider
-predates the move.
+conformance suite runs on each, once more as a user with exactly the ACL above, and once in
+plain mode with the cases of the fallbacks. `tests/fallbacks.rs` adds faults on plain Redis
+too. The cross-implementation test also needs `STREAMS_BROOK_PY`, a Python SDK checkout whose
+provider predates the move.
