@@ -1848,6 +1848,8 @@ struct WorkflowStartedInfo {
     memo: Option<Memo>,
     search_attrs: Option<SearchAttributes>,
     retry_policy: Option<RetryPolicy>,
+    /// A cron schedule starts the chain's next run when this one completes or fails.
+    cron: bool,
 }
 
 /// Wraps outgoing activation job protos with some internal details core might care about
