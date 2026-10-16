@@ -109,6 +109,59 @@ impl Capabilities {
     }
 }
 
+impl From<Capabilities> for crate::proto::StoreCapabilities {
+    fn from(capabilities: Capabilities) -> Self {
+        Self {
+            producer_state: capabilities.producer_state,
+            conditional_tail: capabilities.conditional.tail,
+            conditional_fence: capabilities.conditional.fence,
+            kept_last: capabilities.kept_last,
+            holds: capabilities.holds,
+            change_feed: capabilities.change_feed,
+            cheap_logs: capabilities.cheap_logs,
+            delete_owner: capabilities.delete_owner,
+            topic_listing: capabilities.topic_listing,
+            long_poll: capabilities.long_poll,
+            dense_positions: capabilities.dense_positions,
+            replay_horizon: capabilities
+                .replay_horizon
+                .and_then(|horizon| horizon.try_into().ok()),
+            max_record_bytes: capabilities.max_record_bytes as u64,
+            max_batch_bytes: capabilities.max_batch_bytes as u64,
+        }
+    }
+}
+
+impl From<&crate::proto::StoreCapabilities> for Capabilities {
+    /// A mask from its proto. A zero limit keeps the default.
+    fn from(mask: &crate::proto::StoreCapabilities) -> Self {
+        let limit = |bytes: u64, default: usize| match bytes {
+            0 => default,
+            bytes => usize::try_from(bytes).unwrap_or(usize::MAX),
+        };
+        Self {
+            producer_state: mask.producer_state,
+            conditional: ConditionForms {
+                tail: mask.conditional_tail,
+                fence: mask.conditional_fence,
+            },
+            kept_last: mask.kept_last,
+            holds: mask.holds,
+            change_feed: mask.change_feed,
+            cheap_logs: mask.cheap_logs,
+            delete_owner: mask.delete_owner,
+            topic_listing: mask.topic_listing,
+            long_poll: mask.long_poll,
+            dense_positions: mask.dense_positions,
+            replay_horizon: mask
+                .replay_horizon
+                .and_then(|horizon| Duration::try_from(horizon).ok()),
+            max_record_bytes: limit(mask.max_record_bytes, MAX_RECORD_BYTES),
+            max_batch_bytes: limit(mask.max_batch_bytes, MAX_BATCH_BYTES),
+        }
+    }
+}
+
 impl Default for Capabilities {
     fn default() -> Self {
         Self::log_only()
