@@ -1,8 +1,10 @@
 //! Streams for lang: one process-wide stream service over the configured store, asking the
 //! client's server about streams' owners.
 
+use prost::Message;
 use std::sync::Arc;
 use temporalio_client::Connection;
+use temporalio_common::protos::google::rpc::Status as RpcStatus;
 use temporalio_common::protos::temporal::api::{
     common::v1::WorkflowExecution,
     enums::v1::StreamOwnerKind,
@@ -142,11 +144,23 @@ impl OwnerClient for ConnectionOwnerClient {
 }
 
 fn owner_error(status: tonic::Status) -> OwnerError {
-    if status.code() == tonic::Code::NotFound {
+    // A missing namespace says nothing about the Workflow. A failover or a namespace being
+    // set up answers it for a while, and a chain must not close on it.
+    if status.code() == tonic::Code::NotFound && !namespace_not_found(&status) {
         OwnerError::NotFound(status.message().to_string())
     } else {
         OwnerError::Failed(status.to_string())
     }
+}
+
+fn namespace_not_found(status: &tonic::Status) -> bool {
+    RpcStatus::decode(status.details()).is_ok_and(|details| {
+        details.details.iter().any(|detail| {
+            detail
+                .type_url
+                .ends_with("/temporal.api.errordetails.v1.NamespaceNotFoundFailure")
+        })
+    })
 }
 
 fn owner_description(
@@ -215,6 +229,26 @@ mod tests {
                 .first_run_id,
             "run-1"
         );
+    }
+
+    #[test]
+    fn a_missing_namespace_is_a_failure_not_a_gone_owner() {
+        let details = RpcStatus {
+            code: tonic::Code::NotFound as i32,
+            message: "namespace ns not found".to_string(),
+            details: vec![prost_types::Any {
+                type_url:
+                    "type.googleapis.com/temporal.api.errordetails.v1.NamespaceNotFoundFailure"
+                        .to_string(),
+                value: Vec::new(),
+            }],
+        };
+        let status = tonic::Status::with_details(
+            tonic::Code::NotFound,
+            "namespace ns not found",
+            details.encode_to_vec().into(),
+        );
+        assert!(matches!(owner_error(status), OwnerError::Failed(_)));
     }
 
     #[test]
