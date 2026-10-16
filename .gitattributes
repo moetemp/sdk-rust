@@ -1,3 +1,9 @@
 CHANGELOG.md merge=union
 # The Redis scripts are hashed byte for byte, so a CRLF checkout would change their SHA-1.
 crates/streams/lua/*.lua text eol=lf
+# GitHub folds vendored protos and test vectors in diffs.
+crates/protos/protos/api_upstream/** linguist-generated=true
+crates/protos/protos/api_cloud_upstream/** linguist-generated=true
+crates/protos/protos/testsrv_upstream/** linguist-generated=true
+**/testdata/** linguist-generated=true
+*_vectors.json linguist-generated=true
