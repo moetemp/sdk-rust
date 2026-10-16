@@ -108,3 +108,12 @@ message StreamNotification {
     // Small details passed on to the callbacks. At most 2 KiB in total, counted as UTF-8 bytes.
     map<string, string> metadata = 4;
 }
+
+// The answer to one entry of a NotifyStreams request.
+message StreamNotificationResult {
+    // The gRPC status code of the entry, as a NotifyStream call for it would answer. Zero (OK)
+    // when the server applied the entry, or dropped it since the stream has no notifier.
+    int32 code = 1;
+    // Why the server refused the entry. Empty when `code` is zero.
+    string message = 2;
+}
