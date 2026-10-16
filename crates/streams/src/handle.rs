@@ -676,14 +676,10 @@ impl Streams {
                 request.after
             )));
         }
-        if stored > expected {
-            return Err(mismatch(format!(
-                "the replayed read holds {stored} records up to {:?}, not the {expected} the read \
-                 got",
-                request.to
-            )));
-        }
-        if page.cursor != request.to || page.records_digest != request.records_digest {
+        if stored > expected
+            || page.cursor != request.to
+            || page.records_digest != request.records_digest
+        {
             // A read from the beginning has no position to check, so a trim since the read shows
             // as other records, which end elsewhere or differ.
             if request.after.is_empty()
@@ -709,6 +705,13 @@ impl Streams {
             {
                 return Err(lost(format!(
                     "the store no longer holds the record at {:?} that the read ended at",
+                    request.to
+                )));
+            }
+            if stored > expected {
+                return Err(mismatch(format!(
+                    "the replayed read holds {stored} records up to {:?}, not the {expected} the \
+                     read got",
                     request.to
                 )));
             }
@@ -2560,6 +2563,29 @@ mod tests {
         assert_eq!(replayed.cursor, page.cursor);
         assert_eq!(replayed.records_digest, page.records_digest);
         assert_eq!(replayed.records, page.records);
+    }
+
+    #[tokio::test]
+    async fn a_replay_whose_end_retention_dropped_is_lost_not_a_mismatch() {
+        let setup = setup(StreamsOptions::default());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup.streams.append(append("p", 2, "2")).await.unwrap();
+        let request = ReadRequest {
+            stream: Some(stream("out")),
+            ..Default::default()
+        };
+        let page = setup.streams.read(request.clone()).await.unwrap();
+        // A lapsed floor let retention take both records, and the stream went on.
+        setup.store.truncate(&chain("run-1"), "out", 0);
+        setup.streams.append(append("p", 3, "3")).await.unwrap();
+        setup.streams.append(append("p", 4, "4")).await.unwrap();
+        setup.streams.append(append("p", 5, "5")).await.unwrap();
+        let error = setup
+            .streams
+            .read_range(replay_of(&request, &page))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::ReplayRangeLost, "{error}");
     }
 
     #[tokio::test]
