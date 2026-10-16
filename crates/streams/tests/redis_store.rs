@@ -1927,3 +1927,204 @@ async fn a_chains_notification_entry_lands_in_the_chains_own_slot() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_retention_past_the_epoch_is_refused_at_connect() {
+    // The check runs before any connection, so no server is needed.
+    let mut options = RedisStoreOptions::new("redis://127.0.0.1:1");
+    options.retention = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+    let error = RedisStore::connect(options).await.unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Refused);
+    assert!(error.message.contains("retention"), "{error}");
+}
+
+#[tokio::test]
+async fn a_position_past_the_head_is_one_the_topic_never_held() {
+    let Some(setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    let landed = setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let (ms, _) = landed.last_position.split_once('-').unwrap();
+    let past = format!("{}-0", ms.parse::<u64>().unwrap() + 1000);
+    let error = setup
+        .store
+        .read(read_after(&chain, &past, 10))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Cursor, "{error}");
+    assert!(error.message.contains("never held"), "{error}");
+}
+
+#[tokio::test]
+async fn the_read_checks_run_by_hash_and_survive_a_script_flush() {
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let evalsha_calls = async |raw: &mut redis::aio::MultiplexedConnection| {
+        let info: String = redis::cmd("INFO")
+            .arg("commandstats")
+            .query_async(raw)
+            .await
+            .unwrap();
+        info.lines()
+            .find_map(|line| line.strip_prefix("cmdstat_evalsha:calls="))
+            .and_then(|rest| rest.split(',').next())
+            .map_or(0, |calls| calls.parse::<u64>().unwrap())
+    };
+    let _: () = redis::cmd("SCRIPT")
+        .arg("FLUSH")
+        .query_async(&mut setup.raw)
+        .await
+        .unwrap();
+    let read = setup.store.read(read_after(&chain, "", 10)).await.unwrap();
+    assert_eq!(read.records.len(), 1);
+    let before = evalsha_calls(&mut setup.raw).await;
+    let read = setup.store.read(read_after(&chain, "", 10)).await.unwrap();
+    assert_eq!(read.records.len(), 1);
+    assert!(evalsha_calls(&mut setup.raw).await > before);
+}
+
+#[tokio::test]
+async fn a_hold_at_zero_neither_fails_the_append_nor_leaves_a_half_written_batch() {
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .hold_floor(&chain, "events", "reader-run/1", "0-0")
+        .await
+        .unwrap();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let log = log_key(&setup.prefix, &chain, "events");
+    let length: usize = setup.raw.xlen(&log).await.unwrap();
+    assert_eq!(length, 1);
+    let ttl: i64 = setup.raw.pttl(&log).await.unwrap();
+    assert!(ttl > 0, "{ttl}");
+}
+
+#[tokio::test]
+async fn a_topic_refuses_a_floor_holder_past_the_cap() {
+    let Some(setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    for holder in 0..temporalio_streams::MAX_FLOOR_HOLDERS {
+        setup
+            .store
+            .hold_floor(&chain, "events", &format!("reader-run/{holder}"), "")
+            .await
+            .unwrap();
+    }
+    let error = setup
+        .store
+        .hold_floor(&chain, "events", "one-more/1", "")
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Refused, "{error}");
+    // A holder already on the topic renews its hold.
+    setup
+        .store
+        .hold_floor(&chain, "events", "reader-run/0", "")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_replay_whose_end_record_the_store_lost_is_rec_01() {
+    use sha2::{Digest, Sha256};
+    use temporalio_common::protos::temporal::api::{
+        common::v1::Payload, enums::v1::WorkflowExecutionStatus,
+    };
+    use temporalio_streams::{
+        Streams, StreamsOptions,
+        proto::{
+            AppendRecord, AppendRequest, NamedProducer, ReadRangeRequest, ReadRequest,
+            StreamAddress, StreamOwnerKind, StreamRecordKind, append_request::Producer,
+        },
+    };
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let prefix = setup.prefix.clone();
+    let streams = Streams::new(
+        Arc::new(setup.store),
+        Arc::new(OneOwner {
+            status: std::sync::Mutex::new(WorkflowExecutionStatus::Running),
+        }),
+        StreamsOptions::default(),
+    );
+    let chain = chain();
+    let stream = StreamAddress {
+        namespace: chain.namespace.clone(),
+        owner_kind: StreamOwnerKind::Workflow as i32,
+        workflow_id: chain.workflow_id.clone(),
+        run_id: String::new(),
+        topic: "events".to_string(),
+    };
+    let append = |sequence: i64| AppendRequest {
+        stream: Some(stream.clone()),
+        producer: Some(Producer::Named(NamedProducer {
+            producer_id: "p".to_string(),
+            attempt: 1,
+        })),
+        sequence,
+        records: vec![AppendRecord {
+            kind: StreamRecordKind::Data as i32,
+            body: Some(Payload {
+                data: sequence.to_be_bytes().to_vec(),
+                ..Default::default()
+            }),
+            content_hash: Sha256::digest(sequence.to_be_bytes()).to_vec(),
+        }],
+        digest: Sha256::digest(sequence.to_be_bytes()).to_vec(),
+    };
+    streams.append(append(1)).await.unwrap();
+    streams.append(append(2)).await.unwrap();
+    let request = ReadRequest {
+        stream: Some(stream.clone()),
+        ..Default::default()
+    };
+    let page = streams.read(request.clone()).await.unwrap();
+    assert_eq!(page.records.len(), 2);
+    // A failover of a store that replicates late loses the acked tail, and later appends land
+    // at new ids.
+    let log = log_key(&prefix, &chain, "events");
+    let ids: Vec<(String, HashMap<String, redis::Value>)> =
+        setup.raw.xrange_all(&log).await.unwrap();
+    for (id, _) in ids {
+        let _: i64 = setup.raw.xdel(&log, &[id]).await.unwrap();
+    }
+    streams.append(append(3)).await.unwrap();
+    streams.append(append(4)).await.unwrap();
+    let error = streams
+        .read_range(ReadRangeRequest {
+            stream: Some(stream.clone()),
+            chain_first_run_id: page.chain_first_run_id.clone(),
+            after: page.start_cursor.clone(),
+            to: page.cursor.clone(),
+            stored_records: 2,
+            state: request.state.clone(),
+            records_digest: page.records_digest.clone(),
+            floor_holder: String::new(),
+            start_from_end: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::ReplayRangeLost, "{error}");
+}
