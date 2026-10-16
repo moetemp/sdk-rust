@@ -52,11 +52,14 @@ at a time across the database. With many producers at once, it costs append thro
 `notifications` in its transaction: the topic and the append's last position, in one of 64
 partitions fixed in the schema. Every topic of a chain lands in the partition that the first four
 bytes of SHA-256 over the chain's fields give. A repeat of the newest batch writes none. When the
-partition held no entry before, the append also sends `NOTIFY` on `<schema>_bell_<partition %
-doorbells>` with the partition, so the doorbell costs nothing while a partition stays busy. Drivers
+partition held no entry that a driver hasn't taken, the append also sends `NOTIFY` on
+`<schema>_bell_<partition % doorbells>` with the partition, so the doorbell costs nothing while a
+partition stays busy, and a driver that drains taken entries still hears of the next one. Drivers
 take entries with `FOR UPDATE SKIP LOCKED`: a consumer's own unacked entries, those another
 consumer left for `claim_idle`, and new ones. An ack deletes them. The janitor keeps the newest
-10,000 entries per partition, so a log with no driver stays bounded. An entry whose topic an owner
+10,000 entries per partition, so a log with no driver stays bounded. It keeps older entries that a
+driver took within the last minute too, so a quiet stream that shares a partition with a busy one
+keeps its only entry while a slow driver works. An entry whose topic an owner
 delete removed is acked as broken when a driver takes it.
 
 **Listener.** One connection per store listens for the doorbells and, with `notify_reads`, the read
@@ -69,8 +72,9 @@ lost ring too. The listener sets TCP keepalive to notice a dead connection withi
 
 **Retention.** PostgreSQL has no key expiry, so each store runs a janitor every
 `janitor_interval` (one minute). A transaction advisory lock around each step lets one janitor
-work at a time across processes, also through PgBouncer in transaction mode. A pass trims the topics that are due, at most 10,000 records per topic per
-transaction, and keeps what a hold holds. It moves the topic's newest dropped position in the same
+work at a time across processes, also through PgBouncer in transaction mode. A pass trims the
+topics that are due, at most 10,000 records per topic per transaction, and keeps what a hold
+holds. It moves the topic's newest dropped position in the same
 transaction. A topic whose records are all gone keeps its row as the tombstone for the retention
 plus 30 days after its last write, as Redis keeps a topic's meta. Then the janitor deletes it, and
 a chain row with no topics that nothing touched for as long. `PostgresStore::run_janitor` runs a
@@ -78,7 +82,9 @@ pass at once.
 
 **Floors.** `floors` keeps one row per holder of a topic, with the lowest position it held and the
 end of its lease. Position `0` holds the whole topic. A release moves the end to now plus the
-release grace. The janitor deletes ended holds before each trim.
+release grace. The janitor deletes ended holds before each trim. A topic keeps at most 1,000 live
+holders, and a new holder past them is refused. A topic whose oldest record a hold keeps is due
+again when the first hold ends, so held topics don't take every janitor pass.
 
 **Owner deletes.** One function deletes an owner's chain rows, their topics and their holds, and
 puts the topics in `purge`. Then the store deletes their records and producer rows in batches of

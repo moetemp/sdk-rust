@@ -681,3 +681,171 @@ async fn a_listener_that_lost_its_connection_wakes_every_waiter() {
     let waited = waiting.await.unwrap();
     assert!(waited < Duration::from_secs(5), "{waited:?}");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn held_topics_leave_the_janitor_room_for_the_others() {
+    let Some(url) = url() else { return };
+    let options = options(&url);
+    let schema = options.schema.clone();
+    let store = PostgresStore::connect(options).await.unwrap();
+    let raw = raw(&url).await;
+    // More held topics than one pass takes, then one plain topic.
+    for topic in 0..600 {
+        let chain = chain(&format!("held-{topic}"));
+        store
+            .append(append(&chain, "out", "p", 1, 1))
+            .await
+            .unwrap();
+        store.hold_floor(&chain, "out", "r/1", "").await.unwrap();
+    }
+    let plain = chain("plain");
+    store
+        .append(append(&plain, "out", "p", 1, 1))
+        .await
+        .unwrap();
+    age(&raw, &schema, 8).await;
+    store.run_janitor().await.unwrap();
+    store.run_janitor().await.unwrap();
+    let left: i64 = raw
+        .query_one(
+            &format!(
+                "SELECT count(*) FROM {schema}.records r JOIN {schema}.topics t \
+                 ON t.topic_id = r.topic_id JOIN {schema}.chains c ON c.chain_id = t.chain_id \
+                 WHERE c.owner_id = 'plain'"
+            ),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(left, 0, "the plain topic was trimmed");
+}
+
+#[tokio::test]
+async fn a_topic_refuses_a_floor_holder_past_the_cap() {
+    let Some(url) = url() else { return };
+    let store = PostgresStore::connect(options(&url)).await.unwrap();
+    let chain = chain("holders");
+    for holder in 0..temporalio_streams::MAX_FLOOR_HOLDERS {
+        store
+            .hold_floor(&chain, "out", &format!("r/{holder}"), "")
+            .await
+            .unwrap();
+    }
+    let error = store
+        .hold_floor(&chain, "out", "one-more/1", "")
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Refused, "{error}");
+    store.hold_floor(&chain, "out", "r/0", "").await.unwrap();
+}
+
+#[tokio::test]
+async fn two_archive_advances_out_of_order_keep_the_higher() {
+    let Some(url) = url() else { return };
+    let mut options = options(&url);
+    options.notification_log = true;
+    options.archive_lease = Some(Duration::from_secs(60));
+    let store = PostgresStore::connect(options).await.unwrap();
+    let chain = chain("advances");
+    let landed = store
+        .append(append(&chain, "out", "p", 1, 2))
+        .await
+        .unwrap();
+    store
+        .advance_archive(&chain, "out", &landed.last_position)
+        .await
+        .unwrap();
+    store
+        .advance_archive(&chain, "out", &landed.first_position)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.archived(&chain, "out").await.unwrap(),
+        Some(landed.last_position)
+    );
+}
+
+#[tokio::test]
+async fn an_append_rings_while_a_driver_holds_the_partitions_entries() {
+    let Some(url) = url() else { return };
+    let mut options = options(&url);
+    options.notification_log = true;
+    let store = PostgresStore::connect(options).await.unwrap();
+    let log = store.notification_log().unwrap();
+    let chain = chain("rings");
+    store
+        .append(append(&chain, "out", "p", 1, 1))
+        .await
+        .unwrap();
+    let rung = |doorbell| log.wait_doorbell(doorbell, "d", Duration::from_secs(2));
+    let mut partition = None;
+    for doorbell in 0..log.doorbells() {
+        if let Some(&first) = rung(doorbell).await.unwrap().first() {
+            partition = Some((doorbell, first));
+        }
+    }
+    let (doorbell, partition) = partition.expect("the first append rang");
+    let taken = log
+        .take(partition, "d", Duration::from_secs(60), 10)
+        .await
+        .unwrap();
+    assert_eq!(taken.len(), 1);
+    // The driver drains and goes back to its doorbell before this append commits.
+    store
+        .append(append(&chain, "out", "p", 2, 1))
+        .await
+        .unwrap();
+    let ids: Vec<String> = taken.iter().map(|entry| entry.id.clone()).collect();
+    log.ack(partition, &ids).await.unwrap();
+    assert_eq!(rung(doorbell).await.unwrap(), [partition]);
+}
+
+#[tokio::test]
+async fn the_log_cap_keeps_an_entry_a_driver_works_on() {
+    let Some(url) = url() else { return };
+    let mut options = options(&url);
+    options.notification_log = true;
+    let schema = options.schema.clone();
+    let store = PostgresStore::connect(options).await.unwrap();
+    let raw = raw(&url).await;
+    let log = store.notification_log().unwrap();
+    let chain = chain("cap");
+    store
+        .append(append(&chain, "out", "p", 1, 1))
+        .await
+        .unwrap();
+    let partition: i16 = raw
+        .query_one(
+            &format!("SELECT partition FROM {schema}.notifications"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let taken = log
+        .take(partition as u32, "d", Duration::from_secs(60), 10)
+        .await
+        .unwrap();
+    for sequence in 2..=3 {
+        store
+            .append(append(&chain, "out", "p", sequence, 1))
+            .await
+            .unwrap();
+    }
+    raw.execute(&format!("SELECT {schema}.cap_log_v1(1)"), &[])
+        .await
+        .unwrap();
+    let left: Vec<i64> = raw
+        .query(
+            &format!("SELECT id FROM {schema}.notifications ORDER BY id"),
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(left.len(), 2, "{left:?}");
+    assert_eq!(left[0].to_string(), taken[0].id);
+}

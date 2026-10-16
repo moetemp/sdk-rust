@@ -2145,6 +2145,21 @@ mod cases {
         assert_eq!(stored(&page.records[2]).link, None);
     }
 
+    pub(crate) async fn a_workflow_activity_keeps_a_topic_whose_first_batch_was_lost(
+        case: &dyn Case,
+    ) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer.sequence = 3;
+        producer.append(&["3"]).await;
+        let written = case.store().written_topics(&chain).await.unwrap();
+        if chain.owner_kind == StreamOwnerKind::WorkflowActivity as i32 {
+            assert_eq!(written, [OUT]);
+        } else {
+            assert!(written.is_empty());
+        }
+    }
+
     pub(crate) async fn a_workflow_activity_keeps_the_topics_it_wrote(case: &dyn Case) {
         let store = case.store();
         let chain = case.chain();
@@ -2882,6 +2897,7 @@ macro_rules! store_cases {
             a_close_with_no_outcome_is_the_first_close_too,
             a_chain_close_keeps_no_outcome,
             a_workflow_activity_keeps_the_topics_it_wrote,
+            a_workflow_activity_keeps_a_topic_whose_first_batch_was_lost,
             a_link_record_reads_back_with_its_link,
         );
     };
