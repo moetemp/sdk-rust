@@ -21,7 +21,8 @@ use tokio::task::JoinSet;
 /// How a driver reads the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamDriverOptions {
-    /// The driver's name in the log's consumer group. Each driver needs its own.
+    /// The driver's name in the log's consumer group. Each driver needs its own, and the default
+    /// is the host name and the process id.
     pub consumer: String,
     /// How often the driver looks at every slot that holds entries.
     pub sweep_interval: Duration,
@@ -36,7 +37,11 @@ pub struct StreamDriverOptions {
 impl Default for StreamDriverOptions {
     fn default() -> Self {
         Self {
-            consumer: "driver".to_string(),
+            consumer: format!(
+                "{}-{}",
+                gethostname::gethostname().to_string_lossy(),
+                std::process::id()
+            ),
             sweep_interval: Duration::from_secs(30),
             claim_idle: Duration::from_secs(60),
             doorbell_wait: Duration::from_secs(5),
@@ -462,6 +467,15 @@ mod tests {
         .unwrap()
         .unwrap_err();
         assert_eq!(error.kind, crate::proto::StreamFailureKind::Unsupported);
+    }
+
+    #[test]
+    fn the_default_consumer_names_the_host_and_the_process() {
+        let consumer = StreamDriverOptions::default().consumer;
+        assert!(
+            consumer.ends_with(&format!("-{}", std::process::id())),
+            "{consumer}"
+        );
     }
 
     #[test]
