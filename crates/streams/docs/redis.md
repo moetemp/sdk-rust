@@ -31,10 +31,12 @@ default, and extends the log's and the meta's expiry to it. `ReleaseFloor` moves
 plus a release grace, one day by default. The append script's trim reads the hash first. It drops
 the ended holds, trims to the lower of the retention floor and the lowest held position, and keeps
 the log until the latest lease ends. A hold from the beginning holds `0-1`, so it keeps the whole
-topic. The scripts use `HGET`, `HSET`, `HGETALL`, `HDEL`, `PTTL` and `PEXPIRE`, which the
-documented ACL allows. Without holds the hash doesn't exist and the trim is as before. The append
-script's hash changes again. A stream close releases no hold, since the readers of a closed
-stream still replay. Only the reader's `ReleaseFloor` and its grace, or a lapsed lease, end one.
+topic. Any position below `0-1` holds `0-1` too. A topic keeps at most 1,000 live holders, and a
+new holder past them is refused, since every append reads them all. The scripts use `HGET`,
+`HSET`, `HGETALL`, `HLEN`, `HDEL`, `PTTL` and `PEXPIRE`, which the documented ACL allows. Without
+holds the hash doesn't exist and the trim is as before. The append script's hash changes again.
+A stream close releases no hold, since the readers of a closed stream still replay. Only the
+reader's `ReleaseFloor` and its grace, or a lapsed lease, end one.
 
 **Mixed providers and floors.** An SDK's own Redis provider trims with its own append script and
 doesn't read the floors hash, so its appends can trim records that a positions-only reader holds.
@@ -47,8 +49,10 @@ notification stream of the chain's Cluster slot, `<prefix>:{<tag>}:n`, where the
 slot, one script writes them, and a reshard moves them together. A standalone server uses the
 same keys. An entry holds `k`, the log key, and `p`, the append's last entry id. The stream keeps
 about the newest 10,000 entries. A repeat of the newest batch adds none. The script answers the
-stream's length too, and when it is 1, Core adds the slot to doorbell `<prefix>:{<tag of slot
-s % doorbells>}:bell`, apart from the script, so a lost ring is possible. Drivers read the slot
+stream's length too, and when it is 1, Core adds the slot to doorbell `d = s % doorbells`, at
+`<prefix>:{<tag of slot d * 16384 / doorbells>}:bell`, apart from the script, so a lost ring is
+possible. The doorbells spread over the slot range, so a cluster's primaries share them, and an
+application and its drivers must agree on the number of doorbells. Drivers read the slot
 streams and the doorbells as the consumer group `streams-driver` (`XREADGROUP`, `XAUTOCLAIM`,
 `XACK`, `XDEL`, `XGROUP CREATE`), and sweep with `XLEN` over each primary's slots from `CLUSTER
 SLOTS`. The slot streams have no expiry, and a driver empties them. The logged append script has
@@ -66,8 +70,9 @@ in the slot of the chain's notification stream, scored by the time of the write.
 with score `0`, so the archive takes closed topics first. `advance.lua` takes it out once the
 archive holds the meta's `last`, and the archive's release takes it out after a closed topic's
 end. The archive needs the notification log. The archived append script has its own hash. With an
-archive, an application also needs `~temporal-streams:{*}:a +zadd`, and a driver also needs
-`+zrangebyscore +zrem` on those keys.
+archive, an application also needs `~temporal-streams:{*}:a +zadd +hexists`, and a driver also
+needs `+zrange +zrem` on those keys. A delete takes a deleted topic's mark out of the set, so it
+also needs `+zrem` there.
 
 **Retired producers.** A field stays until a write's trim finds it older than the retention, so
 a topic written by many short-lived producers holds one field per producer attempt of the last
@@ -95,7 +100,7 @@ an Activity's keys. The tag starts with the namespace, so the documented ACL cov
 Its keys have the hash tag `{<namespace>:!wa:<workflow id>:<run id>:<activity id>}`, so each
 Activity lands in a slot of its own and Activity `1` of the next run is another chain. Such a
 chain has one more key, `<prefix>:{<tag>}:topics`, a set of the log keys its producers wrote. The
-append script adds the log key with `SADD` when a producer attempt writes its first batch, and
+append script adds the log key with `SADD` on every batch, since a first batch can be lost, and
 slides the set's expiry to the retention plus the grace on each append. The scheduling Workflow's
 Core reads it with `SMEMBERS` to close every topic when the Activity ends.
 
@@ -115,7 +120,7 @@ percent-encoded. A Redis ACL user for one namespace's applications, with the rul
 conformance suite runs as:
 
 ```text
-ACL SETUSER streams-app on >secret resetkeys ~temporal-streams:{my-ns:* resetchannels -@all +evalsha +eval +script|load +multi +exec +xadd +xread +xrevrange +xrange +xtrim +xlen +hget +hset +hgetall +hincrby +hdel +hscan +sadd +smembers +rpush +lrange +exists +del +unlink +pexpire +pttl +time +info +config|get +ping +hello +client|setinfo +cluster|slots
+ACL SETUSER streams-app on >secret resetkeys ~temporal-streams:{my-ns:* resetchannels -@all +evalsha +eval +script|load +multi +exec +xadd +xread +xrevrange +xrange +xtrim +xlen +hget +hset +hgetall +hlen +hincrby +hdel +hscan +sadd +smembers +rpush +lrange +exists +del +unlink +pexpire +pttl +time +info +config|get +ping +hello +client|setinfo +cluster|slots
 ```
 
 A cluster client reads the topology with `CLUSTER SLOTS` first. An ACL user lives on one node,
