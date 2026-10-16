@@ -1150,14 +1150,14 @@ mod cases {
             .await;
         assert_eq!(repeat, kept);
         // The retired attempt no longer does, which is why only an attempt whose last append
-        // returned may be retired.
+        // returned may be retired. Readers still drop the second copy.
         let again = Producer::new(case, &chain, OUT, "p", 1)
             .append(&["1"])
             .await;
         assert_ne!(again.first_position, first.first_position);
         assert_eq!(
             values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
-            ["1", "2", "1"]
+            ["1", "2"]
         );
     }
 
