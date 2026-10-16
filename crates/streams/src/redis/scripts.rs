@@ -2,10 +2,11 @@
 //!
 //! The append script is the one the SDKs sent, with one more check, the topic's close flag, so a
 //! batch can't land after the topic's close returned (DD-16), and its trim keeps what
-//! positions-only readers hold. Its trim also finds the newest record to drop by reading forward
-//! from the oldest, since `XREVRANGE` from the floor read the whole retained log when no record
-//! was older than the floor. `keep.lua` is the prelude of every script that writes a log, and
-//! `floor.lua` of every script that reads or writes the holds.
+//! positions-only readers hold. Its trim reads back from the floor only when the oldest record is
+//! below it, since `XREVRANGE` from the floor reads the whole retained log when no record is older,
+//! and a forward read copies every doomed record into Lua. Redis doesn't roll a script back, so it
+//! runs every step that can fail before its first record lands. `keep.lua` is the prelude of every
+//! script that writes a log, and `floor.lua` of every script that reads or writes the holds.
 
 use redis::Script;
 use std::sync::LazyLock;
@@ -125,27 +126,21 @@ mod tests {
     /// What the append script adds for a Workflow Activity's topic set.
     const TOPIC_SET: &str = "local topics = KEYS[5]
 if topics then
-  if sequence == 1 then
-    redis.call('SADD', topics, KEYS[1])
-  end
+  -- On every batch, since the first one can be lost and the close must still find the topic.
+  redis.call('SADD', topics, KEYS[1])
   redis.call('PEXPIRE', topics, retention + grace)
 end
 ";
 
     /// How the trim finds the newest record to drop, and what it replaces.
     const TRIM_SCAN: (&str, &str) = (
-        "  local doomed
-  local from = '-'
-  repeat
-    local older = redis.call('XRANGE', log, from, '(' .. floor, 'COUNT', 1000)
-    if #older > 0 then
-      doomed = older[#older][1]
-      from = '(' .. doomed
-    end
-  until #older < 1000
-  if doomed then
+        "  -- Two reads that cost O(log n) each. Reading back from the floor walks the whole log when no
+  -- record is older, so it runs only when the oldest record is.
+  local oldest = redis.call('XRANGE', log, '-', '+', 'COUNT', 1)
+  if #oldest > 0 and id_below(oldest[1][1], floor) then
+    local doomed = redis.call('XREVRANGE', log, '(' .. floor, '-', 'COUNT', 1)
     redis.call('XTRIM', log, 'MINID', floor)
-    redis.call('HSET', meta, 'trimmed', doomed)
+    redis.call('HSET', meta, 'trimmed', doomed[1][1])
   end
 ",
         "  local doomed = redis.call('XREVRANGE', log, '(' .. floor, '-', 'COUNT', 1)
@@ -157,14 +152,19 @@ end
     );
 
     /// What the floor adds to the append script, each with what it replaces.
-    const FLOOR_EDITS: [(&str, &str); 5] = [
+    const FLOOR_EDITS: [(&str, &str); 8] = [
         (
-            "local function keep(log, meta, added, last, retention, grace, floors)",
-            "local function keep(log, meta, added, last, retention, grace)",
+            "local function trim(log, meta, retention, floors)",
+            "local function trim(log, meta, retention)",
         ),
         (
             "  local life\n  floor, life = held(floors, floor, retention)\n",
             "",
+        ),
+        ("  return floor_ms, life\n", "  return floor_ms\n"),
+        (
+            "local function keep(log, meta, added, last, grace, floor_ms, life)",
+            "local function keep(log, meta, added, last, retention, grace, floor_ms)",
         ),
         (
             "redis.call('PEXPIRE', log, life)",
@@ -175,8 +175,12 @@ end
             "redis.call('PEXPIRE', meta, retention + grace)",
         ),
         (
-            "keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace, KEYS[4])",
-            "keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace)",
+            "local floor_ms, life = trim(KEYS[1], KEYS[2], retention, KEYS[4])",
+            "local floor_ms = trim(KEYS[1], KEYS[2], retention)",
+        ),
+        (
+            "keep(KEYS[1], KEYS[2], #ARGV - 5, last, grace, floor_ms, life)",
+            "keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace, floor_ms)",
         ),
     ];
 
@@ -191,7 +195,7 @@ end
         assert_eq!(APPEND_LOGGED.matches("XADD', KEYS[5]").count(), 1);
         assert_eq!(
             APPEND_LOGGED_SCRIPT.get_hash(),
-            "eeed648a51793f36d1ed5f89c735dc8032d5fe7f"
+            "5ea5fe3e6a0a6812bf50a57906031cddb79c7fd2"
         );
     }
 
@@ -210,15 +214,15 @@ end
         assert_eq!(was, *APPEND_LOGGED);
         assert_eq!(
             APPEND_ARCHIVED_SCRIPT.get_hash(),
-            "337494c09860e9e0bd9dbdf4a6db81a57719bd4c"
+            "d1cba6fb10c613d027bab7de7e06c39782dc8db4"
         );
     }
 
     #[test]
-    fn the_append_script_matches_the_sdks_with_the_topic_check_floor_topic_set_and_scan_only() {
+    fn the_append_script_is_the_one_before_the_floor_with_the_floor_edits_only() {
         assert_eq!(
             APPEND_SCRIPT.get_hash(),
-            "188afac5fc0de85f8a3f1ae86129a8e19b861cec"
+            "7f3b95cfa4e62a5421c0ac696a527b210da72e99"
         );
         let mut before_floor = APPEND
             .strip_prefix(include_str!("../../lua/floor.lua"))
@@ -235,13 +239,8 @@ end
         }
         assert_eq!(
             Script::new(&before_floor).get_hash(),
-            "96d2eb81ddf241103a1ed5495a015285d7bd37f0"
+            "806e20d928e761eff5467386c0ffe78372e48bec"
         );
         assert_eq!(before_floor.matches(TOPIC_CHECK).count(), 1);
-        let sdk_script = before_floor.replacen(TOPIC_CHECK, "", 1);
-        assert_eq!(
-            Script::new(&sdk_script).get_hash(),
-            "7944489663d477b49e3f4f947933e15de3269718"
-        );
     }
 }
