@@ -214,6 +214,10 @@ impl StreamStore for TieredStore {
         self.hot.name()
     }
 
+    fn capabilities(&self) -> crate::Capabilities {
+        self.hot.capabilities()
+    }
+
     fn notification_log(&self) -> Option<Arc<dyn crate::NotificationLog>> {
         self.hot.notification_log()
     }
@@ -345,6 +349,10 @@ impl StreamStore for TieredStore {
         self.hot
             .retire_producer(chain, topic, producer_id, attempt)
             .await
+    }
+
+    async fn list_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        self.hot.list_topics(chain).await
     }
 
     async fn written_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {

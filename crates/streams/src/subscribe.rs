@@ -1429,13 +1429,13 @@ mod tests {
                 sequence: 1,
                 digest: vec![1],
                 records: (0..count)
-                    .map(|_| {
+                    .map(|index| {
                         crate::proto::StreamRecord {
                             topic: "tokens".to_string(),
                             kind: crate::proto::StreamRecordKind::Data as i32,
                             producer_id: "p".to_string(),
                             attempt: 1,
-                            sequence: 1,
+                            sequence: index + 1,
                             ..Default::default()
                         }
                         .encode_to_vec()
