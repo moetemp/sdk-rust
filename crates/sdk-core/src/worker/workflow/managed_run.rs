@@ -969,6 +969,8 @@ impl ManagedRun {
             run_id: machines.run_id.clone(),
             first_run_id: machines.first_execution_run_id.clone(),
             attempt,
+            task_started: machines.stream_task_started(),
+            completed_tasks: machines.stream_completed_tasks(),
             topics,
         }))
     }
