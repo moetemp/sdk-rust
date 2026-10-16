@@ -236,6 +236,10 @@ message ReadRequest {
   // id. The store holds the records after this read's start against retention for that holder,
   // until `ReleaseFloor` and its grace, or until the holder's lease passes with no read.
   string floor_holder = 7;
+  // The most stored record bytes one answer holds past its first record. Zero puts no bound. A
+  // Workflow reader that records its answers in History sets it, so an answer stays below the
+  // server's blob size limit.
+  uint64 max_bytes = 9;
 }
 
 // A later attempt of a producer started writing. Readers synthesize it, and no store holds it.
