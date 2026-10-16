@@ -28,8 +28,8 @@ local function trim(log, meta, retention, floors)
   local floor = floor_ms .. '-0'
   local life
   floor, life = held(floors, floor, retention)
-  -- Two reads that cost O(log n) each. Reading back from the floor walks the whole log when no
-  -- record is older, so it runs only when the oldest record is.
+  -- Two reads that cost O(log n) each. Reading back from the floor walks the whole log
+  -- when no record is older, so it runs only when the oldest record is.
   local oldest = redis.call('XRANGE', log, '-', '+', 'COUNT', 1)
   if #oldest > 0 and id_below(oldest[1][1], floor) then
     local doomed = redis.call('XREVRANGE', log, '(' .. floor, '-', 'COUNT', 1)
