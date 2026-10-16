@@ -135,6 +135,18 @@ pub trait NotifierClient: Send + Sync {
         Ok(())
     }
 
+    /// [Self::notify_streams], with one outcome per notification in the same order. The call
+    /// fails only as a whole. A client whose server answers only for the whole call answers each
+    /// notification as landed when the call does.
+    async fn notify_streams_each(
+        &self,
+        notifications: Vec<StreamNotification>,
+    ) -> Result<Vec<Result<(), NotifyError>>, NotifyError> {
+        let count = notifications.len();
+        self.notify_streams(notifications).await?;
+        Ok((0..count).map(|_| Ok(())).collect())
+    }
+
     /// Attaches a Workflow's reader to a stream's notifier. Idempotent by its request id.
     async fn attach_workflow(&self, attachment: WorkflowAttachment) -> Result<(), NotifyError> {
         let _ = attachment;
