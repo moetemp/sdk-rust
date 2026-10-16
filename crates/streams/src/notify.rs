@@ -94,6 +94,8 @@ pub struct WorkflowAttachment {
     pub run_id: String,
     /// Names the reader in its run.
     pub subscription_id: String,
+    /// The reader hears nothing until a wait after a counter, and still gets the close.
+    pub idle: bool,
 }
 
 /// What a stream's notifier answered a client's wait with.
