@@ -876,6 +876,9 @@ impl StreamStore for PostgresStore {
             if !look.response.records.is_empty() || look.response.closed {
                 return Ok(look.response);
             }
+            inner
+                .waiters
+                .learn(&(chain.clone(), request.topic.clone()), look.topic_id);
             if tokio::time::timeout_at(deadline, wake.changed())
                 .await
                 .is_err()

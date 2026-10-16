@@ -43,7 +43,8 @@ path, and this wait is the path for a reader without it.
 
 **`notify_reads`.** With it, each append also sends `NOTIFY` on `<schema>_read_<topic id % 64>`
 with the topic id, and the store's listener wakes the waiters of that topic. A reader in another
-process then wakes in a few milliseconds. It is off by default, since a transaction that sent
+process then wakes in a few milliseconds. A reader that waits on a topic with no row yet wakes
+from the poll, since a `NOTIFY` can't name it. It is off by default, since a transaction that sent
 `NOTIFY` takes a lock on the server's notification queue as it commits, so such commits run one
 at a time across the database. With many producers at once, it costs append throughput.
 
