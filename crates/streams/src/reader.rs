@@ -231,9 +231,9 @@ impl ReadState {
 /// the newest the read delivered is still delivered, marked `stale`. The attempts seen ride in
 /// `state`, so this holds across calls. A read that starts from a cursor without state looks up
 /// the record at the cursor first, since that record was delivered before. Only that record's
-/// producer is known then, and another producer's earlier attempts are not. A read remembers at most
-/// [MAX_TRACKED_PRODUCERS] producers in at most [MAX_STATE_BYTES], and the next attempt of one it
-/// forgot reads without `SUPERSEDED`.
+/// producer is known then, and another producer's earlier attempts are not. A read remembers at
+/// most [MAX_TRACKED_PRODUCERS] producers in at most [MAX_STATE_BYTES], and the next attempt of one
+/// it forgot reads without `SUPERSEDED`.
 ///
 /// A record that does not parse fails the call as `RECORD` with its cursor, so the caller resumes
 /// past it on purpose. Skipping it would lose data no one hears of. The records before it in the
