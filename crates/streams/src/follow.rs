@@ -296,6 +296,7 @@ pub(crate) async fn follow(
                         generation: subscriber.generation,
                     },
                     wake_after,
+                    None,
                 )
                 .await?;
             // A record from before the attach woke no one, so it is read now.
