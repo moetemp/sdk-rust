@@ -1065,3 +1065,25 @@ async fn rule_20_4_a_malformed_entry_fails_with_its_cursor() {
     .unwrap();
     assert_eq!(after.records.len(), 1);
 }
+
+#[tokio::test]
+async fn a_position_past_the_head_is_one_the_topic_never_held() {
+    let Some(setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    let landed = setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let (ms, _) = landed.last_position.split_once('-').unwrap();
+    let past = format!("{}-0", ms.parse::<u64>().unwrap() + 1000);
+    let error = setup
+        .store
+        .read(read_after(&chain, &past, 10))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Cursor, "{error}");
+    assert!(error.message.contains("never held"), "{error}");
+}

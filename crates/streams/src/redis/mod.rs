@@ -273,6 +273,15 @@ impl TopicState {
         let Some((position, at)) = position else {
             return Ok(None);
         };
+        if let Some(last) = &self.last
+            && at > entry(last)?
+        {
+            // The memory store refuses this too. A failover that lost the tail also lands here,
+            // and a read that went on would skip the records written after it.
+            return Ok(Some(StreamError::cursor(format!(
+                "position {position} is one topic {topic:?} never held"
+            ))));
+        }
         if !self.log_exists && found.is_empty() {
             if !self.meta_exists {
                 return Ok(Some(StreamError::not_found(format!(
