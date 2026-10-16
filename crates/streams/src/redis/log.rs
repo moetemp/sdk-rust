@@ -49,7 +49,11 @@ impl RedisLog {
     /// apart from the append, so a ring can be lost. The sweep finds the entry then.
     pub(crate) async fn ring(&self, slot: u16) {
         let rung: StreamResult<String> = redis::cmd("XADD")
-            .arg(doorbell(&self.prefix, u32::from(slot) % self.doorbells))
+            .arg(doorbell(
+                &self.prefix,
+                u32::from(slot) % self.doorbells,
+                self.doorbells,
+            ))
             .arg("MAXLEN")
             .arg("~")
             .arg(DOORBELL_LENGTH)
@@ -177,7 +181,7 @@ impl NotificationLog for RedisLog {
         consumer: &str,
         block: Duration,
     ) -> StreamResult<Vec<u32>> {
-        let key = doorbell(&self.prefix, doorbell_index);
+        let key = doorbell(&self.prefix, doorbell_index, self.doorbells);
         let deadline = Instant::now() + block;
         let mut read = redis::cmd("XREADGROUP");
         read.arg("GROUP")

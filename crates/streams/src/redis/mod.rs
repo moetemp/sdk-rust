@@ -21,8 +21,12 @@ use keys::{
     ChainKeys, activity_owner_pattern, owner_pattern, session_field, workflow_activity_pattern,
 };
 use prost::Message;
-use redis::{Cmd, Value, streams::StreamReadReply};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use redis::{Cmd, Script, Value, streams::StreamReadReply};
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 use tokio::time::Instant;
 
 const NAME: &str = "redis";
@@ -122,6 +126,16 @@ impl RedisStore {
                 options.retention
             )));
         }
+        // The scripts trim below `now - retention` as a stream id, which can't be negative.
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        if retention_ms >= now_ms {
+            return Err(StreamError::refused(format!(
+                "the retention must be shorter than the time since 1970, not {:?}",
+                options.retention
+            )));
+        }
         let shared = Shared::connect(&options.urls, options.cluster, options.response_timeout)
             .await
             .mapped(Call::Read)?;
@@ -193,11 +207,19 @@ impl RedisStore {
     }
 
     /// What a read needs to know besides the records, in one script so a cluster answers it
-    /// from the slot the chain's keys share.
-    fn checks(keys: &ChainKeys, topic: &str) -> Cmd {
-        let mut eval = redis::cmd("EVAL");
-        eval.arg(TOPIC_STATE)
-            .arg(4)
+    /// from the slot the chain's keys share. By hash, unless the server answered it lost the
+    /// script, since the text costs every read its bytes and a parse.
+    fn checks(keys: &ChainKeys, topic: &str, by_hash: bool) -> Cmd {
+        let mut eval = if by_hash {
+            let mut eval = redis::cmd("EVALSHA");
+            eval.arg(TOPIC_STATE_SCRIPT.get_hash());
+            eval
+        } else {
+            let mut eval = redis::cmd("EVAL");
+            eval.arg(TOPIC_STATE);
+            eval
+        };
+        eval.arg(4)
             .arg(keys.log(topic))
             .arg(keys.meta(topic))
             .arg(keys.chain())
@@ -358,6 +380,12 @@ redis.call('HGET', KEYS[2], 'trimmed'), redis.call('HGET', KEYS[2], 'last'), \
 redis.call('HGET', KEYS[3], ARGV[1]), redis.call('HGET', KEYS[4], ARGV[1]), \
 redis.call('HGET', KEYS[2], 'close')}";
 
+static TOPIC_STATE_SCRIPT: LazyLock<Script> = LazyLock::new(|| Script::new(TOPIC_STATE));
+
+fn no_script(error: &redis::RedisError) -> bool {
+    error.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::NoScript)
+}
+
 /// What the store knows about a topic besides its records.
 #[derive(Debug, Default)]
 struct TopicState {
@@ -422,6 +450,15 @@ impl TopicState {
         let Some((position, at)) = position else {
             return Ok(None);
         };
+        if let Some(last) = &self.last
+            && at > entry(last)?
+        {
+            // The memory store refuses this too. A failover that lost the tail also lands here,
+            // and a read that went on would skip the records written after it.
+            return Ok(Some(StreamError::cursor(format!(
+                "position {position} is one topic {topic:?} never held"
+            ))));
+        }
         if !self.log_exists && found.is_empty() {
             if !self.meta_exists {
                 return Ok(Some(StreamError::not_found(format!(
@@ -553,14 +590,19 @@ impl StreamStore for RedisStore {
         let after = position.map_or("0-0", |(position, _)| position);
         let wait = wait_of(&request);
         let deadline = Instant::now() + wait;
-        let mut pipeline = redis::pipe();
-        pipeline.add_command(Self::xread(&keys, topic, after, request.max_records, None));
-        let checks = Self::checks(&keys, topic);
-        pipeline.add_command(checks.clone());
-        let (reply, mut state): (Value, TopicState) = pipeline
-            .query_async(&mut self.shared.clone())
-            .await
-            .mapped(Call::Read)?;
+        let first = async |by_hash| {
+            let mut pipeline = redis::pipe();
+            pipeline.add_command(Self::xread(&keys, topic, after, request.max_records, None));
+            pipeline.add_command(Self::checks(&keys, topic, by_hash));
+            pipeline
+                .query_async::<(Value, TopicState)>(&mut self.shared.clone())
+                .await
+        };
+        let (reply, mut state) = match first(true).await {
+            Err(error) if no_script(&error) => first(false).await,
+            answer => answer,
+        }
+        .mapped(Call::Read)?;
         let mut found = records(reply)?;
         if found.is_empty() && !wait.is_zero() && state.lost(topic, position, &found)?.is_none() {
             let xread = Self::xread(&keys, topic, after, request.max_records, Some(wait));
@@ -572,10 +614,18 @@ impl StreamStore for RedisStore {
             if let Some(reply) = blocked {
                 found = records(reply)?;
                 // Read again after the wait, so a trim or a close that raced it is seen.
-                state = checks
+                state = match Self::checks(&keys, topic, true)
                     .query_async(&mut self.shared.clone())
                     .await
-                    .mapped(Call::Read)?;
+                {
+                    Err(error) if no_script(&error) => {
+                        Self::checks(&keys, topic, false)
+                            .query_async(&mut self.shared.clone())
+                            .await
+                    }
+                    answer => answer,
+                }
+                .mapped(Call::Read)?;
             }
         }
         if let Some(error) = state.lost(topic, position, &found)? {
@@ -674,11 +724,10 @@ impl StreamStore for RedisStore {
     ) -> StreamResult<()> {
         let keys = ChainKeys::new(&self.prefix, chain);
         // Redis never stores `0-0`, so `0-1` holds every record, and the trim's exclusive range
-        // below it stays valid.
-        let position = if position.is_empty() {
+        // below it stays valid. Below it, a crafted `0-0` would fail every later append.
+        let position = if position.is_empty() || entry(position)? < (0, 1) {
             "0-1"
         } else {
-            entry(position)?;
             position
         };
         scripts::HOLD_SCRIPT
@@ -689,6 +738,7 @@ impl StreamStore for RedisStore {
             .arg(position)
             .arg(self.floor_lease_ms)
             .arg(self.grace_ms)
+            .arg(crate::MAX_FLOOR_HOLDERS)
             .invoke_async::<i64>(&mut self.shared.clone())
             .await
             .mapped(Call::Write)
