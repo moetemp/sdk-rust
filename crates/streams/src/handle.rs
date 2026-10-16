@@ -449,7 +449,8 @@ impl Streams {
     ///
     /// Only safe once the attempt's last append returned: a retry of an earlier batch would land
     /// a second time. Nothing else is lost. A store compares a batch with its own attempt's
-    /// state only, and readers find a newer attempt from the records.
+    /// state only, and readers find a newer attempt from the records. A store without producer
+    /// state keeps none, so the call does nothing there.
     pub async fn retire_producer(
         &self,
         request: RetireProducerRequest,
@@ -464,6 +465,9 @@ impl Streams {
                 return Err(StreamError::invalid_argument("a retire needs its producer"));
             }
         };
+        if !self.store.capabilities().producer_state {
+            return Ok(RetireProducerResponse {});
+        }
         let key = producer_key(owner_key(stream), &producer_id, attempt);
         // The chain the attempt's appends resolved, even when a newer chain took the Workflow
         // id since, so the state goes from where it was written.
@@ -1526,6 +1530,23 @@ mod tests {
         let error = setup.streams.append(batch).await.unwrap_err();
         assert!(error.message.contains("batch limit of 300"), "{error}");
         setup.streams.append(append("p", 1, "fits")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn without_producer_state_a_retire_does_nothing() {
+        let setup = setup_on(without_producer_state(), StreamsOptions::default());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        setup
+            .streams
+            .retire_producer(RetireProducerRequest {
+                stream: Some(stream("out")),
+                producer: Some(retire_producer_request::Producer::Named(NamedProducer {
+                    producer_id: "p".to_string(),
+                    attempt: 1,
+                })),
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test(start_paused = true)]

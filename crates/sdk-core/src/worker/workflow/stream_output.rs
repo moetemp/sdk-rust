@@ -284,8 +284,14 @@ impl OutputStore {
         let chain = self.chain(&retired.workflow_id, &retired.first_run_id);
         let producer_id = temporalio_streams::workflow_producer_id(&retired.run_id);
         let store = self.store.clone();
+        // A store without producer state keeps no sessions to drop.
+        let sessions = if store.capabilities().producer_state {
+            retired.sessions
+        } else {
+            Default::default()
+        };
         self.tasks.spawn(async move {
-            for (attempt, topics) in &retired.sessions {
+            for (attempt, topics) in &sessions {
                 for topic in topics {
                     if let Err(error) = store
                         .retire_producer(&chain, topic, &producer_id, *attempt)
