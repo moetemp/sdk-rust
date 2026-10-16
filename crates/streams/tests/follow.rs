@@ -512,6 +512,10 @@ impl StreamStore for RacingStore {
         self.inner.name()
     }
 
+    fn capabilities(&self) -> temporalio_streams::Capabilities {
+        self.inner.capabilities()
+    }
+
     async fn append(
         &self,
         request: temporalio_streams::proto::StoreAppendRequest,
