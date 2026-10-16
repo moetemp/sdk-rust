@@ -453,7 +453,7 @@ impl Workflows {
                                 record(&run_metrics);
                             }
                             if let Some(retired) = retired {
-                                self.retire_stream_sessions(&retired).await;
+                                self.retire_stream_sessions(*retired);
                             }
                             if response.reset_history_event_id > 0 {
                                 reset_last_started_to = Some(response.reset_history_event_id);
@@ -765,10 +765,11 @@ impl Workflows {
         ))
     }
 
-    async fn retire_stream_sessions(&self, retired: &stream_output::RetiredSessions) {
+    fn retire_stream_sessions(&self, retired: stream_output::RetiredSessions) {
         #[cfg(feature = "streams")]
         if let Some(store) = &self.output_store {
-            store.retire(retired).await;
+            store.retire(retired);
+            return;
         }
         let _ = retired;
     }
@@ -851,6 +852,10 @@ impl Workflows {
                 let as_str = e.downcast::<&str>();
                 anyhow!("Error joining workflow processing thread: {as_str:?}")
             })?;
+        }
+        #[cfg(feature = "streams")]
+        if let Some(store) = &self.output_store {
+            store.flush().await;
         }
         Ok(())
     }
