@@ -77,6 +77,26 @@ relevant information.
   `segment_bytes` (4 MiB), once the stream is closed or idle for `segment_idle` (five minutes), and
   at least that often while it keeps taking writes. Reads move from the archive to the store with
   the same cursors. An archive needs `notification_log`. The C bridge builds the S3 archive.
+* Experimental: `StreamStoreConfig.postgres` keeps streams in a PostgreSQL database, 14 or later,
+  in one set of tables in `schema` (`temporal_streams`). The store applies its migrations at
+  connect unless `skip_migrations` is set. A janitor trims records past `retention` (seven days)
+  every `janitor_interval` (one minute). Waiting reads hold no connection and wake within
+  `poll_interval` (100 ms). TLS follows the URL's `sslmode` and `sslrootcert`. The C bridge builds
+  the store.
+* Experimental: the PostgreSQL store keeps a notification log with `notification_log`, a
+  `notifications` table with 64 partitions that the append writes in its transaction. Drivers take
+  entries with `FOR UPDATE SKIP LOCKED`, and a `NOTIFY` doorbell rings when a partition takes its
+  first entry. `listen_url` names a direct connection for the listener and the migrations when
+  `url` goes through PgBouncer in transaction mode. `notify_reads` sends a `NOTIFY` per append, so
+  waiting reads in other processes wake at once.
+* Experimental: `StreamStoreConfig.archive` works with the PostgreSQL store. A topic's first record
+  makes the archive's hold as a `floors` row, and the janitor drops only what the archive holds
+  while the driver keeps up. The archive is off unless the config sets it.
+* Experimental: the Redis append no longer costs more the longer a topic's retained log is. Its
+  trim finds the newest record to drop with `XRANGE` forward from the oldest, where the SDKs'
+  script read the whole log with `XREVRANGE`. At 100,000 retained records an append took about
+  4 ms before and takes about the same as on a short log now. The append script's hashes are now
+  `188afac5`, `eeed648a` with the notification log, and `337494c0` with the archive.
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with

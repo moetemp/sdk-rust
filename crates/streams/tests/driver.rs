@@ -1,10 +1,11 @@
-//! The stream driver over a Redis notification log, on a standalone server and on a cluster.
+//! The stream driver over a Redis notification log, on a standalone server and on a cluster, and
+//! over a PostgreSQL one.
 //!
-//! Set `STREAMS_REDIS_URL` and `STREAMS_REDIS_CLUSTER_URL` to run these. The cluster cases that
-//! move slots and fail a primary over need `STREAMS_REDIS_CLUSTER_ADMIN`, since they change the
-//! cluster, and replicas for the failover.
+//! Set `STREAMS_REDIS_URL`, `STREAMS_REDIS_CLUSTER_URL` and `STREAMS_POSTGRES_URL` to run these.
+//! The cluster cases that move slots and fail a primary over need `STREAMS_REDIS_CLUSTER_ADMIN`,
+//! since they change the cluster, and replicas for the failover.
 
-#![cfg(feature = "redis")]
+#![cfg(any(feature = "redis", feature = "postgres"))]
 
 use std::{
     collections::{BTreeMap, HashMap},
@@ -15,14 +16,17 @@ use std::{
     time::Duration,
 };
 use temporalio_streams::{
-    NotifierClient, NotifyError, RedisStore, RedisStoreOptions, StreamDriver, StreamDriverOptions,
-    StreamNotification, StreamStore, chain_owner, mint_cursor, progress_counter,
+    NotifierClient, NotifyError, StreamDriver, StreamDriverOptions, StreamNotification,
+    StreamStore, chain_owner, mint_cursor, progress_counter,
     proto::{ChainId, StoreAppendRequest, StreamOwnerKind},
     stream_hash,
 };
+#[cfg(feature = "redis")]
+use temporalio_streams::{RedisStore, RedisStoreOptions};
 
 static IDS: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(feature = "redis")]
 /// The cases that move a slot or fail a primary over hold it alone, the others share it, since a
 /// cluster change makes appends fail for a moment.
 static CLUSTER: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
@@ -105,6 +109,7 @@ impl Notifiers {
     }
 }
 
+#[cfg(feature = "redis")]
 async fn store(url: &str, cluster: bool, prefix: &str) -> Arc<RedisStore> {
     let mut options = RedisStoreOptions::new(url);
     options.cluster = cluster;
@@ -127,7 +132,7 @@ fn options(consumer: &str) -> StreamDriverOptions {
 /// Appends one batch to `streams` chains, each in its own slot most likely, and answers each
 /// stream's newest counter.
 async fn write(
-    store: &RedisStore,
+    store: &dyn StreamStore,
     streams: usize,
     sequence: i64,
 ) -> BTreeMap<(String, String), i64> {
@@ -162,7 +167,7 @@ async fn write(
 /// Appends one batch to the runs of `streams` standalone Activities, `act-<index>`, and answers
 /// each Activity stream's newest counter and its cursor.
 async fn write_activities(
-    store: &RedisStore,
+    store: &dyn StreamStore,
     streams: usize,
 ) -> BTreeMap<(String, String), (i64, String)> {
     let mut expected = BTreeMap::new();
@@ -200,15 +205,12 @@ async fn write_activities(
     expected
 }
 
-async fn activity_streams_reach_their_notifiers(url: &str, cluster: bool) {
-    let _shared = CLUSTER.read().await;
-    let prefix = unique("driver-activity");
-    let store = store(url, cluster, &prefix).await;
+async fn activity_streams_reach_their_notifiers(store: Arc<dyn StreamStore>) {
     let notifiers = Arc::new(Notifiers::default());
     let driver =
         Arc::new(StreamDriver::new(store.clone(), notifiers.clone(), options("d1")).unwrap());
     let running = tokio::spawn(driver.run());
-    let expected = write_activities(&store, 100).await;
+    let expected = write_activities(&*store, 100).await;
     let counters = expected
         .iter()
         .map(|(stream, (counter, _))| (stream.clone(), *counter))
@@ -221,20 +223,26 @@ async fn activity_streams_reach_their_notifiers(url: &str, cluster: bool) {
     }
 }
 
+#[cfg(feature = "redis")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn activity_streams_on_a_server_reach_their_notifiers() {
     let Some(url) = url("STREAMS_REDIS_URL") else {
         return;
     };
-    activity_streams_reach_their_notifiers(&url, false).await;
+    let _shared = CLUSTER.read().await;
+    activity_streams_reach_their_notifiers(store(&url, false, &unique("driver-activity")).await)
+        .await;
 }
 
+#[cfg(feature = "redis")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn activity_streams_in_a_cluster_reach_their_notifiers() {
     let Some(url) = url("STREAMS_REDIS_CLUSTER_URL") else {
         return;
     };
-    activity_streams_reach_their_notifiers(&url, true).await;
+    let _shared = CLUSTER.read().await;
+    activity_streams_reach_their_notifiers(store(&url, true, &unique("driver-activity")).await)
+        .await;
 }
 
 fn url(variable: &str) -> Option<String> {
@@ -245,18 +253,15 @@ fn url(variable: &str) -> Option<String> {
     url
 }
 
-async fn streams_in_every_slot_reach_their_notifiers(url: &str, cluster: bool) {
-    let _shared = CLUSTER.read().await;
-    let prefix = unique("driver-spread");
-    let store = store(url, cluster, &prefix).await;
+async fn streams_in_every_slot_reach_their_notifiers(store: Arc<dyn StreamStore>) {
     let notifiers = Arc::new(Notifiers::default());
     let driver =
         Arc::new(StreamDriver::new(store.clone(), notifiers.clone(), options("d1")).unwrap());
     let running = tokio::spawn(driver.run());
-    let expected = write(&store, 300, 1).await;
+    let expected = write(&*store, 300, 1).await;
     notifiers.reach(&expected, Duration::from_secs(20)).await;
     // A second batch moves every counter on.
-    let expected = write(&store, 300, 2).await;
+    let expected = write(&*store, 300, 2).await;
     notifiers.reach(&expected, Duration::from_secs(20)).await;
     running.abort();
     let log = store.notification_log().unwrap();
@@ -266,22 +271,29 @@ async fn streams_in_every_slot_reach_their_notifiers(url: &str, cluster: bool) {
     );
 }
 
+#[cfg(feature = "redis")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn streams_on_a_server_reach_their_notifiers() {
     let Some(url) = url("STREAMS_REDIS_URL") else {
         return;
     };
-    streams_in_every_slot_reach_their_notifiers(&url, false).await;
+    let _shared = CLUSTER.read().await;
+    streams_in_every_slot_reach_their_notifiers(store(&url, false, &unique("driver-spread")).await)
+        .await;
 }
 
+#[cfg(feature = "redis")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn streams_in_every_slot_of_a_cluster_reach_their_notifiers() {
     let Some(url) = url("STREAMS_REDIS_CLUSTER_URL") else {
         return;
     };
-    streams_in_every_slot_reach_their_notifiers(&url, true).await;
+    let _shared = CLUSTER.read().await;
+    streams_in_every_slot_reach_their_notifiers(store(&url, true, &unique("driver-spread")).await)
+        .await;
 }
 
+#[cfg(feature = "redis")]
 /// The four doorbells of a store under `prefix`, which needs no percent-encoding.
 fn bell_keys(prefix: &str) -> Vec<String> {
     let tags: Vec<String> =
@@ -292,6 +304,7 @@ fn bell_keys(prefix: &str) -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "redis")]
 async fn delete(url: &str, cluster: bool, keys: &[String]) {
     for key in keys {
         if cluster {
@@ -320,11 +333,12 @@ async fn delete(url: &str, cluster: bool, keys: &[String]) {
     }
 }
 
+#[cfg(feature = "redis")]
 async fn a_lost_ring_is_found_by_the_sweep(url: &str, cluster: bool) {
     let _shared = CLUSTER.read().await;
     let prefix = unique("driver-sweep");
     let store = store(url, cluster, &prefix).await;
-    let expected = write(&store, 20, 1).await;
+    let expected = write(&*store, 20, 1).await;
     // The rings are gone, as when Core stopped between the append and its ring.
     delete(url, cluster, &bell_keys(&prefix)).await;
     let notifiers = Arc::new(Notifiers::default());
@@ -336,6 +350,7 @@ async fn a_lost_ring_is_found_by_the_sweep(url: &str, cluster: bool) {
     running.abort();
 }
 
+#[cfg(feature = "redis")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lost_ring_on_a_server_is_found_by_the_sweep() {
     let Some(url) = url("STREAMS_REDIS_URL") else {
@@ -344,6 +359,7 @@ async fn a_lost_ring_on_a_server_is_found_by_the_sweep() {
     a_lost_ring_is_found_by_the_sweep(&url, false).await;
 }
 
+#[cfg(feature = "redis")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lost_ring_on_a_cluster_is_found_by_the_sweep() {
     let Some(url) = url("STREAMS_REDIS_CLUSTER_URL") else {
@@ -352,21 +368,24 @@ async fn a_lost_ring_on_a_cluster_is_found_by_the_sweep() {
     a_lost_ring_is_found_by_the_sweep(&url, true).await;
 }
 
+#[cfg(feature = "redis")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stopped_drivers_entries_move_to_another_driver() {
     let Some(url) = url("STREAMS_REDIS_CLUSTER_URL") else {
         return;
     };
     let _shared = CLUSTER.read().await;
-    let prefix = unique("driver-claim");
-    let store = store(&url, true, &prefix).await;
+    a_stopped_drivers_entries_move_on(store(&url, true, &unique("driver-claim")).await).await;
+}
+
+async fn a_stopped_drivers_entries_move_on(store: Arc<dyn StreamStore>) {
     let failing = Arc::new(Notifiers::default());
     failing.fail.store(true, Ordering::SeqCst);
     let stopped = tokio::spawn(
         Arc::new(StreamDriver::new(store.clone(), failing.clone(), options("stopped")).unwrap())
             .run(),
     );
-    let expected = write(&store, 30, 1).await;
+    let expected = write(&*store, 30, 1).await;
     // The first driver takes the entries and can't send them, then stops.
     tokio::time::sleep(Duration::from_millis(500)).await;
     stopped.abort();
@@ -379,12 +398,14 @@ async fn a_stopped_drivers_entries_move_to_another_driver() {
     other.abort();
 }
 
+#[cfg(feature = "redis")]
 /// The cluster to move slots on and fail over, when the test may change it.
 fn admin_url() -> Option<String> {
     let admin = std::env::var("STREAMS_REDIS_CLUSTER_ADMIN").ok()?;
     url("STREAMS_REDIS_CLUSTER_URL").filter(|_| admin == "1")
 }
 
+#[cfg(feature = "redis")]
 /// One node of the cluster, as `CLUSTER NODES` lists it.
 #[derive(Debug, Clone)]
 struct Node {
@@ -393,6 +414,7 @@ struct Node {
     primary_id: Option<String>,
 }
 
+#[cfg(feature = "redis")]
 async fn node_list(url: &str) -> Vec<Node> {
     let mut conn = redis::Client::open(url)
         .unwrap()
@@ -417,6 +439,7 @@ async fn node_list(url: &str) -> Vec<Node> {
         .collect()
 }
 
+#[cfg(feature = "redis")]
 async fn on(url: &str, cmd: &redis::Cmd) -> redis::Value {
     let mut conn = redis::Client::open(url)
         .unwrap()
@@ -426,6 +449,7 @@ async fn on(url: &str, cmd: &redis::Cmd) -> redis::Value {
     cmd.query_async(&mut conn).await.unwrap()
 }
 
+#[cfg(feature = "redis")]
 /// A key's Cluster slot, as Redis computes it from the hash tag.
 fn keyslot(key: &str) -> u16 {
     let tag = key
@@ -435,6 +459,7 @@ fn keyslot(key: &str) -> u16 {
     crc16::State::<crc16::XMODEM>::calculate(tag.as_bytes()) % 16384
 }
 
+#[cfg(feature = "redis")]
 /// The primary that serves `slot`.
 async fn owner_of(url: &str, slot: u16) -> Node {
     let mut conn = redis::Client::open(url)
@@ -480,6 +505,7 @@ async fn owner_of(url: &str, slot: u16) -> Node {
         .unwrap()
 }
 
+#[cfg(feature = "redis")]
 /// Workflow ids whose chains land in `slot`, found by asking the cluster.
 fn ids_in_slot(prefix: &str, slot: u16, count: usize) -> Vec<String> {
     let mut found = vec![];
@@ -494,6 +520,7 @@ fn ids_in_slot(prefix: &str, slot: u16, count: usize) -> Vec<String> {
     found
 }
 
+#[cfg(feature = "redis")]
 /// Appends to each of `ids` again and again until `stop`, retrying a batch that a slot move
 /// refused, and answers each stream's newest counter.
 async fn traffic(
@@ -537,6 +564,7 @@ async fn traffic(
     expected
 }
 
+#[cfg(feature = "redis")]
 /// Moves `slot` from its primary to another one, key by key, as `redis-cli --cluster reshard`
 /// does.
 async fn move_slot(url: &str, slot: u16) {
@@ -613,6 +641,7 @@ async fn move_slot(url: &str, slot: u16) {
     }
 }
 
+#[cfg(feature = "redis")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slot_moved_under_traffic_loses_no_notification() {
     let Some(url) = admin_url() else { return };
@@ -636,6 +665,7 @@ async fn a_slot_moved_under_traffic_loses_no_notification() {
     running.abort();
 }
 
+#[cfg(feature = "redis")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_primary_failover_under_traffic_still_notifies_every_stream() {
     let Some(url) = admin_url() else { return };
@@ -677,4 +707,67 @@ async fn a_primary_failover_under_traffic_still_notifies_every_stream() {
     let expected = writer.await.unwrap();
     notifiers.reach(&expected, Duration::from_secs(30)).await;
     running.abort();
+}
+
+#[cfg(feature = "postgres")]
+mod on_postgres {
+    use super::*;
+    use temporalio_streams::{PostgresStore, PostgresStoreOptions};
+
+    /// A schema no other case uses.
+    fn schema() -> String {
+        unique("driver").replace('-', "_")
+    }
+
+    async fn store(url: &str, schema: &str) -> Arc<PostgresStore> {
+        let mut options = PostgresStoreOptions::new(url);
+        options.schema = schema.to_string();
+        options.max_connections = 8;
+        options.notification_log = true;
+        options.notify_doorbells = 4;
+        Arc::new(PostgresStore::connect(options).await.unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn streams_on_postgres_reach_their_notifiers() {
+        let Some(url) = url("STREAMS_POSTGRES_URL") else {
+            return;
+        };
+        streams_in_every_slot_reach_their_notifiers(store(&url, &schema()).await).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn activity_streams_on_postgres_reach_their_notifiers() {
+        let Some(url) = url("STREAMS_POSTGRES_URL") else {
+            return;
+        };
+        activity_streams_reach_their_notifiers(store(&url, &schema()).await).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_lost_ring_on_postgres_is_found_by_the_sweep() {
+        let Some(url) = url("STREAMS_POSTGRES_URL") else {
+            return;
+        };
+        let schema = schema();
+        // The rings go to the writer's listener, as when the driver's process was away.
+        let writer = store(&url, &schema).await;
+        let expected = write(&*writer, 20, 1).await;
+        let reader = store(&url, &schema).await;
+        let notifiers = Arc::new(Notifiers::default());
+        let driver =
+            Arc::new(StreamDriver::new(reader.clone(), notifiers.clone(), options("d1")).unwrap());
+        let running = tokio::spawn(driver.run());
+        // One sweep interval and the time one sweep takes.
+        notifiers.reach(&expected, Duration::from_secs(5)).await;
+        running.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_stopped_drivers_entries_on_postgres_move_to_another_driver() {
+        let Some(url) = url("STREAMS_POSTGRES_URL") else {
+            return;
+        };
+        a_stopped_drivers_entries_move_on(store(&url, &schema()).await).await;
+    }
 }
