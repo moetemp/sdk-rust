@@ -363,12 +363,22 @@ impl NotificationLog for RedisLog {
                 .query_pipeline_on(node.as_ref(), pipeline, slots.len())
                 .await
                 .mapped(Call::Read)?;
+            // The scores come from the scripts' `TIME`, so the age is taken on the same clock.
+            let mut time = redis::pipe();
+            time.cmd("TIME");
+            let [(seconds, micros)]: [(u64, u64); 1] = self
+                .shared
+                .query_pipeline_on(node.as_ref(), time, 1)
+                .await
+                .mapped(Call::Read)?;
+            let now_ms = seconds * 1000 + micros / 1000;
             for (log, written_ms) in sets.into_iter().flatten() {
                 match chain_of_log(&self.prefix, &log) {
                     Some((chain, topic)) => marks.push(ArchiveMark {
                         chain,
                         topic,
                         written_ms: written_ms as u64,
+                        idle_ms: now_ms.saturating_sub(written_ms as u64),
                     }),
                     None => tracing::warn!(log, "A slot's set to archive names no log key"),
                 }

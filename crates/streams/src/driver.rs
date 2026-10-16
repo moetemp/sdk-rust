@@ -223,16 +223,13 @@ impl StreamDriver {
         loop {
             match self.log.archive_marks(ARCHIVE_MARKS).await {
                 Ok(marks) => {
-                    let now_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map_or(0, |since| since.as_millis() as u64);
                     let idle_ms = sink.segment_idle.as_millis() as u64;
                     let mut seen = HashMap::with_capacity(marks.len());
                     for mark in marks {
                         let key = (ChainKey::of(&mark.chain), mark.topic.clone());
                         let last = taken.get(&key).copied();
                         let due = mark.written_ms == 0
-                            || now_ms.saturating_sub(mark.written_ms) >= idle_ms
+                            || mark.idle_ms >= idle_ms
                             || last.is_none_or(|last| last.elapsed() >= sink.segment_idle);
                         if !due {
                             seen.insert(key, last.unwrap_or_else(Instant::now));

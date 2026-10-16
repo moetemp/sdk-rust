@@ -162,6 +162,7 @@ impl MemoryLog {
                 chain: chain.clone(),
                 topic: topic.to_string(),
                 written_ms,
+                idle_ms: 0,
             },
         );
     }
@@ -247,6 +248,10 @@ impl NotificationLog for MemoryLog {
         let mut marks: Vec<ArchiveMark> = state.marks.values().cloned().collect();
         marks.sort_by_key(|mark| mark.written_ms);
         marks.truncate(max);
+        let now = unix_ms();
+        for mark in &mut marks {
+            mark.idle_ms = now.saturating_sub(mark.written_ms);
+        }
         Ok(marks)
     }
 
