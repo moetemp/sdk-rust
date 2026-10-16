@@ -780,6 +780,19 @@ mod on_redis {
                 let _: i64 = raw.query(redis::cmd("DEL").arg(key)).await;
             }
         }
+
+        async fn lapse_archive_hold(&self, chain: &ChainId, topic: &str) {
+            let floors = format!("{}:floors", log_key(&self.prefix, chain, topic));
+            let _: i64 = self
+                .raw
+                .clone()
+                .query(
+                    redis::cmd("HDEL")
+                        .arg(floors)
+                        .arg(temporalio_streams::ARCHIVE_HOLDER),
+                )
+                .await;
+        }
     }
 
     async fn redis_with(variable: &str, cluster: bool, notification_log: bool) -> Option<Redis> {
