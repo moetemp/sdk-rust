@@ -311,7 +311,8 @@ impl OutputStore {
         }
         let store = self.store.clone();
         let namespace = self.namespace.clone();
-        tokio::spawn(async move {
+        // Replay never sends the close again, so a Worker shutdown waits for it.
+        self.tasks.spawn(async move {
             for close in closes {
                 close_one(store.as_ref(), &namespace, close).await;
             }

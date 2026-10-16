@@ -73,6 +73,8 @@ struct RecordingStore {
     closes: Mutex<Vec<(ChainId, String, StoredClose)>>,
     /// Refuses every topic close.
     refuse_closes: bool,
+    /// How long each topic close takes.
+    close_delay: Option<Duration>,
 
     /// A retire waits for a permit here, when set.
     retire_gate: Option<Arc<tokio::sync::Semaphore>>,
@@ -208,6 +210,9 @@ impl StreamStore for RecordingStore {
         self.calls.lock().push("close_topic_with");
         if self.refuse_closes {
             return Err(StreamError::storage("the store is down"));
+        }
+        if let Some(delay) = self.close_delay {
+            tokio::time::sleep(delay).await;
         }
         self.closes
             .lock()
@@ -1607,6 +1612,26 @@ async fn a_marked_activity_that_completes_closes_each_topic_it_wrote_with_null()
         .await
         .unwrap();
     assert!(read.closed);
+}
+
+#[tokio::test]
+async fn a_worker_shutdown_waits_for_the_activity_stream_closes() {
+    let store = Arc::new(RecordingStore {
+        close_delay: Some(Duration::from_millis(200)),
+        ..Default::default()
+    });
+    run_activity_owner(
+        canned_histories::single_activity("tool"),
+        store.clone(),
+        true,
+        &["tokens"],
+    )
+    .await;
+    assert_eq!(
+        store.closes.lock().len(),
+        1,
+        "closed before the shutdown returned"
+    );
 }
 
 #[tokio::test]
