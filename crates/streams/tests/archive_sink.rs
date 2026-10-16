@@ -312,3 +312,33 @@ async fn the_driver_archives_a_postgres_store_into_a_directory() {
     .await;
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[cfg(feature = "redis")]
+#[tokio::test]
+async fn a_redis_mark_is_aged_on_the_store_clock() {
+    let Ok(url) = std::env::var("STREAMS_REDIS_URL") else {
+        eprintln!("set STREAMS_REDIS_URL to run the Redis archive cases");
+        return;
+    };
+    let mut options = temporalio_streams::RedisStoreOptions::new(url);
+    options.key_prefix = unique("archive-age");
+    options.notification_log = true;
+    options.archive_lease = Some(Duration::from_secs(60));
+    let store = temporalio_streams::RedisStore::connect(options)
+        .await
+        .unwrap();
+    let chain = chain();
+    store
+        .append(append(&chain, "out", 1, &["1"]))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let marks = store
+        .notification_log()
+        .unwrap()
+        .archive_marks(1000)
+        .await
+        .unwrap();
+    let mark = marks.iter().find(|mark| mark.chain == chain).unwrap();
+    assert!((250..5_000).contains(&mark.idle_ms), "{mark:?}");
+}

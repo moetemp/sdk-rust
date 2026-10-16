@@ -6,7 +6,9 @@
 //! it must stay byte for byte what `crates/streams/nexus/operation_token_vectors.json` holds.
 
 use crate::{
-    CallerAttachment, NotifierClient, NotifyError, StreamError, StreamResult, Streams,
+    CallerAttachment, NotifierClient, NotifyError, OWNER_RECHECK, StreamError, StreamResult,
+    Streams,
+    handle::{Remembered, chain_of},
     proto::{
         AttachCallerRequest, AttachCallerResponse, ChainId, DetachCallerRequest,
         DetachCallerResponse, StreamAddress, StreamOwnerKind,
@@ -22,9 +24,10 @@ pub(crate) async fn attach_caller(
     streams: &Streams,
     client: Option<&Arc<dyn NotifierClient>>,
     announce: Option<&Arc<crate::Notifier>>,
+    chains: &Remembered<String>,
     request: AttachCallerRequest,
 ) -> AttachCallerResponse {
-    match attach(streams, client, announce, request).await {
+    match attach(streams, client, announce, chains, request).await {
         Ok(operation_token) => AttachCallerResponse {
             operation_token,
             failure: None,
@@ -53,6 +56,7 @@ async fn attach(
     streams: &Streams,
     client: Option<&Arc<dyn NotifierClient>>,
     announce: Option<&Arc<crate::Notifier>>,
+    chains: &Remembered<String>,
     request: AttachCallerRequest,
 ) -> StreamResult<String> {
     if request.callback_url.is_empty() {
@@ -67,9 +71,19 @@ async fn attach(
         StreamError::unsupported("attaching a caller needs a client connected to the server")
     })?;
     let stream = checked(request.stream.as_ref())?;
-    // Fresh for the latest run, since the Workflow id may have moved on to a new chain since a
-    // read warmed the cache, and an attach to the ended chain would never hear the new stream.
-    let chain = streams.chain_now(stream).await?;
+    // A retried start goes to the chain its first try attached to, so it mints the same token and
+    // the server keeps one attach. Otherwise fresh for the latest run, since the Workflow id may
+    // have moved on to a new chain since a read warmed the cache, and an attach to the ended
+    // chain would never hear the new stream.
+    let key = format!(
+        "{}\0{}\0{}\0{}",
+        stream.namespace, stream.workflow_id, stream.topic, request.request_id
+    );
+    let chain = match chains.get(&key) {
+        Some(attached) => chain_of(stream, &attached.first_run_id),
+        None => streams.chain_now(stream).await?,
+    };
+    let first_run_id = chain.first_run_id.clone();
     let operation_token = OperationToken {
         stream: stream.clone(),
         attach_request_id: request.request_id.clone(),
@@ -93,6 +107,7 @@ async fn attach(
     if let Some(notifier) = announce {
         announce_newest(streams, notifier, chain, &stream.topic).await;
     }
+    chains.put(key, &first_run_id, OWNER_RECHECK);
     Ok(operation_token)
 }
 
@@ -755,6 +770,31 @@ mod tests {
                 ..attached[1].clone()
             },
             "the server keys the attach by the request id, so the second changes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_retried_start_after_the_chain_moved_keeps_its_chain_and_token() {
+        let setup = setup();
+        let first = attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        setup
+            .owners
+            .chains
+            .lock()
+            .unwrap()
+            .insert("owner-1".to_string(), "chain-2".to_string());
+        let again = attach(&setup.service, attach_request("temporal://system"))
+            .await
+            .unwrap();
+        assert_eq!(first, again);
+        let attached = setup.notifier.attached.lock().unwrap().clone();
+        assert!(
+            attached
+                .iter()
+                .all(|attachment| attachment.chain.first_run_id == "chain-1"),
+            "{attached:?}"
         );
     }
 
