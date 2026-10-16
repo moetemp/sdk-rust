@@ -94,6 +94,8 @@ pub struct WorkflowAttachment {
     pub run_id: String,
     /// Names the reader in its run.
     pub subscription_id: String,
+    /// The reader hears nothing until a wait after a counter, and still gets the close.
+    pub idle: bool,
 }
 
 /// What a stream's notifier answered a client's wait with.
@@ -135,6 +137,22 @@ pub trait NotifierClient: Send + Sync {
         let _ = attachment;
         Err(NotifyError::Unsupported(
             "this client can't attach readers".to_string(),
+        ))
+    }
+
+    /// Wakes the idle callback that the attach with `request_id` attached to `chain`'s stream on
+    /// `topic` once, when the notifier's counter is above `after_counter`, at once when it is
+    /// already. A newer wait replaces an older one.
+    async fn wait_callback(
+        &self,
+        chain: ChainId,
+        topic: String,
+        request_id: String,
+        after_counter: i64,
+    ) -> Result<(), NotifyError> {
+        let _ = (chain, topic, request_id, after_counter);
+        Err(NotifyError::Unsupported(
+            "this client can't wake callers".to_string(),
         ))
     }
 
