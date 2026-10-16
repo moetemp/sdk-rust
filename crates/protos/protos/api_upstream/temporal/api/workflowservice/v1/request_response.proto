@@ -3879,4 +3879,7 @@ message NotifyStreamsRequest {
 }
 
 message NotifyStreamsResponse {
+    // One result per entry of the request, in the same order. Empty only from a server that
+    // fails the whole call on a bad entry, so an empty list on success means every entry applied.
+    repeated temporal.api.stream.v1.StreamNotificationResult results = 1;
 }
