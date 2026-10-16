@@ -569,7 +569,8 @@ async fn notify_reads_wakes_a_reader_in_another_process_at_once() {
         .append(append(&chain, "out", "q", 1, 1))
         .await
         .unwrap();
-    let after = writer
+    // The reader reads first, so its pool holds a connection before the timed part.
+    let after = reader
         .read(read(&chain, "out", "", Duration::ZERO))
         .await
         .unwrap()
