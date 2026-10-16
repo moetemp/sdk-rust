@@ -10,6 +10,7 @@ use crate::{
         ReadRangeRequest, ReadRequest, ReadResponse, SourceRange, SourceWake, StreamFailure,
         StreamFailureKind, SubscribeRequest, read_record,
     },
+    reader::ReadState,
     subscribe::Subscriptions,
 };
 use prost::Message;
@@ -86,11 +87,22 @@ impl Call<'_> {
         let stored = stored_count(&page);
         let consumed = self.state.clone().apply(number, page_of(&page)).consumed;
         if consumed < stored {
-            let again = ReadRequest {
+            let mut again = ReadRequest {
                 max_records: consumed as u32,
                 wait: None,
                 ..request.clone()
             };
+            if request.after == END {
+                // Another `$end` would find the end again, after records that landed since. Read
+                // from the start the first read found, and look up no record there, as it didn't.
+                let mut state = match ReadState::decode_from(&request.state) {
+                    Ok(state) => state,
+                    Err(error) => return self.failed(number, error),
+                };
+                state.started = true;
+                again.after = page.start_cursor.clone();
+                again.state = state.encode_to_vec();
+            }
             page = match self.streams.read(again).await {
                 Ok(page) => page,
                 Err(error) => return self.failed(number, error),

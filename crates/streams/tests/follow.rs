@@ -498,3 +498,155 @@ async fn standalone_redis_a_missing_child_is_unavailable_after_the_grace() {
     a_missing_child_is_unavailable_after_the_grace(on_redis("STREAMS_REDIS_URL", false).await)
         .await;
 }
+
+/// A memory store that writes `racing` into the agent's stream right after the first `latest`
+/// call answers, as an append between a `$end` read's `latest` and its read would.
+struct RacingStore {
+    inner: MemoryStore,
+    racing: std::sync::Mutex<Option<temporalio_streams::proto::StoreAppendRequest>>,
+}
+
+#[async_trait::async_trait]
+impl StreamStore for RacingStore {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    async fn append(
+        &self,
+        request: temporalio_streams::proto::StoreAppendRequest,
+    ) -> temporalio_streams::StreamResult<temporalio_streams::proto::StoreAppendResponse> {
+        self.inner.append(request).await
+    }
+
+    async fn read(
+        &self,
+        request: temporalio_streams::proto::StoreReadRequest,
+    ) -> temporalio_streams::StreamResult<temporalio_streams::proto::StoreReadResponse> {
+        self.inner.read(request).await
+    }
+
+    async fn latest(
+        &self,
+        request: temporalio_streams::proto::StoreLatestRequest,
+    ) -> temporalio_streams::StreamResult<temporalio_streams::proto::StoreLatestResponse> {
+        let latest = self.inner.latest(request).await;
+        let racing = self.racing.lock().unwrap().take();
+        if let Some(racing) = racing {
+            self.inner.append(racing).await.unwrap();
+        }
+        latest
+    }
+
+    async fn record_at(
+        &self,
+        chain: &temporalio_streams::proto::ChainId,
+        topic: &str,
+        position: &str,
+    ) -> temporalio_streams::StreamResult<Option<Vec<u8>>> {
+        self.inner.record_at(chain, topic, position).await
+    }
+
+    async fn close_chain(
+        &self,
+        chain: &temporalio_streams::proto::ChainId,
+    ) -> temporalio_streams::StreamResult<()> {
+        self.inner.close_chain(chain).await
+    }
+
+    async fn close_topic(
+        &self,
+        chain: &temporalio_streams::proto::ChainId,
+        topic: &str,
+    ) -> temporalio_streams::StreamResult<()> {
+        self.inner.close_topic(chain, topic).await
+    }
+
+    async fn retire_producer(
+        &self,
+        chain: &temporalio_streams::proto::ChainId,
+        topic: &str,
+        producer_id: &str,
+        attempt: i64,
+    ) -> temporalio_streams::StreamResult<()> {
+        self.inner
+            .retire_producer(chain, topic, producer_id, attempt)
+            .await
+    }
+
+    async fn written_topics(
+        &self,
+        chain: &temporalio_streams::proto::ChainId,
+    ) -> temporalio_streams::StreamResult<Vec<String>> {
+        self.inner.written_topics(chain).await
+    }
+
+    async fn delete_owner(
+        &self,
+        request: temporalio_streams::proto::DeleteOwnerRequest,
+    ) -> temporalio_streams::StreamResult<temporalio_streams::proto::DeleteOwnerResponse> {
+        self.inner.delete_owner(request).await
+    }
+}
+
+#[tokio::test]
+async fn a_follow_from_the_end_keeps_records_that_landed_during_its_first_read() {
+    use stream_link::Event::{Join, Open};
+    let store = Arc::new(RacingStore {
+        inner: MemoryStore::new(),
+        racing: std::sync::Mutex::new(None),
+    });
+    let streams = service(store.clone());
+    let (agent, tool) = (streams.agent_stream(), streams.tool_stream());
+    // The open tool's JOIN gates the page, so the follow reads it again up to the gate.
+    let records = [
+        data("d1"),
+        link(Open, Some(&tool), "tool-42"),
+        link(Join, None, "tool-42"),
+        data("d2"),
+    ];
+    *store.racing.lock().unwrap() = Some(temporalio_streams::proto::StoreAppendRequest {
+        chain: Some(temporalio_streams::proto::ChainId {
+            namespace: agent.namespace.clone(),
+            workflow_id: agent.workflow_id.clone(),
+            first_run_id: "run-1".to_string(),
+            ..Default::default()
+        }),
+        topic: agent.topic.clone(),
+        producer_id: "p".to_string(),
+        attempt: 1,
+        sequence: 1,
+        digest: vec![1; 32],
+        records: records
+            .iter()
+            .enumerate()
+            .map(|(at, record)| {
+                temporalio_streams::stored_append_record(
+                    &agent.topic,
+                    "p",
+                    1,
+                    1 + at as i64,
+                    record,
+                )
+                .unwrap()
+                .encode_to_vec()
+            })
+            .collect(),
+    });
+    let first: FollowResponse = streams
+        .call(
+            "Follow",
+            FollowRequest {
+                stream: Some(agent.clone()),
+                after: "$end".to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+    let order = shape(&[(vec![], first)]);
+    assert!(order.contains(&"d1".to_string()), "{order:?}");
+    assert!(
+        order.contains(&"EVENT_OPEN:tool-42".to_string()),
+        "{order:?}"
+    );
+}
