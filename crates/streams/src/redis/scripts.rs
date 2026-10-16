@@ -134,8 +134,8 @@ end
 
     /// How the trim finds the newest record to drop, and what it replaces.
     const TRIM_SCAN: (&str, &str) = (
-        "  -- Two reads that cost O(log n) each. Reading back from the floor walks the whole log when no
-  -- record is older, so it runs only when the oldest record is.
+        "  -- Two reads that cost O(log n) each. Reading back from the floor walks the whole log
+  -- when no record is older, so it runs only when the oldest record is.
   local oldest = redis.call('XRANGE', log, '-', '+', 'COUNT', 1)
   if #oldest > 0 and id_below(oldest[1][1], floor) then
     local doomed = redis.call('XREVRANGE', log, '(' .. floor, '-', 'COUNT', 1)
@@ -195,7 +195,7 @@ end
         assert_eq!(APPEND_LOGGED.matches("XADD', KEYS[5]").count(), 1);
         assert_eq!(
             APPEND_LOGGED_SCRIPT.get_hash(),
-            "5ea5fe3e6a0a6812bf50a57906031cddb79c7fd2"
+            "49820889a3c7680122a0b43ed0946c4b4cb0286e"
         );
     }
 
@@ -214,7 +214,7 @@ end
         assert_eq!(was, *APPEND_LOGGED);
         assert_eq!(
             APPEND_ARCHIVED_SCRIPT.get_hash(),
-            "d1cba6fb10c613d027bab7de7e06c39782dc8db4"
+            "98302a233c87f8a10303d4ca17b418cb51fe2799"
         );
     }
 
@@ -222,7 +222,7 @@ end
     fn the_append_script_is_the_one_before_the_floor_with_the_floor_edits_only() {
         assert_eq!(
             APPEND_SCRIPT.get_hash(),
-            "7f3b95cfa4e62a5421c0ac696a527b210da72e99"
+            "b818ae457ec5777a3a1d321e17215037cfdf5c6e"
         );
         let mut before_floor = APPEND
             .strip_prefix(include_str!("../../lua/floor.lua"))
