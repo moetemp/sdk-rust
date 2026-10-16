@@ -69,6 +69,7 @@ impl Call<'_> {
             state,
             floor_holder: self.floor_holder(number),
             subscriber: None,
+            max_bytes: 0,
         })
     }
 
