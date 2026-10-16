@@ -73,6 +73,9 @@ struct RecordingStore {
     closes: Mutex<Vec<(ChainId, String, StoredClose)>>,
     /// Refuses every topic close.
     refuse_closes: bool,
+
+    /// A retire waits for a permit here, when set.
+    retire_gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 
 impl RecordingStore {
@@ -220,6 +223,9 @@ impl StreamStore for RecordingStore {
         attempt: i64,
     ) -> StreamResult<()> {
         self.calls.lock().push("retire_producer");
+        if let Some(gate) = &self.retire_gate {
+            let _permit = gate.acquire().await.unwrap();
+        }
         self.retired
             .lock()
             .push((topic.to_string(), producer_id.to_string(), attempt));
@@ -696,6 +702,56 @@ async fn the_next_task_moves_the_prefix_and_starts_the_sequence_again() {
     );
 }
 
+#[tokio::test]
+async fn a_completion_does_not_wait_for_the_retire_and_shutdown_does() {
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let store = Arc::new(RecordingStore {
+        retire_gate: Some(gate.clone()),
+        ..Default::default()
+    });
+    let worker = worker_appending_to(
+        timer_history(),
+        vec![1.into(), 2.into()],
+        store.clone(),
+        Default::default(),
+    );
+    let activation = worker.poll_workflow_activation().await.unwrap();
+    let run_id = activation.run_id.clone();
+    complete(
+        &worker,
+        &run_id,
+        vec![
+            output_commit_command(records(&["a"])),
+            start_timer_cmd(1, Duration::from_secs(10)),
+        ],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    let completed = complete(
+        &worker,
+        &fired.run_id,
+        vec![
+            output_commit_command(records(&["b"])),
+            CompleteWorkflowExecution::default().into(),
+        ],
+    );
+    tokio::time::timeout(Duration::from_secs(5), completed)
+        .await
+        .expect("the completion returns while the retire waits");
+    assert!(store.retired().is_empty());
+    let shutdown = worker.drain_pollers_and_shutdown();
+    tokio::pin!(shutdown);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut shutdown)
+            .await
+            .is_err(),
+        "shutdown waits for the retire"
+    );
+    gate.add_permits(10);
+    shutdown.await;
+    assert_eq!(store.retired().len(), 1);
+}
+
 /// Replays the first task of `history`, then commits `["c"]` live in the task after it, and
 /// answers each append's attempt and sequence.
 async fn commit_after_replay(history: TestHistoryBuilder) -> Vec<(i64, i64)> {
@@ -875,6 +931,97 @@ async fn an_unhandled_command_rerun_supersedes_what_the_refused_task_appended() 
             "encrypted a",
             "encrypted b"
         ]
+    );
+}
+
+#[tokio::test]
+async fn a_rerun_that_skips_the_topic_still_withdraws_what_the_failed_task_appended() {
+    // The first completion is refused. The rerun takes another branch, writes nothing to the
+    // topic and completes. The task after it writes again under a new prefix.
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_failed_with_failure(
+        WorkflowTaskFailedCause::UnhandledCommand,
+        Default::default(),
+    );
+    t.add_we_signaled("go", vec![]);
+    t.add_full_wf_task();
+    let timer = t.add_timer_started("1".to_string());
+    t.add_timer_fired(timer, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let events = t.get_full_history_info().unwrap().events().to_vec();
+    let first_task = TestHistoryBuilder::from_history(events[..3].to_vec());
+    let first_task = hist_to_poll_resp(&first_task, "fakeid", 1.into()).resp;
+    let rerun_task = TestHistoryBuilder::from_history(events[..7].to_vec());
+    let rerun_task = hist_to_poll_resp(&rerun_task, "fakeid", ResponseType::AllHistory).resp;
+    let store = Arc::new(RecordingStore::default());
+    let mut answers = 0;
+    let mut mock_cfg = MockPollCfg::from_resp_batches(
+        "fakeid",
+        t,
+        [
+            ResponseType::Raw(first_task),
+            ResponseType::Raw(rerun_task),
+            ResponseType::AllHistory,
+        ],
+        mock_worker_client(),
+    );
+    mock_cfg.completion_mock_fn = Some(Box::new(move |_| {
+        answers += 1;
+        if answers == 1 {
+            Err(tonic::Status::invalid_argument("UnhandledCommand"))
+        } else {
+            Ok(RespondWorkflowTaskCompletedResponse::default())
+        }
+    }));
+    let mut mock = build_mock_pollers(mock_cfg);
+    with_store(&mut mock, Some(store.clone()));
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first.run_id,
+        vec![
+            output_commit_command(records(&["draft"])),
+            CompleteWorkflowExecution::default().into(),
+        ],
+    )
+    .await;
+    let eviction = worker.poll_workflow_activation().await.unwrap();
+    assert!(eviction.eviction_reason().is_some());
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    let rerun = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &rerun.run_id,
+        vec![start_timer_cmd(1, Duration::from_secs(10))],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &fired.run_id,
+        vec![
+            output_commit_command(records(&["final"])),
+            CompleteWorkflowExecution::default().into(),
+        ],
+    )
+    .await;
+    worker.drain_pollers_and_shutdown().await;
+
+    let appends = store.appends();
+    assert_eq!(
+        appends.iter().map(|a| a.attempt).collect::<Vec<_>>(),
+        [attempt(0, 1), attempt(7, 1)]
+    );
+    assert_eq!(
+        store.read(TOPIC).await,
+        ["encrypted draft", "SUPERSEDED", "encrypted final"]
     );
 }
 
