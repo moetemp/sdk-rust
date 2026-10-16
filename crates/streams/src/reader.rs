@@ -9,7 +9,7 @@ use crate::{
     BEGINNING, END, StreamError, StreamResult, StreamStore, cursor_position, mint_cursor,
     proto::{
         ChainId, ReadRecord, ReadRequest, ReadResponse, StoreLatestRequest, StoreReadRequest,
-        StreamRecord, StreamRecordKind, Supersession, read_record,
+        StoredRecord, StreamRecord, StreamRecordKind, Supersession, read_record,
     },
 };
 use prost::Message;
@@ -319,7 +319,8 @@ pub(crate) async fn read_with(
         }
     }
     state.started = true;
-    if position.is_empty() {
+    let capabilities = store.capabilities();
+    if position.is_empty() && capabilities.kept_last {
         if !state.watermark_known {
             state.watermark = store.newest_ever(&target.chain, &target.topic).await?;
             state.watermark_known = true;
@@ -333,13 +334,22 @@ pub(crate) async fn read_with(
                 target.topic
             )));
         }
+    } else if position.is_empty() && !state.watermark_known {
+        state.watermark = store
+            .latest(StoreLatestRequest {
+                chain: Some(target.chain.clone()),
+                topic: target.topic.clone(),
+            })
+            .await?
+            .position;
+        state.watermark_known = true;
     }
 
     let page = store
         .read(StoreReadRequest {
             chain: Some(target.chain.clone()),
             topic: target.topic.clone(),
-            after_position: position,
+            after_position: position.clone(),
             wait: request.wait,
             max_records: match request.max_records {
                 0 => DEFAULT_MAX_RECORDS,
@@ -347,6 +357,21 @@ pub(crate) async fn read_with(
             },
         })
         .await?;
+    if !capabilities.kept_last {
+        let mark = if position.is_empty() {
+            &state.watermark
+        } else {
+            &position
+        };
+        check_prefix(
+            store,
+            target,
+            mark,
+            &page.records,
+            capabilities.dense_positions,
+        )
+        .await?;
+    }
     let mut closed = page.closed;
     let mut records = Vec::with_capacity(page.records.len());
     let mut previous = start;
@@ -417,6 +442,46 @@ pub(crate) async fn read_with(
     ))
 }
 
+/// Fails as expired when retention may have dropped records after `mark` that the read had not
+/// delivered, on a store that doesn't keep a topic's last position. Retention drops only the
+/// oldest records, so while the record at `mark` is still there, nothing after it is gone. It
+/// looks after the read, so a trim that raced the read is seen too. On a store with dense
+/// positions, a page that starts right after `mark` is whole without a look. The answer can be a
+/// false expired, for a reader whose mark retention dropped with nothing lost after it, but
+/// never a silent skip.
+async fn check_prefix(
+    store: &dyn StreamStore,
+    target: &ReadTarget,
+    mark: &str,
+    page: &[StoredRecord],
+    dense: bool,
+) -> StreamResult<()> {
+    if mark.is_empty() {
+        return Ok(());
+    }
+    let next = |first: &StoredRecord| {
+        let (Ok(mark), Ok(first)) = (mark.parse::<u64>(), first.position.parse::<u64>()) else {
+            return false;
+        };
+        mark.checked_add(1) == Some(first)
+    };
+    if dense && page.first().is_some_and(next) {
+        return Ok(());
+    }
+    if store
+        .record_at(&target.chain, &target.topic, mark)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    Err(StreamError::expired(format!(
+        "retention dropped position {mark} on topic {:?}, so records after it may be lost to this \
+         read",
+        target.topic
+    )))
+}
+
 /// A stored record as the read takes it. Fails on bytes that are no record, and on a kind no
 /// writer stores, such as the `SUPERSEDED` that only readers synthesize.
 ///
@@ -475,6 +540,10 @@ mod tests {
         lookups: AtomicUsize,
         /// The last sequence each producer attempt wrote.
         sequences: Mutex<HashMap<(String, i64), i64>>,
+        /// How many of the oldest records retention dropped.
+        trimmed: AtomicUsize,
+        /// Whether the log forgets its last position, so the read decides expiry itself.
+        forgets_last: bool,
     }
 
     impl Log {
@@ -526,12 +595,20 @@ mod tests {
             "log"
         }
 
+        fn capabilities(&self) -> crate::Capabilities {
+            crate::Capabilities {
+                kept_last: !self.forgets_last,
+                ..crate::Capabilities::log_only()
+            }
+        }
+
         async fn append(&self, _: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
             unreachable!()
         }
 
         async fn read(&self, request: StoreReadRequest) -> StreamResult<StoreReadResponse> {
             let after: usize = request.after_position.parse().unwrap_or(0);
+            let after = after.max(self.trimmed.load(Ordering::Relaxed));
             let entries = self.entries.lock().unwrap();
             let records = entries
                 .iter()
@@ -567,6 +644,9 @@ mod tests {
         ) -> StreamResult<Option<Vec<u8>>> {
             self.lookups.fetch_add(1, Ordering::Relaxed);
             let index: usize = position.parse().unwrap();
+            if index <= self.trimmed.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
             Ok(self.entries.lock().unwrap().get(index - 1).cloned())
         }
 
@@ -783,6 +863,98 @@ mod tests {
         log.write("p", 1, b"3");
         let read = read(&log, BEGINNING, &[]).await.unwrap();
         assert_eq!(values(&read), ["1", "2"]);
+    }
+
+    fn forgetful() -> Log {
+        Log {
+            forgets_last: true,
+            ..Log::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_kept_last_position_a_lost_cursor_record_reads_as_expired() {
+        let log = forgetful();
+        for value in ["1", "2", "3", "4"] {
+            log.write("p", 1, value.as_bytes());
+        }
+        let first = read_page(
+            &log,
+            &target(),
+            &ReadRequest {
+                max_records: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.cursor, cursor("1"));
+        // While the record at the cursor is there, nothing after it is gone.
+        log.trimmed.store(1, Ordering::Relaxed);
+        let error = read(&log, &first.cursor, &first.state).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Expired);
+        // A position the store still holds reads on.
+        let held = read(&log, &cursor("2"), &[]).await.unwrap();
+        assert_eq!(values(&held), ["3", "4"]);
+        // A quiet stream whose last delivered record expired reads as expired too, where a store
+        // that keeps the last position answers empty.
+        log.trimmed.store(4, Ordering::Relaxed);
+        let quiet = read(&log, &cursor("4"), &[]).await.unwrap_err();
+        assert_eq!(quiet.kind, StreamFailureKind::Expired);
+    }
+
+    #[tokio::test]
+    async fn without_a_kept_last_position_a_read_from_the_start_keeps_a_mark() {
+        let log = forgetful();
+        let empty = read(&log, BEGINNING, &[]).await.unwrap();
+        assert!(empty.records.is_empty());
+        log.write("p", 1, b"1");
+        let next = read(&log, &empty.cursor, &empty.state).await.unwrap();
+        assert_eq!(values(&next), ["1"]);
+    }
+
+    #[tokio::test]
+    async fn on_dense_positions_a_page_right_after_a_lost_cursor_is_whole() {
+        let store = crate::MemoryStore::with_capabilities(crate::Capabilities {
+            kept_last: false,
+            ..crate::MemoryStore::new().capabilities()
+        });
+        let chain = target().chain;
+        for sequence in 1..=4 {
+            let record = StreamRecord {
+                sequence,
+                ..data_record("p", 1, sequence.to_string().as_bytes())
+            };
+            store
+                .append(StoreAppendRequest {
+                    chain: Some(chain.clone()),
+                    topic: "out".to_string(),
+                    producer_id: "p".to_string(),
+                    attempt: 1,
+                    sequence,
+                    digest: vec![1],
+                    records: vec![record.encode_to_vec()],
+                })
+                .await
+                .unwrap();
+        }
+        let at = |position: &str| mint_cursor("memory", &target().stream_hash, position);
+        let read = async |after: &str| {
+            read_page(
+                &store,
+                &target(),
+                &ReadRequest {
+                    after: after.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+        };
+        store.truncate(&chain, "out", 3);
+        assert_eq!(values(&read(&at("0")).await.unwrap()), ["2", "3", "4"]);
+        store.truncate(&chain, "out", 2);
+        let error = read(&at("0")).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Expired);
     }
 
     fn values(response: &ReadResponse) -> Vec<String> {
