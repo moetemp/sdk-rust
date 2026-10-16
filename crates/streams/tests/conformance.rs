@@ -642,6 +642,50 @@ mod on_redis {
         })
     }
 
+    /// A store with the notification log and an archive, as a user with the documented rules,
+    /// the log's and the archive's. A driver reads the archive marks under the same user.
+    pub(crate) async fn redis_as_documented_user_with_archive(
+        variable: &str,
+        cluster: bool,
+    ) -> Option<Redis> {
+        let Ok(url) = std::env::var(variable) else {
+            eprintln!("set {variable} to run the Redis store cases");
+            return None;
+        };
+        let page = include_str!("../docs/redis.md");
+        for rules in [
+            "`~temporal-streams:{*}:a +zadd +hexists`",
+            "`+zrange +zrem`",
+        ] {
+            assert!(page.contains(rules), "the Redis page names {rules}");
+        }
+        let prefix = unique("conformance-acl-archive");
+        let rules = [
+            format!("~{}:{{*}}:n", part(&prefix)),
+            format!("%W~{}:{{*}}:bell", part(&prefix)),
+            format!("~{}:{{*}}:a", part(&prefix)),
+            "+zadd".to_string(),
+            "+hexists".to_string(),
+            "+zrange".to_string(),
+            "+zrem".to_string(),
+            // The page names it as the one rule an owner delete needs beyond the others.
+            "+scan".to_string(),
+        ];
+        let rules: Vec<&str> = rules.iter().map(String::as_str).collect();
+        let user = DocumentedUser::create(&url, &prefix, "default", &rules).await;
+        let mut options = RedisStoreOptions::new(user.url.clone());
+        options.key_prefix = prefix.clone();
+        options.cluster = cluster;
+        options.notification_log = true;
+        options.archive_lease = Some(Duration::from_secs(7 * 24 * 60 * 60));
+        Some(Redis {
+            store: Arc::new(RedisStore::connect(options).await.unwrap()),
+            raw: Raw::connect(&url, cluster).await,
+            prefix,
+            _user: Some(user),
+        })
+    }
+
     /// A store with the notification log on, as a user with exactly the MemoryDB access string.
     pub(crate) async fn redis_as_memorydb_user(variable: &str, cluster: bool) -> Option<Redis> {
         let Ok(url) = std::env::var(variable) else {
@@ -2400,6 +2444,26 @@ mod archive_cases {
         );
     }
 
+    pub(crate) async fn a_driver_finds_the_topics_to_archive(case: &dyn ArchiveCase) {
+        let chain = case.chain();
+        Producer::new(case, &chain, OUT, "p", 1)
+            .append(&["1"])
+            .await;
+        let marks = case
+            .hot()
+            .notification_log()
+            .unwrap()
+            .archive_marks(1000)
+            .await
+            .unwrap();
+        assert!(
+            marks
+                .iter()
+                .any(|mark| mark.chain == chain && mark.topic == OUT),
+            "{marks:?}"
+        );
+    }
+
     pub(crate) async fn a_drop_the_archive_holds_loses_nothing(case: &dyn ArchiveCase) {
         let chain = case.chain();
         let first = read(case, &chain, OUT, BEGINNING).await.unwrap();
@@ -2868,6 +2932,18 @@ mod archive_standalone_redis {
         "STREAMS_REDIS_URL",
         false
     )));
+}
+
+#[cfg(feature = "redis")]
+mod archive_documented_acl_redis {
+    archive_cases!(super::tiered(
+        super::on_redis::redis_as_documented_user_with_archive("STREAMS_REDIS_URL", false)
+    ));
+    archive_conformance!(super::tiered(
+        super::on_redis::redis_as_documented_user_with_archive("STREAMS_REDIS_URL", false)
+    );
+        a_driver_finds_the_topics_to_archive,
+    );
 }
 
 #[cfg(feature = "redis")]
