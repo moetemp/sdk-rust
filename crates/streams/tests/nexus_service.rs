@@ -1052,14 +1052,38 @@ async fn a_record_the_reader_cannot_parse_has_an_empty_range_at_its_cursor() {
 }
 
 #[tokio::test]
+async fn a_floor_holder_names_the_caller_and_starts_at_a_cursor() {
+    let calls = service(memory(), NexusOptions::default());
+    let wf = workflow();
+    write(&calls, &wf, 1, &["one"]).await;
+    for holder in ["reader-run/1", "ns//1", "archive"] {
+        let mut input = read_input(&wf, "");
+        input["floor_holder"] = json!(holder);
+        let refused = read(&calls, input).await.unwrap_err();
+        assert_eq!(
+            kind_of(&refused),
+            ("BAD_REQUEST", false, "ValueError"),
+            "{holder}"
+        );
+    }
+    let refused = read(&calls, holding(&wf, "$end")).await.unwrap_err();
+    assert_eq!(kind_of(&refused), ("BAD_REQUEST", false, "ValueError"));
+    assert!(
+        refused.message.contains("latest_only"),
+        "{}",
+        refused.message
+    );
+}
+
+#[tokio::test]
 async fn a_floor_holder_is_at_most_512_bytes_and_never_beside_latest_only() {
     let calls = service(memory(), NexusOptions::default());
     let wf = workflow();
     write(&calls, &wf, 1, &["one"]).await;
     let mut input = read_input(&wf, "");
-    input["floor_holder"] = json!("h".repeat(512));
+    input["floor_holder"] = json!(format!("ns/run/{}", "h".repeat(505)));
     read(&calls, input.clone()).await.unwrap();
-    input["floor_holder"] = json!("h".repeat(513));
+    input["floor_holder"] = json!(format!("ns/run/{}", "h".repeat(506)));
     let refused = read(&calls, input).await.unwrap_err();
     assert_eq!(kind_of(&refused), ("BAD_REQUEST", false, "ValueError"));
     assert!(refused.message.contains("512"), "{}", refused.message);
