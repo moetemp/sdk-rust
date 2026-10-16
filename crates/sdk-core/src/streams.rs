@@ -215,6 +215,7 @@ fn attach_request(attachment: WorkflowAttachment) -> AttachStreamCallbackRequest
             run_id: attachment.run_id,
             subscription_id: attachment.subscription_id,
         }),
+        idle: attachment.idle,
         ..Default::default()
     }
 }
@@ -787,6 +788,7 @@ mod tests {
             workflow_id: "reader".to_string(),
             run_id: "reader-run".to_string(),
             subscription_id: "1".to_string(),
+            idle: true,
         });
         assert_eq!(request.namespace, "ns");
         assert_eq!(
@@ -809,6 +811,10 @@ mod tests {
             })
         );
         assert!(request.callback.is_none(), "exactly one target");
+        assert!(
+            request.idle,
+            "the reader asks for each wake once it is caught up"
+        );
     }
 
     #[test]
