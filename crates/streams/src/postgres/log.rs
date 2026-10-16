@@ -130,6 +130,7 @@ impl NotificationLog for PostgresLog {
                 chain: chain(row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)),
                 topic: row.get(5),
                 written_ms: row.get::<_, i64>(6).max(0) as u64,
+                idle_ms: row.get::<_, i64>(7).max(0) as u64,
             })
             .collect())
     }
