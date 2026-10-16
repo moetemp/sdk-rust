@@ -2374,6 +2374,32 @@ mod archive_cases {
         assert_eq!(values, ["3", "4"]);
     }
 
+    pub(crate) async fn a_read_at_the_last_record_the_archive_lost_goes_on(case: &dyn ArchiveCase) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let first = producer.append(&["1", "2"]).await;
+        case.archive_now(&chain, OUT, 10).await;
+        let lost = producer.append(&["3"]).await;
+        producer.append(&["4", "5"]).await;
+        // The archive's hold lapses, and retention drops `3` before the archive takes it.
+        case.hot()
+            .release_floor(&chain, OUT, temporalio_streams::ARCHIVE_HOLDER)
+            .await
+            .unwrap();
+        case.drop_oldest(&chain, OUT, 2).await;
+        case.archive_now(&chain, OUT, 10).await;
+        // Only the archive answers now.
+        case.forget(&chain, OUT).await;
+        let at_lost = cursor(case, &chain, OUT, &lost.last_position);
+        let (values, _) = read_all(case, &chain, OUT, &at_lost).await;
+        assert_eq!(values, ["4", "5"]);
+        let before_lost = cursor(case, &chain, OUT, &first.last_position);
+        assert_eq!(
+            kind(read(case, &chain, OUT, &before_lost).await),
+            StreamFailureKind::Expired
+        );
+    }
+
     pub(crate) async fn a_drop_the_archive_holds_loses_nothing(case: &dyn ArchiveCase) {
         let chain = case.chain();
         let first = read(case, &chain, OUT, BEGINNING).await.unwrap();
@@ -2450,6 +2476,7 @@ macro_rules! archive_cases {
             a_closed_topic_reads_its_close_from_the_archive,
             an_open_topic_the_hot_store_forgot_reads_from_the_archive,
             a_read_before_what_the_archive_holds_is_expired,
+            a_read_at_the_last_record_the_archive_lost_goes_on,
             a_drop_the_archive_holds_loses_nothing,
             deleting_an_owner_deletes_its_archive,
         );
