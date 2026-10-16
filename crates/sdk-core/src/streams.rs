@@ -59,14 +59,42 @@ impl NotifierClient for ConnectionNotifierClient {
         &self,
         notifications: Vec<StreamNotification>,
     ) -> Result<(), NotifyError> {
+        self.notify_streams_each(notifications)
+            .await?
+            .into_iter()
+            .collect()
+    }
+
+    async fn notify_streams_each(
+        &self,
+        notifications: Vec<StreamNotification>,
+    ) -> Result<Vec<Result<(), NotifyError>>, NotifyError> {
+        let namespaces: Vec<_> = notifications
+            .iter()
+            .map(|n| n.chain.namespace.clone())
+            .collect();
+        let mut results: Vec<_> = namespaces.iter().map(|_| Ok(())).collect();
         for request in notify_streams_requests(notifications, self.connection.identity()) {
-            self.connection
+            // A request keeps the order of its namespace's notifications.
+            let indexes: Vec<_> = (0..namespaces.len())
+                .filter(|&index| namespaces[index] == request.namespace)
+                .collect();
+            let response = self
+                .connection
                 .workflow_service()
                 .notify_streams(request.into_request())
                 .await
-                .map_err(notify_error)?;
+                .map_err(notify_error)?
+                .into_inner();
+            // A server that answers no results applied every entry.
+            for (index, result) in indexes.into_iter().zip(response.results) {
+                if result.code != tonic::Code::Ok as i32 {
+                    let code = tonic::Code::from(result.code);
+                    results[index] = Err(notify_error(tonic::Status::new(code, result.message)));
+                }
+            }
         }
-        Ok(())
+        Ok(results)
     }
 
     async fn attach_workflow(&self, attachment: WorkflowAttachment) -> Result<(), NotifyError> {
