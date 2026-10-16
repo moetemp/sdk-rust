@@ -42,8 +42,20 @@ impl ActivityStreamClose {
     ) -> Option<Self> {
         let failure = match resolution?.status.as_ref()? {
             activity_resolution::Status::Completed(_) => None,
-            activity_resolution::Status::Failed(failed) => Some(failed.failure.clone()?),
-            activity_resolution::Status::Cancelled(cancelled) => Some(cancelled.failure.clone()?),
+            // A resolution with no failure still ends the Activity, so its streams close with a
+            // failure of their own.
+            activity_resolution::Status::Failed(failed) => Some(
+                failed
+                    .failure
+                    .clone()
+                    .unwrap_or_else(|| no_failure("failed")),
+            ),
+            activity_resolution::Status::Cancelled(cancelled) => Some(
+                cancelled
+                    .failure
+                    .clone()
+                    .unwrap_or_else(|| no_failure("was cancelled")),
+            ),
             // Only Local Activities back off, and they own no streams.
             activity_resolution::Status::Backoff(_) => return None,
         };
@@ -53,6 +65,13 @@ impl ActivityStreamClose {
             activity_id: activity_id.to_string(),
             failure,
         })
+    }
+}
+
+fn no_failure(what: &str) -> Failure {
+    Failure {
+        message: format!("The Activity {what} with no failure"),
+        ..Default::default()
     }
 }
 
@@ -415,6 +434,26 @@ fn fit_failure(failure: Failure, closed_by_bytes: usize) -> Failure {
 mod tests {
     use super::*;
     use temporalio_common::protos::temporal::api::common::v1::Payload;
+
+    #[test]
+    fn a_failed_or_cancelled_resolution_with_no_failure_still_closes() {
+        use temporalio_common::protos::coresdk::activity_result::{
+            Cancellation, Failure as Failed,
+        };
+        for status in [
+            activity_resolution::Status::Failed(Failed {
+                failure: None,
+                ..Default::default()
+            }),
+            activity_resolution::Status::Cancelled(Cancellation { failure: None }),
+        ] {
+            let resolution = ActivityResolution {
+                status: Some(status),
+            };
+            let close = ActivityStreamClose::of("wf", "run-1", "tool", Some(&resolution)).unwrap();
+            assert!(close.failure.is_some());
+        }
+    }
 
     fn data(topic: &str, hash: u8) -> OutputRecord {
         OutputRecord {
