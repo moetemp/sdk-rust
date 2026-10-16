@@ -902,7 +902,9 @@ mod tests {
 
     /// Needs a server with the stream notifier and progress on, at `STREAMS_NOTIFIER_SERVER`
     /// (such as `http://127.0.0.1:7861`), whose `callback.allowedAddresses` takes
-    /// `127.0.0.1:7899`. Answers `None` without one.
+    /// `127.0.0.1:7899`. Answers `None` without one. Also answers `None` without
+    /// `STREAMS_NOTIFIER_NEXUS_PROGRESS`, since a Jetty server sends progress only to Workflow
+    /// wake targets.
     async fn live() -> Option<Live> {
         use temporalio_common::protos::temporal::api::{
             common::v1::WorkflowType,
@@ -913,6 +915,10 @@ mod tests {
             eprintln!("set STREAMS_NOTIFIER_SERVER to run the live notifier test");
             return None;
         };
+        if std::env::var("STREAMS_NOTIFIER_NEXUS_PROGRESS").is_err() {
+            eprintln!("set STREAMS_NOTIFIER_NEXUS_PROGRESS for a server with Nexus progress");
+            return None;
+        }
         let turn = LIVE_TURN.lock().await;
         let connection = Connection::connect(
             temporalio_client::ConnectionOptions::new(url::Url::parse(&server).unwrap()).build(),
