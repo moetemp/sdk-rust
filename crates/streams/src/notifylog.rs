@@ -78,4 +78,7 @@ pub struct ArchiveMark {
     /// When the topic last took a write, in milliseconds since the Unix epoch. `0` for a closed
     /// topic, which the archive takes first.
     pub written_ms: u64,
+    /// How long the topic went without a write, on the store's clock, so a driver whose clock
+    /// is off still finds idle topics.
+    pub idle_ms: u64,
 }

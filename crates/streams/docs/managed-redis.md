@@ -44,7 +44,7 @@ string for one namespace's applications, with the notification log on and owner 
 conformance suite runs as a user with exactly these rules on local Redis.
 
 ```text
-on ~temporal-streams:{my-ns:* ~temporal-streams:{*}:n ~temporal-streams:{*}:bell -@all +evalsha +eval +script|load +multi +exec +xadd +xread +xrevrange +xrange +xtrim +xlen +hget +hset +hgetall +hincrby +hdel +hscan +sadd +smembers +rpush +lrange +exists +del +unlink +scan +pexpire +pttl +time +info +ping +hello +client|setinfo +cluster|slots
+on ~temporal-streams:{my-ns:* ~temporal-streams:{*}:n ~temporal-streams:{*}:bell -@all +evalsha +eval +script|load +multi +exec +xadd +xread +xrevrange +xrange +xtrim +xlen +hget +hset +hgetall +hlen +hincrby +hdel +hscan +sadd +smembers +rpush +lrange +exists +del +unlink +scan +pexpire +pttl +time +info +ping +hello +client|setinfo +cluster|slots
 ```
 
 It differs from the `ACL SETUSER` rules in [redis.md](redis.md) in four ways.
