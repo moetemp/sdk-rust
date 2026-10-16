@@ -353,6 +353,7 @@ impl NexusCalls {
             state: state.clone(),
             arm: input.arm.unwrap_or(false),
             floor_holder: String::new(),
+            max_bytes: 0,
         };
         let mut read = match self.streams.read_carried(request).await {
             Ok(read) => read,
