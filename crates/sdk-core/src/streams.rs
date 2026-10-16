@@ -1265,32 +1265,6 @@ mod tests {
         live.end().await;
     }
 
-    /// One record from one producer, as its batch at `sequence`.
-    fn record_append(stream: &proto::StreamAddress, sequence: i64) -> proto::AppendRequest {
-        proto::AppendRequest {
-            stream: Some(stream.clone()),
-            producer: Some(proto::append_request::Producer::Named(
-                proto::NamedProducer {
-                    producer_id: "producer".to_string(),
-                    attempt: 1,
-                },
-            )),
-            sequence,
-            records: vec![proto::AppendRecord {
-                kind: proto::StreamRecordKind::Data as i32,
-                body: Some(
-                    temporalio_common::protos::temporal::api::common::v1::Payload {
-                        data: b"token".to_vec(),
-                        ..Default::default()
-                    },
-                ),
-                content_hash: vec![7; 32],
-                ..Default::default()
-            }],
-            digest: vec![sequence as u8; 32],
-        }
-    }
-
     /// Needs a server with idle Workflow targets at `STREAMS_NOTIFIER_SERVER`, and a recheck
     /// interval longer than the test, since a recheck wakes the reader too.
     #[tokio::test(flavor = "multi_thread")]
@@ -1390,7 +1364,7 @@ mod tests {
             }
         };
         let append = |sequence: i64| {
-            let request = record_append(&stream, sequence);
+            let request = one_append(&stream, sequence);
             let service = service.clone();
             async move {
                 service
