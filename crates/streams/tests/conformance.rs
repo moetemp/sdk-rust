@@ -796,18 +796,57 @@ mod on_postgres {
     }
 
     pub(crate) async fn postgres(variable: &str) -> Option<Postgres> {
+        postgres_with(variable, |_| {}).await
+    }
+
+    /// [postgres] with a notification log.
+    pub(crate) async fn postgres_with_log(variable: &str) -> Option<Postgres> {
+        postgres_with(variable, |options| {
+            options.notification_log = true;
+            options.notify_doorbells = 4;
+        })
+        .await
+    }
+
+    /// [postgres] with a `NOTIFY` per append for waiting reads.
+    pub(crate) async fn postgres_notifying_reads(variable: &str) -> Option<Postgres> {
+        postgres_with(variable, |options| options.notify_reads = true).await
+    }
+
+    pub(crate) async fn postgres_with(
+        variable: &str,
+        change: impl FnOnce(&mut PostgresStoreOptions),
+    ) -> Option<Postgres> {
         let Ok(url) = std::env::var(variable) else {
             eprintln!("set {variable} to run the PostgreSQL store cases");
             return None;
         };
         let schema = schema();
+        let mut options = options(&url, &schema);
+        change(&mut options);
         Some(Postgres {
-            store: Arc::new(
-                PostgresStore::connect(options(&url, &schema))
-                    .await
-                    .unwrap(),
-            ),
+            store: Arc::new(PostgresStore::connect(options).await.unwrap()),
             raw: Arc::new(raw(&url).await),
+            schema,
+        })
+    }
+
+    /// The store through PgBouncer in transaction mode at `STREAMS_POSTGRES_PGBOUNCER_URL`, with
+    /// the log, and the listener and the migrations on the direct `STREAMS_POSTGRES_URL`.
+    pub(crate) async fn postgres_through_pgbouncer() -> Option<Postgres> {
+        let Ok(pooled) = std::env::var("STREAMS_POSTGRES_PGBOUNCER_URL") else {
+            eprintln!("set STREAMS_POSTGRES_PGBOUNCER_URL to run the PgBouncer cases");
+            return None;
+        };
+        let direct = std::env::var("STREAMS_POSTGRES_URL").unwrap();
+        let schema = schema();
+        let mut options = options(&pooled, &schema);
+        options.listen_url = Some(direct.clone());
+        options.notification_log = true;
+        options.notify_doorbells = 4;
+        Some(Postgres {
+            store: Arc::new(PostgresStore::connect(options).await.unwrap()),
+            raw: Arc::new(raw(&direct).await),
             schema,
         })
     }
@@ -834,6 +873,15 @@ mod on_postgres {
     /// A store as a role with exactly the documented grants, on a schema an owner migrated. The
     /// page's schema, role and password are swapped for the test's own, and nothing else changes.
     pub(crate) async fn postgres_as_documented_role(variable: &str) -> Option<Postgres> {
+        postgres_as_documented_role_with(variable, false).await
+    }
+
+    /// [postgres_as_documented_role] with a notification log.
+    pub(crate) async fn postgres_as_documented_role_with_log(variable: &str) -> Option<Postgres> {
+        postgres_as_documented_role_with(variable, true).await
+    }
+
+    async fn postgres_as_documented_role_with(variable: &str, log: bool) -> Option<Postgres> {
         let Ok(url) = std::env::var(variable) else {
             eprintln!("set {variable} to run the PostgreSQL store cases");
             return None;
@@ -858,6 +906,7 @@ mod on_postgres {
         let role_url = format!("postgres://{role}:{password}@{address}");
         let mut options = options(&role_url, &schema);
         options.skip_migrations = true;
+        options.notification_log = log;
         Some(Postgres {
             store: Arc::new(PostgresStore::connect(options).await.unwrap()),
             raw: Arc::new(raw),
@@ -3031,8 +3080,35 @@ mod postgres {
 }
 
 #[cfg(feature = "postgres")]
+mod postgres_with_log {
+    store_cases!(super::on_postgres::postgres_with_log(
+        "STREAMS_POSTGRES_URL"
+    ));
+    log_cases!(super::on_postgres::postgres_with_log(
+        "STREAMS_POSTGRES_URL"
+    ));
+}
+
+#[cfg(feature = "postgres")]
+mod postgres_notifying_reads {
+    store_cases!(super::on_postgres::postgres_notifying_reads(
+        "STREAMS_POSTGRES_URL"
+    ));
+}
+
+#[cfg(feature = "postgres")]
+mod pgbouncer_postgres {
+    // Transaction mode, with the listener and the migrations on a direct connection.
+    store_cases!(super::on_postgres::postgres_through_pgbouncer());
+    log_cases!(super::on_postgres::postgres_through_pgbouncer());
+}
+
+#[cfg(feature = "postgres")]
 mod activity_postgres {
     store_cases!(super::activity(super::on_postgres::postgres(
+        "STREAMS_POSTGRES_URL"
+    )));
+    log_cases!(super::activity(super::on_postgres::postgres_with_log(
         "STREAMS_POSTGRES_URL"
     )));
     conformance!(super::activity(super::on_postgres::postgres("STREAMS_POSTGRES_URL"));
@@ -3045,9 +3121,22 @@ mod workflow_activity_postgres {
     store_cases!(super::workflow_activity(super::on_postgres::postgres(
         "STREAMS_POSTGRES_URL"
     )));
+    log_cases!(super::workflow_activity(
+        super::on_postgres::postgres_with_log("STREAMS_POSTGRES_URL")
+    ));
     conformance!(super::workflow_activity(super::on_postgres::postgres("STREAMS_POSTGRES_URL"));
         deleting_a_workflow_drops_its_workflow_activities,
     );
+}
+
+#[cfg(feature = "postgres")]
+mod documented_role_postgres_with_log {
+    store_cases!(super::on_postgres::postgres_as_documented_role_with_log(
+        "STREAMS_POSTGRES_URL"
+    ));
+    log_cases!(super::on_postgres::postgres_as_documented_role_with_log(
+        "STREAMS_POSTGRES_URL"
+    ));
 }
 
 #[cfg(feature = "postgres")]

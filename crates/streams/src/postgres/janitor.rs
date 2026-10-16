@@ -2,7 +2,7 @@
 //! session advisory lock lets one pass run at a time across processes.
 
 use super::{
-    DELETE_BATCH, Inner,
+    DELETE_BATCH, Inner, LOG_CAP,
     errors::{Call, mapped, timed_out, unreachable},
     migrations::LOCK_SPACE,
 };
@@ -29,7 +29,8 @@ pub(super) async fn run(inner: Weak<Inner>, interval: Duration) {
 }
 
 impl Inner {
-    /// One pass: trims the topics that are due, finishes purges, and deletes idle chains.
+    /// One pass: trims the topics that are due, finishes purges, caps the notification log, and
+    /// deletes idle chains.
     pub(super) async fn janitor_pass(&self) -> StreamResult<u64> {
         let client = self.pool.get().await.map_err(unreachable)?;
         let key = format!("{}:janitor", self.schema);
@@ -88,6 +89,9 @@ impl Inner {
             if purged[0].get::<_, bool>(1) {
                 break;
             }
+        }
+        if self.log {
+            self.on(client, &self.sql.cap_log, &[&LOG_CAP]).await?;
         }
         self.on(
             client,

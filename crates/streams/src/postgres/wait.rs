@@ -1,7 +1,7 @@
 //! Waiting reads. A waiting read holds no connection. It waits for a wake from an append or a
-//! close through this store, or from one batched poll per process for every stream with a
-//! waiter. A wake only makes the read look again, so a lost or a spurious wake costs latency and
-//! never a record.
+//! close through this store, from one batched poll per process for every stream with a waiter,
+//! or from a `NOTIFY` with `notify_reads`. A wake only makes the read look again, so a lost or a
+//! spurious wake costs latency and never a record.
 
 use super::Chain;
 use std::{collections::HashMap, sync::Mutex};
@@ -23,22 +23,27 @@ struct Waiting {
     wake: watch::Sender<u64>,
     /// The state the waiters were woken for last, which the poll compares with.
     seen: Seen,
+    /// The topic's row, which a `NOTIFY` names. `None` before the topic has one.
+    topic_id: Option<i64>,
 }
 
 impl Waiters {
     /// Registers a waiter that saw `seen`. Register before the read looks once more, so a write
     /// between the two wakes it.
-    pub(super) fn register(&self, key: StreamKey, seen: Seen) -> watch::Receiver<u64> {
-        self.streams
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_insert_with(|| Waiting {
-                wake: watch::Sender::new(0),
-                seen,
-            })
-            .wake
-            .subscribe()
+    pub(super) fn register(
+        &self,
+        key: StreamKey,
+        seen: Seen,
+        topic_id: Option<i64>,
+    ) -> watch::Receiver<u64> {
+        let mut streams = self.streams.lock().unwrap();
+        let waiting = streams.entry(key).or_insert_with(|| Waiting {
+            wake: watch::Sender::new(0),
+            seen,
+            topic_id,
+        });
+        waiting.topic_id = waiting.topic_id.or(topic_id);
+        waiting.wake.subscribe()
     }
 
     /// Wakes the waiters of one stream.
@@ -54,6 +59,23 @@ impl Waiters {
             if of == chain {
                 waiting.wake.send_modify(|n| *n += 1);
             }
+        }
+    }
+
+    /// Wakes the waiters of the topic a `NOTIFY` named, and those of topics with no row yet,
+    /// which a `NOTIFY` can't name.
+    pub(super) fn wake_topic(&self, topic_id: i64) {
+        for waiting in self.streams.lock().unwrap().values() {
+            if waiting.topic_id.is_none_or(|id| id == topic_id) {
+                waiting.wake.send_modify(|n| *n += 1);
+            }
+        }
+    }
+
+    /// Wakes every waiter, for when wakes may have been lost.
+    pub(super) fn wake_all(&self) {
+        for waiting in self.streams.lock().unwrap().values() {
+            waiting.wake.send_modify(|n| *n += 1);
         }
     }
 
@@ -105,7 +127,7 @@ mod tests {
     #[test]
     fn a_poll_wakes_only_on_a_change() {
         let waiters = Waiters::default();
-        let mut rx = waiters.register(key("out"), (Some(1), false));
+        let mut rx = waiters.register(key("out"), (Some(1), false), Some(7));
         waiters.polled(&key("out"), (Some(1), false));
         assert!(!rx.has_changed().unwrap());
         waiters.polled(&key("out"), (Some(2), false));
@@ -118,11 +140,11 @@ mod tests {
     #[test]
     fn a_chain_wake_reaches_its_topics_only() {
         let waiters = Waiters::default();
-        let out = waiters.register(key("out"), (None, false));
-        let other = waiters.register(key("other"), (None, false));
+        let out = waiters.register(key("out"), (None, false), None);
+        let other = waiters.register(key("other"), (None, false), None);
         let mut elsewhere = key("out");
         elsewhere.0.owner = "wf2".to_string();
-        let far = waiters.register(elsewhere, (None, false));
+        let far = waiters.register(elsewhere, (None, false), None);
         waiters.wake_chain(&key("out").0);
         assert!(out.has_changed().unwrap());
         assert!(other.has_changed().unwrap());
@@ -130,9 +152,21 @@ mod tests {
     }
 
     #[test]
+    fn a_notify_wakes_its_topic_and_topics_with_no_row() {
+        let waiters = Waiters::default();
+        let seven = waiters.register(key("seven"), (Some(1), false), Some(7));
+        let eight = waiters.register(key("eight"), (Some(1), false), Some(8));
+        let new = waiters.register(key("new"), (None, false), None);
+        waiters.wake_topic(7);
+        assert!(seven.has_changed().unwrap());
+        assert!(!eight.has_changed().unwrap());
+        assert!(new.has_changed().unwrap());
+    }
+
+    #[test]
     fn a_dropped_waiter_leaves_no_stream() {
         let waiters = Waiters::default();
-        let rx = waiters.register(key("out"), (None, false));
+        let rx = waiters.register(key("out"), (None, false), None);
         assert_eq!(waiters.streams().len(), 1);
         assert_eq!(waiters.len(), 1);
         drop(rx);

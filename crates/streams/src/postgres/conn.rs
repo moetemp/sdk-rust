@@ -9,7 +9,10 @@ use rustls::{
     pki_types::{CertificateDer, ServerName, UnixTime, pem::PemObject},
 };
 use std::{sync::Arc, time::Duration};
-use tokio_postgres::{Client, NoTls, config::SslMode};
+use tokio::sync::mpsc;
+use tokio_postgres::{
+    AsyncMessage, Client, Connection, NoTls, Notification, config::SslMode, tls::TlsStream,
+};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
 /// The `sslmode` values libpq takes. `allow` is left out, since it trusts a plain connection
@@ -93,6 +96,27 @@ impl Target {
         }
     }
 
+    /// One connection of its own whose notifications arrive on the receiver. The receiver
+    /// closes when the connection ends.
+    pub(super) async fn listen(
+        &self,
+    ) -> Result<(Client, mpsc::UnboundedReceiver<Notification>), tokio_postgres::Error> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let client = match &self.tls {
+            Some(tls) => {
+                let (client, connection) = self.config.connect(tls.clone()).await?;
+                tokio::spawn(forward(connection, sender));
+                client
+            }
+            None => {
+                let (client, connection) = self.config.connect(NoTls).await?;
+                tokio::spawn(forward(connection, sender));
+                client
+            }
+        };
+        Ok((client, receiver))
+    }
+
     /// The pool of `size` connections. Each new connection pins the session settings the store
     /// functions depend on.
     pub(super) fn pool(&self, size: usize, timeout: Duration) -> StreamResult<Pool> {
@@ -121,6 +145,30 @@ impl Target {
             }))
             .build()
             .map_err(|error| StreamError::refused(format!("the PostgreSQL pool: {error}")))
+    }
+}
+
+/// Drives a connection and hands its notifications on, until it ends.
+async fn forward<S, T>(
+    mut connection: Connection<S, T>,
+    sender: mpsc::UnboundedSender<Notification>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    T: TlsStream + Unpin,
+{
+    while let Some(message) = std::future::poll_fn(|cx| connection.poll_message(cx)).await {
+        match message {
+            Ok(AsyncMessage::Notification(notification)) => {
+                if sender.send(notification).is_err() {
+                    return;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::debug!("The PostgreSQL store's listener connection ended: {error}");
+                return;
+            }
+        }
     }
 }
 

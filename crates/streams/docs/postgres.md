@@ -41,6 +41,30 @@ store, or for the store's poll. While any read waits, the store runs one stateme
 another process wakes within about `poll_interval`. The server's stream notifier is the main wake
 path, and this wait is the path for a reader without it.
 
+**`notify_reads`.** With it, each append also sends `NOTIFY` on `<schema>_read_<topic id % 64>`
+with the topic id, and the store's listener wakes the waiters of that topic. A reader in another
+process then wakes in a few milliseconds. It is off by default, since a transaction that sent
+`NOTIFY` takes a lock on the server's notification queue as it commits, so such commits run one
+at a time across the database. With many producers at once, it costs append throughput.
+
+**Notification log.** With `notification_log` on, the append also writes a row to
+`notifications` in its transaction: the topic and the append's last position, in one of 64
+partitions fixed in the schema. Every topic of a chain lands in the partition that the first four
+bytes of SHA-256 over the chain's fields give. A repeat of the newest batch writes none. When the
+partition held no entry before, the append also sends `NOTIFY` on `<schema>_bell_<partition %
+doorbells>` with the partition, so the doorbell costs nothing while a partition stays busy. Drivers
+take entries with `FOR UPDATE SKIP LOCKED`: a consumer's own unacked entries, those another
+consumer left for `claim_idle`, and new ones. An ack deletes them. The janitor keeps the newest
+10,000 entries per partition, so a log with no driver stays bounded. An entry whose topic an owner
+delete removed is acked as broken when a driver takes it.
+
+**Listener.** One connection per store listens for the doorbells and, with `notify_reads`, the read
+channels. It connects with the store, so a store whose listener can't connect fails at once. When
+the connection ends, it connects again with backoff, rings every doorbell for every partition and
+wakes every waiting read, since what was sent while it was away is gone. The driver's sweep finds a
+lost ring too. `LISTEN` keeps state on the server session, so the listener uses `listen_url` when
+it is set, and `url` otherwise. Both must name the primary, since a standby refuses `LISTEN`.
+
 **Retention.** PostgreSQL has no key expiry, so each store runs a janitor every
 `janitor_interval` (one minute). A session advisory lock lets one pass run at a time across
 processes. A pass trims the topics that are due, at most 10,000 records per topic per
@@ -69,10 +93,12 @@ so it reports `REFUSED`. A read reports `STORAGE`. A server below PostgreSQL 14 
 ## Migrations
 
 The store embeds its migrations and applies the missing ones at connect, each in its own
-transaction, under a session advisory lock on the schema's name. It refuses to start when an
-applied migration differs from the embedded one, or when the database has a migration that needs a
-newer build. A function's name carries its version, such as `append_v1`, so a migration that
-changes a contract adds a new function and keeps the old one for a release.
+transaction, under a session advisory lock on the schema's name. They run on a connection of their
+own to `listen_url` when it is set, since a pooler in transaction mode can't keep a session lock.
+The store refuses to start when an applied migration differs from the embedded one, or when the
+database has a migration that needs a newer build. A function's name carries its version, such
+as `append_v1`, so a migration that changes a contract adds a new function and keeps the old one
+for a release.
 
 With `skip_migrations`, the store only checks that every migration it knows is applied. A DBA then
 applies the files in `src/postgres/migrations/` in order, after `SET search_path = <schema>,
@@ -127,8 +153,10 @@ IAM database authentication is not in this release, so the password comes from t
 **PgBouncer.** Session mode works with no setting. Transaction mode works from PgBouncer 1.21 with
 `max_prepared_statements` set, since the store prepares its statements. The session settings
 apply to the server connection that made each pooled connection, so all clients of that
-PgBouncer database should use the same `READ COMMITTED` default. Migrations take a session lock,
-so run them once through a direct connection, or use `skip_migrations`.
+PgBouncer database should use the same `READ COMMITTED` default. Set `listen_url` to a direct
+connection, which the listener and the migrations use. The conformance suite runs through
+PgBouncer 1.26 in transaction mode with `max_prepared_statements = 200` and a direct
+`listen_url`.
 
 **Servers that speak the protocol.** CockroachDB, YugabyteDB and other servers that speak the
 PostgreSQL protocol are not supported. The store needs advisory locks, PL/pgSQL and PostgreSQL's
@@ -142,9 +170,11 @@ Redis.
 
 ## Tests
 
-`scripts/postgres-test-server.sh` starts PostgreSQL 14 and 17 in Docker on free ports and prints
-the URLs to export. The suite reads `STREAMS_POSTGRES_URL`, a role that may create schemas. Each
-case runs in a schema of its own.
+`scripts/postgres-test-server.sh` starts PostgreSQL 14 and 17 in Docker on free ports, and
+PgBouncer in transaction mode in front of 17, and prints the URLs to export. The suite reads
+`STREAMS_POSTGRES_URL`, a role that may create schemas, and `STREAMS_POSTGRES_PGBOUNCER_URL`. Each
+case runs in a schema of its own. A schema name takes at most 55 bytes, so that the channel names
+stay within 63.
 
 ```sh
 eval "$(crates/streams/scripts/postgres-test-server.sh)"

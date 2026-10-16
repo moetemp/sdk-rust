@@ -32,7 +32,7 @@ mod subscribe;
 mod tiered;
 
 #[cfg(feature = "postgres")]
-pub use self::postgres::{PostgresStore, PostgresStoreOptions};
+pub use self::postgres::{DEFAULT_POSTGRES_DOORBELLS, PostgresStore, PostgresStoreOptions};
 #[cfg(feature = "redis")]
 pub use self::redis::{DEFAULT_NOTIFY_DOORBELLS, RedisStore, RedisStoreOptions};
 #[cfg(feature = "archive")]

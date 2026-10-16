@@ -3,11 +3,13 @@
 mod conn;
 mod errors;
 mod janitor;
+mod listen;
+mod log;
 mod migrations;
 mod wait;
 
 use crate::{
-    StreamError, StreamResult, StreamStore,
+    NotificationLog, StreamError, StreamResult, StreamStore,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
@@ -35,6 +37,13 @@ const DELETE_BATCH: i32 = 10_000;
 const PARTITIONS: u32 = 64;
 /// The oldest PostgreSQL the store runs on, as `server_version_num`.
 const OLDEST_SERVER: i32 = 140_000;
+/// How many entries each log partition keeps at most, as the Redis log's `MAXLEN ~ 10000`.
+const LOG_CAP: i32 = 10_000;
+/// The longest schema name. A channel name, `<schema>_read_63`, takes at most 63 bytes.
+const MAX_SCHEMA: usize = 55;
+
+/// How many doorbells a notification log rings when the options don't say.
+pub const DEFAULT_POSTGRES_DOORBELLS: u32 = 16;
 
 /// How to reach PostgreSQL and how long streams live there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,6 +71,17 @@ pub struct PostgresStoreOptions {
     pub skip_migrations: bool,
     /// How often the janitor trims records past the retention and deletes old tombstones.
     pub janitor_interval: Duration,
+    /// Each append also writes an entry to the notification log in its transaction, which a
+    /// driver reads.
+    pub notification_log: bool,
+    /// How many doorbells the notification log rings, from 1 to 64.
+    pub notify_doorbells: u32,
+    /// A URL for the connection that listens and the one that applies migrations, when `url`
+    /// goes through a pooler in transaction mode. `None` uses `url`.
+    pub listen_url: Option<String>,
+    /// Each append also sends `NOTIFY`, so waiting reads in other processes wake in milliseconds.
+    /// Costs append throughput when many producers write at once.
+    pub notify_reads: bool,
 }
 
 impl PostgresStoreOptions {
@@ -78,6 +98,10 @@ impl PostgresStoreOptions {
             poll_interval: Duration::from_millis(100),
             skip_migrations: false,
             janitor_interval: Duration::from_secs(60),
+            notification_log: false,
+            notify_doorbells: DEFAULT_POSTGRES_DOORBELLS,
+            listen_url: None,
+            notify_reads: false,
         }
     }
 }
@@ -85,6 +109,7 @@ impl PostgresStoreOptions {
 /// A [StreamStore] on PostgreSQL.
 pub struct PostgresStore {
     inner: Arc<Inner>,
+    log: Option<Arc<log::PostgresLog>>,
     tasks: Vec<JoinHandle<()>>,
 }
 
@@ -176,6 +201,10 @@ struct Sql {
     due: String,
     trim: String,
     idle_chains: String,
+    take: String,
+    ack: String,
+    busy: String,
+    cap_log: String,
 }
 
 /// The chain key, as `$1` to `$5`.
@@ -243,6 +272,25 @@ impl Sql {
             ),
             trim: format!("SELECT deleted, done FROM {s}.trim_topic_v1($1, $2, $3, $4)"),
             idle_chains: format!("SELECT {s}.drop_idle_chains_v1($1, $2, $3)"),
+            take: format!(
+                "WITH picked AS (SELECT n.partition, n.id FROM {s}.notifications n \
+                   WHERE n.partition = $1 AND (n.taken_by IS NULL OR n.taken_by = $2 \
+                     OR n.taken_at < now() - $3::bigint * interval '1 millisecond') \
+                   ORDER BY n.id LIMIT $4 FOR UPDATE SKIP LOCKED), \
+                 taken AS (UPDATE {s}.notifications n SET taken_by = $2, taken_at = now() \
+                   FROM picked WHERE n.partition = picked.partition AND n.id = picked.id \
+                   RETURNING n.id, n.topic_id, n.position) \
+                 SELECT taken.id, c.namespace, c.owner_kind, c.owner_id, c.first_run_id, \
+                   c.activity_id, t.topic, taken.position \
+                 FROM taken LEFT JOIN {s}.topics t ON t.topic_id = taken.topic_id \
+                 LEFT JOIN {s}.chains c ON c.chain_id = t.chain_id ORDER BY taken.id"
+            ),
+            ack: format!("DELETE FROM {s}.notifications WHERE partition = $1 AND id = ANY ($2)"),
+            busy: format!(
+                "SELECT p FROM generate_series(0, 63) p \
+                 WHERE EXISTS (SELECT 1 FROM {s}.notifications n WHERE n.partition = p)"
+            ),
+            cap_log: format!("SELECT {s}.cap_log_v1($1)"),
         }
     }
 }
@@ -259,6 +307,10 @@ struct Inner {
     /// statement timeout, so the server's own timeout comes first.
     call_timeout: Duration,
     waiters: Waiters,
+    /// Whether appends write the notification log.
+    log: bool,
+    doorbells: i32,
+    notify_reads: bool,
 }
 
 impl PostgresStore {
@@ -270,8 +322,15 @@ impl PostgresStore {
     pub async fn connect(options: PostgresStoreOptions) -> StreamResult<Self> {
         if !valid_schema(&options.schema) {
             return Err(StreamError::refused(format!(
-                "the schema must match [a-z_][a-z0-9_]{{0,62}}, not {:?}",
+                "the schema must match [a-z_][a-z0-9_]{{0,{}}}, not {:?}",
+                MAX_SCHEMA - 1,
                 options.schema
+            )));
+        }
+        if !(1..=PARTITIONS).contains(&options.notify_doorbells) {
+            return Err(StreamError::refused(format!(
+                "the notification log rings 1 to {PARTITIONS} doorbells, not {}",
+                options.notify_doorbells
             )));
         }
         let retention_ms = i64::try_from(options.retention.as_millis()).unwrap_or(i64::MAX);
@@ -282,11 +341,31 @@ impl PostgresStore {
             )));
         }
         let target = Target::from_url(&options.url)?;
-        let mut direct = target.connect().await.map_err(unreachable)?;
+        // Migrations take a session lock, so they run on the direct connection when there is one.
+        let direct_target = match &options.listen_url {
+            Some(url) => Target::from_url(url)?,
+            None => target.clone(),
+        };
+        let mut direct = direct_target.connect().await.map_err(unreachable)?;
         check_server(&direct).await?;
         migrations::run(&mut direct, &options.schema, !options.skip_migrations).await?;
         drop(direct);
         let pool = target.pool(options.max_connections, options.response_timeout)?;
+        let rings = options
+            .notification_log
+            .then(|| Arc::new(listen::Rings::new(options.notify_doorbells)));
+        let listener = (options.notification_log || options.notify_reads).then(|| {
+            listen::Listener::new(
+                direct_target,
+                &options.schema,
+                rings.clone(),
+                options.notify_reads,
+            )
+        });
+        let listening = match &listener {
+            Some(listener) => Some(listener.connect().await?),
+            None => None,
+        };
         let inner = Arc::new(Inner {
             pool,
             sql: Sql::new(&options.schema),
@@ -299,15 +378,32 @@ impl PostgresStore {
             floor_release_grace_ms: millis(options.floor_release_grace),
             call_timeout: options.response_timeout + Duration::from_secs(2),
             waiters: Waiters::default(),
+            log: options.notification_log,
+            doorbells: options.notify_doorbells as i32,
+            notify_reads: options.notify_reads,
         });
-        let tasks = vec![
+        let mut tasks = vec![
             tokio::spawn(poll(Arc::downgrade(&inner), options.poll_interval)),
             tokio::spawn(janitor::run(
                 Arc::downgrade(&inner),
                 options.janitor_interval,
             )),
         ];
-        Ok(Self { inner, tasks })
+        if let (Some(listener), Some((client, notifications))) = (listener, listening) {
+            tasks.push(tokio::spawn(listener.run(
+                Arc::downgrade(&inner),
+                client,
+                notifications,
+            )));
+        }
+        let log = rings.map(|rings| {
+            Arc::new(log::PostgresLog {
+                inner: inner.clone(),
+                rings,
+                doorbells: options.notify_doorbells,
+            })
+        });
+        Ok(Self { inner, log, tasks })
     }
 
     /// Runs one janitor pass now, as the store's janitor task does every `janitor_interval`.
@@ -322,7 +418,7 @@ fn valid_schema(schema: &str) -> bool {
     bytes
         .next()
         .is_some_and(|first| first.is_ascii_lowercase() || first == b'_')
-        && schema.len() <= 63
+        && schema.len() <= MAX_SCHEMA
         && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
@@ -384,6 +480,7 @@ fn wait_of(request: &StoreReadRequest) -> Duration {
 struct Look {
     response: StoreReadResponse,
     seen: Seen,
+    topic_id: Option<i64>,
 }
 
 impl Inner {
@@ -461,6 +558,7 @@ impl Inner {
                 close: close.clone().filter(|_| topic_closed),
             },
             seen,
+            topic_id,
         };
         let (Some(_), Some(last)) = (topic_id, last) else {
             // A topic that never held a record. A closed one answers empty and closed, as a
@@ -578,6 +676,10 @@ impl StreamStore for PostgresStore {
         NAME
     }
 
+    fn notification_log(&self) -> Option<Arc<dyn NotificationLog>> {
+        self.log.clone().map(|log| log as Arc<dyn NotificationLog>)
+    }
+
     async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
         if request.records.is_empty() {
             return Err(StreamError::refused("an append needs at least one record"));
@@ -606,11 +708,11 @@ impl StreamStore for PostgresStore {
                     &request.digest,
                     &request.records,
                     &chain.keeps_topics(),
-                    &false,
-                    &0i32,
+                    &inner.log,
+                    &inner.doorbells,
                     &no_lease,
                     &inner.retention_ms,
-                    &false,
+                    &inner.notify_reads,
                 ],
             )
             .await?;
@@ -674,9 +776,11 @@ impl StreamStore for PostgresStore {
         if wait.is_zero() || !look.response.records.is_empty() || look.response.closed {
             return Ok(look.response);
         }
-        let mut wake = inner
-            .waiters
-            .register((chain.clone(), request.topic.clone()), look.seen);
+        let mut wake = inner.waiters.register(
+            (chain.clone(), request.topic.clone()),
+            look.seen,
+            look.topic_id,
+        );
         loop {
             look = inner.look(&chain, &request).await?;
             if !look.response.records.is_empty() || look.response.closed {
@@ -1019,8 +1123,8 @@ mod tests {
         ] {
             assert_eq!(valid_schema(schema), ok, "{schema:?}");
         }
-        assert!(valid_schema(&"a".repeat(63)));
-        assert!(!valid_schema(&"a".repeat(64)));
+        assert!(valid_schema(&"a".repeat(55)));
+        assert!(!valid_schema(&"a".repeat(56)));
     }
 
     #[test]

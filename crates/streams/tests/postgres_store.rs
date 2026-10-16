@@ -534,3 +534,101 @@ async fn tls_with_require_reaches_a_server_with_tls() {
     let error = PostgresStore::connect(options).await.unwrap_err();
     assert_eq!(error.kind, StreamFailureKind::Storage, "{error}");
 }
+
+/// Waits for one record on `chain` from `reader` in a task of its own, and answers how long the
+/// wait took.
+fn wait_for_one(reader: Arc<PostgresStore>, chain: &ChainId) -> tokio::task::JoinHandle<Duration> {
+    let chain = chain.clone();
+    tokio::spawn(async move {
+        let started = Instant::now();
+        let page = reader
+            .read(read(&chain, "out", "", Duration::from_secs(10)))
+            .await
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        started.elapsed()
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn notify_reads_wakes_a_reader_in_another_process_at_once() {
+    let Some(url) = url() else { return };
+    let mut options = options(&url);
+    options.notify_reads = true;
+    // The poll can't be what wakes the reader.
+    options.poll_interval = Duration::from_secs(3600);
+    let reader = Arc::new(PostgresStore::connect(options.clone()).await.unwrap());
+    let writer = PostgresStore::connect(options).await.unwrap();
+    let chain = chain("notified");
+    // The topic exists first, so the waiter knows the row a `NOTIFY` names.
+    writer
+        .append(append(&chain, "other", "p", 1, 1))
+        .await
+        .unwrap();
+    writer
+        .append(append(&chain, "out", "q", 1, 1))
+        .await
+        .unwrap();
+    let after = writer
+        .read(read(&chain, "out", "", Duration::ZERO))
+        .await
+        .unwrap()
+        .records[0]
+        .position
+        .clone();
+    let waiting = {
+        let (reader, chain, after) = (reader.clone(), chain.clone(), after.clone());
+        tokio::spawn(async move {
+            let page = reader
+                .read(read(&chain, "out", &after, Duration::from_secs(10)))
+                .await
+                .unwrap();
+            (page.records.len(), Instant::now())
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let sent = Instant::now();
+    writer
+        .append(append(&chain, "out", "q", 2, 1))
+        .await
+        .unwrap();
+    let (records, woke) = waiting.await.unwrap();
+    assert_eq!(records, 1);
+    let took = woke - sent;
+    assert!(took < Duration::from_millis(50), "{took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_listener_that_lost_its_connection_wakes_every_waiter() {
+    let Some(url) = url() else { return };
+    let mut options = options(&url);
+    options.notify_reads = true;
+    options.poll_interval = Duration::from_secs(3600);
+    let schema = options.schema.clone();
+    let reader = Arc::new(PostgresStore::connect(options.clone()).await.unwrap());
+    let mut quiet = options.clone();
+    quiet.notify_reads = false;
+    let writer = PostgresStore::connect(quiet).await.unwrap();
+    let chain = chain("reconnect");
+    let waiting = wait_for_one(reader.clone(), &chain);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The writer sends no `NOTIFY` and the poll is an hour away, so only the listener's
+    // reconnect can wake the waiter.
+    let admin = raw(&url).await;
+    let killed: i64 = admin
+        .query_one(
+            "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity \
+             WHERE application_name = 'temporal-streams' AND query LIKE $1",
+            &[&format!("LISTEN {schema}_%")],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(killed, 1);
+    writer
+        .append(append(&chain, "out", "p", 1, 1))
+        .await
+        .unwrap();
+    let waited = waiting.await.unwrap();
+    assert!(waited < Duration::from_secs(5), "{waited:?}");
+}

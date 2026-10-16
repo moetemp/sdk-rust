@@ -83,6 +83,12 @@ relevant information.
   every `janitor_interval` (one minute). Waiting reads hold no connection and wake within
   `poll_interval` (100 ms). TLS follows the URL's `sslmode` and `sslrootcert`. The C bridge builds
   the store.
+* Experimental: the PostgreSQL store keeps a notification log with `notification_log`, a
+  `notifications` table with 64 partitions that the append writes in its transaction. Drivers take
+  entries with `FOR UPDATE SKIP LOCKED`, and a `NOTIFY` doorbell rings when a partition takes its
+  first entry. `listen_url` names a direct connection for the listener and the migrations when
+  `url` goes through PgBouncer in transaction mode. `notify_reads` sends a `NOTIFY` per append, so
+  waiting reads in other processes wake at once.
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with

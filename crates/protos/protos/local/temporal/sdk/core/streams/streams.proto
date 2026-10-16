@@ -162,8 +162,17 @@ message PostgresStoreConfig {
   google.protobuf.Duration floor_lease = 6;
   // How long a hold lasts after its reader released it. Unset keeps one day.
   google.protobuf.Duration floor_release_grace = 7;
+  // With `StreamStoreConfig.notification_log`, how many doorbells the log rings, from 1 to 64.
+  // Zero uses 16.
+  uint32 notify_doorbells = 8;
+  // A URL for the connection that listens and the one that applies migrations, when `url` goes
+  // through a pooler in transaction mode. Empty uses `url`.
+  string listen_url = 9;
   // How often a process looks for new records for its waiting reads. Unset uses 100 ms.
   google.protobuf.Duration poll_interval = 10;
+  // Each append also sends NOTIFY, so waiting reads in other processes wake in milliseconds.
+  // Costs append throughput when many producers write at once.
+  bool notify_reads = 11;
   // The store checks the schema version and never changes it. A DBA applies the migrations.
   bool skip_migrations = 12;
   // How often the janitor trims records past the retention. Unset uses one minute.
