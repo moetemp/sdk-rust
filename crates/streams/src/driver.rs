@@ -2,9 +2,10 @@
 //!
 //! A driver blocks on each doorbell, drains each slot a doorbell names, and sweeps every slot
 //! that holds entries now and then, since a ring can be lost. It folds a drain's entries to the
-//! newest counter of each stream, sends them in one call, and acks them only once the call
-//! landed. A failed call leaves them pending, so this driver or another one sends them again.
-//! Delivery is at least once, and a notifier ignores a counter it has seen.
+//! newest counter of each stream, sends them in one call per namespace, and acks them only once
+//! the call landed. A failed call leaves them pending, so this driver or another one sends them
+//! again. Delivery is at least once, and a notifier ignores a counter it has seen. A call the
+//! server refuses goes again one stream at a time, so one bad entry holds back no other stream.
 
 use crate::{
     NotificationEntry, NotificationLog, NotifierClient, NotifyError, StreamError,
@@ -13,7 +14,10 @@ use crate::{
 };
 use std::{
     collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::task::JoinSet;
@@ -21,7 +25,8 @@ use tokio::task::JoinSet;
 /// How a driver reads the log.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamDriverOptions {
-    /// The driver's name in the log's consumer group. Each driver needs its own.
+    /// The driver's name in the log's consumer group. Each driver needs its own, and the default
+    /// is the host name and the process id.
     pub consumer: String,
     /// How often the driver looks at every slot that holds entries.
     pub sweep_interval: Duration,
@@ -36,7 +41,11 @@ pub struct StreamDriverOptions {
 impl Default for StreamDriverOptions {
     fn default() -> Self {
         Self {
-            consumer: "driver".to_string(),
+            consumer: format!(
+                "{}-{}",
+                gethostname::gethostname().to_string_lossy(),
+                std::process::id()
+            ),
             sweep_interval: Duration::from_secs(30),
             claim_idle: Duration::from_secs(60),
             doorbell_wait: Duration::from_secs(5),
@@ -48,6 +57,30 @@ impl Default for StreamDriverOptions {
 /// Waits before a slot whose notify call failed is drained again.
 const RETRY_WAIT: Duration = Duration::from_secs(1);
 
+/// How many times one entry's call may fail while the server takes other streams' calls before
+/// the entry is dropped.
+const MAX_ENTRY_FAILURES: u32 = 10;
+
+/// How many entries' failures a driver counts at most.
+const MAX_TRACKED_FAILURES: usize = 10_000;
+
+/// What one drain did with its entries.
+#[derive(Default)]
+struct Sent {
+    /// The entries to ack, since they landed or never will.
+    acked: Vec<String>,
+    /// Some entries are left for the next drain.
+    left_pending: bool,
+    /// A namespace answered that the server takes no notifications.
+    unsupported: bool,
+}
+
+impl Sent {
+    fn ack(&mut self, ids: impl IntoIterator<Item = String>) {
+        self.acked.extend(ids);
+    }
+}
+
 /// A driver over one store's notification log.
 pub struct StreamDriver {
     store: Arc<dyn StreamStore>,
@@ -57,6 +90,11 @@ pub struct StreamDriver {
     /// The slots a drain runs on now, so the doorbells and the sweep don't drain one twice. Set
     /// when another task wanted to drain the slot meanwhile, so the drain looks once more.
     draining: Mutex<HashMap<u32, bool>>,
+    /// Whether any call landed, so a server with no notifiers at all is told from one namespace
+    /// without them.
+    delivered: AtomicBool,
+    /// How often each entry's call failed while the server took other calls.
+    failures: Mutex<HashMap<String, u32>>,
 }
 
 impl StreamDriver {
@@ -83,11 +121,13 @@ impl StreamDriver {
             client,
             options,
             draining: Mutex::default(),
+            delivered: AtomicBool::new(false),
+            failures: Mutex::default(),
         })
     }
 
     /// Runs until the returned future is dropped. It only ends early when the server can't take
-    /// notifications at all.
+    /// notifications at all: every namespace it sent for answered so, and no call ever landed.
     pub async fn run(self: Arc<Self>) -> StreamResult<()> {
         let mut tasks = JoinSet::new();
         for doorbell in 0..self.log.doorbells() {
@@ -184,33 +224,179 @@ impl StreamDriver {
                     return Ok(());
                 }
             };
-            let ids: Vec<String> = entries.iter().map(|entry| entry.id.clone()).collect();
-            match self.client.notify_streams(self.fold(entries)).await {
-                Ok(()) => {
-                    if let Err(error) = self.log.ack(slot, &ids).await {
-                        // The entries come again, and the notifier drops the repeat.
-                        tracing::warn!(slot, %error, "A stream driver could not ack its entries");
-                        return Ok(());
+            // A server call names one namespace, and one namespace's refusal must not hold back
+            // the others in the slot.
+            let mut by_namespace: BTreeMap<String, Vec<NotificationEntry>> = BTreeMap::new();
+            for entry in entries {
+                by_namespace
+                    .entry(entry.chain.namespace.clone())
+                    .or_default()
+                    .push(entry);
+            }
+            let mut sent = Sent::default();
+            for (namespace, entries) in by_namespace {
+                self.send_namespace(slot, &namespace, entries, &mut sent)
+                    .await;
+            }
+            if !sent.acked.is_empty() {
+                if let Err(error) = self.log.ack(slot, &sent.acked).await {
+                    // The entries come again, and the notifier drops the repeat.
+                    tracing::warn!(slot, %error, "A stream driver could not ack its entries");
+                    return Ok(());
+                }
+                let mut failures = self.failures.lock().unwrap();
+                for id in &sent.acked {
+                    failures.remove(id);
+                }
+            }
+            if sent.unsupported && !self.delivered.load(Ordering::Relaxed) {
+                return Err(StreamError::unsupported(
+                    "the server takes no stream notifications",
+                ));
+            }
+            if sent.left_pending {
+                // Left pending, so the next drain sends them again.
+                tokio::time::sleep(RETRY_WAIT).await;
+                return Ok(());
+            }
+        }
+    }
+
+    /// Sends one namespace's entries in one call. When the server refuses the call, each stream
+    /// goes on its own, so one bad entry holds back no other stream.
+    async fn send_namespace(
+        &self,
+        slot: u32,
+        namespace: &str,
+        entries: Vec<NotificationEntry>,
+        sent: &mut Sent,
+    ) {
+        let (streams, unsendable): (Vec<_>, Vec<_>) = self
+            .fold(entries)
+            .into_iter()
+            .partition(|(notification, _)| notification.counter > 0);
+        sent.ack(unsendable.into_iter().flat_map(|(_, ids)| ids));
+        if streams.is_empty() {
+            return;
+        }
+        let notifications = streams.iter().map(|(n, _)| n.clone()).collect();
+        match self.client.notify_streams(notifications).await {
+            Ok(()) => {
+                self.delivered.store(true, Ordering::Relaxed);
+                sent.ack(streams.into_iter().flat_map(|(_, ids)| ids));
+            }
+            Err(NotifyError::Unsupported(error)) => {
+                // A server with no notifiers answers this for every namespace. Only one namespace
+                // answering it, the others still get theirs.
+                tracing::warn!(
+                    slot,
+                    namespace,
+                    error,
+                    "A namespace takes no stream notifications"
+                );
+                sent.unsupported = true;
+                sent.ack(streams.into_iter().flat_map(|(_, ids)| ids));
+            }
+            Err(error) if streams.len() == 1 => {
+                self.settle_one(slot, error, streams, sent, false);
+            }
+            Err(_) => {
+                let mut reached = false;
+                let mut failed = vec![];
+                for (notification, ids) in streams {
+                    match self.client.notify_streams(vec![notification.clone()]).await {
+                        Ok(()) => {
+                            self.delivered.store(true, Ordering::Relaxed);
+                            reached = true;
+                            sent.ack(ids);
+                        }
+                        Err(error) => failed.push((error, notification, ids)),
                     }
                 }
-                Err(NotifyError::Unsupported(message)) => {
-                    return Err(StreamError::unsupported(format!(
-                        "the server takes no stream notifications: {message}"
-                    )));
-                }
-                Err(error) => {
-                    // Left pending, so the next drain sends them again.
-                    tracing::warn!(slot, %error, "A stream driver's notify call failed");
-                    tokio::time::sleep(RETRY_WAIT).await;
-                    return Ok(());
+                for (error, notification, ids) in failed {
+                    self.settle_one(slot, error, vec![(notification, ids)], sent, reached);
                 }
             }
         }
     }
 
-    /// One notification per stream, at the newest counter the entries hold for it.
-    fn fold(&self, entries: Vec<NotificationEntry>) -> Vec<StreamNotification> {
-        let mut newest: BTreeMap<(ChainKey, String), (i64, String)> = BTreeMap::new();
+    /// What becomes of one stream's entries whose call failed. A refusal won't change on a retry,
+    /// so it is logged and acked. A failure is tried again, but only [MAX_ENTRY_FAILURES] times
+    /// while the server takes other streams' calls, since then the server is up and this entry
+    /// is the one it can't take.
+    fn settle_one(
+        &self,
+        slot: u32,
+        error: NotifyError,
+        streams: Vec<(StreamNotification, Vec<String>)>,
+        sent: &mut Sent,
+        server_reached: bool,
+    ) {
+        for (notification, ids) in streams {
+            let workflow_id = notification.chain.workflow_id.as_str();
+            let topic = notification.topic.as_str();
+            match &error {
+                NotifyError::Unsupported(message) => {
+                    tracing::warn!(slot, workflow_id, topic, message, "Dropped a notification");
+                    sent.unsupported = true;
+                    sent.ack(ids);
+                }
+                NotifyError::Refused(message) => {
+                    tracing::warn!(
+                        slot,
+                        workflow_id,
+                        topic,
+                        message,
+                        "The server refused a stream notification, so it is dropped"
+                    );
+                    sent.ack(ids);
+                }
+                NotifyError::Failed(message) => {
+                    let failures = if server_reached {
+                        self.failed_again(&ids)
+                    } else {
+                        0
+                    };
+                    if failures >= MAX_ENTRY_FAILURES {
+                        tracing::warn!(
+                            slot,
+                            workflow_id,
+                            topic,
+                            message,
+                            "A stream notification failed {failures} times while others landed, \
+                             so it is dropped"
+                        );
+                        sent.ack(ids);
+                    } else {
+                        tracing::warn!(slot, workflow_id, topic, message, "A notify call failed");
+                        sent.left_pending = true;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Counts one more failure for each entry, and answers the highest count.
+    fn failed_again(&self, ids: &[String]) -> u32 {
+        let mut failures = self.failures.lock().unwrap();
+        // Entries another driver acked since are never seen again, so the map is bounded.
+        if failures.len() > MAX_TRACKED_FAILURES {
+            failures.clear();
+        }
+        ids.iter()
+            .map(|id| {
+                let count = failures.entry(id.clone()).or_default();
+                *count += 1;
+                *count
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// One notification per stream, at the newest counter the entries hold for it, with the ids
+    /// of every entry it stands for.
+    fn fold(&self, entries: Vec<NotificationEntry>) -> Vec<(StreamNotification, Vec<String>)> {
+        let mut newest: BTreeMap<(ChainKey, String), (i64, String, Vec<String>)> = BTreeMap::new();
         for entry in entries {
             let Some(counter) = progress_counter(&entry.position) else {
                 tracing::warn!(
@@ -220,29 +406,35 @@ impl StreamDriver {
                     position = %entry.position,
                     "No notifier counter comes from this position, so it isn't notified"
                 );
+                // No call will take it, so it is acked with the stream's other entries, if any.
+                newest
+                    .entry((ChainKey::of(&entry.chain), entry.topic))
+                    .or_insert((0, String::new(), vec![]))
+                    .2
+                    .push(entry.id);
                 continue;
             };
             let key = (ChainKey::of(&entry.chain), entry.topic);
-            match newest.get(&key) {
-                Some((held, _)) if *held >= counter => {}
-                _ => {
-                    newest.insert(key, (counter, entry.position));
-                }
+            let held = newest.entry(key).or_insert((0, String::new(), vec![]));
+            held.2.push(entry.id);
+            if held.0 < counter {
+                (held.0, held.1) = (counter, entry.position);
             }
         }
         newest
             .into_iter()
-            .map(|((chain, topic), (counter, position))| {
+            .map(|((chain, topic), (counter, position, ids))| {
                 let chain = chain.into_chain();
                 let (kind, id) = chain_owner(&chain);
                 let hash = stream_hash(&chain.namespace, kind, &id, &topic);
-                StreamNotification {
+                let notification = StreamNotification {
                     position: mint_cursor(self.store.name(), &hash, &position),
                     chain,
                     topic,
                     counter,
                     close: None,
-                }
+                };
+                (notification, ids)
             })
             .collect()
     }
@@ -286,6 +478,12 @@ mod tests {
         calls: Mutex<Vec<Vec<StreamNotification>>>,
         fail: AtomicBool,
         unsupported: AtomicBool,
+        /// A call that names this Workflow id is refused whole, as the server does.
+        refuse_workflow: Mutex<Option<String>>,
+        /// A call that names this Workflow id fails whole.
+        fail_workflow: Mutex<Option<String>>,
+        /// A call for this namespace answers that it takes no notifications.
+        unsupported_namespace: Mutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
@@ -303,6 +501,21 @@ mod tests {
             }
             if self.fail.load(Ordering::SeqCst) {
                 return Err(NotifyError::Failed("the server is down".to_string()));
+            }
+            let names = |field: &Mutex<Option<String>>, of: fn(&StreamNotification) -> &str| {
+                let field = field.lock().unwrap();
+                notifications
+                    .iter()
+                    .any(|n| field.as_deref() == Some(of(n)))
+            };
+            if names(&self.unsupported_namespace, |n| &n.chain.namespace) {
+                return Err(NotifyError::Unsupported("off here".to_string()));
+            }
+            if names(&self.refuse_workflow, |n| &n.chain.workflow_id) {
+                return Err(NotifyError::Refused("no such owner".to_string()));
+            }
+            if names(&self.fail_workflow, |n| &n.chain.workflow_id) {
+                return Err(NotifyError::Failed("internal".to_string()));
             }
             self.calls.lock().unwrap().push(notifications);
             Ok(())
@@ -322,9 +535,9 @@ mod tests {
         }
     }
 
-    fn chain(workflow_id: &str) -> ChainId {
+    fn chain_in(namespace: &str, workflow_id: &str) -> ChainId {
         ChainId {
-            namespace: "ns".to_string(),
+            namespace: namespace.to_string(),
             workflow_id: workflow_id.to_string(),
             first_run_id: "run-1".to_string(),
             ..Default::default()
@@ -332,9 +545,19 @@ mod tests {
     }
 
     async fn append(store: &MemoryStore, workflow_id: &str, topic: &str, sequence: i64) {
+        append_in(store, "ns", workflow_id, topic, sequence).await;
+    }
+
+    async fn append_in(
+        store: &MemoryStore,
+        namespace: &str,
+        workflow_id: &str,
+        topic: &str,
+        sequence: i64,
+    ) {
         store
             .append(StoreAppendRequest {
-                chain: Some(chain(workflow_id)),
+                chain: Some(chain_in(namespace, workflow_id)),
                 topic: topic.to_string(),
                 producer_id: "p".to_string(),
                 attempt: 1,
@@ -504,6 +727,86 @@ mod tests {
         .unwrap()
         .unwrap_err();
         assert_eq!(error.kind, crate::proto::StreamFailureKind::Unsupported);
+    }
+
+    async fn log_is_empty(store: &MemoryStore) -> bool {
+        store
+            .notification_log()
+            .unwrap()
+            .busy()
+            .await
+            .unwrap()
+            .is_empty()
+    }
+
+    #[tokio::test]
+    async fn one_refused_entry_holds_back_no_other_stream() {
+        let store = Arc::new(MemoryStore::with_notification_log());
+        let client = Arc::new(Recorder::default());
+        *client.refuse_workflow.lock().unwrap() = Some("bad".to_string());
+        append(&store, "bad", "out", 1).await;
+        append(&store, "good", "out", 1).await;
+        driver(&store, &client, "d1").drain(0).await.unwrap();
+        assert_eq!(client.sent(), [("good".to_string(), "out".to_string(), 1)]);
+        assert!(log_is_empty(&store).await, "the refused entry is acked too");
+    }
+
+    #[tokio::test]
+    async fn a_namespace_without_notifiers_stops_neither_the_driver_nor_the_others() {
+        let store = Arc::new(MemoryStore::with_notification_log());
+        let client = Arc::new(Recorder::default());
+        *client.unsupported_namespace.lock().unwrap() = Some("off".to_string());
+        append_in(&store, "off", "a", "out", 1).await;
+        append_in(&store, "on", "b", "out", 1).await;
+        driver(&store, &client, "d1").drain(0).await.unwrap();
+        assert_eq!(client.sent(), [("b".to_string(), "out".to_string(), 1)]);
+        assert!(log_is_empty(&store).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_entry_that_keeps_failing_while_others_land_is_dropped() {
+        let store = Arc::new(MemoryStore::with_notification_log());
+        let client = Arc::new(Recorder::default());
+        *client.fail_workflow.lock().unwrap() = Some("bad".to_string());
+        append(&store, "bad", "out", 1).await;
+        let driver = driver(&store, &client, "d1");
+        for sequence in 1..=MAX_ENTRY_FAILURES as i64 {
+            assert!(!log_is_empty(&store).await, "kept after {sequence} drains");
+            append(&store, "good", "out", sequence).await;
+            driver.drain(0).await.unwrap();
+        }
+        assert!(log_is_empty(&store).await);
+        assert_eq!(
+            client.sent().last(),
+            Some(&(
+                "good".to_string(),
+                "out".to_string(),
+                MAX_ENTRY_FAILURES as i64
+            ))
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_server_drops_nothing() {
+        let store = Arc::new(MemoryStore::with_notification_log());
+        let client = Arc::new(Recorder::default());
+        append(&store, "a", "out", 1).await;
+        append(&store, "b", "out", 1).await;
+        client.fail.store(true, Ordering::SeqCst);
+        let driver = driver(&store, &client, "d1");
+        for _ in 0..=MAX_ENTRY_FAILURES {
+            driver.drain(0).await.unwrap();
+        }
+        assert!(!log_is_empty(&store).await);
+    }
+
+    #[test]
+    fn the_default_consumer_names_the_host_and_the_process() {
+        let consumer = StreamDriverOptions::default().consumer;
+        assert!(
+            consumer.ends_with(&format!("-{}", std::process::id())),
+            "{consumer}"
+        );
     }
 
     #[test]
