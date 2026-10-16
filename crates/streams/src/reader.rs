@@ -10,11 +10,12 @@ use crate::{
     progress_counter,
     proto::{
         ChainId, ReadRecord, ReadRequest, ReadResponse, StoreLatestRequest, StoreReadRequest,
-        StoredClose, StreamRecord, StreamRecordKind, Supersession, read_record,
+        StoreReadResponse, StoredClose, StoredRecord, StreamRecord, StreamRecordKind, Supersession,
+        read_record,
     },
 };
 use prost::Message;
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 /// The low bits of a Workflow producer's attempt, which count the reruns of one task. The high
 /// bits name the last task that completed before it.
@@ -101,6 +102,9 @@ pub(crate) struct ReadState {
     /// found one. The owner start grace counts from it.
     #[prost(uint64, tag = "11")]
     pub(crate) owner_missing_since_ms: u64,
+    /// Set once the read reached the first `CLOSE` record, so it ends there.
+    #[prost(bool, tag = "12")]
+    closed: bool,
 }
 
 /// What a read knows of one producer.
@@ -117,6 +121,10 @@ struct Tracked {
     /// producer.
     #[prost(int64, tag = "3")]
     started: i64,
+    /// The highest sequence of the newest attempt this read delivered. A record of that attempt
+    /// at or below it is a copy of one already delivered.
+    #[prost(int64, tag = "4")]
+    sequence: i64,
 }
 
 /// What one record tells the read about its producer's attempts.
@@ -132,6 +140,9 @@ enum Observed {
         /// The newest attempt the read delivered.
         newest: i64,
     },
+    /// A copy of a record of the newest attempt that the read already delivered. A store without
+    /// producer state lands one when a producer repeats a batch whose answer it lost.
+    Copy,
 }
 
 impl ReadState {
@@ -206,11 +217,18 @@ impl ReadState {
             return Observed::Behind { newest: seen };
         }
         if record.attempt == seen {
+            // A producer sends one batch at a time and repeats it until it has an answer, so a
+            // copy always comes after the record it copies.
+            if record.sequence > 0 && record.sequence <= tracked.sequence {
+                return Observed::Copy;
+            }
+            tracked.sequence = tracked.sequence.max(record.sequence);
             return Observed::Known;
         }
         let started = tracked.started;
         tracked.attempt = record.attempt;
         tracked.started = record.task_started_event_id;
+        tracked.sequence = record.sequence;
         self.forget_beyond(MAX_TRACKED_PRODUCERS);
         let superseded = seen > 0 && supersedes(seen, started, record);
         Observed::Newer(superseded.then(|| Supersession {
@@ -235,6 +253,15 @@ impl ReadState {
 /// most [MAX_TRACKED_PRODUCERS] producers in at most [MAX_STATE_BYTES], and the next attempt of one
 /// it forgot reads without `SUPERSEDED`.
 ///
+/// A record of a producer's newest attempt at or below the highest sequence the read delivered of
+/// it is a copy, and the read drops it, on every store. A record with no sequence is never a
+/// copy. A read that starts from a cursor without state knows only the cursor record's sequence,
+/// so it can deliver a copy whose first copy came before the cursor.
+///
+/// The first `CLOSE` record of the topic, or of the chain, ends the read on every store. The read
+/// answers the records before it, and later calls answer none. A `TOPIC` record is not the topic
+/// reader's, so the read skips it. The read writes nothing.
+///
 /// A record that does not parse fails the call as `RECORD` with its cursor, so the caller resumes
 /// past it on purpose. Skipping it would lose data no one hears of. The records before it in the
 /// same page are returned first, and the next call fails.
@@ -250,14 +277,21 @@ pub async fn read_page(
 }
 
 /// [read_page] with the state already decoded, for a caller that keeps fields of its own in it.
-/// The answer's `state` is left empty. Also answers whether the store marked the stream closed,
-/// and the topic's first close when it was closed as a topic.
+/// The answer's `state` is left empty. Also answers whether the store marked the stream closed or
+/// the read reached a `CLOSE` record, and the topic's first close when it was closed as a topic.
 pub(crate) async fn read_with(
     store: &dyn StreamStore,
     target: &ReadTarget,
     request: &ReadRequest,
     state: &mut ReadState,
 ) -> StreamResult<(ReadResponse, bool, Option<StoredClose>)> {
+    if state.closed {
+        let response = ReadResponse {
+            cursor: request.after.clone(),
+            ..Default::default()
+        };
+        return Ok((response, true, None));
+    }
     let from_end = request.after == END;
     let position = if from_end {
         store
@@ -287,7 +321,8 @@ pub(crate) async fn read_with(
         }
     }
     state.started = true;
-    if position.is_empty() {
+    let capabilities = store.capabilities();
+    if position.is_empty() && capabilities.kept_last {
         if !state.watermark_known {
             state.watermark = store.newest_ever(&target.chain, &target.topic).await?;
             state.watermark_known = true;
@@ -301,21 +336,48 @@ pub(crate) async fn read_with(
                 target.topic
             )));
         }
+    } else if position.is_empty() && !state.watermark_known {
+        state.watermark = store
+            .latest(StoreLatestRequest {
+                chain: Some(target.chain.clone()),
+                topic: target.topic.clone(),
+            })
+            .await?
+            .position;
+        state.watermark_known = true;
     }
 
-    let page = store
-        .read(StoreReadRequest {
-            chain: Some(target.chain.clone()),
-            topic: target.topic.clone(),
-            after_position: position.clone(),
-            wait: request.wait,
-            max_records: match request.max_records {
-                0 => DEFAULT_MAX_RECORDS,
-                max => max,
-            },
-            arm: request.arm,
-        })
+    let page_request = StoreReadRequest {
+        chain: Some(target.chain.clone()),
+        topic: target.topic.clone(),
+        after_position: position.clone(),
+        wait: request.wait,
+        max_records: match request.max_records {
+            0 => DEFAULT_MAX_RECORDS,
+            max => max,
+        },
+        arm: request.arm,
+    };
+    let page = if capabilities.long_poll {
+        store.read(page_request).await?
+    } else {
+        poll(store, page_request).await?
+    };
+    if !capabilities.kept_last {
+        let mark = if position.is_empty() {
+            &state.watermark
+        } else {
+            &position
+        };
+        check_prefix(
+            store,
+            target,
+            mark,
+            &page.records,
+            capabilities.dense_positions,
+        )
         .await?;
+    }
     let (mut closed, armed, mut close) = (page.closed, page.armed, page.close);
     let mut records = Vec::with_capacity(page.records.len());
     let mut previous = start.clone();
@@ -341,7 +403,26 @@ pub(crate) async fn read_with(
             }
             Err(_) => break,
         };
+        match StreamRecordKind::try_from(record.kind) {
+            // The cursor stays before the close, so a read that resumes there ends at it too.
+            Ok(StreamRecordKind::Close)
+                if record.topic.is_empty() || record.topic == target.topic =>
+            {
+                state.closed = true;
+                closed = true;
+                break;
+            }
+            Ok(StreamRecordKind::Close | StreamRecordKind::Topic) => {
+                previous = cursor;
+                continue;
+            }
+            _ => {}
+        }
         let stale = match state.observe(&record) {
+            Observed::Copy => {
+                previous = cursor;
+                continue;
+            }
             Observed::Known => false,
             Observed::Newer(superseded) => {
                 if let Some(superseded) = superseded {
@@ -429,7 +510,74 @@ pub(crate) fn records_digest(records: &[ReadRecord]) -> Vec<u8> {
     digest.finalize().to_vec()
 }
 
-/// A stored record as a reader delivers it. Fails on bytes that are no record, and on a kind no
+/// The first poll interval of a read on a store with no long poll, and the longest.
+const POLL_FIRST: Duration = Duration::from_millis(50);
+const POLL_MAX: Duration = Duration::from_secs(1);
+
+/// Reads a page on a store that can't wait for a record, asking again with a backoff until a
+/// record arrives, the stream closes or the request's wait passes.
+async fn poll(
+    store: &dyn StreamStore,
+    request: StoreReadRequest,
+) -> StreamResult<StoreReadResponse> {
+    let wait = request
+        .wait
+        .and_then(|wait| Duration::try_from(wait).ok())
+        .unwrap_or_default();
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut interval = POLL_FIRST;
+    loop {
+        let page = store.read(request.clone()).await?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if !page.records.is_empty() || page.closed || remaining.is_zero() {
+            return Ok(page);
+        }
+        tokio::time::sleep(interval.min(remaining)).await;
+        interval = (interval * 2).min(POLL_MAX);
+    }
+}
+
+/// Fails as expired when retention may have dropped records after `mark` that the read had not
+/// delivered, on a store that doesn't keep a topic's last position. Retention drops only the
+/// oldest records, so while the record at `mark` is still there, nothing after it is gone. It
+/// looks after the read, so a trim that raced the read is seen too. On a store with dense
+/// positions, a page that starts right after `mark` is whole without a look. The answer can be a
+/// false expired, for a reader whose mark retention dropped with nothing lost after it, but
+/// never a silent skip.
+async fn check_prefix(
+    store: &dyn StreamStore,
+    target: &ReadTarget,
+    mark: &str,
+    page: &[StoredRecord],
+    dense: bool,
+) -> StreamResult<()> {
+    if mark.is_empty() {
+        return Ok(());
+    }
+    let next = |first: &StoredRecord| {
+        let (Ok(mark), Ok(first)) = (mark.parse::<u64>(), first.position.parse::<u64>()) else {
+            return false;
+        };
+        mark.checked_add(1) == Some(first)
+    };
+    if dense && page.first().is_some_and(next) {
+        return Ok(());
+    }
+    if store
+        .record_at(&target.chain, &target.topic, mark)
+        .await?
+        .is_some()
+    {
+        return Ok(());
+    }
+    Err(StreamError::expired(format!(
+        "retention dropped position {mark} on topic {:?}, so records after it may be lost to this \
+         read",
+        target.topic
+    )))
+}
+
+/// A stored record as the read takes it. Fails on bytes that are no record, and on a kind no
 /// writer stores, such as the `SUPERSEDED` that only readers synthesize.
 ///
 /// Empty bytes are no record either. Every stored record names its topic, so it is never empty,
@@ -440,7 +588,12 @@ fn parse(bytes: &[u8]) -> Result<StreamRecord, String> {
     }
     let mut record = StreamRecord::decode(bytes).map_err(|error| error.to_string())?;
     match StreamRecordKind::try_from(record.kind) {
-        Ok(StreamRecordKind::Data | StreamRecordKind::Finish) => {}
+        Ok(
+            StreamRecordKind::Data
+            | StreamRecordKind::Finish
+            | StreamRecordKind::Close
+            | StreamRecordKind::Topic,
+        ) => {}
         Ok(StreamRecordKind::Unspecified) => record.kind = StreamRecordKind::Data as i32,
         Err(_) => return Err(format!("no writer stores a record of kind {}", record.kind)),
     }
@@ -480,6 +633,12 @@ mod tests {
     struct Log {
         entries: Mutex<Vec<Vec<u8>>>,
         lookups: AtomicUsize,
+        /// The last sequence each producer attempt wrote.
+        sequences: Mutex<HashMap<(String, i64), i64>>,
+        /// How many of the oldest records retention dropped.
+        trimmed: AtomicUsize,
+        /// Whether the log forgets its last position, so the read decides expiry itself.
+        forgets_last: bool,
     }
 
     impl Log {
@@ -489,8 +648,24 @@ mod tests {
             entries.len().to_string()
         }
 
+        /// Writes the attempt's next record.
         fn write(&self, producer: &str, attempt: i64, data: &[u8]) -> String {
-            self.push(data_record(producer, attempt, data).encode_to_vec())
+            let mut sequences = self.sequences.lock().unwrap();
+            let sequence = sequences
+                .entry((producer.to_string(), attempt))
+                .or_default();
+            *sequence += 1;
+            let sequence = *sequence;
+            drop(sequences);
+            self.write_at(producer, attempt, sequence, data)
+        }
+
+        fn write_at(&self, producer: &str, attempt: i64, sequence: i64, data: &[u8]) -> String {
+            let record = StreamRecord {
+                sequence,
+                ..data_record(producer, attempt, data)
+            };
+            self.push(record.encode_to_vec())
         }
     }
 
@@ -515,12 +690,20 @@ mod tests {
             "log"
         }
 
+        fn capabilities(&self) -> crate::Capabilities {
+            crate::Capabilities {
+                kept_last: !self.forgets_last,
+                ..crate::Capabilities::log_only()
+            }
+        }
+
         async fn append(&self, _: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
             unreachable!()
         }
 
         async fn read(&self, request: StoreReadRequest) -> StreamResult<StoreReadResponse> {
             let after: usize = request.after_position.parse().unwrap_or(0);
+            let after = after.max(self.trimmed.load(Ordering::Relaxed));
             let entries = self.entries.lock().unwrap();
             let records = entries
                 .iter()
@@ -556,6 +739,9 @@ mod tests {
         ) -> StreamResult<Option<Vec<u8>>> {
             self.lookups.fetch_add(1, Ordering::Relaxed);
             let index: usize = position.parse().unwrap();
+            if index <= self.trimmed.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
             Ok(self.entries.lock().unwrap().get(index - 1).cloned())
         }
 
@@ -634,8 +820,323 @@ mod tests {
     const DATA: i32 = StreamRecordKind::Data as i32;
     const SUPERSEDED: i32 = 3;
 
+    /// Observes a record with no sequence, which is never a copy.
     fn observe(state: &mut ReadState, producer: &str, attempt: i64) -> Observed {
-        state.observe(&data_record(producer, attempt, b""))
+        state.observe(&StreamRecord {
+            sequence: 0,
+            ..data_record(producer, attempt, b"")
+        })
+    }
+
+    fn observe_at(state: &mut ReadState, producer: &str, attempt: i64, sequence: i64) -> Observed {
+        state.observe(&StreamRecord {
+            sequence,
+            ..data_record(producer, attempt, b"")
+        })
+    }
+
+    #[test]
+    fn a_record_at_or_below_the_highest_sequence_of_its_attempt_is_a_copy() {
+        let mut state = ReadState::default();
+        assert_eq!(observe_at(&mut state, "p", 1, 1), Observed::Newer(None));
+        assert_eq!(observe_at(&mut state, "p", 1, 2), Observed::Known);
+        assert_eq!(observe_at(&mut state, "p", 1, 2), Observed::Copy);
+        assert_eq!(observe_at(&mut state, "p", 1, 1), Observed::Copy);
+        assert_eq!(observe_at(&mut state, "p", 1, 0), Observed::Known);
+        // A gap is no copy, and the highest sequence moves past it.
+        assert_eq!(observe_at(&mut state, "p", 1, 5), Observed::Known);
+        assert_eq!(observe_at(&mut state, "p", 1, 4), Observed::Copy);
+        // A new attempt counts from its own records.
+        assert!(matches!(
+            observe_at(&mut state, "p", 2, 1),
+            Observed::Newer(Some(_))
+        ));
+        assert_eq!(observe_at(&mut state, "p", 2, 1), Observed::Copy);
+        // An older attempt's copy is still delivered, as stale.
+        assert_eq!(
+            observe_at(&mut state, "p", 1, 1),
+            Observed::Behind { newest: 2 }
+        );
+        assert_eq!(observe_at(&mut state, "q", 1, 1), Observed::Newer(None));
+    }
+
+    #[tokio::test]
+    async fn a_copy_is_dropped_and_the_cursor_moves_past_it() {
+        let log = Log::default();
+        log.write_at("p", 1, 1, b"1");
+        log.write_at("q", 1, 1, b"2");
+        // `p` lost the answer to its batch and sent it again.
+        log.write_at("p", 1, 1, b"1");
+        log.write_at("p", 1, 2, b"3");
+        let all = read(&log, BEGINNING, &[]).await.unwrap();
+        assert_eq!(values(&all), ["1", "2", "3"]);
+        let first = read_page(
+            &log,
+            &target(),
+            &ReadRequest {
+                after: BEGINNING.to_string(),
+                max_records: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(values(&first), ["1", "2"]);
+        assert_eq!(first.cursor, cursor("3"));
+        let next = read(&log, &first.cursor, &first.state).await.unwrap();
+        assert_eq!(values(&next), ["3"]);
+    }
+
+    #[tokio::test]
+    async fn a_read_from_a_cursor_knows_the_sequence_of_the_cursor_record() {
+        let log = Log::default();
+        log.write_at("p", 1, 1, b"1");
+        log.write_at("p", 1, 2, b"2");
+        log.write_at("p", 1, 2, b"2");
+        log.write_at("p", 1, 1, b"1");
+        let resumed = read(&log, &cursor("2"), &[]).await.unwrap();
+        assert!(resumed.records.is_empty());
+        assert_eq!(resumed.cursor, cursor("4"));
+        // A cursor before the first copy delivers its batch once.
+        let earlier = read(&log, &cursor("1"), &[]).await.unwrap();
+        assert_eq!(values(&earlier), ["2"]);
+    }
+
+    fn control(kind: StreamRecordKind, topic: &str) -> Vec<u8> {
+        StreamRecord {
+            topic: topic.to_string(),
+            kind: kind as i32,
+            producer_id: "closer".to_string(),
+            attempt: 1,
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    #[tokio::test]
+    async fn the_first_close_ends_the_read_and_every_later_call() {
+        let log = Log::default();
+        log.write("p", 1, b"1");
+        log.push(control(StreamRecordKind::Topic, "out"));
+        log.write("p", 1, b"2");
+        log.push(control(StreamRecordKind::Close, "out"));
+        log.write("p", 1, b"3");
+        log.push(control(StreamRecordKind::Close, "out"));
+        let mut state = ReadState::default();
+        let request = ReadRequest {
+            after: BEGINNING.to_string(),
+            ..Default::default()
+        };
+        let (page, closed, _) = read_with(&log, &target(), &request, &mut state)
+            .await
+            .unwrap();
+        assert!(closed);
+        assert_eq!(values(&page), ["1", "2"]);
+        // The cursor stays before the close, so a read that resumes there ends at it too.
+        assert_eq!(page.cursor, cursor("3"));
+        let lookups = log.lookups.load(Ordering::Relaxed);
+        let next = ReadRequest {
+            after: page.cursor.clone(),
+            ..Default::default()
+        };
+        let (again, closed, _) = read_with(&log, &target(), &next, &mut state).await.unwrap();
+        assert!(closed && again.records.is_empty());
+        assert_eq!(log.lookups.load(Ordering::Relaxed), lookups);
+        let resumed = read(&log, &page.cursor, &[]).await.unwrap();
+        assert!(resumed.records.is_empty());
+        let state = ReadState::decode_from(&resumed.state).unwrap();
+        assert!(state.closed);
+    }
+
+    #[tokio::test]
+    async fn a_chain_close_ends_the_read_and_another_topics_close_does_not() {
+        let log = Log::default();
+        log.write("p", 1, b"1");
+        log.push(control(StreamRecordKind::Close, "other"));
+        log.write("p", 1, b"2");
+        log.push(control(StreamRecordKind::Close, ""));
+        log.write("p", 1, b"3");
+        let read = read(&log, BEGINNING, &[]).await.unwrap();
+        assert_eq!(values(&read), ["1", "2"]);
+    }
+
+    fn forgetful() -> Log {
+        Log {
+            forgets_last: true,
+            ..Log::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_kept_last_position_a_lost_cursor_record_reads_as_expired() {
+        let log = forgetful();
+        for value in ["1", "2", "3", "4"] {
+            log.write("p", 1, value.as_bytes());
+        }
+        let first = read_page(
+            &log,
+            &target(),
+            &ReadRequest {
+                max_records: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.cursor, cursor("1"));
+        // While the record at the cursor is there, nothing after it is gone.
+        log.trimmed.store(1, Ordering::Relaxed);
+        let error = read(&log, &first.cursor, &first.state).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Expired);
+        // A position the store still holds reads on.
+        let held = read(&log, &cursor("2"), &[]).await.unwrap();
+        assert_eq!(values(&held), ["3", "4"]);
+        // A quiet stream whose last delivered record expired reads as expired too, where a store
+        // that keeps the last position answers empty.
+        log.trimmed.store(4, Ordering::Relaxed);
+        let quiet = read(&log, &cursor("4"), &[]).await.unwrap_err();
+        assert_eq!(quiet.kind, StreamFailureKind::Expired);
+    }
+
+    #[tokio::test]
+    async fn without_a_kept_last_position_a_read_from_the_start_keeps_a_mark() {
+        let log = forgetful();
+        let empty = read(&log, BEGINNING, &[]).await.unwrap();
+        assert!(empty.records.is_empty());
+        log.write("p", 1, b"1");
+        let next = read(&log, &empty.cursor, &empty.state).await.unwrap();
+        assert_eq!(values(&next), ["1"]);
+    }
+
+    #[tokio::test]
+    async fn on_dense_positions_a_page_right_after_a_lost_cursor_is_whole() {
+        let store = crate::MemoryStore::with_capabilities(crate::Capabilities {
+            kept_last: false,
+            ..crate::MemoryStore::new().capabilities()
+        });
+        let chain = target().chain;
+        for sequence in 1..=4 {
+            let record = StreamRecord {
+                sequence,
+                ..data_record("p", 1, sequence.to_string().as_bytes())
+            };
+            store
+                .append(StoreAppendRequest {
+                    chain: Some(chain.clone()),
+                    topic: "out".to_string(),
+                    producer_id: "p".to_string(),
+                    attempt: 1,
+                    sequence,
+                    digest: vec![1],
+                    records: vec![record.encode_to_vec()],
+                })
+                .await
+                .unwrap();
+        }
+        let at = |position: &str| mint_cursor("memory", &target().stream_hash, position);
+        let read = async |after: &str| {
+            read_page(
+                &store,
+                &target(),
+                &ReadRequest {
+                    after: after.to_string(),
+                    ..Default::default()
+                },
+            )
+            .await
+        };
+        store.truncate(&chain, "out", 3);
+        assert_eq!(values(&read(&at("0")).await.unwrap()), ["2", "3", "4"]);
+        store.truncate(&chain, "out", 2);
+        let error = read(&at("0")).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Expired);
+    }
+
+    fn values(response: &ReadResponse) -> Vec<String> {
+        response
+            .records
+            .iter()
+            .filter_map(|record| match record.record.as_ref().unwrap() {
+                read_record::Record::Stored(stored) => {
+                    Some(String::from_utf8(stored.body.clone().unwrap().data).unwrap())
+                }
+                read_record::Record::Superseded(_) => None,
+            })
+            .collect()
+    }
+
+    /// The reader rules every SDK checks itself against.
+    #[tokio::test]
+    async fn the_reader_rules_match_the_shared_vectors() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/reader_rules.json")).unwrap();
+        for case in vectors["cases"].as_array().unwrap() {
+            let label = case["label"].as_str().unwrap();
+            let log = Log::default();
+            for (index, record) in case["records"].as_array().unwrap().iter().enumerate() {
+                let stored = StreamRecord {
+                    topic: record["topic"].as_str().unwrap_or("out").to_string(),
+                    kind: record["kind"].as_i64().unwrap_or(1) as i32,
+                    producer_id: record["producer"].as_str().unwrap().to_string(),
+                    attempt: record["attempt"].as_i64().unwrap(),
+                    sequence: record["sequence"].as_i64().unwrap(),
+                    body: Some(Payload {
+                        data: index.to_string().into_bytes(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                };
+                log.push(stored.encode_to_vec());
+            }
+            let after = match case["resume_after"].as_u64() {
+                Some(index) => cursor(&(index + 1).to_string()),
+                None => BEGINNING.to_string(),
+            };
+            let mut state = ReadState::default();
+            let request = ReadRequest {
+                after,
+                ..Default::default()
+            };
+            let (page, closed, _) = read_with(&log, &target(), &request, &mut state)
+                .await
+                .unwrap();
+            assert_eq!(closed, case["closed"].as_bool().unwrap_or(false), "{label}");
+            let delivered: Vec<u64> = page
+                .records
+                .iter()
+                .filter_map(|record| match record.record.as_ref().unwrap() {
+                    read_record::Record::Stored(stored) => {
+                        let index = String::from_utf8(stored.body.clone().unwrap().data);
+                        Some(index.unwrap().parse().unwrap())
+                    }
+                    read_record::Record::Superseded(_) => None,
+                })
+                .collect();
+            let expected: Vec<u64> = case["delivered"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|index| index.as_u64().unwrap())
+                .collect();
+            assert_eq!(delivered, expected, "{label}");
+            let stale: Vec<u64> = page
+                .records
+                .iter()
+                .filter(|record| record.stale)
+                .map(|record| match record.record.as_ref().unwrap() {
+                    read_record::Record::Stored(stored) => {
+                        let index = String::from_utf8(stored.body.clone().unwrap().data);
+                        index.unwrap().parse().unwrap()
+                    }
+                    read_record::Record::Superseded(_) => unreachable!(),
+                })
+                .collect();
+            let expected_stale: Vec<u64> = case["stale"]
+                .as_array()
+                .map(|indexes| indexes.iter().map(|i| i.as_u64().unwrap()).collect())
+                .unwrap_or_default();
+            assert_eq!(stale, expected_stale, "{label}");
+        }
     }
 
     #[test]
