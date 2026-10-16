@@ -521,8 +521,8 @@ async fn tls_with_require_reaches_a_server_with_tls() {
     let raw = raw(&url).await;
     let encrypted: bool = raw
         .query_one(
-            "SELECT bool_and(s.ssl) FROM pg_stat_ssl s JOIN pg_stat_activity a USING (pid) \
-             WHERE a.application_name = 'temporal-streams'",
+            "SELECT count(*) FILTER (WHERE s.ssl) > 0 FROM pg_stat_ssl s \
+             JOIN pg_stat_activity a USING (pid) WHERE a.application_name = 'temporal-streams'",
             &[],
         )
         .await
