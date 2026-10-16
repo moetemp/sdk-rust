@@ -46,17 +46,20 @@ providers on such a topic are unsupported.
 **Notification log.** With `notification_log` on, the append script also adds an entry to the
 notification stream of the chain's Cluster slot, `<prefix>:{<tag>}:n`, where the tag is the one
 `testdata/redis/notify_slots.json` pins for that slot. So the log, the meta and the entry share a
-slot, one script writes them, and a reshard moves them together. A standalone server uses the
-same keys. An entry holds `k`, the log key, and `p`, the append's last entry id. The stream keeps
-about the newest 10,000 entries. A repeat of the newest batch adds none. The script answers the
-stream's length too, and when it is 1, Core adds the slot to doorbell `d = s % doorbells`, at
-`<prefix>:{<tag of slot d * 16384 / doorbells>}:bell`, apart from the script, so a lost ring is
-possible. The doorbells spread over the slot range, so a cluster's primaries share them, and an
-application and its drivers must agree on the number of doorbells. Drivers read the slot
-streams and the doorbells as the consumer group `streams-driver` (`XREADGROUP`, `XAUTOCLAIM`,
-`XACK`, `XDEL`, `XGROUP CREATE`), and sweep with `XLEN` over each primary's slots from `CLUSTER
-SLOTS`. The slot streams have no expiry, and a driver empties them. The logged append script has
-its own hash. The plain one is unchanged, and an SDK's provider writes no entries.
+slot, one script writes them, and a reshard moves them together. A standalone server uses the same
+keys. An entry holds `k`, the log key, and `p`, the append's last entry id. The stream keeps about
+the newest 10,000 entries, also ones a driver took and has not acked. So a driver that falls more
+than 10,000 appends behind on a slot loses the oldest entries, and a quiet stream that shares the
+slot with a busy one can lose its only entry. Its readers then wake on their recheck. A repeat of
+the newest batch adds none. The script answers the stream's length too, and when it is 1, Core adds
+the slot to doorbell `d = s % doorbells`, at `<prefix>:{<tag of slot d * 16384 / doorbells>}:bell`,
+apart from the script, so a lost ring is possible. The doorbells spread over the slot range, so a
+cluster's primaries share them, and an application and its drivers must agree on the number of
+doorbells. Drivers read the slot streams and the doorbells as the consumer group `streams-driver`
+(`XREADGROUP`, `XAUTOCLAIM`, `XACK`, `XDEL`, `XGROUP CREATE`), and sweep with `XLEN` over each
+primary's slots from `CLUSTER SLOTS`. The slot streams have no expiry, and a driver empties them.
+The logged append script has its own hash. The plain one is unchanged, and an SDK's provider writes
+no entries.
 
 **Archive hold.** With `archive_lease` set, a driver copies each topic into an archive, and the
 store holds what the archive doesn't hold yet. The floors hash keeps the holder `archive`. The
