@@ -265,7 +265,20 @@ pub(crate) async fn follow(
         && let Some(subscriber) = &request.subscriber
     {
         let mut landed = false;
-        for number in call.state.readable() {
+        // A source this call didn't read empty has no counter to wait after, and a wait after
+        // zero wakes at once. It is still waited on when no source was read.
+        let readable = call.state.readable();
+        let read_empty: Vec<u32> = readable
+            .iter()
+            .copied()
+            .filter(|number| call.wake_after.contains_key(number))
+            .collect();
+        let waited = if read_empty.is_empty() {
+            readable
+        } else {
+            read_empty
+        };
+        for number in waited {
             let Some((stream, ..)) = call.state.read_input(number) else {
                 continue;
             };
