@@ -32,10 +32,11 @@ service StreamService {
   // Waits until the stream notifications this process sent are out, for at most 10 seconds. A
   // notification goes in the background, so a process calls it before it stops.
   rpc FlushNotifications(FlushNotificationsRequest) returns (FlushNotificationsResponse);
-  // Attaches a Workflow's reader of a stream to the stream's notifier, so the notifier wakes the
-  // Workflow with a `StreamWake` on its next Workflow Task. A reader calls it before its first
-  // read. The process attaches each subscription once and answers a repeat from memory, and the
-  // server takes a repeat from another process as the same attach.
+  // Attaches a Workflow's reader of a stream to the stream's notifier as an idle callback. An idle
+  // reader hears nothing until a read with `subscriber` finds no record and asks for one wake, so
+  // a reader reads with `subscriber` and needs no call of its own. The process attaches each
+  // subscription once and answers a repeat from memory, and the server takes a repeat from
+  // another process as the same attach.
   rpc Subscribe(SubscribeRequest) returns (SubscribeResponse);
   // Detaches a Workflow's reader that stops before the stream ends.
   rpc Unsubscribe(UnsubscribeRequest) returns (UnsubscribeResponse);
@@ -304,6 +305,19 @@ message ReadRequest {
   // id. The store holds the records after this read's start against retention for that holder,
   // until `ReleaseFloor` and its grace, or until the holder's lease passes with no read.
   string floor_holder = 7;
+  // Set by a Workflow reader. An answer with no records that is not `done` attaches the reader
+  // idle when this process has not, asks the notifier for one wake after the answer's
+  // `wake_after`, and reads once more when a record landed before the attach. An answer with
+  // records sends nothing, so a reader that keeps up costs the notifier nothing.
+  ReadSubscriber subscriber = 8;
+}
+
+// The Workflow reader that an idle read wakes, as `SubscribeRequest` names it.
+message ReadSubscriber {
+  string workflow_id = 1;
+  string run_id = 2;
+  string subscription_id = 3;
+  uint32 generation = 4;
 }
 
 // A later attempt of a producer started writing. Readers synthesize it, and no store holds it.
@@ -411,7 +425,8 @@ message FollowRequest {
   uint32 max_open = 7;
   // For a positions-only follower: each source holds its records as `<floor_holder>/<source>`.
   string floor_holder = 8;
-  // Set by a Workflow follower, so an empty answer attaches each idle source.
+  // Set by a Workflow follower. An empty answer attaches each idle source idle and asks its
+  // notifier for one wake after the source's `wake_after`.
   FollowSubscriber subscriber = 9;
 }
 

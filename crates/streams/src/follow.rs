@@ -67,6 +67,7 @@ impl Call<'_> {
             max_records: self.budget,
             state,
             floor_holder: self.floor_holder(number),
+            subscriber: None,
         })
     }
 
@@ -258,8 +259,9 @@ pub(crate) async fn follow(
                 continue;
             };
             let subscription_id = format!("{}.{number}", subscriber.subscription_prefix);
-            let attached = subscriptions
-                .subscribe(
+            let wake_after = call.wake_after.get(&number).copied().unwrap_or_default();
+            let newest = subscriptions
+                .wait_idle(
                     streams,
                     SubscribeRequest {
                         stream: Some(stream),
@@ -268,11 +270,11 @@ pub(crate) async fn follow(
                         subscription_id: subscription_id.clone(),
                         generation: subscriber.generation,
                     },
+                    wake_after,
                 )
                 .await?;
-            let wake_after = call.wake_after.get(&number).copied().unwrap_or_default();
             // A record from before the attach woke no one, so it is read now.
-            landed |= attached.newest_counter > wake_after;
+            landed |= newest.is_some_and(|newest| newest > wake_after);
             wakes.push(SourceWake {
                 source: number,
                 subscription_id,
