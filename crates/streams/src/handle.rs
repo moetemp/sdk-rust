@@ -381,14 +381,10 @@ impl Streams {
     async fn owner_ended(&self, stream: &StreamAddress, chain: &ChainId) -> StreamResult<bool> {
         let key = owner_key(stream);
         match self.describe(&key, &key.run_id).await {
-            Err(OwnerError::NotFound(_)) => {
-                // The chain came from this Workflow, so History has since dropped it, and
-                // nothing more will be written for it.
-                if key.run_id.is_empty() {
-                    self.store.close_chain(chain).await?;
-                }
-                Ok(true)
-            }
+            // The chain came from this Workflow, so History has since dropped it, or a failover
+            // hides it for a while. A reader only ends its own read, and producers close the
+            // chain.
+            Err(OwnerError::NotFound(_)) => Ok(self.gone_for_good(chain)),
             Err(error) => Err(describe_failed(&error)),
             Ok(described) if !key.run_id.is_empty() => {
                 Ok(described.status != WorkflowExecutionStatus::Running)
@@ -569,6 +565,16 @@ impl Streams {
     /// at least [StreamsOptions::owner_recheck] after the first. The first answer fails the call
     /// as a storage failure, which the caller retries.
     async fn gone(&self, chain: &ChainId) -> StreamError {
+        if self.gone_for_good(chain) {
+            self.closed(chain, "is gone from History").await
+        } else {
+            missing(chain)
+        }
+    }
+
+    /// Whether Temporal answered that `chain`'s owner is gone twice, at least
+    /// [StreamsOptions::owner_recheck] apart, with no answer that holds it in between.
+    fn gone_for_good(&self, chain: &ChainId) -> bool {
         let key = OwnerKey {
             namespace: chain.namespace.clone(),
             workflow_id: chain.workflow_id.clone(),
@@ -576,15 +582,10 @@ impl Streams {
         };
         let recheck = self.options.owner_recheck;
         match self.missing.get(&key) {
-            Some(seen)
-                if seen.first_run_id == chain.first_run_id && seen.at.elapsed() >= recheck =>
-            {
-                self.closed(chain, "is gone from History").await
-            }
-            Some(seen) if seen.first_run_id == chain.first_run_id => missing(chain),
+            Some(seen) if seen.first_run_id == chain.first_run_id => seen.at.elapsed() >= recheck,
             _ => {
                 self.missing.put(key, &chain.first_run_id, recheck * 2);
-                missing(chain)
+                false
             }
         }
     }
@@ -1698,7 +1699,10 @@ mod tests {
 
     #[tokio::test]
     async fn rule_20_3_a_read_ends_when_history_no_longer_holds_its_owner() {
-        let setup = setup(quick());
+        let setup = setup(StreamsOptions {
+            owner_recheck: Duration::from_millis(200),
+            ..quick()
+        });
         setup.streams.append(append("p", 1, "1")).await.unwrap();
         let first = setup
             .streams
@@ -1718,7 +1722,45 @@ mod tests {
             .await
             .unwrap();
         assert!(page.done);
-        assert!(chain_closed(&setup.store, "run-1").await);
+        // The reader's check ends its own read only. A producer's check closes the chain.
+        assert!(!chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test]
+    async fn a_read_goes_on_after_one_not_found_from_its_owner_check() {
+        let setup = setup(quick());
+        setup.streams.append(append("p", 1, "1")).await.unwrap();
+        let first = setup
+            .streams
+            .read(read_after("", &[], Duration::ZERO))
+            .await
+            .unwrap();
+        setup
+            .owners
+            .fail("wf", OwnerError::NotFound("workflow not found".to_string()));
+        let page = setup
+            .streams
+            .read(read_after(
+                &first.cursor,
+                &first.state,
+                Duration::from_millis(300),
+            ))
+            .await
+            .unwrap();
+        assert!(!page.done);
+        setup.owners.run("wf", "run-1", "run-1");
+        setup.streams.append(append("p", 2, "2")).await.unwrap();
+        let page = setup
+            .streams
+            .read(read_after(
+                &page.cursor,
+                &page.state,
+                Duration::from_secs(5),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(page.records.len(), 1);
+        assert!(!chain_closed(&setup.store, "run-1").await);
     }
 
     #[tokio::test]
