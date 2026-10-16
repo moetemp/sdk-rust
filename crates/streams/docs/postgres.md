@@ -63,8 +63,9 @@ delete removed is acked as broken when a driver takes it.
 channels. It connects with the store, so a store whose listener can't connect fails at once. When
 the connection ends, it connects again with backoff, rings every doorbell for every partition and
 wakes every waiting read, since what was sent while it was away is gone. The driver's sweep finds a
-lost ring too. `LISTEN` keeps state on the server session, so the listener uses `listen_url` when
-it is set, and `url` otherwise. Both must name the primary, since a standby refuses `LISTEN`.
+lost ring too. The listener sets TCP keepalive to notice a dead connection within a minute.
+`LISTEN` keeps state on the server session, so the listener uses `listen_url` when it is set, and
+`url` otherwise. Both must name the primary, since a standby refuses `LISTEN`.
 
 **Retention.** PostgreSQL has no key expiry, so each store runs a janitor every
 `janitor_interval` (one minute). A transaction advisory lock around each step lets one janitor
