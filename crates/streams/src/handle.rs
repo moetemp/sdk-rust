@@ -100,8 +100,13 @@ impl<K: std::hash::Hash + Eq + Clone> Remembered<K> {
         let mut entries = self.entries.lock().unwrap();
         if entries.len() >= self.limit && !entries.contains_key(&key) {
             entries.retain(|_, checked| checked.at.elapsed() < fresh_for);
-            if entries.len() >= self.limit {
-                entries.clear();
+            if entries.len() >= self.limit
+                && let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, checked)| checked.at)
+                    .map(|(key, _)| key.clone())
+            {
+                entries.remove(&oldest);
             }
         }
         entries.insert(
@@ -923,6 +928,19 @@ mod tests {
         assert_eq!(error.kind, StreamFailureKind::Closed);
         assert!(error.message.contains("gone from History"), "{error}");
         assert!(chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_full_memory_forgets_its_oldest_entry_only() {
+        let remembered = Remembered::new(3);
+        for key in 0..4 {
+            remembered.put(key, "run-1", Duration::from_secs(3600));
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        assert!(remembered.get(&0).is_none());
+        for key in 1..4 {
+            assert!(remembered.get(&key).is_some(), "{key}");
+        }
     }
 
     #[tokio::test(start_paused = true)]
