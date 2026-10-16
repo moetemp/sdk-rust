@@ -1546,3 +1546,70 @@ async fn notification_counters_come_from_redis_entry_ids_and_grow_with_the_strea
         "{counters:?}"
     );
 }
+
+#[tokio::test]
+async fn a_retention_past_the_epoch_is_refused_at_connect() {
+    // The check runs before any connection, so no server is needed.
+    let mut options = RedisStoreOptions::new("redis://127.0.0.1:1");
+    options.retention = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+    let error = RedisStore::connect(options).await.unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Refused);
+    assert!(error.message.contains("retention"), "{error}");
+}
+
+#[tokio::test]
+async fn a_position_past_the_head_is_one_the_topic_never_held() {
+    let Some(setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    let landed = setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let (ms, _) = landed.last_position.split_once('-').unwrap();
+    let past = format!("{}-0", ms.parse::<u64>().unwrap() + 1000);
+    let error = setup
+        .store
+        .read(read_after(&chain, &past, 10))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Cursor, "{error}");
+    assert!(error.message.contains("never held"), "{error}");
+}
+
+#[tokio::test]
+async fn the_read_checks_run_by_hash_and_survive_a_script_flush() {
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let evalsha_calls = async |raw: &mut redis::aio::MultiplexedConnection| {
+        let info: String = redis::cmd("INFO")
+            .arg("commandstats")
+            .query_async(raw)
+            .await
+            .unwrap();
+        info.lines()
+            .find_map(|line| line.strip_prefix("cmdstat_evalsha:calls="))
+            .and_then(|rest| rest.split(',').next())
+            .map_or(0, |calls| calls.parse::<u64>().unwrap())
+    };
+    let _: () = redis::cmd("SCRIPT")
+        .arg("FLUSH")
+        .query_async(&mut setup.raw)
+        .await
+        .unwrap();
+    let read = setup.store.read(read_after(&chain, "", 10)).await.unwrap();
+    assert_eq!(read.records.len(), 1);
+    let before = evalsha_calls(&mut setup.raw).await;
+    let read = setup.store.read(read_after(&chain, "", 10)).await.unwrap();
+    assert_eq!(read.records.len(), 1);
+    assert!(evalsha_calls(&mut setup.raw).await > before);
+}

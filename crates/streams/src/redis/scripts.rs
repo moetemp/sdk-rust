@@ -1,8 +1,9 @@
 //! The Lua scripts, on the stored format the SDKs used before the store moved into Core.
 //!
 //! The append script is the one the SDKs sent, with one more check, the topic's close flag, so a
-//! batch can't land after the topic's close returned (DD-16). `keep.lua` is the prelude of every
-//! script that writes a log.
+//! batch can't land after the topic's close returned (DD-16). Redis doesn't roll a script back,
+//! so it also runs every step that can fail before its first record lands. `keep.lua` is the
+//! prelude of every script that writes a log.
 
 use redis::Script;
 use std::sync::LazyLock;
@@ -22,16 +23,11 @@ mod tests {
     const TOPIC_CHECK: &str = " or redis.call('HGET', KEYS[2], 'closed')";
 
     #[test]
-    fn the_append_script_matches_the_sdks_with_the_topic_check_only() {
+    fn the_append_script_is_pinned() {
         assert_eq!(
             APPEND_SCRIPT.get_hash(),
-            "96d2eb81ddf241103a1ed5495a015285d7bd37f0"
+            "806e20d928e761eff5467386c0ffe78372e48bec"
         );
         assert_eq!(APPEND.matches(TOPIC_CHECK).count(), 1);
-        let sdk_script = APPEND.replacen(TOPIC_CHECK, "", 1);
-        assert_eq!(
-            Script::new(&sdk_script).get_hash(),
-            "7944489663d477b49e3f4f947933e15de3269718"
-        );
     }
 }
