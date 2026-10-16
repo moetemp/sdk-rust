@@ -41,6 +41,8 @@ pub struct StreamService {
     nexus: NexusCalls,
     callers: Option<Arc<dyn NotifierClient>>,
     attach_progress: Option<Arc<Notifier>>,
+    /// The chain each start's attach went to, by request id, so a retried start attaches there.
+    caller_chains: crate::handle::Remembered<String>,
     /// What a driver archives into, when the config names an archive.
     archive: Option<ArchiveSink>,
 }
@@ -174,6 +176,7 @@ impl StreamService {
             nexus,
             callers: None,
             attach_progress: None,
+            caller_chains: crate::handle::Remembered::new(StreamsOptions::default().remembered),
             archive: None,
         }
     }
@@ -329,6 +332,7 @@ impl StreamService {
                 &self.streams,
                 self.callers.as_ref(),
                 self.attach_progress.as_ref(),
+                &self.caller_chains,
                 decode::<AttachCallerRequest>(rpc, request)?,
             )
             .await
