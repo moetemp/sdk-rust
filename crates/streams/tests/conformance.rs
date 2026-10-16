@@ -131,6 +131,14 @@ impl<C: Case> Case for Notifying<C> {
 #[async_trait::async_trait]
 trait Forgets: Case {
     async fn forget(&self, chain: &ChainId, topic: &str);
+
+    /// Ends the archive's hold on a topic at once, as a lapsed lease does.
+    async fn lapse_archive_hold(&self, chain: &ChainId, topic: &str) {
+        self.store()
+            .release_floor(chain, topic, temporalio_streams::ARCHIVE_HOLDER)
+            .await
+            .unwrap();
+    }
 }
 
 #[async_trait::async_trait]
@@ -224,6 +232,9 @@ trait ArchiveCase: Case {
     /// Deletes one archive object, as a bucket lifecycle rule does.
     async fn lose(&self, name: &str);
 
+    /// Ends the archive's hold on a topic at once, as a lapsed lease does.
+    async fn lapse_archive_hold(&self, chain: &ChainId, topic: &str);
+
     /// Archives what the hot store holds of a topic, in segments of at most `records` records.
     async fn archive_now(&self, chain: &ChainId, topic: &str, records: u32) {
         let limits = SegmentLimits {
@@ -250,6 +261,10 @@ impl<C: Forgets> ArchiveCase for Tiered<C> {
         self.inner.forget(chain, topic).await;
     }
 
+    async fn lapse_archive_hold(&self, chain: &ChainId, topic: &str) {
+        self.inner.lapse_archive_hold(chain, topic).await;
+    }
+
     async fn lose(&self, name: &str) {
         match &self.root {
             Some(root) => std::fs::remove_file(root.join(name)).unwrap(),
@@ -263,12 +278,20 @@ impl<C: Forgets> Forgets for Activity<C> {
     async fn forget(&self, chain: &ChainId, topic: &str) {
         self.0.forget(chain, topic).await;
     }
+
+    async fn lapse_archive_hold(&self, chain: &ChainId, topic: &str) {
+        self.0.lapse_archive_hold(chain, topic).await;
+    }
 }
 
 #[async_trait::async_trait]
 impl<C: Forgets> Forgets for WorkflowActivity<C> {
     async fn forget(&self, chain: &ChainId, topic: &str) {
         self.0.forget(chain, topic).await;
+    }
+
+    async fn lapse_archive_hold(&self, chain: &ChainId, topic: &str) {
+        self.0.lapse_archive_hold(chain, topic).await;
     }
 }
 
@@ -1077,6 +1100,19 @@ mod on_postgres {
                      producers AS (DELETE FROM {{s}}.producers h USING t \
                        WHERE h.topic_id = t.topic_id) \
                      DELETE FROM {{s}}.topics x USING t WHERE x.topic_id = t.topic_id"
+                ),
+                chain,
+                topic,
+                &[],
+            )
+            .await;
+        }
+
+        async fn lapse_archive_hold(&self, chain: &ChainId, topic: &str) {
+            self.on_topic(
+                &format!(
+                    "WITH t AS ({TOPIC}) UPDATE {{s}}.floors f SET until = now() - interval '1 s' \
+                     FROM t WHERE f.topic_id = t.topic_id AND f.holder = 'archive'"
                 ),
                 chain,
                 topic,
@@ -2721,10 +2757,7 @@ mod archive_cases {
         let lost = producer.append(&["3"]).await;
         producer.append(&["4", "5"]).await;
         // The archive's hold lapses, and retention drops `3` before the archive takes it.
-        case.hot()
-            .release_floor(&chain, OUT, temporalio_streams::ARCHIVE_HOLDER)
-            .await
-            .unwrap();
+        case.lapse_archive_hold(&chain, OUT).await;
         case.drop_oldest(&chain, OUT, 2).await;
         case.archive_now(&chain, OUT, 10).await;
         // Only the archive answers now.
