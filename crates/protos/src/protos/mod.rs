@@ -3104,6 +3104,8 @@ mod sdk_helpers {
                     attempt: 2,
                     sequence: 3,
                     link: None,
+                    task_started_event_id: 0,
+                    completed_tasks: vec![],
                 }
             }
 
