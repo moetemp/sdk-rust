@@ -68,6 +68,7 @@ impl Call<'_> {
             max_records: self.budget,
             state,
             floor_holder: self.floor_holder(number),
+            max_bytes: 0,
         })
     }
 
