@@ -6,7 +6,8 @@ mod keys;
 mod scripts;
 
 use crate::{
-    StreamError, StreamResult, StreamStore,
+    Capabilities, ConditionForms, MAX_BATCH_BYTES, MAX_RECORD_BYTES, StreamError, StreamResult,
+    StreamStore,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredRecord,
@@ -29,6 +30,25 @@ const RECORD_FIELD: &str = "r";
 const TOMBSTONE_GRACE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const CLOSED_FIELD: &str = "closed";
 const DELETE_BATCH: usize = 500;
+
+const CAPABILITIES: Capabilities = Capabilities {
+    producer_state: true,
+    conditional: ConditionForms {
+        tail: false,
+        fence: false,
+    },
+    kept_last: true,
+    holds: false,
+    change_feed: false,
+    cheap_logs: true,
+    delete_owner: true,
+    topic_listing: true,
+    long_poll: true,
+    dense_positions: false,
+    replay_horizon: None,
+    max_record_bytes: MAX_RECORD_BYTES,
+    max_batch_bytes: MAX_BATCH_BYTES,
+};
 
 /// How to reach Redis and how long streams live there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -430,6 +450,10 @@ impl StreamStore for RedisStore {
         NAME
     }
 
+    fn capabilities(&self) -> Capabilities {
+        CAPABILITIES
+    }
+
     async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
         if request.records.is_empty() {
             return Err(StreamError::refused("an append needs at least one record"));
@@ -633,6 +657,31 @@ impl StreamStore for RedisStore {
             .query_async::<()>(&mut self.shared.clone())
             .await
             .mapped(Call::Write)
+    }
+
+    async fn list_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        let keys = ChainKeys::new(&self.prefix, chain);
+        let pattern = keys.topics_pattern();
+        let mut topics = Vec::new();
+        // The chain's keys share one slot, but which primary holds it is the cluster's business.
+        for node in self.shared.primaries().await.mapped(Call::Read)? {
+            let mut cursor = "0".to_string();
+            loop {
+                let (next, found) = self
+                    .shared
+                    .scan(node.as_ref(), &cursor, &pattern)
+                    .await
+                    .mapped(Call::Read)?;
+                topics.extend(found.iter().filter_map(|key| keys.topic_of(key)));
+                if next == "0" {
+                    break;
+                }
+                cursor = next;
+            }
+        }
+        topics.sort_unstable();
+        topics.dedup();
+        Ok(topics)
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {

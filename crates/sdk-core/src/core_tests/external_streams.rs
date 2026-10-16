@@ -148,6 +148,10 @@ impl StreamStore for RecordingStore {
         "recording"
     }
 
+    fn capabilities(&self) -> temporalio_streams::Capabilities {
+        self.inner.capabilities()
+    }
+
     async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
         self.calls.lock().push("append");
         if let Some(error) = &self.refuse {
@@ -210,6 +214,11 @@ impl StreamStore for RecordingStore {
         self.inner
             .retire_producer(chain, topic, producer_id, attempt)
             .await
+    }
+
+    async fn list_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        self.calls.lock().push("list_topics");
+        self.inner.list_topics(chain).await
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {

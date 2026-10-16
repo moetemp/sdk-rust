@@ -35,7 +35,7 @@ pub use record::{
     workflow_batch_digest, workflow_producer_id,
 };
 pub use service::StreamService;
-pub use store::StreamStore;
+pub use store::{Capabilities, ConditionForms, MAX_BATCH_BYTES, MAX_RECORD_BYTES, StreamStore};
 
 /// The protos stores and lang exchange.
 pub mod proto {
