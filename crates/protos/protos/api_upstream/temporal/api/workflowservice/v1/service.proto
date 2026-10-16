@@ -2095,8 +2095,10 @@ service WorkflowService {
     // NotifyStreams tells the notifiers of many streams in one namespace that they moved. It acts as
     // one NotifyStream without close per entry. A stream with no notifier drops its entry, as
     // NotifyStream does. A driver that reads the store's notification log calls it with the newest
-    // counter of each stream in a batch. A call that fails may have applied some entries. Sending
-    // the batch again is safe, since a notifier ignores a counter at or below the one it holds.
+    // counter of each stream in a batch. The server checks and applies each entry on its own and
+    // answers each in `results`, so a bad entry doesn't hold up the others. The call fails only for
+    // the request as a whole, such as an empty batch or one that is too large. Sending an entry
+    // again is safe, since a notifier ignores a counter at or below the one it holds.
     //
     // (-- api-linter: core::0127::http-annotation=disabled
     //     aip.dev/not-precedent: SDKs reach the stream notifier through gRPC. --)
