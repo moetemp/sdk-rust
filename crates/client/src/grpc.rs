@@ -1897,6 +1897,15 @@ proxier! {
         }
     );
     (
+        wait_stream_callback,
+        WaitStreamCallbackRequest,
+        WaitStreamCallbackResponse,
+        |r| {
+            let labels = namespaced_request!(r);
+            r.extensions_mut().insert(labels);
+        }
+    );
+    (
         notify_stream,
         NotifyStreamRequest,
         NotifyStreamResponse,
