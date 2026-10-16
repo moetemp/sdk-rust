@@ -9,7 +9,8 @@ mod migrations;
 mod wait;
 
 use crate::{
-    NotificationLog, StreamError, StreamResult, StreamStore,
+    Capabilities, ConditionForms, MAX_BATCH_BYTES, MAX_RECORD_BYTES, NotificationLog, StreamError,
+    StreamResult, StreamStore,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
@@ -193,6 +194,7 @@ struct Sql {
     close_topic: String,
     retire: String,
     written: String,
+    topics: String,
     delete_owner: String,
     purge: String,
     hold: String,
@@ -250,6 +252,10 @@ impl Sql {
                 "DELETE FROM {s}.producers h USING {s}.chains c, {s}.topics t \
                  WHERE {CHAIN_KEY} AND t.chain_id = c.chain_id AND t.topic = $6 \
                  AND h.topic_id = t.topic_id AND h.producer_id = $7 AND h.attempt = $8"
+            ),
+            topics: format!(
+                "SELECT t.topic FROM {s}.chains c JOIN {s}.topics t ON t.chain_id = c.chain_id \
+                 WHERE {CHAIN_KEY} AND t.last_position IS NOT NULL ORDER BY t.topic COLLATE \"C\""
             ),
             written: format!(
                 "SELECT t.topic FROM {s}.chains c JOIN {s}.topics t ON t.chain_id = c.chain_id \
@@ -770,6 +776,24 @@ impl StreamStore for PostgresStore {
         self.log.clone().map(|log| log as Arc<dyn NotificationLog>)
     }
 
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            producer_state: true,
+            conditional: ConditionForms::default(),
+            kept_last: true,
+            holds: true,
+            change_feed: self.notification_log().is_some(),
+            cheap_logs: true,
+            delete_owner: true,
+            topic_listing: true,
+            long_poll: true,
+            dense_positions: true,
+            replay_horizon: None,
+            max_record_bytes: MAX_RECORD_BYTES,
+            max_batch_bytes: MAX_BATCH_BYTES,
+        }
+    }
+
     async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
         if request.records.is_empty() {
             return Err(StreamError::refused("an append needs at least one record"));
@@ -1096,6 +1120,25 @@ impl StreamStore for PostgresStore {
             )
             .await
             .map(drop)
+    }
+
+    async fn list_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        let chain = Chain::of(chain);
+        let inner = &self.inner;
+        let rows = inner
+            .query(
+                Call::Read,
+                &inner.sql.topics,
+                &[
+                    &chain.namespace,
+                    &chain.kind,
+                    &chain.owner,
+                    &chain.run,
+                    &chain.activity,
+                ],
+            )
+            .await?;
+        Ok(rows.iter().map(|row| row.get(0)).collect())
     }
 
     async fn written_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
