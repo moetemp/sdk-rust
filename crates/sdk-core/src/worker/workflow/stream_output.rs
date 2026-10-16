@@ -20,6 +20,10 @@ pub(crate) struct OutputBatch {
     pub(crate) first_run_id: String,
     /// The run's producer attempt for the current Workflow Task, from History.
     pub(crate) attempt: i64,
+    /// The current task's WorkflowTaskStarted event id.
+    pub(crate) task_started: i64,
+    /// The last completed tasks' WorkflowTaskStarted event ids, newest first, from History.
+    pub(crate) completed_tasks: Vec<i64>,
     /// One append per topic, in order of first publish.
     pub(crate) topics: Vec<TopicOutput>,
 }
@@ -181,7 +185,14 @@ impl OutputStore {
                         sequence,
                         &append,
                     )
-                    .map(|stored| stored.encode_to_vec())
+                    .map(|mut stored| {
+                        // The attempt names both, so a repeat of the batch stores the same.
+                        stored.task_started_event_id = batch.task_started;
+                        if sequence == topic.sequence {
+                            stored.completed_tasks = batch.completed_tasks.clone();
+                        }
+                        stored.encode_to_vec()
+                    })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let request = StoreAppendRequest {
