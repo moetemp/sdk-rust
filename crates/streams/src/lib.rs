@@ -20,6 +20,8 @@ mod memory;
 mod notify;
 mod notifylog;
 mod owner;
+#[cfg(feature = "postgres")]
+mod postgres;
 mod reader;
 mod record;
 #[cfg(feature = "redis")]
@@ -29,6 +31,8 @@ mod store;
 mod subscribe;
 mod tiered;
 
+#[cfg(feature = "postgres")]
+pub use self::postgres::{DEFAULT_POSTGRES_DOORBELLS, PostgresStore, PostgresStoreOptions};
 #[cfg(feature = "redis")]
 pub use self::redis::{DEFAULT_NOTIFY_DOORBELLS, RedisStore, RedisStoreOptions};
 #[cfg(feature = "archive")]
