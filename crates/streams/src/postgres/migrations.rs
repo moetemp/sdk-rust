@@ -44,6 +44,12 @@ pub(super) const MIGRATIONS: &[Migration] = &[
         sql: include_str!("migrations/0004_review_fixes.sql"),
         compatible_from: 1,
     },
+    Migration {
+        version: 5,
+        name: "archive_trim",
+        sql: include_str!("migrations/0005_archive_trim.sql"),
+        compatible_from: 1,
+    },
 ];
 
 /// The first key of every advisory lock the store takes.
