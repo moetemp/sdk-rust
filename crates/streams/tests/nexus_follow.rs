@@ -323,7 +323,12 @@ async fn an_idle_root_with_an_open_tool_waits_for_the_tools_record_in_the_call()
         chain_first_run_id: "run-1".to_string(),
     }
     .encode();
-    let input = json!({"stream": stream(&id, TOPIC), "state": first["state"], "wake_token": token});
+    let input = json!({
+        "stream": stream(&id, TOPIC),
+        "state": first["state"],
+        "wake_token": token,
+        "wait_ms": 5000,
+    });
     let late = async {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         write(store.clone(), tool(&id), "t", &["t1"]).await;
@@ -338,4 +343,75 @@ async fn an_idle_root_with_an_open_tool_waits_for_the_tools_record_in_the_call()
     let (answer, ()) = tokio::join!(followed, late);
     assert_eq!(shape(&answer), ["1:t1"]);
     assert!(started.elapsed() < std::time::Duration::from_secs(3));
+}
+
+/// The caller's operation, as the server takes its waits.
+#[derive(Default)]
+struct Waits(std::sync::Mutex<Vec<i64>>);
+
+#[async_trait::async_trait]
+impl temporalio_streams::NotifierClient for Waits {
+    async fn notify(
+        &self,
+        _: temporalio_streams::StreamNotification,
+    ) -> Result<(), temporalio_streams::NotifyError> {
+        Ok(())
+    }
+
+    async fn wait_callback(
+        &self,
+        _: temporalio_streams::proto::ChainId,
+        _: String,
+        _: String,
+        after_counter: i64,
+    ) -> Result<(), temporalio_streams::NotifyError> {
+        self.0.lock().unwrap().push(after_counter);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_linked_follow_that_finds_nothing_still_waits_on_the_root() {
+    let store = memory();
+    let id = agent();
+    link(store.clone(), &id, 1, open_tool(&id, "")).await;
+    let waits = Arc::new(Waits::default());
+    let calls = service(store.clone(), NexusOptions::default()).with_callers(waits.clone());
+    let (first, _) = follow_once(&calls, json!({"stream": stream(&id, TOPIC)})).await;
+    let token = temporalio_streams::nexus::OperationToken {
+        stream: StreamAddress {
+            namespace: NAMESPACE.to_string(),
+            owner_kind: StreamOwnerKind::Workflow as i32,
+            workflow_id: id.clone(),
+            topic: TOPIC.to_string(),
+            ..Default::default()
+        },
+        attach_request_id: "attach-1".to_string(),
+        chain_first_run_id: "run-1".to_string(),
+    }
+    .encode();
+    for wait_ms in [0, 100] {
+        let input = json!({
+            "stream": stream(&id, TOPIC),
+            "state": first["state"],
+            "wake_token": token,
+            "wait_ms": wait_ms,
+        });
+        let started = std::time::Instant::now();
+        let step = calls
+            .follow(call_with(input, 0, 0, std::time::Duration::from_secs(8)))
+            .await;
+        let answer = drive(&calls, step, Codec::Sealing).await.unwrap();
+        assert!(answer["records"].as_array().unwrap().is_empty());
+        // The call waits no longer than the caller asked, not half its deadline.
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{wait_ms}"
+        );
+    }
+    assert_eq!(
+        waits.0.lock().unwrap().len(),
+        2,
+        "one root wait per empty answer"
+    );
 }

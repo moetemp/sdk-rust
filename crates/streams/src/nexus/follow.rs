@@ -126,8 +126,15 @@ impl NexusCalls {
             let again = if linked {
                 // The caller's operation hears only the root's notifier, and an agent's root is
                 // often idle while a tool it links is busy. So the call waits on every open
-                // stream itself, for up to half its deadline.
-                self.follow_longer(request, deadline, limits).await
+                // stream itself, for up to half its deadline. When nothing came, the root's
+                // wait still goes out, so a later root record wakes the caller.
+                match self
+                    .follow_longer(request.clone(), deadline, wait, limits)
+                    .await
+                {
+                    Ok(None) => self.wake_on_root(token, &root, request).await,
+                    other => other,
+                }
             } else {
                 self.wake_on_root(token, &root, request).await
             };
@@ -209,22 +216,22 @@ impl NexusCalls {
         crate::follow::follow(&self.streams, &subscriptions, request).await
     }
 
-    /// Follows once more, waiting on every open stream for up to half of what is left of the
-    /// deadline, or the longest wait a call takes when there is none. Answers that follow when it
-    /// found something.
+    /// Follows once more, waiting on every open stream for up to `asked`, the caller's wait, and
+    /// at most half of what is left of the deadline. Answers that follow when it found something.
     async fn follow_longer(
         &self,
         mut request: FollowRequest,
         deadline: Option<SystemTime>,
+        asked: Duration,
         limits: Limits,
     ) -> Result<Option<FollowResponse>, StreamError> {
-        let left = deadline.map_or(Duration::from_millis(MAX_WAIT_MS as u64), |deadline| {
+        let left = deadline.map_or(asked, |deadline| {
             deadline
                 .duration_since(SystemTime::now())
                 .unwrap_or_default()
                 / 2
         });
-        let wait = left.min(Duration::from_millis(MAX_WAIT_MS as u64));
+        let wait = left.min(asked);
         if wait.is_zero() {
             return Ok(None);
         }
@@ -246,7 +253,7 @@ impl NexusCalls {
         })?;
         let chain = crate::handle::chain_of(root, &token.chain_first_run_id);
         let (counter, _) = self.streams.newest(root, &chain).await?;
-        client
+        match client
             .wait_callback(
                 chain,
                 root.topic.clone(),
@@ -254,7 +261,20 @@ impl NexusCalls {
                 counter,
             )
             .await
-            .map_err(operation::caller_error)?;
+        {
+            Ok(()) => {}
+            // The empty answer stands, and the caller follows again on its own.
+            Err(crate::NotifyError::Refused(error) | crate::NotifyError::Unsupported(error)) => {
+                tracing::warn!(
+                    workflow_id = %root.workflow_id,
+                    topic = %root.topic,
+                    error,
+                    "The notifier took no wait for a caught-up Nexus follower"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(operation::caller_error(error)),
+        }
         request.wait = None;
         let again =
             crate::follow::follow(&self.streams, &Subscriptions::default(), request).await?;
