@@ -19,12 +19,30 @@ use std::collections::HashMap;
 /// bits name the last task that completed before it.
 const WORKFLOW_RETRY_BITS: u32 = 16;
 
-/// Whether a producer's `attempt` withdraws what its `previous` attempt wrote. A Workflow
-/// producer (`@<run id>`) moves to a higher attempt with each completed task, and only a rerun
-/// of the same task withdraws. Any other producer's higher attempt is a retry.
-fn supersedes(producer_id: &str, previous: i64, attempt: i64) -> bool {
-    !producer_id.starts_with('@')
-        || previous >> WORKFLOW_RETRY_BITS == attempt >> WORKFLOW_RETRY_BITS
+/// Whether `record` withdraws what its producer's `previous` attempt wrote. `started` is the
+/// WorkflowTaskStarted event id that `previous` carried.
+///
+/// Any producer's higher attempt is a retry, except a Workflow producer's (`@<run id>`). It moves
+/// to a higher attempt with each completed task, so a later task withdraws nothing by itself. A
+/// rerun of the same task withdraws. So does a later task whose list of completed tasks shows
+/// that another attempt completed `previous`'s task, which happens when the rerun wrote nothing
+/// to the topic. When the list doesn't reach back to that task, nothing is withdrawn.
+fn supersedes(previous: i64, started: i64, record: &StreamRecord) -> bool {
+    if !record.producer_id.starts_with('@') {
+        return true;
+    }
+    let prefix = previous >> WORKFLOW_RETRY_BITS;
+    if prefix == record.attempt >> WORKFLOW_RETRY_BITS {
+        return true;
+    }
+    let completed = &record.completed_tasks;
+    // The task completed after `prefix` is the one just before it in the newest-first list.
+    started > 0
+        && !completed.contains(&started)
+        && completed
+            .iter()
+            .position(|&id| id == prefix)
+            .is_some_and(|at| at > 0)
 }
 
 /// How many producers a read remembers the newest attempt of.
@@ -94,6 +112,10 @@ struct Tracked {
     /// seen one is forgotten first.
     #[prost(uint64, tag = "2")]
     seen: u64,
+    /// The WorkflowTaskStarted event id the newest attempt's records carried, for a Workflow
+    /// producer.
+    #[prost(int64, tag = "3")]
+    started: i64,
 }
 
 /// What one record tells the read about its producer's attempts.
@@ -185,9 +207,11 @@ impl ReadState {
         if record.attempt == seen {
             return Observed::Known;
         }
+        let started = tracked.started;
         tracked.attempt = record.attempt;
+        tracked.started = record.task_started_event_id;
         self.forget_beyond(MAX_TRACKED_PRODUCERS);
-        let superseded = seen > 0 && supersedes(&record.producer_id, seen, record.attempt);
+        let superseded = seen > 0 && supersedes(seen, started, record);
         Observed::Newer(superseded.then(|| Supersession {
             topic: record.topic.clone(),
             producer_id: record.producer_id.clone(),
@@ -202,11 +226,11 @@ impl ReadState {
 /// The read turns stored records into what lang delivers. A producer's newer attempt gets a
 /// `SUPERSEDED` record before it, at the cursor of the record delivered before it, so a read that
 /// resumes there reports the supersession again. A Workflow producer's attempt for a later task
-/// gets none, since only a rerun of the same task withdraws records. A record from an attempt below the newest the
-/// read delivered is still delivered, marked `stale`. The attempts seen ride in `state`, so this
-/// holds across calls. A read that starts from a cursor without state looks up the record at the
-/// cursor first, since that record was delivered before. Only that record's producer is known
-/// then, and another producer's earlier attempts are not. A read remembers at most
+/// gets one only when the earlier attempt's task never completed. A record from an attempt below
+/// the newest the read delivered is still delivered, marked `stale`. The attempts seen ride in
+/// `state`, so this holds across calls. A read that starts from a cursor without state looks up
+/// the record at the cursor first, since that record was delivered before. Only that record's
+/// producer is known then, and another producer's earlier attempts are not. A read remembers at most
 /// [MAX_TRACKED_PRODUCERS] producers in at most [MAX_STATE_BYTES], and the next attempt of one it
 /// forgot reads without `SUPERSEDED`.
 ///
@@ -667,6 +691,43 @@ mod tests {
                 .contains_key(&local_call(MAX_TRACKED_PRODUCERS - 1))
         );
         assert!(!kept.producers.contains_key(&local_call(0)));
+    }
+
+    /// The vectors every SDK checks its attempt bits and supersession rule against.
+    fn vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!("../testdata/workflow_attempts.json")).unwrap()
+    }
+
+    #[test]
+    fn a_workflow_producer_withdraws_an_attempt_whose_task_never_completed() {
+        let vectors = vectors();
+        assert_eq!(vectors["retry_bits"], WORKFLOW_RETRY_BITS);
+        let written = |written: &serde_json::Value| StreamRecord {
+            task_started_event_id: written["task_started_event_id"].as_i64().unwrap(),
+            completed_tasks: written["completed_tasks"]
+                .as_array()
+                .map(|ids| ids.iter().map(|id| id.as_i64().unwrap()).collect())
+                .unwrap_or_default(),
+            ..data_record("@run", written["attempt"].as_i64().unwrap(), b"")
+        };
+        for case in vectors["supersession"].as_array().unwrap() {
+            let mut state = ReadState::default();
+            state.observe(&written(&case["previous"]));
+            let observed = state.observe(&written(&case["next"]));
+            assert_eq!(
+                matches!(observed, Observed::Newer(Some(_))),
+                case["superseded"].as_bool().unwrap(),
+                "{}",
+                case["label"]
+            );
+        }
+        for case in vectors["attempts"].as_array().unwrap() {
+            let attempt = case["attempt"].as_i64().unwrap();
+            assert_eq!(
+                attempt >> WORKFLOW_RETRY_BITS,
+                case["prefix"].as_i64().unwrap()
+            );
+        }
     }
 
     #[test]
