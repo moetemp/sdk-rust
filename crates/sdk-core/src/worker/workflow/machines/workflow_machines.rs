@@ -102,6 +102,16 @@ fn workflow_task_reruns_in(event: &HistoryEvent) -> i64 {
 /// The bits of a Workflow producer's attempt that hold the reruns since the last completed task.
 const STREAM_RETRY_BITS: u32 = 16;
 
+/// How many completed tasks a Workflow producer's records name. A reader learns from them whether
+/// an earlier attempt it delivered completed, as long as fewer tasks completed since.
+const STREAM_COMPLETED_TASKS: usize = 8;
+
+/// A Workflow producer's attempt: the prefix in the high bits, then 1 plus the reruns since it.
+fn stream_attempt(prefix: i64, reruns: i64) -> i64 {
+    let retry = (1 + reruns).min((1 << STREAM_RETRY_BITS) - 1);
+    (prefix << STREAM_RETRY_BITS) | retry
+}
+
 slotmap::new_key_type! { struct MachineKey; }
 /// Handles all the logic for driving a workflow. It orchestrates many state machines that together
 /// comprise the logic of an executing workflow. One instance will exist per currently executing
@@ -133,6 +143,10 @@ pub(crate) struct WorkflowMachines {
     stream_reruns: i64,
     /// The id of the last WorkflowTaskStarted event applied.
     stream_last_started: i64,
+    /// The WorkflowTaskStarted event ids of the last completed tasks, newest first.
+    stream_completed: std::collections::VecDeque<i64>,
+    /// How many tasks completed in all.
+    stream_completed_count: usize,
     /// The event id of the next workflow task started event that the machines need to process.
     /// Eventually, this number should reach the started id in the latest history update, but
     /// we must incrementally apply the history while communicating with lang.
@@ -332,6 +346,8 @@ impl WorkflowMachines {
             stream_prefix: 0,
             stream_reruns: 0,
             stream_last_started: 0,
+            stream_completed: Default::default(),
+            stream_completed_count: 0,
             next_started_event_id: 0,
             last_processed_event: 0,
             workflow_start_time: None,
@@ -466,8 +482,22 @@ impl WorkflowMachines {
     /// completed task's WorkflowTaskStarted event id in the high bits, then 1 plus the reruns
     /// since it. History alone gives it, so a Worker restart or a cache miss gets the same one.
     pub(crate) fn stream_producer_attempt(&self) -> i64 {
-        let retry = (1 + self.stream_reruns).min((1 << STREAM_RETRY_BITS) - 1);
-        (self.stream_prefix << STREAM_RETRY_BITS) | retry
+        stream_attempt(self.stream_prefix, self.stream_reruns)
+    }
+
+    /// The WorkflowTaskStarted event id of the current task.
+    pub(crate) fn stream_task_started(&self) -> i64 {
+        self.stream_last_started
+    }
+
+    /// The WorkflowTaskStarted event ids of the last completed tasks, newest first, with a
+    /// trailing zero when they go back to the run's start.
+    pub(crate) fn stream_completed_tasks(&self) -> Vec<i64> {
+        let mut ids: Vec<i64> = self.stream_completed.iter().copied().collect();
+        if self.stream_completed_count < STREAM_COMPLETED_TASKS {
+            ids.push(0);
+        }
+        ids
     }
 
     pub(crate) fn prepare_for_wft_response(&mut self) -> MachinesWFTResponseContent<'_> {
@@ -815,6 +845,9 @@ impl WorkflowMachines {
                 EventType::WorkflowTaskCompleted => {
                     self.stream_prefix = self.stream_last_started;
                     self.stream_reruns = 0;
+                    self.stream_completed.push_front(self.stream_last_started);
+                    self.stream_completed.truncate(STREAM_COMPLETED_TASKS);
+                    self.stream_completed_count += 1;
                 }
                 _ => self.stream_reruns += workflow_task_reruns_in(&event),
             }
@@ -2165,5 +2198,30 @@ mod stream_wake_tests {
                 ..wake("a", 7, "later")
             }]
         );
+    }
+}
+
+#[cfg(test)]
+mod stream_attempt_tests {
+    use super::*;
+
+    #[test]
+    fn the_attempt_bits_match_the_shared_vectors() {
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../../streams/testdata/workflow_attempts.json"
+        ))
+        .unwrap();
+        assert_eq!(vectors["retry_bits"], STREAM_RETRY_BITS);
+        for case in vectors["attempts"].as_array().unwrap() {
+            let (prefix, reruns) = (
+                case["prefix"].as_i64().unwrap(),
+                case["reruns"].as_i64().unwrap(),
+            );
+            assert_eq!(
+                stream_attempt(prefix, reruns),
+                case["attempt"].as_i64().unwrap(),
+                "{case}"
+            );
+        }
     }
 }

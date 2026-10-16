@@ -360,6 +360,7 @@ impl NexusCalls {
             state: state.clone(),
             arm: input.arm.unwrap_or(false),
             floor_holder: floor_holder.clone(),
+            max_bytes: 0,
         };
         let positions = !floor_holder.is_empty();
         let mut read = match self.streams.read_carried(request).await {

@@ -3,8 +3,9 @@
 //! The append script is the one the SDKs sent, with one more check, the topic's close flag, so a
 //! batch can't land after the topic's close returned (DD-16). It also reports the topic's arm, so
 //! a producer notifies only while a reader sleeps (DD-118), and its trim keeps what positions-only
-//! readers hold. `keep.lua` is the prelude of every script that writes a log, and `floor.lua` of
-//! every script that reads or writes the holds.
+//! readers hold. Redis doesn't roll a script back, so it runs every step that can fail before its
+//! first record lands. `keep.lua` is the prelude of every script that writes a log, and
+//! `floor.lua` of every script that reads or writes the holds.
 
 use redis::Script;
 use std::sync::LazyLock;
@@ -47,14 +48,26 @@ mod tests {
     const APPEND_ARM: &str = ", redis.call('HGET', KEYS[2], 'arm') or '0'";
 
     /// What the floor adds to the append script, each with what it replaces.
-    const FLOOR_EDITS: [(&str, &str); 5] = [
+    const FLOOR_EDITS: [(&str, &str); 8] = [
         (
-            "local function keep(log, meta, added, last, retention, grace, floors)",
-            "local function keep(log, meta, added, last, retention, grace)",
+            "local function trim(log, meta, retention, floors)",
+            "local function trim(log, meta, retention)",
         ),
         (
-            "  local life\n  floor, life = held(floors, floor, retention)\n",
+            "  local life
+  floor, life = held(floors, floor, retention)
+",
             "",
+        ),
+        (
+            "  return floor_ms, life
+",
+            "  return floor_ms
+",
+        ),
+        (
+            "local function keep(log, meta, added, last, grace, floor_ms, life)",
+            "local function keep(log, meta, added, last, retention, grace, floor_ms)",
         ),
         (
             "redis.call('PEXPIRE', log, life)",
@@ -65,16 +78,20 @@ mod tests {
             "redis.call('PEXPIRE', meta, retention + grace)",
         ),
         (
-            "keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace, KEYS[4])",
-            "keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace)",
+            "local floor_ms, life = trim(KEYS[1], KEYS[2], retention, KEYS[4])",
+            "local floor_ms = trim(KEYS[1], KEYS[2], retention)",
+        ),
+        (
+            "keep(KEYS[1], KEYS[2], #ARGV - 5, last, grace, floor_ms, life)",
+            "keep(KEYS[1], KEYS[2], #ARGV - 5, last, retention, grace, floor_ms)",
         ),
     ];
 
     #[test]
-    fn the_append_script_matches_the_sdks_with_the_topic_check_the_arm_and_the_floor_only() {
+    fn the_append_script_is_the_one_before_the_floor_with_the_floor_edits_only() {
         assert_eq!(
             APPEND_SCRIPT.get_hash(),
-            "57d10e1ab0e8c139a18014504b4058dd1179ab1f"
+            "b0071d190d50d0588c58126f12455c89b9165a5d"
         );
         let mut before_floor = APPEND
             .strip_prefix(include_str!("../../lua/floor.lua"))
@@ -86,16 +103,9 @@ mod tests {
         }
         assert_eq!(
             Script::new(&before_floor).get_hash(),
-            "8545a1ddb455599193a343d231501deecf170914"
+            "0eca2d1cf90ab743ca84471387b1494768599832"
         );
         assert_eq!(before_floor.matches(TOPIC_CHECK).count(), 1);
         assert_eq!(before_floor.matches(APPEND_ARM).count(), 2);
-        let sdk_script = before_floor
-            .replacen(TOPIC_CHECK, "", 1)
-            .replace(APPEND_ARM, "");
-        assert_eq!(
-            Script::new(&sdk_script).get_hash(),
-            "7944489663d477b49e3f4f947933e15de3269718"
-        );
     }
 }

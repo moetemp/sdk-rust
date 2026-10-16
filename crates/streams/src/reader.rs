@@ -20,12 +20,30 @@ use std::collections::HashMap;
 /// bits name the last task that completed before it.
 const WORKFLOW_RETRY_BITS: u32 = 16;
 
-/// Whether a producer's `attempt` withdraws what its `previous` attempt wrote. A Workflow
-/// producer (`@<run id>`) moves to a higher attempt with each completed task, and only a rerun
-/// of the same task withdraws. Any other producer's higher attempt is a retry.
-fn supersedes(producer_id: &str, previous: i64, attempt: i64) -> bool {
-    !producer_id.starts_with('@')
-        || previous >> WORKFLOW_RETRY_BITS == attempt >> WORKFLOW_RETRY_BITS
+/// Whether `record` withdraws what its producer's `previous` attempt wrote. `started` is the
+/// WorkflowTaskStarted event id that `previous` carried.
+///
+/// Any producer's higher attempt is a retry, except a Workflow producer's (`@<run id>`). It moves
+/// to a higher attempt with each completed task, so a later task withdraws nothing by itself. A
+/// rerun of the same task withdraws. So does a later task whose list of completed tasks shows
+/// that another attempt completed `previous`'s task, which happens when the rerun wrote nothing
+/// to the topic. When the list doesn't reach back to that task, nothing is withdrawn.
+fn supersedes(previous: i64, started: i64, record: &StreamRecord) -> bool {
+    if !record.producer_id.starts_with('@') {
+        return true;
+    }
+    let prefix = previous >> WORKFLOW_RETRY_BITS;
+    if prefix == record.attempt >> WORKFLOW_RETRY_BITS {
+        return true;
+    }
+    let completed = &record.completed_tasks;
+    // The task completed after `prefix` is the one just before it in the newest-first list.
+    started > 0
+        && !completed.contains(&started)
+        && completed
+            .iter()
+            .position(|&id| id == prefix)
+            .is_some_and(|at| at > 0)
 }
 
 /// How many producers a read remembers the newest attempt of.
@@ -95,6 +113,10 @@ struct Tracked {
     /// seen one is forgotten first.
     #[prost(uint64, tag = "2")]
     seen: u64,
+    /// The WorkflowTaskStarted event id the newest attempt's records carried, for a Workflow
+    /// producer.
+    #[prost(int64, tag = "3")]
+    started: i64,
 }
 
 /// The producer attempts a read knows at one point of a page, so an answer cut short can hand back
@@ -250,9 +272,11 @@ impl ReadState {
         if record.attempt == seen {
             return Observed::Known;
         }
+        let started = tracked.started;
         tracked.attempt = record.attempt;
+        tracked.started = record.task_started_event_id;
         self.forget_beyond(MAX_TRACKED_PRODUCERS);
-        let superseded = seen > 0 && supersedes(&record.producer_id, seen, record.attempt);
+        let superseded = seen > 0 && supersedes(seen, started, record);
         Observed::Newer(superseded.then(|| Supersession {
             topic: record.topic.clone(),
             producer_id: record.producer_id.clone(),
@@ -267,13 +291,13 @@ impl ReadState {
 /// The read turns stored records into what lang delivers. A producer's newer attempt gets a
 /// `SUPERSEDED` record before it, at the cursor of the record delivered before it, so a read that
 /// resumes there reports the supersession again. A Workflow producer's attempt for a later task
-/// gets none, since only a rerun of the same task withdraws records. A record from an attempt below the newest the
-/// read delivered is still delivered, marked `stale`. The attempts seen ride in `state`, so this
-/// holds across calls. A read that starts from a cursor without state looks up the record at the
-/// cursor first, since that record was delivered before. Only that record's producer is known
-/// then, and another producer's earlier attempts are not. A read remembers at most
-/// [MAX_TRACKED_PRODUCERS] producers in at most [MAX_STATE_BYTES], and the next attempt of one it
-/// forgot reads without `SUPERSEDED`.
+/// gets one only when the earlier attempt's task never completed. A record from an attempt below
+/// the newest the read delivered is still delivered, marked `stale`. The attempts seen ride in
+/// `state`, so this holds across calls. A read that starts from a cursor without state looks up
+/// the record at the cursor first, since that record was delivered before. Only that record's
+/// producer is known then, and another producer's earlier attempts are not. A read remembers at
+/// most [MAX_TRACKED_PRODUCERS] producers in at most [MAX_STATE_BYTES], and the next attempt of one
+/// it forgot reads without `SUPERSEDED`.
 ///
 /// A record that does not parse fails the call as `RECORD` with its cursor, so the caller resumes
 /// past it on purpose. Skipping it would lose data no one hears of. The records before it in the
@@ -358,11 +382,21 @@ pub(crate) async fn read_with(
             arm: request.arm,
         })
         .await?;
-    let (closed, armed, close) = (page.closed, page.armed, page.close);
+    let (mut closed, armed, mut close) = (page.closed, page.armed, page.close);
     let before = state.attempts();
     let mut records = Vec::with_capacity(page.records.len());
     let mut previous = start.clone();
+    let max_bytes = usize::try_from(request.max_bytes).unwrap_or(usize::MAX);
+    let (mut bytes, mut kept) = (0usize, 0usize);
     for stored in page.records {
+        // The first record always goes, so a record above the budget still reads.
+        if max_bytes > 0 && kept > 0 && bytes + stored.record.len() > max_bytes {
+            // The records left come first, so the close waits for the next answer.
+            (closed, close) = (false, None);
+            break;
+        }
+        bytes += stored.record.len();
+        kept += 1;
         let cursor = mint_cursor(store.name(), &target.stream_hash, &stored.position);
         let record = match parse(&stored.record) {
             Ok(record) => record,
@@ -792,6 +826,43 @@ mod tests {
         assert!(!kept.producers.contains_key(&local_call(0)));
     }
 
+    /// The vectors every SDK checks its attempt bits and supersession rule against.
+    fn vectors() -> serde_json::Value {
+        serde_json::from_str(include_str!("../testdata/workflow_attempts.json")).unwrap()
+    }
+
+    #[test]
+    fn a_workflow_producer_withdraws_an_attempt_whose_task_never_completed() {
+        let vectors = vectors();
+        assert_eq!(vectors["retry_bits"], WORKFLOW_RETRY_BITS);
+        let written = |written: &serde_json::Value| StreamRecord {
+            task_started_event_id: written["task_started_event_id"].as_i64().unwrap(),
+            completed_tasks: written["completed_tasks"]
+                .as_array()
+                .map(|ids| ids.iter().map(|id| id.as_i64().unwrap()).collect())
+                .unwrap_or_default(),
+            ..data_record("@run", written["attempt"].as_i64().unwrap(), b"")
+        };
+        for case in vectors["supersession"].as_array().unwrap() {
+            let mut state = ReadState::default();
+            state.observe(&written(&case["previous"]));
+            let observed = state.observe(&written(&case["next"]));
+            assert_eq!(
+                matches!(observed, Observed::Newer(Some(_))),
+                case["superseded"].as_bool().unwrap(),
+                "{}",
+                case["label"]
+            );
+        }
+        for case in vectors["attempts"].as_array().unwrap() {
+            let attempt = case["attempt"].as_i64().unwrap();
+            assert_eq!(
+                attempt >> WORKFLOW_RETRY_BITS,
+                case["prefix"].as_i64().unwrap()
+            );
+        }
+    }
+
     #[test]
     fn a_state_with_more_producers_than_a_read_remembers_is_refused() {
         let mut state = ReadState::default();
@@ -1069,6 +1140,35 @@ mod tests {
         }
         let read = read(&log, BEGINNING, &[]).await.unwrap();
         assert_eq!(read.records.len(), DEFAULT_MAX_RECORDS as usize);
+    }
+
+    #[tokio::test]
+    async fn an_answer_holds_at_most_max_bytes_past_its_first_record() {
+        let log = Log::default();
+        for data in [b"a".as_slice(), b"b", b"c"] {
+            log.write("p", 1, data);
+        }
+        let size = log.entries.lock().unwrap()[0].len() as u64;
+        let mut after = BEGINNING.to_string();
+        let mut sizes = Vec::new();
+        for max_bytes in [2 * size, 1] {
+            let page = read_page(
+                &log,
+                &target(),
+                &ReadRequest {
+                    after: after.clone(),
+                    max_bytes,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            sizes.push(page.records.len());
+            after = page.cursor;
+        }
+        // A budget below one record still reads that record.
+        assert_eq!(sizes, [2, 1]);
+        assert_eq!(after, cursor("3"));
     }
 
     #[tokio::test]
