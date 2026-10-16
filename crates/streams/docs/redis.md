@@ -79,7 +79,11 @@ attempt's field only and readers find a newer attempt from the records.
 
 **Retention.** Every script that writes a log trims it with `XTRIM MINID` to the retention and
 slides the expiry of the log and its meta, so a stream dies a retention after its last write
-and nobody cleans up when the Workflow closes. The meta outlives its log by a 30-day grace, as
+and nobody cleans up when the Workflow closes. The trim finds the newest record it drops with
+`XRANGE` forward from the oldest, 1,000 at a time, so it reads only what it drops. The SDKs'
+script used `XREVRANGE` back from the floor, which read the whole retained log when no record was
+older than the floor, so an append cost more the longer the log was. The `+xrange` rule already
+covers the new call. The meta outlives its log by a 30-day grace, as
 the tombstone that tells a log that expired from one that never existed.
 
 **Activity owners.** A standalone Activity run is a chain of one run. Its keys have the hash tag
