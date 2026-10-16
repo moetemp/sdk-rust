@@ -2188,3 +2188,340 @@ async fn an_append_costs_the_same_however_long_the_retained_log_is() {
         "{on_long:?} on the long log, {on_short:?} on the short one"
     );
 }
+#[tokio::test]
+async fn a_retention_past_the_epoch_is_refused_at_connect() {
+    // The check runs before any connection, so no server is needed.
+    let mut options = RedisStoreOptions::new("redis://127.0.0.1:1");
+    options.retention = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+    let error = RedisStore::connect(options).await.unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Refused);
+    assert!(error.message.contains("retention"), "{error}");
+}
+
+#[tokio::test]
+async fn a_position_past_the_head_is_one_the_topic_never_held() {
+    let Some(setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    let landed = setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let (ms, _) = landed.last_position.split_once('-').unwrap();
+    let past = format!("{}-0", ms.parse::<u64>().unwrap() + 1000);
+    let error = setup
+        .store
+        .read(read_after(&chain, &past, 10))
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Cursor, "{error}");
+    assert!(error.message.contains("never held"), "{error}");
+}
+
+#[tokio::test]
+async fn the_read_checks_run_by_hash_and_survive_a_script_flush() {
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let evalsha_calls = async |raw: &mut redis::aio::MultiplexedConnection| {
+        let info: String = redis::cmd("INFO")
+            .arg("commandstats")
+            .query_async(raw)
+            .await
+            .unwrap();
+        info.lines()
+            .find_map(|line| line.strip_prefix("cmdstat_evalsha:calls="))
+            .and_then(|rest| rest.split(',').next())
+            .map_or(0, |calls| calls.parse::<u64>().unwrap())
+    };
+    let _: () = redis::cmd("SCRIPT")
+        .arg("FLUSH")
+        .query_async(&mut setup.raw)
+        .await
+        .unwrap();
+    let read = setup.store.read(read_after(&chain, "", 10)).await.unwrap();
+    assert_eq!(read.records.len(), 1);
+    let before = evalsha_calls(&mut setup.raw).await;
+    let read = setup.store.read(read_after(&chain, "", 10)).await.unwrap();
+    assert_eq!(read.records.len(), 1);
+    assert!(evalsha_calls(&mut setup.raw).await > before);
+}
+
+#[tokio::test]
+async fn a_hold_at_zero_neither_fails_the_append_nor_leaves_a_half_written_batch() {
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .hold_floor(&chain, "events", "reader-run/1", "0-0")
+        .await
+        .unwrap();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let log = log_key(&setup.prefix, &chain, "events");
+    let length: usize = setup.raw.xlen(&log).await.unwrap();
+    assert_eq!(length, 1);
+    let ttl: i64 = setup.raw.pttl(&log).await.unwrap();
+    assert!(ttl > 0, "{ttl}");
+}
+
+#[tokio::test]
+async fn a_topic_refuses_a_floor_holder_past_the_cap() {
+    let Some(setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    for holder in 0..temporalio_streams::MAX_FLOOR_HOLDERS {
+        setup
+            .store
+            .hold_floor(&chain, "events", &format!("reader-run/{holder}"), "")
+            .await
+            .unwrap();
+    }
+    let error = setup
+        .store
+        .hold_floor(&chain, "events", "one-more/1", "")
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Refused, "{error}");
+    // A holder already on the topic renews its hold.
+    setup
+        .store
+        .hold_floor(&chain, "events", "reader-run/0", "")
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_replay_whose_end_record_the_store_lost_is_rec_01() {
+    use sha2::{Digest, Sha256};
+    use temporalio_common::protos::temporal::api::{
+        common::v1::Payload, enums::v1::WorkflowExecutionStatus,
+    };
+    use temporalio_streams::{
+        Streams, StreamsOptions,
+        proto::{
+            AppendRecord, AppendRequest, NamedProducer, ReadRangeRequest, ReadRequest,
+            StreamAddress, StreamOwnerKind, StreamRecordKind, append_request::Producer,
+        },
+    };
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let prefix = setup.prefix.clone();
+    let streams = Streams::new(
+        Arc::new(setup.store),
+        Arc::new(OneOwner {
+            status: std::sync::Mutex::new(WorkflowExecutionStatus::Running),
+        }),
+        StreamsOptions::default(),
+    );
+    let chain = chain();
+    let stream = StreamAddress {
+        namespace: chain.namespace.clone(),
+        owner_kind: StreamOwnerKind::Workflow as i32,
+        workflow_id: chain.workflow_id.clone(),
+        run_id: String::new(),
+        topic: "events".to_string(),
+        ..Default::default()
+    };
+    let append = |sequence: i64| AppendRequest {
+        stream: Some(stream.clone()),
+        producer: Some(Producer::Named(NamedProducer {
+            producer_id: "p".to_string(),
+            attempt: 1,
+        })),
+        sequence,
+        records: vec![AppendRecord {
+            kind: StreamRecordKind::Data as i32,
+            body: Some(Payload {
+                data: sequence.to_be_bytes().to_vec(),
+                ..Default::default()
+            }),
+            content_hash: Sha256::digest(sequence.to_be_bytes()).to_vec(),
+            link: None,
+        }],
+        digest: Sha256::digest(sequence.to_be_bytes()).to_vec(),
+    };
+    streams.append(append(1)).await.unwrap();
+    streams.append(append(2)).await.unwrap();
+    let request = ReadRequest {
+        stream: Some(stream.clone()),
+        ..Default::default()
+    };
+    let page = streams.read(request.clone()).await.unwrap();
+    assert_eq!(page.records.len(), 2);
+    // A failover of a store that replicates late loses the acked tail, and later appends land
+    // at new ids.
+    let log = log_key(&prefix, &chain, "events");
+    let ids: Vec<(String, HashMap<String, redis::Value>)> =
+        setup.raw.xrange_all(&log).await.unwrap();
+    for (id, _) in ids {
+        let _: i64 = setup.raw.xdel(&log, &[id]).await.unwrap();
+    }
+    streams.append(append(3)).await.unwrap();
+    streams.append(append(4)).await.unwrap();
+    let error = streams
+        .read_range(ReadRangeRequest {
+            stream: Some(stream.clone()),
+            chain_first_run_id: page.chain_first_run_id.clone(),
+            after: page.start_cursor.clone(),
+            to: page.cursor.clone(),
+            stored_records: 2,
+            state: request.state.clone(),
+            records_digest: page.records_digest.clone(),
+            floor_holder: String::new(),
+            start_from_end: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::ReplayRangeLost, "{error}");
+}
+
+#[tokio::test]
+async fn two_archive_advances_out_of_order_keep_the_higher() {
+    let Some(mut setup) = archiving(Duration::from_secs(60), Duration::from_secs(60)).await else {
+        return;
+    };
+    let chain = chain();
+    let lower = setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let higher = setup
+        .store
+        .append(append(&chain, "p", 2, 1, b"\x02"))
+        .await
+        .unwrap();
+    setup
+        .store
+        .advance_archive(&chain, "events", &higher.last_position)
+        .await
+        .unwrap();
+    setup
+        .store
+        .advance_archive(&chain, "events", &lower.last_position)
+        .await
+        .unwrap();
+    assert_eq!(
+        setup.store.archived(&chain, "events").await.unwrap(),
+        Some(higher.last_position.clone())
+    );
+    let log = log_key(&setup.prefix, &chain, "events");
+    let hold: String = setup
+        .raw
+        .hget(format!("{log}:floors"), temporalio_streams::ARCHIVE_HOLDER)
+        .await
+        .unwrap();
+    assert!(
+        hold.starts_with(&format!("{}|", higher.last_position)),
+        "{hold}"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_topics_archive_mark_is_dropped() {
+    let Some(mut setup) = archiving(Duration::from_secs(60), Duration::from_secs(60)).await else {
+        return;
+    };
+    let (gone, deleted) = (chain(), chain());
+    for chain in [&gone, &deleted] {
+        setup
+            .store
+            .append(append(chain, "p", 1, 1, b"\x01"))
+            .await
+            .unwrap();
+    }
+    let marked = |chain: &ChainId| {
+        let log = log_key(&setup.prefix, chain, "events");
+        (archive_pending(&setup.prefix, &log), log)
+    };
+    // A topic whose keys expired, then a late advance.
+    let (pending, log) = marked(&gone);
+    let _: () = setup
+        .raw
+        .del(&[format!("{log}:meta"), log.clone()])
+        .await
+        .unwrap();
+    setup
+        .store
+        .advance_archive(&gone, "events", "1-1")
+        .await
+        .unwrap();
+    let score: Option<f64> = setup.raw.zscore(&pending, &log).await.unwrap();
+    assert_eq!(score, None);
+    // An owner delete.
+    let (pending, log) = marked(&deleted);
+    setup
+        .store
+        .delete_owner(temporalio_streams::proto::DeleteOwnerRequest {
+            namespace: deleted.namespace.clone(),
+            owner_kind: temporalio_streams::proto::StreamOwnerKind::Workflow as i32,
+            workflow_id: deleted.workflow_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let score: Option<f64> = setup.raw.zscore(&pending, &log).await.unwrap();
+    assert_eq!(score, None);
+}
+
+#[tokio::test]
+async fn a_large_trim_takes_no_longer_than_a_small_one() {
+    let Some(url) = url() else { return };
+    let setup = setup_with(&url, &url, &unique("large-trim"), |options| {
+        options.retention = Duration::from_millis(500);
+        options.floor_lease = Some(Duration::from_secs(60));
+    })
+    .await;
+    let chain = chain();
+    // A hold keeps 50,000 records of 1 KiB past the retention, then ends.
+    setup
+        .store
+        .hold_floor(&chain, "events", "reader-run/1", "")
+        .await
+        .unwrap();
+    let body = vec![7u8; 1024];
+    let mut sequence = 1;
+    while sequence <= 50_000 {
+        let mut batch = append(&chain, "p", sequence, 1000, &sequence.to_be_bytes());
+        batch.records = vec![body.clone(); 1000];
+        setup.store.append(batch).await.unwrap();
+        sequence += 1000;
+    }
+    setup
+        .store
+        .release_floor(&chain, "events", "reader-run/1")
+        .await
+        .unwrap();
+    let mut raw = setup.raw.clone();
+    let floors = format!("{}:floors", log_key(&setup.prefix, &chain, "events"));
+    let _: () = raw.del(&floors).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let started = tokio::time::Instant::now();
+    setup
+        .store
+        .append(append(&chain, "p", sequence, 1, b"last"))
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    let log = log_key(&setup.prefix, &chain, "events");
+    let length: usize = raw.xlen(&log).await.unwrap();
+    assert_eq!(length, 1, "the trim dropped every held record");
+    // Copying 50,000 doomed records into Lua took about 80 ms.
+    assert!(took < Duration::from_millis(30), "{took:?}");
+}

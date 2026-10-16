@@ -102,19 +102,32 @@ impl Target {
         &self,
     ) -> Result<(Client, mpsc::UnboundedReceiver<Notification>), tokio_postgres::Error> {
         let (sender, receiver) = mpsc::unbounded_channel();
+        let config = self.listen_config();
         let client = match &self.tls {
             Some(tls) => {
-                let (client, connection) = self.config.connect(tls.clone()).await?;
+                let (client, connection) = config.connect(tls.clone()).await?;
                 tokio::spawn(forward(connection, sender));
                 client
             }
             None => {
-                let (client, connection) = self.config.connect(NoTls).await?;
+                let (client, connection) = config.connect(NoTls).await?;
                 tokio::spawn(forward(connection, sender));
                 client
             }
         };
         Ok((client, receiver))
+    }
+
+    /// The listener only receives, so a half-open connection shows only to TCP keepalive. The
+    /// system default notices it after about two hours, and the listener's wakes stop meanwhile.
+    fn listen_config(&self) -> tokio_postgres::Config {
+        let mut config = self.config.clone();
+        config
+            .keepalives(true)
+            .keepalives_idle(Duration::from_secs(30))
+            .keepalives_interval(Duration::from_secs(10))
+            .keepalives_retries(3);
+        config
     }
 
     /// The pool of `size` connections. Each new connection pins the session settings the store
@@ -446,6 +459,20 @@ mod tests {
         assert_eq!(mode, Mode::Prefer);
         let (_, mode, _) = parse_url("postgres://h/db?sslmode=require&sslrootcert=ca.pem").unwrap();
         assert_eq!(mode, Mode::VerifyCa);
+    }
+
+    #[test]
+    fn the_listener_notices_a_dead_connection_within_a_minute() {
+        let target = Target {
+            config: parse_url("postgres://u:p@localhost/db").unwrap().0,
+            tls: None,
+            mode: Mode::Disable,
+        };
+        let config = target.listen_config();
+        assert!(config.get_keepalives());
+        let detect = config.get_keepalives_idle()
+            + config.get_keepalives_interval().unwrap() * config.get_keepalives_retries().unwrap();
+        assert!(detect <= Duration::from_secs(60), "{detect:?}");
     }
 
     #[test]
