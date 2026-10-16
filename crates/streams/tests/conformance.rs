@@ -763,6 +763,227 @@ mod on_redis {
     }
 }
 
+#[cfg(feature = "postgres")]
+mod on_postgres {
+    use super::*;
+    use temporalio_streams::{PostgresStore, PostgresStoreOptions};
+
+    /// A schema name no other case uses.
+    pub(crate) fn schema() -> String {
+        unique("conformance").replace('-', "_")
+    }
+
+    /// A connection of the test's own, to do to the rows what retention does.
+    pub(crate) async fn raw(url: &str) -> tokio_postgres::Client {
+        let (client, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        tokio::spawn(connection);
+        client
+    }
+
+    pub(crate) fn options(url: &str, schema: &str) -> PostgresStoreOptions {
+        let mut options = PostgresStoreOptions::new(url);
+        options.schema = schema.to_string();
+        options.max_connections = 4;
+        options
+    }
+
+    pub(crate) struct Postgres {
+        pub(crate) store: Arc<PostgresStore>,
+        pub(crate) raw: Arc<tokio_postgres::Client>,
+        pub(crate) schema: String,
+    }
+
+    pub(crate) async fn postgres(variable: &str) -> Option<Postgres> {
+        let Ok(url) = std::env::var(variable) else {
+            eprintln!("set {variable} to run the PostgreSQL store cases");
+            return None;
+        };
+        let schema = schema();
+        Some(Postgres {
+            store: Arc::new(
+                PostgresStore::connect(options(&url, &schema))
+                    .await
+                    .unwrap(),
+            ),
+            raw: Arc::new(raw(&url).await),
+            schema,
+        })
+    }
+
+    /// The role lines of the PostgreSQL page: one `CREATE ROLE` and the `GRANT`s after it.
+    pub(crate) fn documented_lines() -> Vec<String> {
+        let page = include_str!("../docs/postgres.md");
+        let lines: Vec<String> = page
+            .lines()
+            .filter(|line| line.starts_with("CREATE ROLE ") || line.starts_with("GRANT "))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.starts_with("CREATE ROLE "))
+                .count(),
+            1,
+            "the PostgreSQL page should give one CREATE ROLE line"
+        );
+        lines
+    }
+
+    /// A store as a role with exactly the documented grants, on a schema an owner migrated. The
+    /// page's schema, role and password are swapped for the test's own, and nothing else changes.
+    pub(crate) async fn postgres_as_documented_role(variable: &str) -> Option<Postgres> {
+        let Ok(url) = std::env::var(variable) else {
+            eprintln!("set {variable} to run the PostgreSQL store cases");
+            return None;
+        };
+        let schema = schema();
+        drop(
+            PostgresStore::connect(options(&url, &schema))
+                .await
+                .unwrap(),
+        );
+        let raw = raw(&url).await;
+        let role = format!("{schema}_app");
+        let password = format!("pw_{schema}");
+        for line in documented_lines() {
+            let line = line
+                .replace("temporal_streams", &schema)
+                .replace("streams_app", &role)
+                .replace("'secret'", &format!("'{password}'"));
+            raw.batch_execute(&line).await.unwrap();
+        }
+        let (_, address) = url.split_once('@').unwrap();
+        let role_url = format!("postgres://{role}:{password}@{address}");
+        let mut options = options(&role_url, &schema);
+        options.skip_migrations = true;
+        Some(Postgres {
+            store: Arc::new(PostgresStore::connect(options).await.unwrap()),
+            raw: Arc::new(raw),
+            schema,
+        })
+    }
+
+    impl Postgres {
+        fn key(chain: &ChainId) -> (String, i16, String, String, String) {
+            let (kind, owner, activity) = match StreamOwnerKind::try_from(chain.owner_kind) {
+                Ok(StreamOwnerKind::Activity) => (2, chain.activity_id.clone(), String::new()),
+                Ok(StreamOwnerKind::WorkflowActivity) => {
+                    (3, chain.workflow_id.clone(), chain.activity_id.clone())
+                }
+                _ => (1, chain.workflow_id.clone(), String::new()),
+            };
+            (
+                chain.namespace.clone(),
+                kind,
+                owner,
+                chain.first_run_id.clone(),
+                activity,
+            )
+        }
+
+        /// Runs `sql` with the chain key as `$1` to `$5` and the topic as `$6`.
+        pub(crate) async fn on_topic(
+            &self,
+            sql: &str,
+            chain: &ChainId,
+            topic: &str,
+            more: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+        ) -> u64 {
+            let (namespace, kind, owner, run, activity) = Self::key(chain);
+            let mut params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                vec![&namespace, &kind, &owner, &run, &activity, &topic];
+            params.extend_from_slice(more);
+            let sql = sql.replace("{s}", &self.schema);
+            self.raw.execute(&sql, &params).await.unwrap()
+        }
+    }
+
+    /// The topic row of `$1` to `$6`.
+    const TOPIC: &str = "SELECT t.topic_id, t.last_position FROM {s}.chains c \
+        JOIN {s}.topics t ON t.chain_id = c.chain_id AND t.topic = $6 \
+        WHERE (c.namespace, c.owner_kind, c.owner_id, c.first_run_id, c.activity_id) \
+        = ($1, $2, $3, $4, $5)";
+
+    #[async_trait::async_trait]
+    impl Case for Postgres {
+        fn store(&self) -> Arc<dyn StreamStore> {
+            self.store.clone()
+        }
+
+        fn chain(&self) -> ChainId {
+            ChainId {
+                namespace: "default".to_string(),
+                workflow_id: unique("conformance"),
+                first_run_id: unique("run"),
+                ..Default::default()
+            }
+        }
+
+        async fn drop_oldest(&self, chain: &ChainId, topic: &str, keep: usize) {
+            // Deletes as the janitor does, keeping what a live hold holds, and moves `trimmed`.
+            let keep = keep as i64;
+            self.on_topic(
+                &format!(
+                    "WITH t AS ({TOPIC}), \
+                     cut AS (SELECT t.topic_id, CASE WHEN n.position IS NULL THEN NULL \
+                       ELSE least(n.position, (SELECT min(f.position) - 1 FROM {{s}}.floors f \
+                         WHERE f.topic_id = t.topic_id AND f.until > now())) END AS position \
+                       FROM t LEFT JOIN LATERAL (SELECT r.position FROM {{s}}.records r \
+                         WHERE r.topic_id = t.topic_id ORDER BY r.position DESC \
+                         OFFSET $7 LIMIT 1) n ON true), \
+                     gone AS (DELETE FROM {{s}}.records r USING cut \
+                       WHERE r.topic_id = cut.topic_id AND r.position <= cut.position \
+                       RETURNING r.position) \
+                     UPDATE {{s}}.topics x SET trimmed = greatest(x.trimmed, \
+                       (SELECT max(position) FROM gone)) \
+                     FROM cut WHERE x.topic_id = cut.topic_id AND EXISTS (SELECT 1 FROM gone)"
+                ),
+                chain,
+                topic,
+                &[&keep],
+            )
+            .await;
+        }
+
+        async fn expire_log(&self, chain: &ChainId, topic: &str) {
+            // The records go and the topic row stays, as the tombstone.
+            self.on_topic(
+                &format!(
+                    "WITH t AS ({TOPIC}), \
+                     gone AS (DELETE FROM {{s}}.records r USING t WHERE r.topic_id = t.topic_id) \
+                     UPDATE {{s}}.topics x SET trimmed = x.last_position FROM t \
+                     WHERE x.topic_id = t.topic_id"
+                ),
+                chain,
+                topic,
+                &[],
+            )
+            .await;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Forgets for Postgres {
+        async fn forget(&self, chain: &ChainId, topic: &str) {
+            self.on_topic(
+                &format!(
+                    "WITH t AS ({TOPIC}), \
+                     records AS (DELETE FROM {{s}}.records r USING t WHERE r.topic_id = t.topic_id), \
+                     producers AS (DELETE FROM {{s}}.producers h USING t \
+                       WHERE h.topic_id = t.topic_id) \
+                     DELETE FROM {{s}}.topics x USING t WHERE x.topic_id = t.topic_id"
+                ),
+                chain,
+                topic,
+                &[],
+            )
+            .await;
+        }
+    }
+}
+
 const OUT: &str = "out";
 const OTHER: &str = "other";
 
@@ -2799,6 +3020,52 @@ mod workflow_activity_kvrocks {
         "STREAMS_KVROCKS_URL",
         false
     )));
+}
+
+#[cfg(feature = "postgres")]
+mod postgres {
+    store_cases!(super::on_postgres::postgres("STREAMS_POSTGRES_URL"));
+    conformance!(super::on_postgres::postgres("STREAMS_POSTGRES_URL");
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
+#[cfg(feature = "postgres")]
+mod activity_postgres {
+    store_cases!(super::activity(super::on_postgres::postgres(
+        "STREAMS_POSTGRES_URL"
+    )));
+    conformance!(super::activity(super::on_postgres::postgres("STREAMS_POSTGRES_URL"));
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
+#[cfg(feature = "postgres")]
+mod workflow_activity_postgres {
+    store_cases!(super::workflow_activity(super::on_postgres::postgres(
+        "STREAMS_POSTGRES_URL"
+    )));
+    conformance!(super::workflow_activity(super::on_postgres::postgres("STREAMS_POSTGRES_URL"));
+        deleting_a_workflow_drops_its_workflow_activities,
+    );
+}
+
+#[cfg(feature = "postgres")]
+mod notifying_postgres {
+    store_cases!(super::notifying(super::on_postgres::postgres(
+        "STREAMS_POSTGRES_URL"
+    )));
+}
+
+#[cfg(feature = "postgres")]
+mod documented_role_postgres {
+    // A role with only the page's grants, on a schema that a DBA migrated.
+    store_cases!(super::on_postgres::postgres_as_documented_role(
+        "STREAMS_POSTGRES_URL"
+    ));
+    conformance!(super::on_postgres::postgres_as_documented_role("STREAMS_POSTGRES_URL");
+        deleting_an_owner_drops_every_chain_of_it,
+    );
 }
 
 mod tiered_memory {

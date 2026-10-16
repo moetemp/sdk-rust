@@ -77,6 +77,12 @@ relevant information.
   `segment_bytes` (4 MiB), once the stream is closed or idle for `segment_idle` (five minutes), and
   at least that often while it keeps taking writes. Reads move from the archive to the store with
   the same cursors. An archive needs `notification_log`. The C bridge builds the S3 archive.
+* Experimental: `StreamStoreConfig.postgres` keeps streams in a PostgreSQL database, 14 or later,
+  in one set of tables in `schema` (`temporal_streams`). The store applies its migrations at
+  connect unless `skip_migrations` is set. A janitor trims records past `retention` (seven days)
+  every `janitor_interval` (one minute). Waiting reads hold no connection and wake within
+  `poll_interval` (100 ms). TLS follows the URL's `sslmode` and `sslrootcert`. The C bridge builds
+  the store.
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with
