@@ -730,6 +730,10 @@ impl StreamStore for NotifyingStore {
         self.inner.name()
     }
 
+    fn capabilities(&self) -> crate::Capabilities {
+        self.inner.capabilities()
+    }
+
     async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
         let chain = request.chain.clone();
         let topic = request.topic.clone();
@@ -810,6 +814,10 @@ impl StreamStore for NotifyingStore {
 
     async fn written_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
         self.inner.written_topics(chain).await
+    }
+
+    async fn list_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        self.inner.list_topics(chain).await
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
