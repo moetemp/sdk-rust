@@ -215,6 +215,27 @@ impl RedisStore {
         error.with_closed_by(closed_by)
     }
 
+    /// Takes deleted keys out of their slot's archive marks. A mark of a deleted topic stays
+    /// lowest in its slot, and enough of them stop the slot's other topics from being archived.
+    async fn drop_archive_marks(&self, keys: &[String]) -> StreamResult<()> {
+        if self.archive_lease_ms.is_none() {
+            return Ok(());
+        }
+        let mut by_slot: HashMap<u16, Vec<&String>> = HashMap::new();
+        for key in keys {
+            by_slot.entry(conn::slot(key)).or_default().push(key);
+        }
+        for (slot, keys) in by_slot {
+            let _: u64 = redis::cmd("ZREM")
+                .arg(keys::archive_pending(&self.prefix, slot))
+                .arg(keys)
+                .query_async(&mut self.shared.clone())
+                .await
+                .mapped(Call::Write)?;
+        }
+        Ok(())
+    }
+
     fn keys(&self, chain: Option<&ChainId>) -> StreamResult<ChainKeys> {
         let chain = chain
             .ok_or_else(|| StreamError::refused("a store call needs the chain it is about"))?;
@@ -952,6 +973,7 @@ impl StreamStore for RedisStore {
                         .await
                         .mapped(Call::Write)?;
                     deleted += removed;
+                    self.drop_archive_marks(batch).await?;
                 }
                 if next == "0" {
                     break;

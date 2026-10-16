@@ -2344,3 +2344,92 @@ async fn a_replay_whose_end_record_the_store_lost_is_rec_01() {
         .unwrap_err();
     assert_eq!(error.kind, StreamFailureKind::ReplayRangeLost, "{error}");
 }
+
+#[tokio::test]
+async fn two_archive_advances_out_of_order_keep_the_higher() {
+    let Some(mut setup) = archiving(Duration::from_secs(60), Duration::from_secs(60)).await else {
+        return;
+    };
+    let chain = chain();
+    let lower = setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let higher = setup
+        .store
+        .append(append(&chain, "p", 2, 1, b"\x02"))
+        .await
+        .unwrap();
+    setup
+        .store
+        .advance_archive(&chain, "events", &higher.last_position)
+        .await
+        .unwrap();
+    setup
+        .store
+        .advance_archive(&chain, "events", &lower.last_position)
+        .await
+        .unwrap();
+    assert_eq!(
+        setup.store.archived(&chain, "events").await.unwrap(),
+        Some(higher.last_position.clone())
+    );
+    let log = log_key(&setup.prefix, &chain, "events");
+    let hold: String = setup
+        .raw
+        .hget(format!("{log}:floors"), temporalio_streams::ARCHIVE_HOLDER)
+        .await
+        .unwrap();
+    assert!(
+        hold.starts_with(&format!("{}|", higher.last_position)),
+        "{hold}"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_topics_archive_mark_is_dropped() {
+    let Some(mut setup) = archiving(Duration::from_secs(60), Duration::from_secs(60)).await else {
+        return;
+    };
+    let (gone, deleted) = (chain(), chain());
+    for chain in [&gone, &deleted] {
+        setup
+            .store
+            .append(append(chain, "p", 1, 1, b"\x01"))
+            .await
+            .unwrap();
+    }
+    let marked = |chain: &ChainId| {
+        let log = log_key(&setup.prefix, chain, "events");
+        (archive_pending(&setup.prefix, &log), log)
+    };
+    // A topic whose keys expired, then a late advance.
+    let (pending, log) = marked(&gone);
+    let _: () = setup
+        .raw
+        .del(&[format!("{log}:meta"), log.clone()])
+        .await
+        .unwrap();
+    setup
+        .store
+        .advance_archive(&gone, "events", "1-1")
+        .await
+        .unwrap();
+    let score: Option<f64> = setup.raw.zscore(&pending, &log).await.unwrap();
+    assert_eq!(score, None);
+    // An owner delete.
+    let (pending, log) = marked(&deleted);
+    setup
+        .store
+        .delete_owner(temporalio_streams::proto::DeleteOwnerRequest {
+            namespace: deleted.namespace.clone(),
+            owner_kind: temporalio_streams::proto::StreamOwnerKind::Workflow as i32,
+            workflow_id: deleted.workflow_id.clone(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let score: Option<f64> = setup.raw.zscore(&pending, &log).await.unwrap();
+    assert_eq!(score, None);
+}
