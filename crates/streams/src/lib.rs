@@ -42,7 +42,9 @@ pub use record::{
     workflow_batch_digest, workflow_producer_id,
 };
 pub use service::StreamService;
-pub use store::{CloseOutcome, MAX_CLOSE_BYTES, NewestOrArm, StreamStore, empty_close_result};
+pub use store::{
+    CloseOutcome, MAX_CLOSE_BYTES, MAX_FLOOR_HOLDERS, NewestOrArm, StreamStore, empty_close_result,
+};
 
 /// The protos stores and lang exchange.
 pub mod proto {

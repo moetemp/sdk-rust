@@ -729,6 +729,7 @@ impl StreamStore for RedisStore {
             .arg(position)
             .arg(self.floor_lease_ms)
             .arg(self.grace_ms)
+            .arg(crate::MAX_FLOOR_HOLDERS)
             .invoke_async::<i64>(&mut self.shared.clone())
             .await
             .mapped(Call::Write)

@@ -2,6 +2,20 @@ local now = clock_ms()
 local lease, grace = tonumber(ARGV[3]), tonumber(ARGV[4])
 local id = ARGV[2]
 local held_value = redis.call('HGET', KEYS[1], ARGV[1])
+if not held_value and redis.call('HLEN', KEYS[1]) >= tonumber(ARGV[5]) then
+  -- Lapsed holds count only until a scan drops them.
+  local entries = redis.call('HGETALL', KEYS[1])
+  for i = 1, #entries, 2 do
+    local until_ms = tonumber(string.match(entries[i + 1], '|(%d+)$'))
+    if not until_ms or until_ms <= now then
+      redis.call('HDEL', KEYS[1], entries[i])
+    end
+  end
+  if redis.call('HLEN', KEYS[1]) >= tonumber(ARGV[5]) then
+    return redis.error_reply('STREAMS_HOLDERS topic already has ' .. ARGV[5] ..
+      ' floor holders, so a positions-only reader can not start on it')
+  end
+end
 if held_value then
   local old = string.match(held_value, '^(%d+%-%d+)|')
   if old and id_below(old, id) then

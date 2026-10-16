@@ -2091,3 +2091,30 @@ async fn a_hold_at_zero_neither_fails_the_append_nor_leaves_a_half_written_batch
     let ttl: i64 = setup.raw.pttl(&log).await.unwrap();
     assert!(ttl > 0, "{ttl}");
 }
+
+#[tokio::test]
+async fn a_topic_refuses_a_floor_holder_past_the_cap() {
+    let Some(setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    for holder in 0..temporalio_streams::MAX_FLOOR_HOLDERS {
+        setup
+            .store
+            .hold_floor(&chain, "events", &format!("reader-run/{holder}"), "")
+            .await
+            .unwrap();
+    }
+    let error = setup
+        .store
+        .hold_floor(&chain, "events", "one-more/1", "")
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::Refused, "{error}");
+    // A holder already on the topic renews its hold.
+    setup
+        .store
+        .hold_floor(&chain, "events", "reader-run/0", "")
+        .await
+        .unwrap();
+}
