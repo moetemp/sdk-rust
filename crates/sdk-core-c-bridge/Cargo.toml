@@ -52,7 +52,7 @@ features = ["ephemeral-server", "otel", "streams"]
 [dependencies.temporalio-streams]
 path = "../streams"
 version = "0.1"
-features = ["archive", "redis"]
+features = ["archive", "postgres", "redis"]
 
 [dependencies.temporalio-common]
 path = "../common"

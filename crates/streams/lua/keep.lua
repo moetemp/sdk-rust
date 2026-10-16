@@ -28,10 +28,18 @@ local function keep(log, meta, added, last, retention, grace, floors)
   local floor = floor_ms .. '-0'
   local life
   floor, life = held(floors, floor, retention)
-  local doomed = redis.call('XREVRANGE', log, '(' .. floor, '-', 'COUNT', 1)
-  if #doomed > 0 then
+  local doomed
+  local from = '-'
+  repeat
+    local older = redis.call('XRANGE', log, from, '(' .. floor, 'COUNT', 1000)
+    if #older > 0 then
+      doomed = older[#older][1]
+      from = '(' .. doomed
+    end
+  until #older < 1000
+  if doomed then
     redis.call('XTRIM', log, 'MINID', floor)
-    redis.call('HSET', meta, 'trimmed', doomed[1][1])
+    redis.call('HSET', meta, 'trimmed', doomed)
   end
   redis.call('PEXPIRE', log, life)
   redis.call('HINCRBY', meta, 'added', added)
