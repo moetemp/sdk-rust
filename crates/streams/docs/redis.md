@@ -49,8 +49,10 @@ notification stream of the chain's Cluster slot, `<prefix>:{<tag>}:n`, where the
 slot, one script writes them, and a reshard moves them together. A standalone server uses the
 same keys. An entry holds `k`, the log key, and `p`, the append's last entry id. The stream keeps
 about the newest 10,000 entries. A repeat of the newest batch adds none. The script answers the
-stream's length too, and when it is 1, Core adds the slot to doorbell `<prefix>:{<tag of slot
-s % doorbells>}:bell`, apart from the script, so a lost ring is possible. Drivers read the slot
+stream's length too, and when it is 1, Core adds the slot to doorbell `d = s % doorbells`, at
+`<prefix>:{<tag of slot d * 16384 / doorbells>}:bell`, apart from the script, so a lost ring is
+possible. The doorbells spread over the slot range, so a cluster's primaries share them, and an
+application and its drivers must agree on the number of doorbells. Drivers read the slot
 streams and the doorbells as the consumer group `streams-driver` (`XREADGROUP`, `XAUTOCLAIM`,
 `XACK`, `XDEL`, `XGROUP CREATE`), and sweep with `XLEN` over each primary's slots from `CLUSTER
 SLOTS`. The slot streams have no expiry, and a driver empties them. The logged append script has
