@@ -353,8 +353,9 @@ impl StreamDriver {
         }
     }
 
-    /// Sends one namespace's entries in one call. When the server refuses the call, each stream
-    /// goes on its own, so one bad entry holds back no other stream.
+    /// Sends one namespace's entries in one call. The server answers each stream, and a stream it
+    /// refused or failed is settled on its own. When the server refuses the whole call, each
+    /// stream goes on its own, so one bad entry holds back no other stream.
     async fn send_namespace(
         &self,
         slot: u32,
@@ -371,10 +372,20 @@ impl StreamDriver {
             return;
         }
         let notifications = streams.iter().map(|(n, _)| n.clone()).collect();
-        match self.client.notify_streams(notifications).await {
-            Ok(()) => {
-                self.delivered.store(true, Ordering::Relaxed);
-                sent.ack(streams.into_iter().flat_map(|(_, ids)| ids));
+        match self.client.notify_streams_each(notifications).await {
+            Ok(results) => {
+                // A server that took some entries is up, so the ones it failed count toward
+                // their drop. A server that failed them all may be busy, so they wait.
+                let reached = results.iter().any(Result::is_ok);
+                if reached {
+                    self.delivered.store(true, Ordering::Relaxed);
+                }
+                for (stream, result) in streams.into_iter().zip(results) {
+                    match result {
+                        Ok(()) => sent.ack(stream.1),
+                        Err(error) => self.settle_one(slot, error, vec![stream], sent, reached),
+                    }
+                }
             }
             Err(NotifyError::Unsupported(error)) => {
                 // A server with no notifiers answers this for every namespace. Only one namespace
@@ -575,6 +586,10 @@ mod tests {
         fail_workflow: Mutex<Option<String>>,
         /// A call for this namespace answers that it takes no notifications.
         unsupported_namespace: Mutex<Option<String>>,
+        /// The server answers an entry for this Workflow id as refused, and takes the others.
+        refuse_entry: Mutex<Option<String>>,
+        /// The server answers an entry for this Workflow id as failed, and takes the others.
+        fail_entry: Mutex<Option<String>>,
     }
 
     #[async_trait::async_trait]
@@ -610,6 +625,32 @@ mod tests {
             }
             self.calls.lock().unwrap().push(notifications);
             Ok(())
+        }
+
+        async fn notify_streams_each(
+            &self,
+            notifications: Vec<StreamNotification>,
+        ) -> Result<Vec<Result<(), NotifyError>>, NotifyError> {
+            let refused = self.refuse_entry.lock().unwrap().clone();
+            let failed = self.fail_entry.lock().unwrap().clone();
+            let results: Vec<_> = notifications
+                .iter()
+                .map(|n| match Some(n.chain.workflow_id.as_str()) {
+                    id if id == refused.as_deref() => {
+                        Err(NotifyError::Refused("no such owner".to_string()))
+                    }
+                    id if id == failed.as_deref() => Err(NotifyError::Failed("busy".to_string())),
+                    _ => Ok(()),
+                })
+                .collect();
+            let landed = notifications
+                .into_iter()
+                .zip(&results)
+                .filter(|(_, result)| result.is_ok())
+                .map(|(notification, _)| notification)
+                .collect();
+            self.notify_streams(landed).await?;
+            Ok(results)
         }
     }
 
@@ -840,6 +881,52 @@ mod tests {
         driver(&store, &client, "d1").drain(0).await.unwrap();
         assert_eq!(client.sent(), [("good".to_string(), "out".to_string(), 1)]);
         assert!(log_is_empty(&store).await, "the refused entry is acked too");
+    }
+
+    #[tokio::test]
+    async fn an_entry_the_answer_refuses_is_acked_with_no_second_call() {
+        let store = Arc::new(MemoryStore::with_notification_log());
+        let client = Arc::new(Recorder::default());
+        *client.refuse_entry.lock().unwrap() = Some("bad".to_string());
+        append(&store, "bad", "out", 1).await;
+        append(&store, "good", "out", 1).await;
+        driver(&store, &client, "d1").drain(0).await.unwrap();
+        assert_eq!(client.calls.lock().unwrap().len(), 1);
+        assert_eq!(client.sent(), [("good".to_string(), "out".to_string(), 1)]);
+        assert!(log_is_empty(&store).await, "the refused entry is acked too");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_entry_the_answer_fails_stays_while_no_other_lands() {
+        let store = Arc::new(MemoryStore::with_notification_log());
+        let client = Arc::new(Recorder::default());
+        *client.fail_entry.lock().unwrap() = Some("bad".to_string());
+        append(&store, "bad", "out", 1).await;
+        let driver = driver(&store, &client, "d1");
+        for _ in 0..=MAX_ENTRY_FAILURES {
+            driver.drain(0).await.unwrap();
+        }
+        assert!(!log_is_empty(&store).await);
+        *client.fail_entry.lock().unwrap() = None;
+        driver.drain(0).await.unwrap();
+        assert_eq!(client.sent(), [("bad".to_string(), "out".to_string(), 1)]);
+        assert!(log_is_empty(&store).await);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_entry_the_answer_keeps_failing_while_others_land_is_dropped() {
+        let store = Arc::new(MemoryStore::with_notification_log());
+        let client = Arc::new(Recorder::default());
+        *client.fail_entry.lock().unwrap() = Some("bad".to_string());
+        append(&store, "bad", "out", 1).await;
+        let driver = driver(&store, &client, "d1");
+        for sequence in 1..=MAX_ENTRY_FAILURES as i64 {
+            assert!(!log_is_empty(&store).await, "kept after {sequence} drains");
+            append(&store, "good", "out", sequence).await;
+            driver.drain(0).await.unwrap();
+        }
+        assert!(log_is_empty(&store).await);
+        assert!(client.sent().iter().all(|(id, _, _)| id == "good"));
     }
 
     #[tokio::test]
