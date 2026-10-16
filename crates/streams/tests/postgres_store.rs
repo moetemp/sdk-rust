@@ -767,6 +767,40 @@ async fn two_archive_advances_out_of_order_keep_the_higher() {
 }
 
 #[tokio::test]
+async fn an_archive_advance_lets_the_janitor_trim_what_it_archived() {
+    let Some(url) = url() else { return };
+    let mut options = options(&url);
+    options.notification_log = true;
+    options.archive_lease = Some(Duration::from_secs(3600));
+    let schema = options.schema.clone();
+    let store = PostgresStore::connect(options).await.unwrap();
+    let raw = raw(&url).await;
+    let chain = chain("archived");
+    let landed = store
+        .append(append(&chain, "out", "p", 1, 5))
+        .await
+        .unwrap();
+    let first: i64 = landed.first_position.parse().unwrap();
+    let last: i64 = landed.last_position.parse().unwrap();
+    let kept = |from: i64| (from..=last).collect::<Vec<_>>();
+    store
+        .advance_archive(&chain, "out", &(first + 1).to_string())
+        .await
+        .unwrap();
+    age(&raw, &schema, 8).await;
+    store.run_janitor().await.unwrap();
+    let positions = |rows: Vec<(i64, _)>| rows.into_iter().map(|row| row.0).collect::<Vec<_>>();
+    assert_eq!(positions(rows(&raw, &schema).await), kept(first + 1));
+    // The hold's lease is an hour away, and the advance alone makes the topic due.
+    store
+        .advance_archive(&chain, "out", &(last - 1).to_string())
+        .await
+        .unwrap();
+    store.run_janitor().await.unwrap();
+    assert_eq!(positions(rows(&raw, &schema).await), kept(last - 1));
+}
+
+#[tokio::test]
 async fn an_append_rings_while_a_driver_holds_the_partitions_entries() {
     let Some(url) = url() else { return };
     let mut options = options(&url);
