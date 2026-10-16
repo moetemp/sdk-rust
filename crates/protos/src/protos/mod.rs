@@ -3099,6 +3099,8 @@ mod sdk_helpers {
                     producer_id: "p".to_string(),
                     attempt: 2,
                     sequence: 3,
+                    task_started_event_id: 0,
+                    completed_tasks: vec![],
                 }
             }
 
