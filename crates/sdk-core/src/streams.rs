@@ -521,7 +521,7 @@ mod tests {
         let service = connect_stream_service(
             proto::StreamStoreConfig {
                 store: Some(proto::stream_store_config::Store::Memory(
-                    proto::MemoryStoreConfig {},
+                    proto::MemoryStoreConfig::default(),
                 )),
                 notify_on_append: true,
                 ..Default::default()
