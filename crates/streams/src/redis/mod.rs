@@ -1334,7 +1334,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_plain_mode_a_repeat_lands_again_and_no_close_flag_is_kept() {
+    async fn in_plain_mode_a_repeat_lands_again_and_a_close_is_a_record() {
         let Ok(url) = std::env::var("STREAMS_REDIS_URL") else {
             return;
         };
@@ -1356,12 +1356,15 @@ mod tests {
         assert_eq!(read.records.len(), 2);
         assert!(!read.closed);
         assert_eq!(store.list_topics(&chain(&run)).await.unwrap(), ["out"]);
-        for error in [
-            store.close_chain(&chain(&run)).await.unwrap_err(),
-            store.close_topic(&chain(&run), "out").await.unwrap_err(),
-        ] {
-            assert_eq!(error.kind, StreamFailureKind::Unsupported);
-        }
+        let error = store.close_chain(&chain(&run)).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Unsupported);
+        // A topic close is a `CLOSE` record, which lands after the two copies.
+        store.close_topic(&chain(&run), "out").await.unwrap();
+        let read = store
+            .read(waiting_read(&run, Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(read.records.len(), 3);
         // A read after a position the log never held answers what follows, as a plain log does.
         let missing = StoreReadRequest {
             after_position: "1-0".to_string(),
