@@ -462,6 +462,11 @@ impl NexusCalls {
         {
             return failed(failure::of_stream(&error));
         }
+        if let Some(holder) = &input.floor_holder
+            && let Err(failure) = check_holder(holder, &input.after_token)
+        {
+            return failed(*failure);
+        }
         let request = ReadRangeRequest {
             stream: Some(address),
             chain_first_run_id: input.chain_first_run_id,
@@ -471,8 +476,8 @@ impl NexusCalls {
             state,
             records_digest: input.records_digest.0,
             floor_holder: input.floor_holder.unwrap_or_default(),
-            // A read that names a floor holder never starts at the end, since only latest_only
-            // does, and it refuses a holder.
+            // A read that names a floor holder never starts at `$end`, since the read refuses it.
+            // The caller reads latest_only first and starts at its cursor.
             start_from_end: false,
         };
         let mut response = match self.streams.read_range(request).await {

@@ -989,6 +989,31 @@ fn base64_of(bytes: &[u8]) -> String {
 }
 
 #[tokio::test]
+async fn a_holding_read_from_the_end_starts_at_latest_only_and_replays() {
+    let (streams, calls) = layered(memory());
+    let wf = workflow();
+    write(&calls, &wf, 1, &["one"]).await;
+    let mut latest = read_input(&wf, "");
+    latest.as_object_mut().unwrap().remove("after_token");
+    latest["latest_only"] = json!(true);
+    let end = read(&calls, latest).await.unwrap();
+    append(&calls, append_input(&wf, "p", 2, 1, &["two"]))
+        .await
+        .unwrap();
+    let live = read(&calls, holding(&wf, token(&end))).await.unwrap();
+    assert_eq!(values(&live), ["SUPERSEDED p 1->2", "p@2 two"]);
+    let replayed = streams
+        .read_range(replay_of(&wf, &live, &[]))
+        .await
+        .unwrap();
+    assert_eq!(
+        replayed.records.len(),
+        2,
+        "the replay sees what the live read saw"
+    );
+}
+
+#[tokio::test]
 async fn a_range_replays_with_the_state_the_read_sent() {
     let (streams, calls) = layered(memory());
     let wf = workflow();
