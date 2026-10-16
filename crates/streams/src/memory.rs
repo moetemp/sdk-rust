@@ -4,10 +4,13 @@
 //! production. It exists so the conformance suite runs the whole store contract without a server,
 //! and to show in one file what a store owes. Positions are offsets that are never reused, so a
 //! position keeps naming the same record after [MemoryStore::truncate] drops older ones.
+//!
+//! [MemoryStore::with_capabilities] masks capabilities off, so Core's fallbacks run in tests.
 
 use crate::{
-    ACTIVITY_OWNER_KIND, NotificationEntry, NotificationLog, StreamError, StreamResult,
-    StreamStore, WORKFLOW_OWNER_KIND, chain_owner,
+    ACTIVITY_OWNER_KIND, Capabilities, ConditionForms, MAX_BATCH_BYTES, MAX_RECORD_BYTES,
+    NotificationEntry, NotificationLog, StreamError, StreamResult, StreamStore,
+    WORKFLOW_OWNER_KIND, chain_owner,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
@@ -22,6 +25,26 @@ use std::{
 use tokio::{sync::watch, time::Instant};
 
 const NAME: &str = "memory";
+
+/// Every capability the memory store has.
+const FULL: Capabilities = Capabilities {
+    producer_state: true,
+    conditional: ConditionForms {
+        tail: false,
+        fence: false,
+    },
+    kept_last: true,
+    holds: false,
+    change_feed: false,
+    cheap_logs: true,
+    delete_owner: true,
+    topic_listing: true,
+    long_poll: true,
+    dense_positions: true,
+    replay_horizon: None,
+    max_record_bytes: MAX_RECORD_BYTES,
+    max_batch_bytes: MAX_BATCH_BYTES,
+};
 
 /// A chain's namespace, owner kind, owner id and first run.
 type ChainKey = (String, &'static str, String, String);
@@ -93,6 +116,7 @@ pub struct MemoryStore {
     /// Bumped on every write, so a waiting read checks again.
     written: watch::Sender<u64>,
     log: Option<Arc<MemoryLog>>,
+    capabilities: Capabilities,
 }
 
 impl Default for MemoryStore {
@@ -101,6 +125,7 @@ impl Default for MemoryStore {
             chains: Mutex::default(),
             written: watch::Sender::new(0),
             log: None,
+            capabilities: FULL,
         }
     }
 }
@@ -238,6 +263,21 @@ impl MemoryStore {
         }
     }
 
+    /// An empty store with only the capabilities both it and `mask` have, and the limits of
+    /// `mask`. Without producer state it keeps no dedupe entries and no close flags, without a
+    /// kept last position its reads never fail as expired or not found, and without a long poll
+    /// its reads never wait.
+    pub fn with_capabilities(mask: Capabilities) -> Self {
+        Self {
+            capabilities: Capabilities {
+                max_record_bytes: mask.max_record_bytes,
+                max_batch_bytes: mask.max_batch_bytes,
+                ..FULL.masked(&mask)
+            },
+            ..Self::default()
+        }
+    }
+
     /// Drops all but the newest `keep` records of a topic, standing in for a store's retention.
     /// It keeps the records a positions-only reader holds, from the position it holds on.
     pub fn truncate(&self, chain: &ChainId, topic: &str, keep: usize) {
@@ -260,6 +300,15 @@ impl MemoryStore {
         topic.base += drop as u64;
     }
 
+    fn producer_state(&self) -> StreamResult<()> {
+        if self.capabilities.producer_state {
+            return Ok(());
+        }
+        Err(StreamError::unsupported(
+            "this store can't keep producer state",
+        ))
+    }
+
     fn wrote(&self) {
         self.written.send_modify(|version| *version += 1);
     }
@@ -271,8 +320,9 @@ impl MemoryStore {
         let topic = chain.and_then(|chain| chain.topics.get(&request.topic));
         let closed = chain.is_some_and(|chain| chain.closed) || topic.is_some_and(|t| t.closed);
         let after = parse_position(&request.after_position)?;
+        let kept_last = self.capabilities.kept_last;
         let Some(topic) = topic else {
-            if after.is_some() {
+            if after.is_some() && kept_last {
                 return Err(StreamError::not_found(format!(
                     "topic {:?} holds no records and none were dropped, so nothing is known \
                      about what followed position {}",
@@ -284,7 +334,10 @@ impl MemoryStore {
                 ..Default::default()
             }));
         };
-        let start = after.map_or(topic.base, |after| after + 1);
+        let mut start = after.map_or(topic.base, |after| after + 1);
+        if !kept_last {
+            start = start.max(topic.base);
+        }
         if start > topic.head() {
             return Err(StreamError::cursor(format!(
                 "position {} is one topic {:?} never held",
@@ -349,6 +402,10 @@ impl StreamStore for MemoryStore {
         self.log.clone().map(|log| log as Arc<dyn NotificationLog>)
     }
 
+    fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
+
     async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
         if request.records.is_empty() {
             return Err(StreamError::refused("an append needs at least one record"));
@@ -356,13 +413,14 @@ impl StreamStore for MemoryStore {
         if request.digest.is_empty() {
             return Err(StreamError::refused("an append needs the batch's digest"));
         }
+        let producer_state = self.capabilities.producer_state;
         let mut chains = self.chains.lock().unwrap();
         let chain = chains
             .entry(chain_key(chain_of(request.chain.as_ref())?))
             .or_default();
         let chain_closed = chain.closed;
         let session = (request.producer_id.clone(), request.attempt);
-        let existing = chain.topics.get(&request.topic);
+        let existing = chain.topics.get(&request.topic).filter(|_| producer_state);
         if let Some(held) = existing.and_then(|topic| topic.held.get(&session)) {
             if request.sequence == held.sequence {
                 if request.digest != held.digest {
@@ -407,15 +465,17 @@ impl StreamStore for MemoryStore {
         let mut positions = request.records.into_iter().map(|record| topic.push(record));
         let first = positions.next().unwrap_or_default();
         let last = positions.last().unwrap_or(first);
-        topic.held.insert(
-            session,
-            Held {
-                sequence: request.sequence,
-                count,
-                first,
-                digest: request.digest,
-            },
-        );
+        if producer_state {
+            topic.held.insert(
+                session,
+                Held {
+                    sequence: request.sequence,
+                    count,
+                    first,
+                    digest: request.digest,
+                },
+            );
+        }
         // Under the store's lock, so the entry lands in the same step as the records.
         if let (Some(log), Some(chain)) = (&self.log, &request.chain) {
             log.push(chain, &request.topic, last.to_string());
@@ -429,7 +489,12 @@ impl StreamStore for MemoryStore {
     }
 
     async fn read(&self, request: StoreReadRequest) -> StreamResult<StoreReadResponse> {
-        let deadline = Instant::now() + wait_of(&request);
+        let wait = if self.capabilities.long_poll {
+            wait_of(&request)
+        } else {
+            Duration::ZERO
+        };
+        let deadline = Instant::now() + wait;
         let mut written = self.written.subscribe();
         loop {
             if let Some(response) = self.read_now(&request)? {
@@ -476,6 +541,9 @@ impl StreamStore for MemoryStore {
     }
 
     async fn newest_ever(&self, chain: &ChainId, topic: &str) -> StreamResult<String> {
+        if !self.capabilities.kept_last {
+            return Ok(String::new());
+        }
         let chains = self.chains.lock().unwrap();
         Ok(chains
             .get(&chain_key(chain))
@@ -491,6 +559,9 @@ impl StreamStore for MemoryStore {
         topic: &str,
         mark: &str,
     ) -> StreamResult<Option<String>> {
+        if !self.capabilities.kept_last {
+            return Ok(None);
+        }
         let mark = parse_position(mark)?;
         let chains = self.chains.lock().unwrap();
         Ok(chains
@@ -542,6 +613,7 @@ impl StreamStore for MemoryStore {
     }
 
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {
+        self.producer_state()?;
         self.chains
             .lock()
             .unwrap()
@@ -564,6 +636,7 @@ impl StreamStore for MemoryStore {
         topic: &str,
         close: StoredClose,
     ) -> StreamResult<StoredClose> {
+        self.producer_state()?;
         let stored = {
             let mut chains = self.chains.lock().unwrap();
             let topic = chains
@@ -586,6 +659,7 @@ impl StreamStore for MemoryStore {
         producer_id: &str,
         attempt: i64,
     ) -> StreamResult<()> {
+        self.producer_state()?;
         let mut chains = self.chains.lock().unwrap();
         if let Some(topic) = chains
             .get_mut(&chain_key(chain))
@@ -596,7 +670,32 @@ impl StreamStore for MemoryStore {
         Ok(())
     }
 
+    async fn list_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        if !self.capabilities.topic_listing {
+            return Err(StreamError::unsupported(
+                "this store can't list the topics of a chain",
+            ));
+        }
+        let chains = self.chains.lock().unwrap();
+        Ok(chains
+            .get(&chain_key(chain))
+            .map(|chain| {
+                chain
+                    .topics
+                    .iter()
+                    .filter(|(_, topic)| topic.head() > 0)
+                    .map(|(name, _)| name.clone())
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
+        if !self.capabilities.delete_owner {
+            return Err(StreamError::unsupported(
+                "this store can't delete the streams of an owner",
+            ));
+        }
         let (owner_kind, owner_id) = match StreamOwnerKind::try_from(request.owner_kind) {
             Ok(StreamOwnerKind::Workflow) => (WORKFLOW_OWNER_KIND, &request.workflow_id),
             Ok(StreamOwnerKind::Activity) => (ACTIVITY_OWNER_KIND, &request.activity_id),
@@ -691,6 +790,89 @@ mod tests {
             Some(b"c".to_vec())
         );
         assert_eq!(store.record_at(&chain(), "out", "0").await.unwrap(), None);
+    }
+
+    fn log_only() -> MemoryStore {
+        MemoryStore::with_capabilities(Capabilities::log_only())
+    }
+
+    #[test]
+    fn a_mask_only_takes_capabilities_away() {
+        assert_eq!(MemoryStore::new().capabilities(), FULL);
+        let masked = log_only().capabilities();
+        assert!(!masked.producer_state && !masked.kept_last && !masked.long_poll);
+        // Positions stay offsets whatever the mask, and the limits stay the store's.
+        assert!(masked.dense_positions);
+        assert_eq!(masked.max_record_bytes, MAX_RECORD_BYTES);
+        let all = Capabilities {
+            holds: true,
+            change_feed: true,
+            ..FULL
+        };
+        assert_eq!(MemoryStore::with_capabilities(all).capabilities(), FULL);
+    }
+
+    #[tokio::test]
+    async fn without_producer_state_a_repeat_lands_again_and_closes_are_unsupported() {
+        let store = log_only();
+        let first = store.append(append(1, &[b"a"])).await.unwrap();
+        let again = store.append(append(1, &[b"a"])).await.unwrap();
+        assert_ne!(first.first_position, again.first_position);
+        assert_eq!(store.read(read_after("")).await.unwrap().records.len(), 2);
+        for error in [
+            store.close_chain(&chain()).await.unwrap_err(),
+            store.close_topic(&chain(), "out").await.unwrap_err(),
+            store
+                .retire_producer(&chain(), "out", "p", 1)
+                .await
+                .unwrap_err(),
+        ] {
+            assert_eq!(error.kind, StreamFailureKind::Unsupported);
+        }
+    }
+
+    #[tokio::test]
+    async fn without_a_kept_last_position_a_read_starts_at_what_is_left() {
+        let store = log_only();
+        store.append(append(1, &[b"a", b"b", b"c"])).await.unwrap();
+        store.truncate(&chain(), "out", 1);
+        let read = store.read(read_after("0")).await.unwrap();
+        assert_eq!(read.records[0].position, "2");
+        assert_eq!(store.newest_ever(&chain(), "out").await.unwrap(), "");
+        assert_eq!(
+            store.dropped_after(&chain(), "out", "").await.unwrap(),
+            None
+        );
+        let missing = StoreReadRequest {
+            topic: "missing".to_string(),
+            ..read_after("4")
+        };
+        assert!(store.read(missing).await.unwrap().records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_long_poll_a_read_answers_at_once() {
+        let store = log_only();
+        let started = Instant::now();
+        let read = store
+            .read(StoreReadRequest {
+                wait: Some(Duration::from_secs(30).try_into().unwrap()),
+                ..read_after("")
+            })
+            .await
+            .unwrap();
+        assert!(read.records.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn the_topics_of_a_chain_are_the_ones_that_took_a_record() {
+        let store = MemoryStore::new();
+        store.append(append(1, &[b"a"])).await.unwrap();
+        store.close_topic(&chain(), "quiet").await.unwrap();
+        assert_eq!(store.list_topics(&chain()).await.unwrap(), ["out"]);
+        let error = log_only().list_topics(&chain()).await.unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::Unsupported);
     }
 
     #[tokio::test]

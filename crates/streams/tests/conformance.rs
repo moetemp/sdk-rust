@@ -15,9 +15,10 @@ use std::{
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
-    BEGINNING, END, MemoryStore, NotificationEntry, NotificationLog, Notifier, NotifierClient,
-    NotifyError, NotifyingStore, ReadTarget, StreamNotification, StreamResult, StreamStore,
-    chain_owner, mint_cursor, proto::*, read_page, stored_append_record, stream_hash,
+    BEGINNING, CHAIN_LOG, Capabilities, END, MemoryStore, NotificationEntry, NotificationLog,
+    Notifier, NotifierClient, NotifyError, NotifyingStore, ReadTarget, StreamNotification,
+    StreamResult, StreamStore, append_batch, chain_owner, close_chain, close_topic, mint_cursor,
+    proto::*, read_page, stored_append_record, stream_hash,
 };
 
 #[async_trait::async_trait]
@@ -165,6 +166,15 @@ impl<C: Case> Case for Activity<C> {
     async fn expire_log(&self, chain: &ChainId, topic: &str) {
         self.0.expire_log(chain, topic).await;
     }
+}
+
+/// The memory store with only the capabilities `mask` leaves, so each fallback runs.
+async fn masked(mask: impl FnOnce(&mut Capabilities)) -> Option<Memory> {
+    let mut capabilities = MemoryStore::new().capabilities();
+    mask(&mut capabilities);
+    Some(Memory(Arc::new(MemoryStore::with_capabilities(
+        capabilities,
+    ))))
 }
 
 #[cfg(feature = "redis")]
@@ -391,15 +401,25 @@ mod on_redis {
     }
 
     pub(crate) async fn redis(variable: &str, cluster: bool) -> Option<Redis> {
-        redis_with(variable, cluster, false).await
+        redis_with(variable, cluster, false, false).await
     }
 
     /// [redis] with a notification log.
     pub(crate) async fn redis_with_log(variable: &str, cluster: bool) -> Option<Redis> {
-        redis_with(variable, cluster, true).await
+        redis_with(variable, cluster, true, false).await
     }
 
-    async fn redis_with(variable: &str, cluster: bool, notification_log: bool) -> Option<Redis> {
+    /// Redis with no Lua, so the store keeps no producer state and no last position.
+    pub(crate) async fn plain_redis(variable: &str, cluster: bool) -> Option<Redis> {
+        redis_with(variable, cluster, false, true).await
+    }
+
+    async fn redis_with(
+        variable: &str,
+        cluster: bool,
+        notification_log: bool,
+        plain: bool,
+    ) -> Option<Redis> {
         let Ok(url) = std::env::var(variable) else {
             eprintln!("set {variable} to run the Redis store cases");
             return None;
@@ -410,6 +430,7 @@ mod on_redis {
         options.cluster = cluster;
         options.key_prefix = prefix.clone();
         options.notification_log = notification_log;
+        options.plain = plain;
         Some(Redis {
             store: Arc::new(RedisStore::connect(options).await.unwrap()),
             raw: Raw::connect(&url, cluster).await,
@@ -1465,14 +1486,14 @@ mod cases {
             .await;
         assert_eq!(repeat, kept);
         // The retired attempt no longer does, which is why only an attempt whose last append
-        // returned may be retired.
+        // returned may be retired. Readers still drop the second copy.
         let again = Producer::new(case, &chain, OUT, "p", 1)
             .append(&["1"])
             .await;
         assert_ne!(again.first_position, first.first_position);
         assert_eq!(
             values(&read(case, &chain, OUT, BEGINNING).await.unwrap()),
-            ["1", "2", "1"]
+            ["1", "2"]
         );
     }
 
@@ -1653,6 +1674,145 @@ mod cases {
             .unwrap();
         assert!(rung.contains(&partition), "{rung:?}");
     }
+
+    /// What a store declares agrees with the calls it answers.
+    pub(crate) async fn the_declared_capabilities_match_the_calls(case: &dyn Case) {
+        let store = case.store();
+        let declared = store.capabilities();
+        let chain = case.chain();
+        let unsupported = |result: StreamResult<()>| {
+            result.is_err_and(|error| error.kind == StreamFailureKind::Unsupported)
+        };
+        assert_eq!(
+            unsupported(store.close_chain(&chain).await),
+            !declared.producer_state
+        );
+        assert_eq!(
+            unsupported(store.close_topic(&chain, OUT).await),
+            !declared.producer_state
+        );
+        assert_eq!(
+            unsupported(store.retire_producer(&chain, OUT, "p", 1).await),
+            !declared.producer_state
+        );
+        assert_eq!(
+            unsupported(store.list_topics(&chain).await.map(drop)),
+            !declared.topic_listing
+        );
+        let delete = store
+            .delete_owner(DeleteOwnerRequest {
+                namespace: chain.namespace.clone(),
+                owner_kind: if chain.owner_kind == StreamOwnerKind::Activity as i32 {
+                    StreamOwnerKind::Activity as i32
+                } else {
+                    StreamOwnerKind::Workflow as i32
+                },
+                workflow_id: chain.workflow_id.clone(),
+                activity_id: chain.activity_id.clone(),
+            })
+            .await;
+        assert_eq!(unsupported(delete.map(drop)), !declared.delete_owner);
+        assert!(declared.max_record_bytes > 0 && declared.max_batch_bytes > 0);
+    }
+
+    /// Without producer state a repeat after a lost answer lands again, and readers drop it.
+    pub(crate) async fn a_repeat_lands_a_copy_that_readers_drop(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let records = [data("1"), data("2")];
+        let request = producer.request(&records);
+        let first = producer.send(&records).await.unwrap();
+        let again = case.store().append(request).await.unwrap();
+        assert_ne!(again.first_position, first.first_position);
+        producer.append(&["3"]).await;
+        let read = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert_eq!(values(&read), ["1", "2", "3"]);
+    }
+
+    /// Without producer state a divergent batch lands, and readers keep the first one.
+    pub(crate) async fn a_divergent_batch_lands_and_readers_keep_the_first(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let divergent = producer.request(&[data("other")]);
+        producer.append(&["1"]).await;
+        case.store().append(divergent).await.unwrap();
+        let read = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert_eq!(values(&read), ["1"]);
+    }
+
+    /// Without close flags a close is a record, and every read ends at the first one.
+    pub(crate) async fn a_close_record_ends_every_read(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let landed = producer.append(&["1"]).await;
+        close_topic(&*store, &chain, OUT, "closer", 1)
+            .await
+            .unwrap();
+        close_topic(&*store, &chain, OUT, "late", 1).await.unwrap();
+        // The store can't refuse what comes after the close, and no reader delivers it.
+        producer.append(&["2"]).await;
+        let first = read(case, &chain, OUT, BEGINNING).await.unwrap();
+        assert_eq!(values(&first), ["1"]);
+        assert_eq!(
+            first.cursor,
+            cursor(case, &chain, OUT, &landed.last_position)
+        );
+        let next = read_with(
+            case,
+            &chain,
+            OUT,
+            &first.cursor,
+            Duration::ZERO,
+            &first.state,
+        )
+        .await
+        .unwrap();
+        assert!(next.records.is_empty());
+        let resumed = read(case, &chain, OUT, &first.cursor).await.unwrap();
+        assert!(resumed.records.is_empty());
+    }
+
+    /// Without close flags a chain close writes a close on each topic it finds.
+    pub(crate) async fn a_chain_close_reaches_every_topic(case: &dyn Case) {
+        let store = case.store();
+        let chain = case.chain();
+        for topic in [OUT, OTHER] {
+            let mut producer = Producer::new(case, &chain, topic, "p", 1);
+            let request = producer.request(&[data(topic)]);
+            append_batch(&*store, request).await.unwrap();
+            producer.sequence += 1;
+            producer.append(&["after"]).await;
+        }
+        close_chain(&*store, &chain, "@run", 1).await.unwrap();
+        for topic in [OUT, OTHER] {
+            let mut producer = Producer::new(case, &chain, topic, "q", 1);
+            producer.append(&["late"]).await;
+            let read = read(case, &chain, topic, BEGINNING).await.unwrap();
+            assert_eq!(values(&read), [topic, "after"], "{topic}");
+        }
+        // A topic reader skips the names, so the control log reads as empty either way.
+        let control = read(case, &chain, CHAIN_LOG, BEGINNING).await.unwrap();
+        assert!(control.records.is_empty());
+    }
+
+    /// Without a kept last position a read whose cursor record retention dropped is expired.
+    pub(crate) async fn a_lost_cursor_record_reads_as_expired(case: &dyn Case) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        let first = producer.append(&["1"]).await;
+        producer.append(&["2", "3"]).await;
+        let at = cursor(case, &chain, OUT, &first.last_position);
+        assert_eq!(
+            values(&read(case, &chain, OUT, &at).await.unwrap()),
+            ["2", "3"]
+        );
+        case.drop_oldest(&chain, OUT, 1).await;
+        assert_eq!(
+            kind(read(case, &chain, OUT, &at).await),
+            StreamFailureKind::Expired
+        );
+    }
 }
 
 macro_rules! conformance {
@@ -1709,6 +1869,8 @@ macro_rules! store_cases {
             a_second_close_answers_the_first,
             a_close_with_no_outcome_is_the_first_close_too,
             a_chain_close_keeps_no_outcome,
+            the_declared_capabilities_match_the_calls,
+            a_lost_cursor_record_reads_as_expired,
         );
     };
 }
@@ -1884,4 +2046,133 @@ mod documented_acl_cluster_redis {
     );
         deleting_an_owner_drops_every_chain_of_it,
     );
+}
+
+/// The cases every store passes, whatever it declares beyond the log. A cursor whose record
+/// retention dropped resumes only with a kept last position or dense positions, so that case
+/// runs apart.
+macro_rules! required {
+    ($case:expr) => {
+        conformance!($case;
+            append_read_roundtrip,
+            a_batch_lands_in_order_and_names_its_last_record,
+            an_empty_append_is_refused,
+            an_append_without_a_digest_is_refused,
+            latest_is_empty_on_an_empty_topic,
+            a_cursor_resumes_strictly_after_its_record,
+            latest_positions_a_reader_at_the_end,
+            end_reads_only_what_arrives_after_the_read_starts,
+            a_read_waits_no_longer_than_asked,
+            dropping_a_waiting_read_releases_it,
+            a_reader_that_falls_behind_retention_is_told,
+            an_empty_read_from_the_beginning_with_nothing_trimmed_goes_on,
+            rule_64_1_a_gap_in_the_sequence_is_accepted,
+            producers_and_attempts_dedupe_apart,
+            a_new_attempt_supersedes_the_old_one,
+            a_read_resumed_before_a_new_attempt_reports_it,
+            a_record_that_does_not_parse_fails_with_its_cursor,
+            finish_is_a_record_of_its_own,
+            topics_and_chains_are_apart,
+            a_cursor_from_another_stream_or_store_is_refused,
+            the_declared_capabilities_match_the_calls,
+            a_lost_cursor_record_reads_as_expired,
+        );
+    };
+}
+
+/// The cases of a store with no producer state, where closes are records.
+macro_rules! without_producer_state {
+    ($case:expr) => {
+        conformance!($case;
+            a_repeat_lands_a_copy_that_readers_drop,
+            a_divergent_batch_lands_and_readers_keep_the_first,
+            a_close_record_ends_every_read,
+            a_chain_close_reaches_every_topic,
+        );
+    };
+}
+
+/// A store with only the log, so every fallback runs.
+mod memory_log_only {
+    async fn case() -> Option<super::Memory> {
+        super::masked(|c| {
+            *c = temporalio_streams::Capabilities {
+                dense_positions: true,
+                ..temporalio_streams::Capabilities::log_only()
+            }
+        })
+        .await
+    }
+    required!(case());
+    // Dense positions tell a page right after a dropped cursor is whole.
+    conformance!(case(); beginning_starts_at_the_oldest_record_still_held);
+    without_producer_state!(case());
+}
+
+mod memory_without_producer_state {
+    async fn case() -> Option<super::Memory> {
+        super::masked(|c| c.producer_state = false).await
+    }
+    required!(case());
+    // Dense positions tell a page right after a dropped cursor is whole.
+    conformance!(case(); beginning_starts_at_the_oldest_record_still_held);
+    without_producer_state!(case());
+    conformance!(case();
+        an_empty_read_from_the_beginning_learns_of_a_trim,
+        rule_11_2_an_empty_read_goes_on_when_a_quiet_log_comes_back,
+        deleting_an_owner_drops_every_chain_of_it,
+    );
+}
+
+/// No producer state and no topic listing, so a chain close finds topics in the control log.
+mod memory_without_listing {
+    async fn case() -> Option<super::Memory> {
+        super::masked(|c| {
+            c.producer_state = false;
+            c.topic_listing = false;
+        })
+        .await
+    }
+    required!(case());
+    // Dense positions tell a page right after a dropped cursor is whole.
+    conformance!(case(); beginning_starts_at_the_oldest_record_still_held);
+    without_producer_state!(case());
+}
+
+mod memory_without_kept_last {
+    async fn case() -> Option<super::Memory> {
+        super::masked(|c| c.kept_last = false).await
+    }
+    required!(case());
+    // Dense positions tell a page right after a dropped cursor is whole.
+    conformance!(case(); beginning_starts_at_the_oldest_record_still_held);
+    conformance!(case();
+        a_retried_append_returns_the_original_positions,
+        a_retry_with_other_ciphertext_still_deduplicates,
+        a_divergent_retry_is_refused,
+        a_sequence_below_the_newest_is_refused,
+        rule_9_1_a_batch_inside_the_held_batch_is_refused,
+        a_closed_chain_refuses_new_batches_but_answers_a_repeat,
+        a_closed_topic_leaves_the_others_open,
+        a_closed_topic_answers_a_repeat_and_ends_reads,
+        retiring_a_producer_drops_only_its_dedupe_state,
+    );
+}
+
+#[cfg(feature = "redis")]
+mod plain_redis {
+    required!(super::on_redis::plain_redis("STREAMS_REDIS_URL", false));
+    without_producer_state!(super::on_redis::plain_redis("STREAMS_REDIS_URL", false));
+}
+
+#[cfg(feature = "redis")]
+mod plain_cluster_redis {
+    required!(super::on_redis::plain_redis(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    ));
+    without_producer_state!(super::on_redis::plain_redis(
+        "STREAMS_REDIS_CLUSTER_URL",
+        true
+    ));
 }

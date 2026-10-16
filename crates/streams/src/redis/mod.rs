@@ -8,7 +8,8 @@ mod scripts;
 mod slots;
 
 use crate::{
-    NotificationLog, StreamError, StreamResult, StreamStore,
+    Capabilities, ConditionForms, MAX_BATCH_BYTES, MAX_RECORD_BYTES, NotificationLog, StreamError,
+    StreamResult, StreamStore,
     proto::{
         ChainId, DeleteOwnerRequest, DeleteOwnerResponse, StoreAppendRequest, StoreAppendResponse,
         StoreLatestRequest, StoreLatestResponse, StoreReadRequest, StoreReadResponse, StoredClose,
@@ -34,6 +35,25 @@ const CLOSED_FIELD: &str = "closed";
 /// The meta field that holds the topic's first close, a serialized `StoredClose`.
 const CLOSE_FIELD: &str = "close";
 const DELETE_BATCH: usize = 500;
+
+const CAPABILITIES: Capabilities = Capabilities {
+    producer_state: true,
+    conditional: ConditionForms {
+        tail: false,
+        fence: false,
+    },
+    kept_last: true,
+    holds: false,
+    change_feed: false,
+    cheap_logs: true,
+    delete_owner: true,
+    topic_listing: true,
+    long_poll: true,
+    dense_positions: false,
+    replay_horizon: None,
+    max_record_bytes: MAX_RECORD_BYTES,
+    max_batch_bytes: MAX_BATCH_BYTES,
+};
 
 /// How to reach Redis and how long streams live there.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +81,10 @@ pub struct RedisStoreOptions {
     pub notification_log: bool,
     /// How many doorbells the notification log rings, each a stream that a driver blocks on.
     pub notify_doorbells: u32,
+    /// Runs with no Lua: no dedupe entries, no close flags and no topic meta. Core then takes
+    /// the fallbacks of producer state and the kept last position, as on a store that has
+    /// only a log. For tests of those fallbacks on a real store.
+    pub plain: bool,
 }
 
 impl RedisStoreOptions {
@@ -77,6 +101,7 @@ impl RedisStoreOptions {
             floor_release_grace: Duration::from_secs(24 * 60 * 60),
             notification_log: false,
             notify_doorbells: DEFAULT_NOTIFY_DOORBELLS,
+            plain: false,
         }
     }
 }
@@ -94,6 +119,7 @@ pub struct RedisStore {
     floor_lease_ms: u64,
     floor_release_grace_ms: u64,
     log: Option<Arc<log::RedisLog>>,
+    plain: bool,
 }
 
 impl std::fmt::Debug for RedisStore {
@@ -101,6 +127,7 @@ impl std::fmt::Debug for RedisStore {
         f.debug_struct("RedisStore")
             .field("prefix", &self.prefix)
             .field("retention_ms", &self.retention_ms)
+            .field("plain", &self.plain)
             .finish_non_exhaustive()
     }
 }
@@ -174,6 +201,7 @@ impl RedisStore {
                 .floor_lease
                 .map_or(retention_ms, |lease| millis(lease).max(1)),
             floor_release_grace_ms: millis(options.floor_release_grace),
+            plain: options.plain,
         })
     }
 
@@ -196,6 +224,94 @@ impl RedisStore {
             .map(|close| close.closed_by)
             .unwrap_or_default();
         error.with_closed_by(closed_by)
+    }
+
+    /// Appends the batch with `XADD`s in one transaction, each trimming by age as it lands.
+    async fn append_plain(
+        &self,
+        request: &StoreAppendRequest,
+    ) -> StreamResult<StoreAppendResponse> {
+        let log = self.keys(request.chain.as_ref())?.log(&request.topic);
+        // The client's clock, since no script can read the server's in the same step. A skew
+        // of seconds moves the trim by seconds, against a retention of days.
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis() as u64);
+        let floor = format!("{}-0", now_ms.saturating_sub(self.retention_ms));
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for record in &request.records {
+            pipe.cmd("XADD")
+                .arg(&log)
+                .arg("MINID")
+                .arg(&floor)
+                .arg("*")
+                .arg(RECORD_FIELD)
+                .arg(record.as_slice());
+        }
+        pipe.cmd("PEXPIRE")
+            .arg(&log)
+            .arg(self.retention_ms)
+            .ignore();
+        let ids: Vec<String> = pipe
+            .query_async(&mut self.shared.clone())
+            .await
+            .mapped(Call::Append)?;
+        let (Some(first), Some(last)) = (ids.first(), ids.last()) else {
+            return Err(StreamError::outcome_unknown(
+                "Redis answered the append with no stream ids",
+            ));
+        };
+        Ok(StoreAppendResponse {
+            first_position: first.clone(),
+            last_position: last.clone(),
+        })
+    }
+
+    /// Reads with `XREAD` alone. With no topic meta, the read can't tell lost records apart, and
+    /// Core decides expiry from the record at the cursor.
+    async fn read_plain(&self, request: &StoreReadRequest) -> StreamResult<StoreReadResponse> {
+        let keys = self.keys(request.chain.as_ref())?;
+        let topic = request.topic.as_str();
+        if !request.after_position.is_empty() {
+            entry(&request.after_position)?;
+        }
+        let after = match request.after_position.as_str() {
+            "" => "0-0",
+            position => position,
+        };
+        let wait = wait_of(request);
+        let deadline = Instant::now() + wait;
+        let xread = Self::xread(&keys, topic, after, request.max_records, None);
+        let reply: Value = xread
+            .query_async(&mut self.shared.clone())
+            .await
+            .mapped(Call::Read)?;
+        let mut found = records(reply)?;
+        if found.is_empty() && !wait.is_zero() {
+            let xread = Self::xread(&keys, topic, after, request.max_records, Some(wait));
+            if let Some(reply) = self
+                .blocking
+                .query(&keys.log(topic), &xread, deadline)
+                .await
+                .mapped(Call::Read)?
+            {
+                found = records(reply)?;
+            }
+        }
+        Ok(StoreReadResponse {
+            records: found,
+            ..Default::default()
+        })
+    }
+
+    fn producer_state(&self) -> StreamResult<()> {
+        if self.plain {
+            return Err(StreamError::unsupported(
+                "the Redis store in plain mode keeps no producer state",
+            ));
+        }
+        Ok(())
     }
 
     fn keys(&self, chain: Option<&ChainId>) -> StreamResult<ChainKeys> {
@@ -518,12 +634,26 @@ impl StreamStore for RedisStore {
         self.log.clone().map(|log| log as Arc<dyn NotificationLog>)
     }
 
+    fn capabilities(&self) -> Capabilities {
+        if self.plain {
+            return Capabilities {
+                producer_state: false,
+                kept_last: false,
+                ..CAPABILITIES
+            };
+        }
+        CAPABILITIES
+    }
+
     async fn append(&self, request: StoreAppendRequest) -> StreamResult<StoreAppendResponse> {
         if request.records.is_empty() {
             return Err(StreamError::refused("an append needs at least one record"));
         }
         if request.digest.is_empty() {
             return Err(StreamError::refused("an append needs the batch's digest"));
+        }
+        if self.plain {
+            return self.append_plain(&request).await;
         }
         let keys = self.keys(request.chain.as_ref())?;
         let mut script = match self.log {
@@ -576,6 +706,9 @@ impl StreamStore for RedisStore {
     }
 
     async fn read(&self, request: StoreReadRequest) -> StreamResult<StoreReadResponse> {
+        if self.plain {
+            return self.read_plain(&request).await;
+        }
         let keys = self.keys(request.chain.as_ref())?;
         let topic = request.topic.as_str();
         let position = match request.after_position.as_str() {
@@ -678,6 +811,9 @@ impl StreamStore for RedisStore {
     }
 
     async fn newest_ever(&self, chain: &ChainId, topic: &str) -> StreamResult<String> {
+        if self.plain {
+            return Ok(String::new());
+        }
         let last: Option<String> = redis::cmd("HGET")
             .arg(ChainKeys::new(&self.prefix, chain).meta(topic))
             .arg("last")
@@ -693,6 +829,9 @@ impl StreamStore for RedisStore {
         topic: &str,
         mark: &str,
     ) -> StreamResult<Option<String>> {
+        if self.plain {
+            return Ok(None);
+        }
         let trimmed: Option<String> = redis::cmd("HGET")
             .arg(ChainKeys::new(&self.prefix, chain).meta(topic))
             .arg("trimmed")
@@ -752,6 +891,7 @@ impl StreamStore for RedisStore {
     }
 
     async fn close_chain(&self, chain: &ChainId) -> StreamResult<()> {
+        self.producer_state()?;
         let keys = ChainKeys::new(&self.prefix, chain);
         redis::pipe()
             .atomic()
@@ -774,6 +914,7 @@ impl StreamStore for RedisStore {
         topic: &str,
         close: StoredClose,
     ) -> StreamResult<StoredClose> {
+        self.producer_state()?;
         let meta = ChainKeys::new(&self.prefix, chain).meta(topic);
         // The meta is the topic's tombstone, so the mark and the outcome live as long as the topic
         // is known.
@@ -796,6 +937,7 @@ impl StreamStore for RedisStore {
         producer_id: &str,
         attempt: i64,
     ) -> StreamResult<()> {
+        self.producer_state()?;
         // One field of one key, so a plain `HDEL` is atomic, and it creates nothing when the meta
         // is gone.
         redis::cmd("HDEL")
@@ -804,6 +946,31 @@ impl StreamStore for RedisStore {
             .query_async::<()>(&mut self.shared.clone())
             .await
             .mapped(Call::Write)
+    }
+
+    async fn list_topics(&self, chain: &ChainId) -> StreamResult<Vec<String>> {
+        let keys = ChainKeys::new(&self.prefix, chain);
+        let pattern = keys.topics_pattern();
+        let mut topics = Vec::new();
+        // The chain's keys share one slot, but which primary holds it is the cluster's business.
+        for node in self.shared.primaries().await.mapped(Call::Read)? {
+            let mut cursor = "0".to_string();
+            loop {
+                let (next, found) = self
+                    .shared
+                    .scan(node.as_ref(), &cursor, &pattern)
+                    .await
+                    .mapped(Call::Read)?;
+                topics.extend(found.iter().filter_map(|key| keys.topic_of(key)));
+                if next == "0" {
+                    break;
+                }
+                cursor = next;
+            }
+        }
+        topics.sort_unstable();
+        topics.dedup();
+        Ok(topics)
     }
 
     async fn delete_owner(&self, request: DeleteOwnerRequest) -> StreamResult<DeleteOwnerResponse> {
@@ -1003,6 +1170,43 @@ mod tests {
             assert!(reader.await.unwrap_err().is_cancelled());
         }
         assert_eq!(store.blocking.in_use(), 0);
+    }
+
+    #[tokio::test]
+    async fn in_plain_mode_a_repeat_lands_again_and_no_close_flag_is_kept() {
+        let Ok(url) = std::env::var("STREAMS_REDIS_URL") else {
+            return;
+        };
+        let mut options = RedisStoreOptions::new(url);
+        options.key_prefix = format!("plain-{}", std::process::id());
+        options.plain = true;
+        let store = RedisStore::connect(options).await.unwrap();
+        let capabilities = store.capabilities();
+        assert!(!capabilities.producer_state && !capabilities.kept_last);
+        assert!(capabilities.long_poll && capabilities.topic_listing);
+        let run = format!("plain-{}", std::process::id());
+        let first = store.append(append(&run, 1)).await.unwrap();
+        let again = store.append(append(&run, 1)).await.unwrap();
+        assert!(entry(&again.first_position).unwrap() > entry(&first.last_position).unwrap());
+        let read = store
+            .read(waiting_read(&run, Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(read.records.len(), 2);
+        assert!(!read.closed);
+        assert_eq!(store.list_topics(&chain(&run)).await.unwrap(), ["out"]);
+        for error in [
+            store.close_chain(&chain(&run)).await.unwrap_err(),
+            store.close_topic(&chain(&run), "out").await.unwrap_err(),
+        ] {
+            assert_eq!(error.kind, StreamFailureKind::Unsupported);
+        }
+        // A read after a position the log never held answers what follows, as a plain log does.
+        let missing = StoreReadRequest {
+            after_position: "1-0".to_string(),
+            ..waiting_read(&format!("{run}-missing"), Duration::ZERO)
+        };
+        assert!(store.read(missing).await.unwrap().records.is_empty());
     }
 
     #[tokio::test]
