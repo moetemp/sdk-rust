@@ -42,8 +42,8 @@ another process wakes within about `poll_interval`. The server's stream notifier
 path, and this wait is the path for a reader without it.
 
 **Retention.** PostgreSQL has no key expiry, so each store runs a janitor every
-`janitor_interval` (one minute). A session advisory lock lets one pass run at a time across
-processes. A pass trims the topics that are due, at most 10,000 records per topic per
+`janitor_interval` (one minute). A transaction advisory lock around each step lets one janitor
+work at a time across processes, also through PgBouncer in transaction mode. A pass trims the topics that are due, at most 10,000 records per topic per
 transaction, and keeps what a hold holds. It moves the topic's newest dropped position in the same
 transaction. A topic whose records are all gone keeps its row as the tombstone for the retention
 plus 30 days after its last write, as Redis keeps a topic's meta. Then the janitor deletes it, and
