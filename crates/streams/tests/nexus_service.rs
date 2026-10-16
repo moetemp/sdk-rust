@@ -115,6 +115,8 @@ fn token(answer: &Value) -> &str {
 struct Waker {
     waits: std::sync::Mutex<Vec<(ChainId, String, String, i64)>>,
     late: std::sync::Mutex<Option<(Arc<dyn StreamStore>, StoreAppendRequest)>>,
+    /// Refuses every wait, as a notifier that lost the callback does.
+    refuse: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait::async_trait]
@@ -134,6 +136,9 @@ impl NotifierClient for Waker {
             .lock()
             .unwrap()
             .push((chain, topic, request_id, after_counter));
+        if self.refuse.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(NotifyError::Refused("no such callback".to_string()));
+        }
         let late = self.late.lock().unwrap().take();
         if let Some((store, request)) = late {
             store.append(request).await.unwrap();
@@ -860,6 +865,33 @@ mod cases {
         assert_eq!(waker.waits.lock().unwrap().len(), 1);
     }
 
+    pub(crate) async fn a_wake_token_of_another_chain_is_refused(store: Arc<dyn StreamStore>) {
+        let waker = Arc::new(Waker::default());
+        let calls = service(store, NexusOptions::default()).with_callers(waker.clone());
+        let wf = workflow();
+        let last = write(&calls, &wf, 1, &["one"]).await;
+        let mut token = OperationToken::decode(NAMESPACE, &operation_token(&wf)).unwrap();
+        token.chain_first_run_id = "run-0".to_string();
+        let mut input = read_input(&wf, &last);
+        input["wake_token"] = json!(token.encode());
+        let refused = read(&calls, input).await.unwrap_err();
+        assert_eq!(kind_of(&refused).0, "BAD_REQUEST");
+        assert!(waker.waits.lock().unwrap().is_empty());
+    }
+
+    pub(crate) async fn a_refused_wait_answers_empty(store: Arc<dyn StreamStore>) {
+        let waker = Arc::new(Waker::default());
+        waker
+            .refuse
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let calls = service(store, NexusOptions::default()).with_callers(waker.clone());
+        let wf = workflow();
+        let last = write(&calls, &wf, 1, &["one"]).await;
+        let caught_up = read(&calls, waking(&wf, &last)).await.unwrap();
+        assert!(records(&caught_up).is_empty());
+        assert_eq!(waker.waits.lock().unwrap().len(), 1);
+    }
+
     pub(crate) async fn a_wake_token_of_another_stream_is_refused(store: Arc<dyn StreamStore>) {
         let waker = Arc::new(Waker::default());
         let calls = service(store, NexusOptions::default()).with_callers(waker.clone());
@@ -915,6 +947,8 @@ macro_rules! all_cases {
             a_record_that_lands_before_the_wait_is_in_the_answer,
             a_positions_reader_waits_and_rereads_too,
             a_wake_token_of_another_stream_is_refused,
+            a_wake_token_of_another_chain_is_refused,
+            a_refused_wait_answers_empty,
         );
     };
 }

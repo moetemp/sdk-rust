@@ -478,7 +478,14 @@ impl NexusCalls {
         let client = self.callers.as_ref().ok_or_else(|| {
             StreamError::unsupported("waking a caller needs a client connected to the server")
         })?;
-        client
+        // The wait counts after the read's position, which only means something on the chain
+        // the read read.
+        if token.chain_first_run_id != read.response.chain_first_run_id {
+            return Err(StreamError::invalid_argument(
+                "wake_token names another chain than the read's",
+            ));
+        }
+        match client
             .wait_callback(
                 crate::proto::ChainId {
                     namespace: address.namespace.clone(),
@@ -491,7 +498,21 @@ impl NexusCalls {
                 read.response.wake_after,
             )
             .await
-            .map_err(operation::caller_error)?;
+        {
+            Ok(()) => {}
+            // The empty answer stands, and the caller reads again on its own. Failing the read
+            // would fail the caller for a wake it can live without.
+            Err(crate::NotifyError::Refused(error) | crate::NotifyError::Unsupported(error)) => {
+                tracing::warn!(
+                    workflow_id = %address.workflow_id,
+                    topic = %address.topic,
+                    error,
+                    "The notifier took no wait for a caught-up Nexus reader"
+                );
+                return Ok(None);
+            }
+            Err(error) => return Err(operation::caller_error(error)),
+        }
         let reread = self
             .streams
             .read_carried(ReadRequest {
