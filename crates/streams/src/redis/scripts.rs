@@ -2,11 +2,11 @@
 //!
 //! The append script is the one the SDKs sent, with one more check, the topic's close flag, so a
 //! batch can't land after the topic's close returned (DD-16), and its trim keeps what
-//! positions-only readers hold. Its trim also finds the newest record to drop by reading forward
-//! from the oldest, since `XREVRANGE` from the floor read the whole retained log when no record
-//! was older than the floor. Redis doesn't roll a script back, so it runs every step that can fail
-//! before its first record lands. `keep.lua` is the prelude of every script that writes a log, and
-//! `floor.lua` of every script that reads or writes the holds.
+//! positions-only readers hold. Its trim reads back from the floor only when the oldest record is
+//! below it, since `XREVRANGE` from the floor reads the whole retained log when no record is older,
+//! and a forward read copies every doomed record into Lua. Redis doesn't roll a script back, so it
+//! runs every step that can fail before its first record lands. `keep.lua` is the prelude of every
+//! script that writes a log, and `floor.lua` of every script that reads or writes the holds.
 
 use redis::Script;
 use std::sync::LazyLock;
@@ -134,18 +134,13 @@ end
 
     /// How the trim finds the newest record to drop, and what it replaces.
     const TRIM_SCAN: (&str, &str) = (
-        "  local doomed
-  local from = '-'
-  repeat
-    local older = redis.call('XRANGE', log, from, '(' .. floor, 'COUNT', 1000)
-    if #older > 0 then
-      doomed = older[#older][1]
-      from = '(' .. doomed
-    end
-  until #older < 1000
-  if doomed then
+        "  -- Two reads that cost O(log n) each. Reading back from the floor walks the whole log when no
+  -- record is older, so it runs only when the oldest record is.
+  local oldest = redis.call('XRANGE', log, '-', '+', 'COUNT', 1)
+  if #oldest > 0 and id_below(oldest[1][1], floor) then
+    local doomed = redis.call('XREVRANGE', log, '(' .. floor, '-', 'COUNT', 1)
     redis.call('XTRIM', log, 'MINID', floor)
-    redis.call('HSET', meta, 'trimmed', doomed)
+    redis.call('HSET', meta, 'trimmed', doomed[1][1])
   end
 ",
         "  local doomed = redis.call('XREVRANGE', log, '(' .. floor, '-', 'COUNT', 1)
@@ -200,7 +195,7 @@ end
         assert_eq!(APPEND_LOGGED.matches("XADD', KEYS[5]").count(), 1);
         assert_eq!(
             APPEND_LOGGED_SCRIPT.get_hash(),
-            "8882324049920202484e88e6607768395cd93bd0"
+            "5ea5fe3e6a0a6812bf50a57906031cddb79c7fd2"
         );
     }
 
@@ -219,7 +214,7 @@ end
         assert_eq!(was, *APPEND_LOGGED);
         assert_eq!(
             APPEND_ARCHIVED_SCRIPT.get_hash(),
-            "84b8cfa23327bc39fc91a0201f307fd28fd4fac3"
+            "d1cba6fb10c613d027bab7de7e06c39782dc8db4"
         );
     }
 
@@ -227,7 +222,7 @@ end
     fn the_append_script_is_the_one_before_the_floor_with_the_floor_edits_only() {
         assert_eq!(
             APPEND_SCRIPT.get_hash(),
-            "861f910d9da400eaa7dc1a17b25a9881a23a4244"
+            "7f3b95cfa4e62a5421c0ac696a527b210da72e99"
         );
         let mut before_floor = APPEND
             .strip_prefix(include_str!("../../lua/floor.lua"))

@@ -83,13 +83,13 @@ and land a second time. Readers lose nothing, since a store compares a batch wit
 attempt's field only and readers find a newer attempt from the records.
 
 **Retention.** Every script that writes a log trims it with `XTRIM MINID` to the retention and
-slides the expiry of the log and its meta, so a stream dies a retention after its last write
-and nobody cleans up when the Workflow closes. The trim finds the newest record it drops with
-`XRANGE` forward from the oldest, 1,000 at a time, so it reads only what it drops. The SDKs'
-script used `XREVRANGE` back from the floor, which read the whole retained log when no record was
-older than the floor, so an append cost more the longer the log was. The `+xrange` rule already
-covers the new call. The meta outlives its log by a 30-day grace, as
-the tombstone that tells a log that expired from one that never existed.
+slides the expiry of the log and its meta, so a stream dies a retention after its last write and
+nobody cleans up when the Workflow closes. The trim reads the oldest record with `XRANGE`, and only
+when it is below the floor finds the newest record it drops with `XREVRANGE` back from the floor.
+Both cost O(log n). `XREVRANGE` alone reads the whole retained log when no record is older than the
+floor, and a forward read copies every dropped record into the script, which blocks Redis on a large
+trim. The `+xrange` rule already covers the new call. The meta outlives its log by a 30-day grace,
+as the tombstone that tells a log that expired from one that never existed.
 
 **Activity owners.** A standalone Activity run is a chain of one run. Its keys have the hash tag
 `{<namespace>:!a:<activity id>:<run id>}`, and every other part of the layout is the same. Each

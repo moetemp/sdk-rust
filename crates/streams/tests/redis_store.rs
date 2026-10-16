@@ -2479,3 +2479,49 @@ async fn a_deleted_topics_archive_mark_is_dropped() {
     let score: Option<f64> = setup.raw.zscore(&pending, &log).await.unwrap();
     assert_eq!(score, None);
 }
+
+#[tokio::test]
+async fn a_large_trim_takes_no_longer_than_a_small_one() {
+    let Some(url) = url() else { return };
+    let setup = setup_with(&url, &url, &unique("large-trim"), |options| {
+        options.retention = Duration::from_millis(500);
+        options.floor_lease = Some(Duration::from_secs(60));
+    })
+    .await;
+    let chain = chain();
+    // A hold keeps 50,000 records of 1 KiB past the retention, then ends.
+    setup
+        .store
+        .hold_floor(&chain, "events", "reader-run/1", "")
+        .await
+        .unwrap();
+    let body = vec![7u8; 1024];
+    let mut sequence = 1;
+    while sequence <= 50_000 {
+        let mut batch = append(&chain, "p", sequence, 1000, &sequence.to_be_bytes());
+        batch.records = vec![body.clone(); 1000];
+        setup.store.append(batch).await.unwrap();
+        sequence += 1000;
+    }
+    setup
+        .store
+        .release_floor(&chain, "events", "reader-run/1")
+        .await
+        .unwrap();
+    let mut raw = setup.raw.clone();
+    let floors = format!("{}:floors", log_key(&setup.prefix, &chain, "events"));
+    let _: () = raw.del(&floors).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let started = tokio::time::Instant::now();
+    setup
+        .store
+        .append(append(&chain, "p", sequence, 1, b"last"))
+        .await
+        .unwrap();
+    let took = started.elapsed();
+    let log = log_key(&setup.prefix, &chain, "events");
+    let length: usize = raw.xlen(&log).await.unwrap();
+    assert_eq!(length, 1, "the trim dropped every held record");
+    // Copying 50,000 doomed records into Lua took about 80 ms.
+    assert!(took < Duration::from_millis(30), "{took:?}");
+}
