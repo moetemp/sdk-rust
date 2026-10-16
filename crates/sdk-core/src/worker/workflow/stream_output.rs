@@ -121,6 +121,8 @@ const APPEND_RETRY_FIRST: std::time::Duration = std::time::Duration::from_millis
 pub(crate) struct OutputStore {
     store: std::sync::Arc<dyn temporalio_streams::StreamStore>,
     namespace: String,
+    /// Store calls that run after the task that caused them. A Worker shutdown waits for them.
+    tasks: tokio_util::task::TaskTracker,
 }
 
 #[cfg(feature = "streams")]
@@ -129,7 +131,11 @@ impl OutputStore {
         store: std::sync::Arc<dyn temporalio_streams::StreamStore>,
         namespace: String,
     ) -> Self {
-        Self { store, namespace }
+        Self {
+            store,
+            namespace,
+            tasks: tokio_util::task::TaskTracker::new(),
+        }
     }
 
     fn chain(&self, workflow_id: &str, first_run_id: &str) -> temporalio_streams::proto::ChainId {
@@ -221,22 +227,31 @@ impl OutputStore {
         Ok(dropped)
     }
 
-    /// Drops the store's dedupe sessions of attempts that will not write again. A failure only
-    /// leaves a session in the store until retention, so it is logged and not returned.
-    pub(crate) async fn retire(&self, retired: &RetiredSessions) {
+    /// Drops the store's dedupe sessions of attempts that will not write again, in the
+    /// background, so the next activation doesn't wait a store round trip per session. A
+    /// failure only leaves a session in the store until retention, so it is logged.
+    pub(crate) fn retire(&self, retired: RetiredSessions) {
         let chain = self.chain(&retired.workflow_id, &retired.first_run_id);
         let producer_id = temporalio_streams::workflow_producer_id(&retired.run_id);
-        for (attempt, topics) in &retired.sessions {
-            for topic in topics {
-                if let Err(error) = self
-                    .store
-                    .retire_producer(&chain, topic, &producer_id, *attempt)
-                    .await
-                {
-                    debug!(%topic, attempt, %error, "Could not retire a stream output session");
+        let store = self.store.clone();
+        self.tasks.spawn(async move {
+            for (attempt, topics) in &retired.sessions {
+                for topic in topics {
+                    if let Err(error) = store
+                        .retire_producer(&chain, topic, &producer_id, *attempt)
+                        .await
+                    {
+                        debug!(%topic, attempt, %error, "Could not retire a stream output session");
+                    }
                 }
             }
-        }
+        });
+    }
+
+    /// Waits for the store calls still running in the background.
+    pub(crate) async fn flush(&self) {
+        self.tasks.close();
+        self.tasks.wait().await;
     }
 }
 
