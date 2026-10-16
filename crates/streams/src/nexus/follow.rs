@@ -29,7 +29,7 @@ use std::{
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 
 /// The most bytes a follow's state may take. It holds every open stream's read state, so it is
-/// larger than a read's, and the limits keep it below this (DD-207).
+/// larger than a read's, and the limits keep it below this (DD-206).
 const MAX_FOLLOW_STATE_BYTES: usize = 64 << 10;
 /// The longest `floor_holder` a follow takes. Each stream holds as `<floor_holder>/<source>`, which
 /// must fit the store's 512 bytes.
@@ -523,7 +523,7 @@ fn follow_state(state: Option<String>) -> Result<Vec<u8>, Box<NexusStep>> {
     }
 }
 
-/// Whether an operation token names the follow's root, on the whole owner (DD-194).
+/// Whether an operation token names the follow's root, on the whole owner.
 fn names_root(token: &StreamAddress, root: &StreamAddress) -> bool {
     token.owner_kind == root.owner_kind
         && token.workflow_id == root.workflow_id
