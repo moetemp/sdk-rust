@@ -9,11 +9,11 @@ use crate::{
     BEGINNING, END, StreamError, StreamResult, StreamStore, cursor_position, mint_cursor,
     proto::{
         ChainId, ReadRecord, ReadRequest, ReadResponse, StoreLatestRequest, StoreReadRequest,
-        StoredRecord, StreamRecord, StreamRecordKind, Supersession, read_record,
+        StoreReadResponse, StoredRecord, StreamRecord, StreamRecordKind, Supersession, read_record,
     },
 };
 use prost::Message;
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 /// The low bits of a Workflow producer's attempt, which count the reruns of one task. The high
 /// bits name the last task that completed before it.
@@ -345,18 +345,21 @@ pub(crate) async fn read_with(
         state.watermark_known = true;
     }
 
-    let page = store
-        .read(StoreReadRequest {
-            chain: Some(target.chain.clone()),
-            topic: target.topic.clone(),
-            after_position: position.clone(),
-            wait: request.wait,
-            max_records: match request.max_records {
-                0 => DEFAULT_MAX_RECORDS,
-                max => max,
-            },
-        })
-        .await?;
+    let page_request = StoreReadRequest {
+        chain: Some(target.chain.clone()),
+        topic: target.topic.clone(),
+        after_position: position.clone(),
+        wait: request.wait,
+        max_records: match request.max_records {
+            0 => DEFAULT_MAX_RECORDS,
+            max => max,
+        },
+    };
+    let page = if capabilities.long_poll {
+        store.read(page_request).await?
+    } else {
+        poll(store, page_request).await?
+    };
     if !capabilities.kept_last {
         let mark = if position.is_empty() {
             &state.watermark
@@ -440,6 +443,33 @@ pub(crate) async fn read_with(
         },
         closed,
     ))
+}
+
+/// The first poll interval of a read on a store with no long poll, and the longest.
+const POLL_FIRST: Duration = Duration::from_millis(50);
+const POLL_MAX: Duration = Duration::from_secs(1);
+
+/// Reads a page on a store that can't wait for a record, asking again with a backoff until a
+/// record arrives, the stream closes or the request's wait passes.
+async fn poll(
+    store: &dyn StreamStore,
+    request: StoreReadRequest,
+) -> StreamResult<StoreReadResponse> {
+    let wait = request
+        .wait
+        .and_then(|wait| Duration::try_from(wait).ok())
+        .unwrap_or_default();
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut interval = POLL_FIRST;
+    loop {
+        let page = store.read(request.clone()).await?;
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if !page.records.is_empty() || page.closed || remaining.is_zero() {
+            return Ok(page);
+        }
+        tokio::time::sleep(interval.min(remaining)).await;
+        interval = (interval * 2).min(POLL_MAX);
+    }
 }
 
 /// Fails as expired when retention may have dropped records after `mark` that the read had not
