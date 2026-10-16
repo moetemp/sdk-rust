@@ -70,9 +70,8 @@ mod tests {
     /// What the append script adds for a Workflow Activity's topic set.
     const TOPIC_SET: &str = "local topics = KEYS[5]
 if topics then
-  if sequence == 1 then
-    redis.call('SADD', topics, KEYS[1])
-  end
+  -- On every batch, since the first one can be lost and the close must still find the topic.
+  redis.call('SADD', topics, KEYS[1])
   redis.call('PEXPIRE', topics, retention + grace)
 end
 ";
@@ -121,7 +120,7 @@ end
         assert_eq!(APPEND_LOGGED.matches("XADD', KEYS[5]").count(), 1);
         assert_eq!(
             APPEND_LOGGED_SCRIPT.get_hash(),
-            "b64e932764749b4512381c532f84aabcf3f47793"
+            "e20b57d34060cd9498c9189e7cf1c2a7ae01190c"
         );
     }
 
@@ -129,7 +128,7 @@ end
     fn the_append_script_is_the_one_before_the_floor_with_the_floor_edits_only() {
         assert_eq!(
             APPEND_SCRIPT.get_hash(),
-            "7b78ecb38fd39b09d510586a77b226f58ba02f66"
+            "792ae093a9c09ea8da9078a724eced11ddf5935d"
         );
         let mut before_floor = APPEND
             .strip_prefix(include_str!("../../lua/floor.lua"))

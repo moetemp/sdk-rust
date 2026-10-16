@@ -405,7 +405,8 @@ impl StreamStore for MemoryStore {
                     .with_closed_by(closed_by),
             );
         }
-        if keeps_topics && request.sequence == 1 {
+        // On every batch, since the first one can be lost and the close must still find it.
+        if keeps_topics {
             chain.written.insert(request.topic.clone());
         }
         let topic = chain.topics.entry(request.topic.clone()).or_default();

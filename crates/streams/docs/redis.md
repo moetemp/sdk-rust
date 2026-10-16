@@ -80,7 +80,7 @@ an Activity's keys. The tag starts with the namespace, so the documented ACL cov
 Its keys have the hash tag `{<namespace>:!wa:<workflow id>:<run id>:<activity id>}`, so each
 Activity lands in a slot of its own and Activity `1` of the next run is another chain. Such a
 chain has one more key, `<prefix>:{<tag>}:topics`, a set of the log keys its producers wrote. The
-append script adds the log key with `SADD` when a producer attempt writes its first batch, and
+append script adds the log key with `SADD` on every batch, since a first batch can be lost, and
 slides the set's expiry to the retention plus the grace on each append. The scheduling Workflow's
 Core reads it with `SMEMBERS` to close every topic when the Activity ends.
 

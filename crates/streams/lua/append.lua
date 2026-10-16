@@ -37,9 +37,8 @@ for i = 6, #ARGV do
 end
 local topics = KEYS[5]
 if topics then
-  if sequence == 1 then
-    redis.call('SADD', topics, KEYS[1])
-  end
+  -- On every batch, since the first one can be lost and the close must still find the topic.
+  redis.call('SADD', topics, KEYS[1])
   redis.call('PEXPIRE', topics, retention + grace)
 end
 keep(KEYS[1], KEYS[2], #ARGV - 5, last, grace, floor_ms, life)

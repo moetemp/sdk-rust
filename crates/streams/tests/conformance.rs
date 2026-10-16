@@ -1569,6 +1569,21 @@ mod cases {
         );
     }
 
+    pub(crate) async fn a_workflow_activity_keeps_a_topic_whose_first_batch_was_lost(
+        case: &dyn Case,
+    ) {
+        let chain = case.chain();
+        let mut producer = Producer::new(case, &chain, OUT, "p", 1);
+        producer.sequence = 3;
+        producer.append(&["3"]).await;
+        let written = case.store().written_topics(&chain).await.unwrap();
+        if chain.owner_kind == StreamOwnerKind::WorkflowActivity as i32 {
+            assert_eq!(written, [OUT]);
+        } else {
+            assert!(written.is_empty());
+        }
+    }
+
     pub(crate) async fn deleting_a_workflow_drops_its_workflow_activities(case: &dyn Case) {
         let store = case.store();
         let chain = case.chain();
@@ -1844,6 +1859,7 @@ macro_rules! store_cases {
             a_close_with_no_outcome_is_the_first_close_too,
             a_chain_close_keeps_no_outcome,
             a_workflow_activity_keeps_the_topics_it_wrote,
+            a_workflow_activity_keeps_a_topic_whose_first_batch_was_lost,
         );
     };
 }
