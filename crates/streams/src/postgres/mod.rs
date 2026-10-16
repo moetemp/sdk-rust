@@ -301,10 +301,11 @@ impl Sql {
             advance: format!("SELECT {s}.advance_archive_v1($1, $2, $3, $4, $5, $6, $7, $8)"),
             archive_marks: format!(
                 "SELECT x.namespace, x.owner_kind, x.owner_id, x.first_run_id, x.activity_id, \
-                   x.topic, x.written_ms FROM ( \
+                   x.topic, x.written_ms, x.idle_ms FROM ( \
                    SELECT c.namespace, c.owner_kind, c.owner_id, c.first_run_id, c.activity_id, \
                      t.topic, CASE WHEN t.closed THEN 0 \
                        ELSE (extract(epoch FROM t.written_at) * 1000)::bigint END AS written_ms, \
+                     (extract(epoch FROM now() - t.written_at) * 1000)::bigint AS idle_ms, \
                      row_number() OVER (PARTITION BY t.partition \
                        ORDER BY t.closed DESC, t.written_at) AS n \
                    FROM {s}.topics t JOIN {s}.chains c ON c.chain_id = t.chain_id \
@@ -344,7 +345,8 @@ impl PostgresStore {
     pub async fn connect(options: PostgresStoreOptions) -> StreamResult<Self> {
         if !valid_schema(&options.schema) {
             return Err(StreamError::refused(format!(
-                "the schema must match [a-z_][a-z0-9_]{{0,{}}}, not {:?}",
+                "the schema must match [a-z_][a-z0-9_]{{0,{}}}, start with no `pg_` and be no \
+                 reserved word, not {:?}",
                 MAX_SCHEMA - 1,
                 options.schema
             )));
@@ -449,7 +451,92 @@ fn valid_schema(schema: &str) -> bool {
         .is_some_and(|first| first.is_ascii_lowercase() || first == b'_')
         && schema.len() <= MAX_SCHEMA
         && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        // PostgreSQL keeps `pg_` names for itself, and a reserved word needs quotes in SQL.
+        && !schema.starts_with("pg_")
+        && !RESERVED_WORDS.contains(&schema)
 }
+
+/// PostgreSQL's reserved key words, which can't name a schema without quotes.
+const RESERVED_WORDS: [&str; 78] = [
+    "all",
+    "analyse",
+    "analyze",
+    "and",
+    "any",
+    "array",
+    "as",
+    "asc",
+    "asymmetric",
+    "both",
+    "case",
+    "cast",
+    "check",
+    "collate",
+    "column",
+    "constraint",
+    "create",
+    "current_catalog",
+    "current_date",
+    "current_role",
+    "current_time",
+    "current_timestamp",
+    "current_user",
+    "default",
+    "deferrable",
+    "desc",
+    "distinct",
+    "do",
+    "else",
+    "end",
+    "except",
+    "false",
+    "fetch",
+    "for",
+    "foreign",
+    "from",
+    "grant",
+    "group",
+    "having",
+    "in",
+    "initially",
+    "intersect",
+    "into",
+    "lateral",
+    "leading",
+    "limit",
+    "localtime",
+    "localtimestamp",
+    "not",
+    "null",
+    "offset",
+    "on",
+    "only",
+    "or",
+    "order",
+    "placing",
+    "primary",
+    "references",
+    "returning",
+    "select",
+    "session_user",
+    "some",
+    "symmetric",
+    "system_user",
+    "table",
+    "then",
+    "to",
+    "trailing",
+    "true",
+    "union",
+    "unique",
+    "user",
+    "using",
+    "variadic",
+    "when",
+    "where",
+    "window",
+    "with",
+];
 
 async fn check_server(client: &tokio_postgres::Client) -> StreamResult<()> {
     let version: String = client
@@ -818,6 +905,9 @@ impl StreamStore for PostgresStore {
             if !look.response.records.is_empty() || look.response.closed {
                 return Ok(look.response);
             }
+            inner
+                .waiters
+                .learn(&(chain.clone(), request.topic.clone()), look.topic_id);
             if tokio::time::timeout_at(deadline, wake.changed())
                 .await
                 .is_err()
@@ -1204,6 +1294,10 @@ mod tests {
             ("Streams", false),
             ("a;drop", false),
             ("a-b", false),
+            ("pg_streams", false),
+            ("user", false),
+            ("select", false),
+            ("users", true),
         ] {
             assert_eq!(valid_schema(schema), ok, "{schema:?}");
         }
