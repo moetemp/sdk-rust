@@ -43,7 +43,8 @@ path, and this wait is the path for a reader without it.
 
 **`notify_reads`.** With it, each append also sends `NOTIFY` on `<schema>_read_<topic id % 64>`
 with the topic id, and the store's listener wakes the waiters of that topic. A reader in another
-process then wakes in a few milliseconds. It is off by default, since a transaction that sent
+process then wakes in a few milliseconds. A reader that waits on a topic with no row yet wakes
+from the poll, since a `NOTIFY` can't name it. It is off by default, since a transaction that sent
 `NOTIFY` takes a lock on the server's notification queue as it commits, so such commits run one
 at a time across the database. With many producers at once, it costs append throughput.
 
@@ -62,12 +63,13 @@ delete removed is acked as broken when a driver takes it.
 channels. It connects with the store, so a store whose listener can't connect fails at once. When
 the connection ends, it connects again with backoff, rings every doorbell for every partition and
 wakes every waiting read, since what was sent while it was away is gone. The driver's sweep finds a
-lost ring too. `LISTEN` keeps state on the server session, so the listener uses `listen_url` when
-it is set, and `url` otherwise. Both must name the primary, since a standby refuses `LISTEN`.
+lost ring too. The listener sets TCP keepalive to notice a dead connection within a minute.
+`LISTEN` keeps state on the server session, so the listener uses `listen_url` when it is set, and
+`url` otherwise. Both must name the primary, since a standby refuses `LISTEN`.
 
 **Retention.** PostgreSQL has no key expiry, so each store runs a janitor every
-`janitor_interval` (one minute). A session advisory lock lets one pass run at a time across
-processes. A pass trims the topics that are due, at most 10,000 records per topic per
+`janitor_interval` (one minute). A transaction advisory lock around each step lets one janitor
+work at a time across processes, also through PgBouncer in transaction mode. A pass trims the topics that are due, at most 10,000 records per topic per
 transaction, and keeps what a hold holds. It moves the topic's newest dropped position in the same
 transaction. A topic whose records are all gone keeps its row as the tombstone for the retention
 plus 30 days after its last write, as Redis keeps a topic's meta. Then the janitor deletes it, and
