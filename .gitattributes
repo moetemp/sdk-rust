@@ -1,1 +1,7 @@
 CHANGELOG.md merge=union
+# GitHub folds vendored protos and test vectors in diffs.
+crates/protos/protos/api_upstream/** linguist-generated=true
+crates/protos/protos/api_cloud_upstream/** linguist-generated=true
+crates/protos/protos/testsrv_upstream/** linguist-generated=true
+**/testdata/** linguist-generated=true
+*_vectors.json linguist-generated=true
