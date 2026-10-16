@@ -53,6 +53,7 @@ impl DrivenWorkflow {
             memo: attribs.memo.clone(),
             search_attrs: attribs.search_attributes.clone(),
             retry_policy: attribs.retry_policy.clone(),
+            cron: !attribs.cron_schedule.is_empty(),
         };
         self.send_job(
             start_workflow_from_attribs(attribs, workflow_id, randomness_seed, start_time).into(),

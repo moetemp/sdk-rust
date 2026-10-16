@@ -134,13 +134,21 @@ other namespaces' streams and positions, never records. A driver needs those key
 write, and `+xreadgroup +xautoclaim +xack +xdel +xgroup|create +xlen +xadd +cluster|slots`.
 `+config|get` only reads `maxmemory-policy`, and the store goes on when a server refuses it.
 
+**Plain mode.** `RedisStoreOptions::plain` runs the store with no Lua. An append is a
+`MULTI` of `XADD`s that trim by age, a read is `XREAD` alone, and no meta and no close flag is
+kept. So the store declares neither producer state nor a kept last position, and Core takes
+their fallbacks: readers drop copies and end at the first `CLOSE` record, and a read decides
+expiry from the record at its cursor. It exists so tests run those fallbacks on a real store.
+Listing a chain's topics scans every primary, as a delete does, and needs `+scan`.
+
 **Tests.** The Redis tests run when `STREAMS_REDIS_URL` names a standalone server and
 `STREAMS_REDIS_CLUSTER_URL` a cluster seed. `scripts/redis-test-servers.sh` starts both, the
 cluster with one replica per primary. `STREAMS_REDIS_CLUSTER_ADMIN=1` lets the driver tests move
 a slot and fail a primary over, so set it only for a cluster of the tests' own. The
-conformance suite runs on each, and once more as a user with exactly the ACL above. The
-cross-implementation test also needs `STREAMS_BROOK_PY`, a Python SDK checkout whose provider
-predates the move.
+conformance suite runs on each, once more as a user with exactly the ACL above, and once in
+plain mode with the cases of the fallbacks. `tests/fallbacks.rs` adds faults on plain Redis
+too. The cross-implementation test also needs `STREAMS_BROOK_PY`, a Python SDK checkout whose
+provider predates the move.
 
 **Managed Redis.** [managed-redis.md](managed-redis.md) covers Amazon MemoryDB and ElastiCache,
 with the access string that those services take in place of `ACL SETUSER`.
