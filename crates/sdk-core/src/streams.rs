@@ -1264,4 +1264,213 @@ mod tests {
         );
         live.end().await;
     }
+
+    /// One record from one producer, as its batch at `sequence`.
+    fn record_append(stream: &proto::StreamAddress, sequence: i64) -> proto::AppendRequest {
+        proto::AppendRequest {
+            stream: Some(stream.clone()),
+            producer: Some(proto::append_request::Producer::Named(
+                proto::NamedProducer {
+                    producer_id: "producer".to_string(),
+                    attempt: 1,
+                },
+            )),
+            sequence,
+            records: vec![proto::AppendRecord {
+                kind: proto::StreamRecordKind::Data as i32,
+                body: Some(
+                    temporalio_common::protos::temporal::api::common::v1::Payload {
+                        data: b"token".to_vec(),
+                        ..Default::default()
+                    },
+                ),
+                content_hash: vec![7; 32],
+                ..Default::default()
+            }],
+            digest: vec![sequence as u8; 32],
+        }
+    }
+
+    /// Needs a server with idle Workflow targets at `STREAMS_NOTIFIER_SERVER`, and a recheck
+    /// interval longer than the test, since a recheck wakes the reader too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_workflow_reader_gets_one_wake_per_idle_stretch() {
+        use prost::Message;
+        use std::time::Duration;
+        use temporalio_common::protos::temporal::api::{
+            common::v1::WorkflowType,
+            taskqueue::v1::TaskQueue,
+            workflowservice::v1::{
+                DescribeStreamNotifierRequest, StartWorkflowExecutionRequest,
+                TerminateWorkflowExecutionRequest,
+            },
+        };
+        let Ok(server) = std::env::var("STREAMS_NOTIFIER_SERVER") else {
+            eprintln!("set STREAMS_NOTIFIER_SERVER to run the live notifier test");
+            return;
+        };
+        let connection = Connection::connect(
+            temporalio_client::ConnectionOptions::new(url::Url::parse(&server).unwrap()).build(),
+        )
+        .await
+        .unwrap();
+        // No Worker polls either Workflow, so the owner's stream stays open and the reader's
+        // wakes stay pending.
+        let mut runs = vec![];
+        for role in ["owner", "reader"] {
+            let workflow_id = format!("cn-idle-{role}-{}", uuid::Uuid::new_v4());
+            let started = connection
+                .workflow_service()
+                .start_workflow_execution(
+                    StartWorkflowExecutionRequest {
+                        namespace: "default".to_string(),
+                        workflow_id: workflow_id.clone(),
+                        workflow_type: Some(WorkflowType {
+                            name: role.to_string(),
+                        }),
+                        task_queue: Some(TaskQueue {
+                            name: "cn-notifier-nobody".to_string(),
+                            ..Default::default()
+                        }),
+                        request_id: uuid::Uuid::new_v4().to_string(),
+                        ..Default::default()
+                    }
+                    .into_request(),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+            runs.push(WorkflowExecution {
+                workflow_id,
+                run_id: started.run_id,
+            });
+        }
+        let (owner, reader) = (runs[0].clone(), runs[1].clone());
+        let service = connect_stream_service(
+            proto::StreamStoreConfig {
+                store: Some(proto::stream_store_config::Store::Memory(
+                    proto::MemoryStoreConfig {},
+                )),
+                notify_on_append: true,
+                ..Default::default()
+            },
+            connection.clone(),
+        )
+        .await
+        .unwrap();
+        let stream = proto::StreamAddress {
+            namespace: "default".to_string(),
+            owner_kind: proto::StreamOwnerKind::Workflow as i32,
+            workflow_id: owner.workflow_id.clone(),
+            topic: "tokens".to_string(),
+            ..Default::default()
+        };
+        let read = |after: String| {
+            let request = proto::ReadRequest {
+                stream: Some(stream.clone()),
+                after,
+                subscriber: Some(proto::ReadSubscriber {
+                    workflow_id: reader.workflow_id.clone(),
+                    run_id: reader.run_id.clone(),
+                    subscription_id: "1".to_string(),
+                    generation: 0,
+                }),
+                ..Default::default()
+            };
+            let service = service.clone();
+            async move {
+                proto::ReadResponse::decode(
+                    service
+                        .call("Read", &request.encode_to_vec())
+                        .await
+                        .unwrap()
+                        .as_slice(),
+                )
+                .unwrap()
+            }
+        };
+        let append = |sequence: i64| {
+            let request = record_append(&stream, sequence);
+            let service = service.clone();
+            async move {
+                service
+                    .call("Append", &request.encode_to_vec())
+                    .await
+                    .unwrap();
+            }
+        };
+        let delivered = || async {
+            let described = connection
+                .workflow_service()
+                .describe_stream_notifier(
+                    DescribeStreamNotifierRequest {
+                        namespace: "default".to_string(),
+                        stream_ref: Some(StreamReference {
+                            owner_kind: StreamOwnerKind::Workflow as i32,
+                            workflow_id: owner.workflow_id.clone(),
+                            run_id: owner.run_id.clone(),
+                            topic: "tokens".to_string(),
+                            ..Default::default()
+                        }),
+                    }
+                    .into_request(),
+                )
+                .await
+                .unwrap()
+                .into_inner();
+            let [callback] = described.callbacks.as_slice() else {
+                panic!("one callback, not {:?}", described.callbacks);
+            };
+            assert_eq!(
+                callback.workflow_target.as_ref().unwrap().workflow_id,
+                reader.workflow_id
+            );
+            callback.delivered_counter
+        };
+        let delivered_reaches = |counter: i64| async move {
+            for _ in 0..100 {
+                if delivered().await >= counter {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            panic!("no wake after counter {counter}");
+        };
+        // A debounce window is one second, so a wake that is not sent by then is held.
+        let settle = || tokio::time::sleep(Duration::from_secs(3));
+
+        let empty = read(String::new()).await;
+        assert!(empty.records.is_empty() && !empty.done);
+        assert_eq!(delivered().await, 0, "an idle attach wakes nothing");
+        append(1).await;
+        delivered_reaches(1).await;
+        append(2).await;
+        settle().await;
+        assert_eq!(delivered().await, 1, "the wait was used up");
+
+        let busy = read(empty.cursor).await;
+        assert_eq!(busy.records.len(), 2);
+        let idle = read(busy.cursor).await;
+        assert!(idle.records.is_empty());
+        assert_eq!(idle.wake_after, 2);
+        settle().await;
+        assert_eq!(delivered().await, 1, "a wait at the counter wakes nothing");
+        append(3).await;
+        delivered_reaches(3).await;
+
+        for run in [owner, reader] {
+            connection
+                .workflow_service()
+                .terminate_workflow_execution(
+                    TerminateWorkflowExecutionRequest {
+                        namespace: "default".to_string(),
+                        workflow_execution: Some(run),
+                        ..Default::default()
+                    }
+                    .into_request(),
+                )
+                .await
+                .unwrap();
+        }
+    }
 }
