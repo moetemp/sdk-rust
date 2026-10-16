@@ -10,6 +10,7 @@
 //! output through the same trait.
 
 mod archive;
+mod close;
 mod cursor;
 mod driver;
 mod error;
@@ -39,6 +40,7 @@ pub use self::redis::{DEFAULT_NOTIFY_DOORBELLS, RedisStore, RedisStoreOptions};
 #[cfg(feature = "archive")]
 pub use archive::ObjectStoreArchive;
 pub use archive::{ArchiveProgress, LocalFileArchive, SegmentLimits, StreamArchive, archive_topic};
+pub use close::{CHAIN_LOG, append_batch, close_chain, close_topic};
 pub use cursor::{BEGINNING, END, cursor_position, mint_cursor, stream_hash};
 pub use driver::{ArchiveSink, StreamDriver, StreamDriverOptions};
 pub use error::{StreamError, StreamResult};
@@ -58,12 +60,13 @@ pub use reader::{
 pub use record::{
     ACTIVITY_OWNER_KIND, MAX_KEYED_ACTIVITY_ATTEMPT, WORKFLOW_ACTIVITY_OWNER_KIND,
     WORKFLOW_OWNER_KIND, activity_attempt, activity_producer_id, chain_owner, check_append_digest,
-    stored_append_record, workflow_batch_digest, workflow_producer_id,
+    check_record_limit, check_store_limits, close_record, stored_append_record, topic_record,
+    workflow_batch_digest, workflow_producer_id,
 };
 pub use service::StreamService;
 pub use store::{
-    ARCHIVE_HOLDER, CloseOutcome, MAX_CLOSE_BYTES, MAX_FLOOR_HOLDERS, StreamStore,
-    empty_close_result,
+    ARCHIVE_HOLDER, Capabilities, CloseOutcome, ConditionForms, MAX_BATCH_BYTES, MAX_CLOSE_BYTES,
+    MAX_FLOOR_HOLDERS, MAX_RECORD_BYTES, StreamStore, empty_close_result,
 };
 pub use tiered::TieredStore;
 

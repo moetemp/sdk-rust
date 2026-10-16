@@ -5,6 +5,7 @@ package temporal.sdk.streams.v1;
 option ruby_package = "Temporalio::Internal::Bridge::Api::StreamRecord";
 
 import "temporal/api/common/v1/message.proto";
+import "temporal/api/failure/v1/message.proto";
 import "temporal/api/stream/v1/message.proto";
 
 // One entry in a stream. The record is the wire format: stores keep it
@@ -44,6 +45,12 @@ message StreamRecord {
     // A trailing zero means the list goes back to the run's start. A reader
     // learns from it whether an earlier attempt it delivered completed.
     repeated int64 completed_tasks = 10;
+    // On a CLOSE, the result the stream closed with, after the payload codec.
+    // `producer_id` names who closed it. A CLOSE with no result and no
+    // failure closed with no outcome.
+    temporal.api.common.v1.Payload close_result = 11;
+    // On a CLOSE, the failure the stream closed with.
+    temporal.api.failure.v1.Failure close_failure = 12;
 }
 
 // What a record means to a reader.
@@ -61,6 +68,13 @@ enum StreamRecordKind {
     // A reference to another stream. `link` carries it. `body` may carry a
     // value, after the payload codec.
     STREAM_RECORD_KIND_LINK = 4;
+    // Ends `topic` for every reader, or every topic of the chain when `topic`
+    // is empty. Readers drop every record after the first one. On a store
+    // without close flags, producers and the owner's Core write it to close.
+    STREAM_RECORD_KIND_CLOSE = 5;
+    // Names `topic` in the chain's control log `_chain`, so a closer finds the
+    // chain's topics on a store that can't list them. Topic readers skip it.
+    STREAM_RECORD_KIND_TOPIC = 6;
 }
 
 // A reference from one stream to another, for followers.
