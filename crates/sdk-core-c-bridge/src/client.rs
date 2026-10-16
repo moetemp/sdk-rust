@@ -716,6 +716,9 @@ async fn call_workflow_service(
         "DetachStreamCallback" => {
             rpc_call_on_trait!(client, call, WorkflowService, detach_stream_callback)
         }
+        "WaitStreamCallback" => {
+            rpc_call_on_trait!(client, call, WorkflowService, wait_stream_callback)
+        }
         "ExecuteMultiOperation" => {
             rpc_call_on_trait!(client, call, WorkflowService, execute_multi_operation)
         }

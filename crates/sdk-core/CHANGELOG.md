@@ -97,6 +97,16 @@ relevant information.
   script read the whole log with `XREVRANGE`. At 100,000 retained records an append took about
   4 ms before and takes about the same as on a short log now. The append script's hashes are now
   `188afac5`, `eeed648a` with the notification log, and `337494c0` with the archive.
+* Experimental: a Workflow's reader gets one wake per idle stretch, not every notification. A
+  `Read` with the new `subscriber` that finds no record attaches the reader as an `idle` callback
+  once per process and sends `WaitStreamCallback` after the answer's `wake_after`. A read that
+  finds records sends nothing. After a fresh attach Core reads once more when a record landed
+  before the notifier existed. A `Follow` with `subscriber` does the same for each idle source.
+  `Subscribe` attaches idle too. A wait the notifier refuses, as one that lost the callback,
+  attaches the reader again and waits once more. A server without the wait (`UNIMPLEMENTED`), or
+  one that refuses an idle Workflow target, keeps readers standing. The process then attaches
+  them standing and sends no waits. `NotifierClient::wait_callback` sends the wait, and the C
+  bridge takes `WaitStreamCallback` as a raw call.
 * Experimental: the new `FlushNotifications` stream call waits up to 10 seconds for the
   notifications still out. A process calls it before it stops.
 * Experimental: a server without the stream notifier answers the first notifier call with
@@ -114,8 +124,7 @@ relevant information.
   `jetty/<run id>/<subscription id>`, so a rerun attaches as the same reader. After a wake with
   `resubscribe`, lang raises `SubscribeRequest.generation`, which makes a new attach. A process
   attaches each subscription once and answers a repeat from memory. The attach names the chain
-  that holds the Workflow id now. The attach only announces the reader, and the first append
-  wakes the Workflow.
+  that holds the Workflow id now. The reader is idle until a read asks for a wake.
 * Experimental: the new `WaitForNotification` stream call waits on a stream's notifier with the
   server's `PollStreamNotifier` long poll, for a client reader whose read came back empty. It
   returns when the notifier's counter passes the read's `wake_after`, when the stream closed, or

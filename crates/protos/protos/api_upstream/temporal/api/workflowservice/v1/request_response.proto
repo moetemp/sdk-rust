@@ -3719,9 +3719,33 @@ message AttachStreamCallbackRequest {
     // Workflow gets each change of the stream as a `StreamWake` on its next Workflow Task. Exactly
     // one of `callback` and `workflow_target` is set.
     temporal.api.stream.v1.WorkflowWakeTarget workflow_target = 8;
+    // Attaches the callback idle. An idle callback gets no progress until WaitStreamCallback asks
+    // for one wake, and it goes back to idle after that delivery. It still gets the completion
+    // when the stream closes. A Workflow reader attaches its `workflow_target` idle, so a busy
+    // reader gets no wake.
+    bool idle = 9;
 }
 
 message AttachStreamCallbackResponse {
+}
+
+message WaitStreamCallbackRequest {
+    string namespace = 1;
+    temporal.api.stream.v1.StreamReference stream_ref = 2;
+    // The request ID the idle callback was attached with.
+    string request_id = 3;
+    // The notifier delivers progress to the callback once, when its counter is above this value.
+    // If the counter is above it already, the delivery goes out at once. A reader passes the
+    // counter of the position its last read reached.
+    //
+    // (-- api-linter: core::0140::prepositions=disabled
+    //     aip.dev/not-precedent: "after" names the bound the counter must pass. --)
+    int64 after_counter = 4;
+    // The identity of the caller.
+    string identity = 5;
+}
+
+message WaitStreamCallbackResponse {
 }
 
 message DetachStreamCallbackRequest {
