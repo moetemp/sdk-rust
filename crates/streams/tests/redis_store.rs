@@ -2141,3 +2141,50 @@ async fn a_readers_short_hold_never_ends_the_archives_hold() {
     // The reader's lease ended, and the records the archive has not taken stay.
     assert_eq!(sequences(&mut setup, &chain).await, [1, 2, 3]);
 }
+
+/// The median time of `n` single-record appends to `chain`'s topic, from sequence `first`.
+async fn median_append(store: &RedisStore, chain: &ChainId, first: i64, n: i64) -> Duration {
+    let mut times = vec![];
+    for sequence in first..first + n {
+        let started = tokio::time::Instant::now();
+        store
+            .append(append(chain, "p", sequence, 1, &sequence.to_be_bytes()))
+            .await
+            .unwrap();
+        times.push(started.elapsed());
+    }
+    times.sort();
+    times[times.len() / 2]
+}
+
+#[tokio::test]
+async fn an_append_costs_the_same_however_long_the_retained_log_is() {
+    let Some(setup) = setup().await else { return };
+    let (short, long) = (chain(), chain());
+    let mut sequence = 1;
+    // 100,000 entries, all within the retention, so the trim drops none of them.
+    while sequence <= 100_000 {
+        setup
+            .store
+            .append(append(&long, "p", sequence, 1000, &sequence.to_be_bytes()))
+            .await
+            .unwrap();
+        sequence += 1000;
+    }
+    setup
+        .store
+        .append(append(&short, "p", 1, 1, b"1"))
+        .await
+        .unwrap();
+    let on_short = median_append(&setup.store, &short, 2, 30).await;
+    let on_long = median_append(&setup.store, &long, sequence, 30).await;
+    // Finding the newest record to trim once scanned the whole log, about 4 ms at this length.
+    assert!(
+        on_long < Duration::from_millis(1),
+        "{on_long:?} on the long log, {on_short:?} on the short one"
+    );
+    assert!(
+        on_long < on_short * 3 + Duration::from_micros(200),
+        "{on_long:?} on the long log, {on_short:?} on the short one"
+    );
+}
