@@ -67,6 +67,36 @@ services:
           replay.
         input: { $ref: "#/$defs/ReadRangeInput" }
         output: { $ref: "#/$defs/ReadOutput" }
+      follow:
+        fqn: follow
+        description: >-
+          Answer with the records after the caller's position on a stream and
+          on every stream its link records open, in one order. Order within
+          each stream is kept. A linked stream's records come after its OPEN
+          link, and the linking stream's records after a JOIN come after the
+          linked stream reached the JOIN's point. Each item names its source,
+          and a linked stream's state comes as a link_state item. A linked
+          stream that can't be read or that ends never fails the call. Links
+          to another namespace or endpoint are not followed. The call waits
+          like read, and the state resumes every open stream.
+        x-nexus-long-poll:
+          wait-field: wait_ms
+          result-field: records
+          done-field: done
+          state-field: state
+        input: { $ref: "#/$defs/FollowInput" }
+        output: { $ref: "#/$defs/FollowOutput" }
+      followRange:
+        fqn: follow_range
+        description: >-
+          Answer again the records of an earlier follow that named a
+          floor_holder, for a Workflow that replays that follow. The call
+          reads each range again with the follow's input state, checks each
+          against its digest and the order against the follow's digest, and
+          answers the same records in the same order. Other records or
+          another order are refused as StreamReplayMismatchError.
+        input: { $ref: "#/$defs/FollowRangeInput" }
+        output: { $ref: "#/$defs/FollowOutput" }
 
 $defs:
   StreamRef:
@@ -408,6 +438,212 @@ $defs:
           content hash of a stored record or the producer and both attempts of
           a supersession. It leaves out the bodies, so a codec change keeps it.
     required: [chain_first_run_id, after_token, stored_records, records_digest]
+    additionalProperties: true
+
+  FollowInput:
+    type: object
+    description: "One follow call: the root stream, where to resume, the limits and the wait."
+    properties:
+      stream: { $ref: "#/$defs/StreamRef" }
+      after_token:
+        type: string
+        x-nexus-cursor: StreamCursor
+        description: >-
+          The root cursor on the follow's first call. Absent or empty starts
+          at the oldest record the root retains. A call with state ignores it.
+      state:
+        type: string
+        contentEncoding: base64
+        description: >-
+          The state of this follow's previous answer, opaque to the caller.
+          Absent on the first call. It holds every open stream's position.
+      max_records:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        description: "Answer with at most this many stored records, across all streams. 100 when absent."
+      wait_ms:
+        type: integer
+        minimum: 0
+        maximum: 60000
+        description: >-
+          Wait at most this long for a record on any open stream before
+          answering. The handler shortens it to fit the request deadline.
+      max_depth:
+        type: integer
+        minimum: 1
+        maximum: 16
+        description: >-
+          How deep links are followed, the root being depth zero. 4 when
+          absent. The first call's limits hold for the whole follow.
+      max_open:
+        type: integer
+        minimum: 1
+        maximum: 32
+        description: "How many linked streams are open at once. 16 when absent."
+      floor_holder:
+        type: string
+        description: >-
+          As on read: each stream holds its records for this holder, and the
+          answer carries replay. At most 480 bytes.
+      wake_token:
+        type: string
+        description: >-
+          The operation token of the caller's stream operation on the root.
+          When the call answers no records and not done, the endpoint asks
+          the root's notifier to wake that operation once the root moves, then
+          follows once more. Refused when the token names another stream.
+    required: [stream]
+    additionalProperties: false
+
+  FollowRangeInput:
+    type: object
+    description: >-
+      One replay of an earlier follow that named a floor_holder. Every member
+      but stream and floor_holder comes from that follow's input and answer.
+    properties:
+      stream: { $ref: "#/$defs/StreamRef" }
+      state:
+        type: string
+        contentEncoding: base64
+        description: "The state the follow sent. Absent when it sent none."
+      ranges:
+        type: array
+        items:
+          type: string
+          contentEncoding: base64
+        description: "The follow answer's replay ranges, as they came."
+      follow_digest:
+        type: string
+        contentEncoding: base64
+        description: "The follow answer's replay follow_digest."
+      max_depth:
+        type: integer
+        minimum: 1
+        maximum: 16
+        description: "As the follow's first call sent it, for a replay of that call."
+      max_open:
+        type: integer
+        minimum: 1
+        maximum: 32
+        description: "As the follow's first call sent it, for a replay of that call."
+      floor_holder:
+        type: string
+        description: "As on follow, so a replay renews the holds."
+    required: [stream, ranges, follow_digest]
+    additionalProperties: false
+
+  FollowedWire:
+    type: object
+    description: "One item of a follow: a record of a source, or the state of a link."
+    properties:
+      source:
+        type: integer
+        minimum: 0
+        description: "The stream the item belongs to. 0 is the root. See sources."
+      record:
+        $ref: "#/$defs/RecordWire"
+        description: "A record of the source, as read answers it."
+      link_state:
+        $ref: "#/$defs/LinkStateWire"
+        description: "What happened to a link of the source."
+    required: [source]
+    additionalProperties: true
+
+  LinkStateWire:
+    type: object
+    description: "What happened to a link, as the follower saw it."
+    properties:
+      kind:
+        type: string
+        description: >-
+          "opened": the linked stream's records follow. "done": its segment
+          ended. "unavailable": it can't be read, and error says why.
+          "skipped": the link was not followed, and reason says why.
+      link:
+        type: string
+        contentEncoding: base64
+        description: "The serialized temporal.sdk.streams.v1.StreamLink."
+      error:
+        type: string
+        description: "Why a linked stream can't be read, for kind unavailable."
+      reason:
+        type: string
+        description: >-
+          Why a link was not followed, for kind skipped: depth, limit, cycle,
+          open or endpoint.
+    required: [kind, link]
+    additionalProperties: true
+
+  FollowSourceWire:
+    type: object
+    description: "A stream that a follow answer's items name."
+    properties:
+      number:
+        type: integer
+        minimum: 0
+        description: "The source number items use."
+      parent:
+        type: integer
+        minimum: 0
+        description: "The source that holds the link that opened it. 0 for the root."
+      depth:
+        type: integer
+        minimum: 0
+        description: "How many links from the root."
+      stream: { $ref: "#/$defs/StreamRef" }
+      name:
+        type: string
+        description: "The link's name. Empty for the root."
+    required: [number, parent, depth, stream, name]
+    additionalProperties: true
+
+  FollowReplay:
+    type: object
+    description: >-
+      What a replay passes to follow_range to get a follow answer's records
+      again, with the state that follow sent.
+    properties:
+      ranges:
+        type: array
+        items:
+          type: string
+          contentEncoding: base64
+        description: "One opaque range per read the follow made, in read order."
+      follow_digest:
+        type: string
+        contentEncoding: base64
+        description: "SHA-256 over the order of the answer's items."
+    required: [ranges, follow_digest]
+    additionalProperties: true
+
+  FollowOutput:
+    type: object
+    description: "What one follow answered, and where to resume."
+    properties:
+      records:
+        type: array
+        items: { $ref: "#/$defs/FollowedWire" }
+        description: "The items, in follow order."
+      done:
+        type: boolean
+        description: >-
+          The root ended and every linked segment ended. Nothing more will
+          arrive, so the caller stops.
+      state:
+        type: string
+        contentEncoding: base64
+        description: >-
+          Pass as state on the next call of this follow. Core always sets it.
+          At most 64 KiB, which is about 86 KiB as base64.
+      sources:
+        type: array
+        items: { $ref: "#/$defs/FollowSourceWire" }
+        description: "Each source that records name."
+      replay:
+        $ref: "#/$defs/FollowReplay"
+        description: "Set when the call named a floor_holder."
+    required: [records, done, sources]
     additionalProperties: true
 
   StreamOperationToken:

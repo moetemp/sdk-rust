@@ -21,6 +21,11 @@ service StreamNexusService {
   rpc NexusRead(NexusCall) returns (NexusStep);
   // The stream service's Nexus `read_range` operation, over its JSON transfer form.
   rpc NexusReadRange(NexusCall) returns (NexusStep);
+  // The stream service's Nexus `follow` operation, over its JSON transfer form. Its answer may
+  // ask for codec work once per owner whose records it holds, so lang resumes until it ends.
+  rpc NexusFollow(NexusCall) returns (NexusStep);
+  // The stream service's Nexus `follow_range` operation, over its JSON transfer form.
+  rpc NexusFollowRange(NexusCall) returns (NexusStep);
   // Goes on with a call that asked for codec work.
   rpc NexusResume(NexusResumeRequest) returns (NexusStep);
   // Attaches the caller of a stream-returning Nexus operation's start to the stream's notifier,
