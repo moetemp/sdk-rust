@@ -5,7 +5,8 @@
 
 use crate::{
     BEGINNING, END, ReadTarget, StreamError, StreamResult, StreamStore, WORKFLOW_OWNER_KIND,
-    activity_producer_id, append_batch, check_append_digest, close_topic, mint_cursor,
+    activity_producer_id, append_batch, check_append_digest, check_store_limits, close_topic,
+    mint_cursor,
     owner::{OwnerClient, OwnerDescription, OwnerError},
     proto::{
         ActivityProducer, AppendRequest, AppendResponse, ChainId, CloseRequest, CloseResponse,
@@ -245,6 +246,7 @@ impl Streams {
                 .map(|stored| stored.encode_to_vec())
             })
             .collect::<StreamResult<Vec<_>>>()?;
+        check_store_limits(&records, &self.store.capabilities())?;
         let landed = append_batch(
             &*self.store,
             StoreAppendRequest {
@@ -1502,6 +1504,28 @@ mod tests {
         let (delivered, _) = read_to_end(&setup.streams, Duration::from_secs(5)).await;
         assert_eq!(delivered, 1);
         assert_eq!(setup.owners.describes(), before);
+    }
+
+    #[tokio::test]
+    async fn a_batch_above_the_stores_limits_is_refused_before_it_lands() {
+        let store = MemoryStore::with_capabilities(crate::Capabilities {
+            max_record_bytes: 200,
+            max_batch_bytes: 300,
+            ..MemoryStore::new().capabilities()
+        });
+        let setup = setup_on(store, StreamsOptions::default());
+        let error = setup
+            .streams
+            .append(append("p", 1, &"x".repeat(300)))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::InvalidArgument);
+        assert!(error.message.contains("record limit of 200"), "{error}");
+        let mut batch = append("p", 1, "small");
+        batch.records = vec![data("a"), data("b"), data("c")];
+        let error = setup.streams.append(batch).await.unwrap_err();
+        assert!(error.message.contains("batch limit of 300"), "{error}");
+        setup.streams.append(append("p", 1, "fits")).await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

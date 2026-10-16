@@ -953,7 +953,12 @@ impl ManagedRun {
             self.stream_attempt = attempt;
             self.committed_by_topic.clear();
         }
-        let topics = output_by_topic(commit.records, &mut self.committed_by_topic)?;
+        let max_batch_bytes = self.max_batch_bytes();
+        let topics = output_by_topic(
+            commit.records,
+            &mut self.committed_by_topic,
+            max_batch_bytes,
+        )?;
         self.stream_sessions
             .entry(attempt)
             .or_default()
@@ -967,6 +972,14 @@ impl ManagedRun {
             completed_tasks: machines.stream_completed_tasks(),
             topics,
         }))
+    }
+
+    fn max_batch_bytes(&self) -> usize {
+        #[cfg(feature = "streams")]
+        if let Some(store) = &self.config.stream_store {
+            return store.capabilities().max_batch_bytes;
+        }
+        super::stream_output::MAX_APPEND_BYTES
     }
 
     fn has_stream_store(&self) -> bool {

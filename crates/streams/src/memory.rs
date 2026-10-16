@@ -125,12 +125,17 @@ impl MemoryStore {
         Self::default()
     }
 
-    /// An empty store with only the capabilities both it and `mask` have. Without producer
-    /// state it keeps no dedupe entries and no close flags, without a kept last position its
-    /// reads never fail as expired or not found, and without a long poll its reads never wait.
+    /// An empty store with only the capabilities both it and `mask` have, and the limits of
+    /// `mask`. Without producer state it keeps no dedupe entries and no close flags, without a
+    /// kept last position its reads never fail as expired or not found, and without a long poll
+    /// its reads never wait.
     pub fn with_capabilities(mask: Capabilities) -> Self {
         Self {
-            capabilities: FULL.masked(&mask),
+            capabilities: Capabilities {
+                max_record_bytes: mask.max_record_bytes,
+                max_batch_bytes: mask.max_batch_bytes,
+                ..FULL.masked(&mask)
+            },
             ..Self::default()
         }
     }

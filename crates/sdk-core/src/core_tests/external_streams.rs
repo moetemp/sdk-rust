@@ -488,6 +488,32 @@ async fn a_store_that_refuses_the_append_fails_the_task_and_sends_no_completion(
 }
 
 #[tokio::test]
+async fn a_record_above_the_stores_record_limit_fails_the_task() {
+    let store = Arc::new(RecordingStore {
+        inner: MemoryStore::with_capabilities(temporalio_streams::Capabilities {
+            max_record_bytes: 64,
+            ..MemoryStore::new().capabilities()
+        }),
+        ..Default::default()
+    });
+    let (worker, failed) = worker_failing_with(Some(store.clone()), &["record limit of 64"]);
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first.run_id,
+        vec![
+            output_commit_command(records(&["a"])),
+            start_timer_cmd(1, Duration::from_secs(10)),
+        ],
+    )
+    .await;
+    failed_within_deadline(&failed).await;
+    worker.shutdown().await;
+    worker.finalize_shutdown().await;
+    assert!(store.appends().is_empty());
+}
+
+#[tokio::test]
 async fn a_live_commit_on_a_worker_without_a_store_fails_the_task() {
     let (worker, failed) = worker_failing_with(None, &["has no stream store"]);
     let first = worker.poll_workflow_activation().await.unwrap();
