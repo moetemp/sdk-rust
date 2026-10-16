@@ -630,6 +630,15 @@ fn producer(
             if named.producer_id.is_empty() {
                 return Err(StreamError::invalid_argument("a producer needs an id"));
             }
+            // A Workflow run writes its own output as `@<run id>`. A named producer with that id
+            // would share the run's dedupe session and could withdraw its records.
+            if named.producer_id.starts_with('@') {
+                return Err(StreamError::invalid_argument(format!(
+                    "a named producer's id can't start with `@`, which names a Workflow run's \
+                     own output, not {:?}",
+                    named.producer_id
+                )));
+            }
             (named.producer_id.clone(), named.attempt)
         }
         (None, Some(activity)) => (activity_producer_id(activity), i64::from(activity.attempt)),
@@ -1161,6 +1170,18 @@ mod tests {
         assert_eq!(error.kind, StreamFailureKind::Closed);
         assert!(error.message.contains("gone from History"), "{error}");
         assert!(chain_closed(&setup.store, "run-1").await);
+    }
+
+    #[tokio::test]
+    async fn a_named_producer_can_not_write_as_a_workflow_run() {
+        let setup = setup(StreamsOptions::default());
+        let error = setup
+            .streams
+            .append(append("@run-1", 1, "1"))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind, StreamFailureKind::InvalidArgument);
+        assert!(error.message.contains("@run-1"), "{error}");
     }
 
     #[tokio::test(start_paused = true)]
