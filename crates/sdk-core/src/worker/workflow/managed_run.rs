@@ -962,7 +962,12 @@ impl ManagedRun {
             self.stream_attempt = attempt;
             self.committed_by_topic.clear();
         }
-        let topics = output_by_topic(commit.records, &mut self.committed_by_topic)?;
+        let max_batch_bytes = self.max_batch_bytes();
+        let topics = output_by_topic(
+            commit.records,
+            &mut self.committed_by_topic,
+            max_batch_bytes,
+        )?;
         self.stream_sessions
             .entry(attempt)
             .or_default()
@@ -976,6 +981,14 @@ impl ManagedRun {
             completed_tasks: machines.stream_completed_tasks(),
             topics,
         }))
+    }
+
+    fn max_batch_bytes(&self) -> usize {
+        #[cfg(feature = "streams")]
+        if let Some(store) = &self.config.stream_store {
+            return store.capabilities().max_batch_bytes;
+        }
+        super::stream_output::MAX_APPEND_BYTES
     }
 
     fn has_stream_store(&self) -> bool {
@@ -1007,21 +1020,41 @@ impl ManagedRun {
     }
 
     /// The store sessions of attempts below the current one. Once the server accepts the
-    /// current task, no earlier attempt of the run writes again.
-    fn sessions_to_retire(&mut self) -> Option<Box<RetiredSessions>> {
+    /// current task, no earlier attempt of the run writes again. With `ends_chain`, the
+    /// current attempt also closes the chain.
+    fn sessions_to_retire(&mut self, ends_chain: bool) -> Option<Box<RetiredSessions>> {
         let current = self.wfm.machines.stream_producer_attempt();
         let kept = self.stream_sessions.split_off(&current);
         let sessions = mem::replace(&mut self.stream_sessions, kept);
-        if sessions.is_empty() {
+        let machines = &self.wfm.machines;
+        if sessions.is_empty() && (!ends_chain || machines.first_execution_run_id.is_empty()) {
             return None;
         }
-        let machines = &self.wfm.machines;
         Some(Box::new(RetiredSessions {
             workflow_id: machines.workflow_id.clone(),
             run_id: machines.run_id.clone(),
             first_run_id: machines.first_execution_run_id.clone(),
             sessions,
+            chain_end: ends_chain.then_some(current),
         }))
+    }
+
+    /// Whether a task with `commands` ends the run's chain, so the owner's Core closes its
+    /// streams. A failure with a retry policy and a run with a cron schedule can go on in the
+    /// same chain, so they leave the close to the producers' owner checks.
+    fn ends_chain(&self, commands: &[super::ProtoCommand]) -> bool {
+        if !self.has_stream_store() {
+            return false;
+        }
+        let started = self.wfm.machines.get_started_info();
+        let cron = started.is_some_and(|info| info.cron);
+        let retries = started.is_some_and(|info| info.retry_policy.is_some());
+        commands.iter().any(|command| match command.attributes {
+            Some(super::Attributes::CompleteWorkflowExecutionCommandAttributes(_)) => !cron,
+            Some(super::Attributes::FailWorkflowExecutionCommandAttributes(_)) => !cron && !retries,
+            Some(super::Attributes::CancelWorkflowExecutionCommandAttributes(_)) => true,
+            _ => false,
+        })
     }
 
     fn _local_resolution(
@@ -1416,9 +1449,13 @@ impl ManagedRun {
         };
         let replaying = machines_wft_response.replaying;
         let mut retired = None;
-        if matches!(outcome, ActivationCompleteOutcome::ReportWFTSuccess(_)) {
+        if let ActivationCompleteOutcome::ReportWFTSuccess(report) = &outcome {
             self.wfm.wft_completion_reported();
-            retired = self.sessions_to_retire();
+            let ends_chain = match &report.action {
+                ActivationAction::WftComplete { commands, .. } => self.ends_chain(commands),
+                _ => false,
+            };
+            retired = self.sessions_to_retire(ends_chain);
         }
         FulfillableActivationComplete {
             result: ActivationCompleteResult {
