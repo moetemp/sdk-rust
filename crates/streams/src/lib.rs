@@ -8,6 +8,7 @@
 //! records, and the error every call fails with. Lang reaches a store through Core's
 //! `StreamService`, and Core's Worker appends a Workflow's own output through the same trait.
 
+mod close;
 mod cursor;
 mod driver;
 mod error;
@@ -26,6 +27,7 @@ mod subscribe;
 
 #[cfg(feature = "redis")]
 pub use self::redis::{DEFAULT_NOTIFY_DOORBELLS, RedisStore, RedisStoreOptions};
+pub use close::{CHAIN_LOG, append_batch, close_chain, close_topic};
 pub use cursor::{BEGINNING, END, cursor_position, mint_cursor, stream_hash};
 pub use driver::{StreamDriver, StreamDriverOptions};
 pub use error::{StreamError, StreamResult};
@@ -42,12 +44,14 @@ pub use reader::{
     DEFAULT_MAX_RECORDS, MAX_STATE_BYTES, MAX_TRACKED_PRODUCERS, ReadTarget, read_page,
 };
 pub use record::{
-    WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, stored_append_record,
-    workflow_batch_digest, workflow_producer_id,
+    WORKFLOW_OWNER_KIND, activity_producer_id, check_append_digest, check_record_limit,
+    check_store_limits, close_record, stored_append_record, topic_record, workflow_batch_digest,
+    workflow_producer_id,
 };
 pub use service::StreamService;
 pub use store::{
-    CloseOutcome, MAX_CLOSE_BYTES, MAX_FLOOR_HOLDERS, StreamStore, empty_close_result,
+    Capabilities, CloseOutcome, ConditionForms, MAX_BATCH_BYTES, MAX_CLOSE_BYTES,
+    MAX_FLOOR_HOLDERS, MAX_RECORD_BYTES, StreamStore, empty_close_result,
 };
 
 /// The protos stores and lang exchange.
