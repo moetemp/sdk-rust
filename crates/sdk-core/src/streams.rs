@@ -12,6 +12,7 @@ use temporalio_common::protos::temporal::api::{
         DescribeActivityExecutionResponse, DescribeWorkflowExecutionRequest,
         DescribeWorkflowExecutionResponse, DetachStreamCallbackRequest, NotifyStreamRequest,
         NotifyStreamsRequest, PollStreamNotifierRequest, PollStreamNotifierResponse,
+        WaitStreamCallbackRequest,
     },
 };
 use temporalio_streams::{
@@ -72,6 +73,30 @@ impl NotifierClient for ConnectionNotifierClient {
         self.connection
             .workflow_service()
             .attach_stream_callback(attach_request(attachment).into_request())
+            .await
+            .map(|_| ())
+            .map_err(notify_error)
+    }
+
+    async fn wait_callback(
+        &self,
+        chain: ChainId,
+        topic: String,
+        request_id: String,
+        after_counter: i64,
+    ) -> Result<(), NotifyError> {
+        self.connection
+            .workflow_service()
+            .wait_stream_callback(
+                WaitStreamCallbackRequest {
+                    namespace: chain.namespace.clone(),
+                    stream_ref: Some(chain_reference(&chain, topic)),
+                    request_id,
+                    after_counter,
+                    identity: self.connection.identity().to_string(),
+                }
+                .into_request(),
+            )
             .await
             .map(|_| ())
             .map_err(notify_error)
@@ -180,6 +205,7 @@ fn attach_request(attachment: WorkflowAttachment) -> AttachStreamCallbackRequest
             run_id: attachment.run_id,
             subscription_id: attachment.subscription_id,
         }),
+        idle: attachment.idle,
         ..Default::default()
     }
 }
@@ -690,6 +716,7 @@ mod tests {
             workflow_id: "reader".to_string(),
             run_id: "reader-run".to_string(),
             subscription_id: "1".to_string(),
+            idle: true,
         });
         assert_eq!(request.namespace, "ns");
         assert_eq!(
@@ -712,6 +739,10 @@ mod tests {
             })
         );
         assert!(request.callback.is_none(), "exactly one target");
+        assert!(
+            request.idle,
+            "the reader asks for each wake once it is caught up"
+        );
     }
 
     #[test]

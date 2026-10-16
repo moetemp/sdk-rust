@@ -191,8 +191,8 @@ impl StreamService {
                 .await
                 .map(|r| r.encode_to_vec()),
             "Read" => self
-                .streams
-                .read(capped(decode::<ReadRequest>(rpc, request)?))
+                .subscriptions
+                .read(&self.streams, capped(decode::<ReadRequest>(rpc, request)?))
                 .await
                 .map(|r| r.encode_to_vec()),
             "Latest" => self
