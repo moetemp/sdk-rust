@@ -490,6 +490,20 @@ impl Streams {
                         .to_string(),
                 ));
             }
+            // A store that replicates late can lose acked records in a failover. The record the
+            // read ended at is gone then, and records written since read as other records.
+            if let Some(end) = cursor_position(&request.to, self.store.name(), &target.stream_hash)?
+                && self
+                    .store
+                    .record_at(&target.chain, &target.topic, end)
+                    .await?
+                    .is_none()
+            {
+                return Err(lost(format!(
+                    "the store no longer holds the record at {:?} that the read ended at",
+                    request.to
+                )));
+            }
             if page.cursor != request.to {
                 return Err(mismatch(format!(
                     "the replayed read ends at {:?}, not at {:?}",

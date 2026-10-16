@@ -2118,3 +2118,87 @@ async fn a_topic_refuses_a_floor_holder_past_the_cap() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_replay_whose_end_record_the_store_lost_is_rec_01() {
+    use sha2::{Digest, Sha256};
+    use temporalio_common::protos::temporal::api::{
+        common::v1::Payload, enums::v1::WorkflowExecutionStatus,
+    };
+    use temporalio_streams::{
+        Streams, StreamsOptions,
+        proto::{
+            AppendRecord, AppendRequest, NamedProducer, ReadRangeRequest, ReadRequest,
+            StreamAddress, StreamOwnerKind, StreamRecordKind, append_request::Producer,
+        },
+    };
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let prefix = setup.prefix.clone();
+    let streams = Streams::new(
+        Arc::new(setup.store),
+        Arc::new(OneOwner {
+            status: std::sync::Mutex::new(WorkflowExecutionStatus::Running),
+        }),
+        StreamsOptions::default(),
+    );
+    let chain = chain();
+    let stream = StreamAddress {
+        namespace: chain.namespace.clone(),
+        owner_kind: StreamOwnerKind::Workflow as i32,
+        workflow_id: chain.workflow_id.clone(),
+        run_id: String::new(),
+        topic: "events".to_string(),
+    };
+    let append = |sequence: i64| AppendRequest {
+        stream: Some(stream.clone()),
+        producer: Some(Producer::Named(NamedProducer {
+            producer_id: "p".to_string(),
+            attempt: 1,
+        })),
+        sequence,
+        records: vec![AppendRecord {
+            kind: StreamRecordKind::Data as i32,
+            body: Some(Payload {
+                data: sequence.to_be_bytes().to_vec(),
+                ..Default::default()
+            }),
+            content_hash: Sha256::digest(sequence.to_be_bytes()).to_vec(),
+        }],
+        digest: Sha256::digest(sequence.to_be_bytes()).to_vec(),
+    };
+    streams.append(append(1)).await.unwrap();
+    streams.append(append(2)).await.unwrap();
+    let request = ReadRequest {
+        stream: Some(stream.clone()),
+        ..Default::default()
+    };
+    let page = streams.read(request.clone()).await.unwrap();
+    assert_eq!(page.records.len(), 2);
+    // A failover of a store that replicates late loses the acked tail, and later appends land
+    // at new ids.
+    let log = log_key(&prefix, &chain, "events");
+    let ids: Vec<(String, HashMap<String, redis::Value>)> =
+        setup.raw.xrange_all(&log).await.unwrap();
+    for (id, _) in ids {
+        let _: i64 = setup.raw.xdel(&log, &[id]).await.unwrap();
+    }
+    streams.append(append(3)).await.unwrap();
+    streams.append(append(4)).await.unwrap();
+    let error = streams
+        .read_range(ReadRangeRequest {
+            stream: Some(stream.clone()),
+            chain_first_run_id: page.chain_first_run_id.clone(),
+            after: page.start_cursor.clone(),
+            to: page.cursor.clone(),
+            stored_records: 2,
+            state: request.state.clone(),
+            records_digest: page.records_digest.clone(),
+            floor_holder: String::new(),
+            start_from_end: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind, StreamFailureKind::ReplayRangeLost, "{error}");
+}
