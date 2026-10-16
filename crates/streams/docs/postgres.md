@@ -70,15 +70,14 @@ lost ring too. The listener sets TCP keepalive to notice a dead connection withi
 `LISTEN` keeps state on the server session, so the listener uses `listen_url` when it is set, and
 `url` otherwise. Both must name the primary, since a standby refuses `LISTEN`.
 
-**Retention.** PostgreSQL has no key expiry, so each store runs a janitor every
-`janitor_interval` (one minute). A transaction advisory lock around each step lets one janitor
-work at a time across processes, also through PgBouncer in transaction mode. A pass trims the
-topics that are due, at most 10,000 records per topic per transaction, and keeps what a hold
-holds. It moves the topic's newest dropped position in the same
-transaction. A topic whose records are all gone keeps its row as the tombstone for the retention
-plus 30 days after its last write, as Redis keeps a topic's meta. Then the janitor deletes it, and
-a chain row with no topics that nothing touched for as long. `PostgresStore::run_janitor` runs a
-pass at once.
+**Retention.** PostgreSQL has no key expiry, so each store runs a janitor every `janitor_interval`
+(one minute). A transaction advisory lock around each step lets one janitor work at a time across
+processes, also through PgBouncer in transaction mode. A pass trims the topics that are due, at most
+10,000 records per topic per transaction, and keeps what a hold holds. It moves the topic's newest
+dropped position in the same transaction. A topic whose records are all gone keeps its row as the
+tombstone for the retention plus 30 days after its last write, as Redis keeps a topic's meta. Then
+the janitor deletes it, and a chain row with no topics that nothing touched for as long.
+`PostgresStore::run_janitor` runs a pass at once.
 
 **Floors.** `floors` keeps one row per holder of a topic, with the lowest position it held and the
 end of its lease. Position `0` holds the whole topic. A release moves the end to now plus the
