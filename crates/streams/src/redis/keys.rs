@@ -76,6 +76,21 @@ impl ChainKeys {
         format!("{}:floors", self.log(topic))
     }
 
+    /// The pattern that matches every topic key of the chain, logs and metas.
+    pub(crate) fn topics_pattern(&self) -> String {
+        format!("{}:t:*", self.base)
+    }
+
+    /// The topic whose log `key` is, or `None` for a meta or another key.
+    pub(crate) fn topic_of(&self, key: &str) -> Option<String> {
+        let part = key.strip_prefix(&self.base)?.strip_prefix(":t:")?;
+        // A topic's own `:` is encoded, so a raw one only starts the meta's suffix.
+        if part.contains(':') {
+            return None;
+        }
+        unpart(part)
+    }
+
     /// The Cluster slot every key of the chain lands in.
     pub(crate) fn slot(&self) -> u16 {
         slot(&self.base)
@@ -151,6 +166,22 @@ pub(crate) fn owner_pattern(prefix: &str, namespace: &str, workflow_id: &str) ->
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn a_topic_reads_back_from_its_log_key_only() {
+        let chain = ChainId {
+            namespace: "ns".to_string(),
+            workflow_id: "w:f".to_string(),
+            first_run_id: "run".to_string(),
+        };
+        let keys = ChainKeys::new("p", &chain);
+        for topic in ["out", "a:b", "é {x}%"] {
+            assert_eq!(keys.topic_of(&keys.log(topic)).as_deref(), Some(topic));
+            assert_eq!(keys.topic_of(&keys.meta(topic)), None);
+        }
+        assert_eq!(keys.topic_of(&keys.chain()), None);
+        assert_eq!(unpart("%zz"), None);
+    }
 
     fn text<'a>(case: &'a Value, field: &str) -> &'a str {
         case[field].as_str().unwrap()
