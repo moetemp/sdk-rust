@@ -715,11 +715,10 @@ impl StreamStore for RedisStore {
     ) -> StreamResult<()> {
         let keys = ChainKeys::new(&self.prefix, chain);
         // Redis never stores `0-0`, so `0-1` holds every record, and the trim's exclusive range
-        // below it stays valid.
-        let position = if position.is_empty() {
+        // below it stays valid. Below it, a crafted `0-0` would fail every later append.
+        let position = if position.is_empty() || entry(position)? < (0, 1) {
             "0-1"
         } else {
-            entry(position)?;
             position
         };
         scripts::HOLD_SCRIPT

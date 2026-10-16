@@ -2068,3 +2068,26 @@ async fn the_read_checks_run_by_hash_and_survive_a_script_flush() {
     assert_eq!(read.records.len(), 1);
     assert!(evalsha_calls(&mut setup.raw).await > before);
 }
+
+#[tokio::test]
+async fn a_hold_at_zero_neither_fails_the_append_nor_leaves_a_half_written_batch() {
+    let Some(mut setup) = setup().await else {
+        return;
+    };
+    let chain = chain();
+    setup
+        .store
+        .hold_floor(&chain, "events", "reader-run/1", "0-0")
+        .await
+        .unwrap();
+    setup
+        .store
+        .append(append(&chain, "p", 1, 1, b"\x01"))
+        .await
+        .unwrap();
+    let log = log_key(&setup.prefix, &chain, "events");
+    let length: usize = setup.raw.xlen(&log).await.unwrap();
+    assert_eq!(length, 1);
+    let ttl: i64 = setup.raw.pttl(&log).await.unwrap();
+    assert!(ttl > 0, "{ttl}");
+}
