@@ -21263,6 +21263,9 @@ components:
             Data the server attaches to this task for the Workflow, such as wakes for its stream
              readers or progress of its Nexus operations. Opaque to the SDK core. Counts toward the
              History size limit.
+
+             (-- api-linter: core::0146::any=disabled
+                 aip.dev/not-precedent: attachments are meant to hold arbitrary server data. --)
     WorkflowTaskStartedEventAttributes:
       type: object
       properties:
