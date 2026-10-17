@@ -25,6 +25,7 @@ mod options_structs;
 /// Experimental APIs for configuring clients with reusable plugins.
 pub mod plugins;
 mod proxy;
+mod raw;
 mod replaceable;
 pub mod request_extensions;
 mod retry;
@@ -990,6 +991,8 @@ pub struct TemporalServiceClient {
     cloud_svc_client: Box<dyn CloudService>,
     test_svc_client: Box<dyn TestService>,
     health_svc_client: Box<dyn HealthService>,
+    /// Calls by method path on the same service. A client built from mock services has none.
+    raw_unary: Option<Box<dyn raw::RawUnaryService>>,
 }
 
 /// We up the limit on incoming messages from server from the 4Mb default to 128Mb. If for
@@ -1032,6 +1035,9 @@ impl TemporalServiceClient {
         let cloud_svc_client = Box::new(configure!(CloudServiceClient::new(svc.clone())));
         let test_svc_client = Box::new(configure!(TestServiceClient::new(svc.clone())));
         let health_svc_client = Box::new(configure!(HealthClient::new(svc.clone())));
+        let raw_unary: Box<dyn raw::RawUnaryService> = Box::new(raw::GrpcRawUnary {
+            grpc: configure!(tonic::client::Grpc::new(svc)),
+        });
 
         Self {
             workflow_svc_client,
@@ -1039,6 +1045,7 @@ impl TemporalServiceClient {
             cloud_svc_client,
             test_svc_client,
             health_svc_client,
+            raw_unary: Some(raw_unary),
         }
     }
 
@@ -1057,6 +1064,7 @@ impl TemporalServiceClient {
             cloud_svc_client: cloud,
             test_svc_client: test,
             health_svc_client: health,
+            raw_unary: None,
         }
     }
 
