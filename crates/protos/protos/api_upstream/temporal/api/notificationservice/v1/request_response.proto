@@ -31,6 +31,10 @@ message OnCompleteRequest {
 
     // User-supplied data which was added to the source invocation. (As applicable.)
     temporal.api.common.v1.Payload source_context = 3;
+
+    // The `receiver_state` of the last OnProgressResponse that the server accepted for this
+    // callback. Empty when no progress was accepted.
+    bytes receiver_state = 4;
 }
 
 // OnCompleteResponse is the return type of the OnComplete operation.

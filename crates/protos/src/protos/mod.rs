@@ -3043,6 +3043,41 @@ mod sdk_helpers {
         };
         use anyhow::anyhow;
 
+        mod nexus_handler_callback {
+            use crate::protos::temporal::api::common::v1::callback::NexusHandler;
+            use prost::Message;
+
+            // The server reads the progress operation by its field number, so a renumbered field
+            // would send progress to an operation the Worker never named.
+            #[test]
+            fn the_progress_operation_keeps_its_field_number() {
+                let handler = NexusHandler {
+                    progress_operation: "p".to_string(),
+                    ..Default::default()
+                };
+                assert_eq!(handler.encode_to_vec(), vec![0x2a, 0x01, b'p']);
+            }
+        }
+
+        mod on_complete_request {
+            // The server writes the receiver state by its field number, so a renumbered field
+            // would hand the completion handler no state, or another field's bytes. Core builds no
+            // type for the notification service, so the test reads the vendored proto.
+            #[test]
+            fn the_receiver_state_keeps_its_field_number() {
+                let proto = include_str!(
+                    "../../protos/api_upstream/temporal/api/notificationservice/v1/\
+                     request_response.proto"
+                );
+                let message = proto
+                    .split("message OnCompleteRequest {")
+                    .nth(1)
+                    .and_then(|rest| rest.split("\n}").next())
+                    .expect("the proto declares OnCompleteRequest");
+                assert!(message.contains("bytes receiver_state = 4;"), "{message}");
+            }
+        }
+
         #[test]
         fn start_from_poll_resp_standalone_activity_populates_run_id() {
             let resp = PollActivityTaskQueueResponse {
