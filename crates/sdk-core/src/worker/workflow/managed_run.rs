@@ -425,6 +425,7 @@ impl ManagedRun {
         versioning_behavior: VersioningBehavior,
         resp_chan: Option<oneshot::Sender<ActivationCompleteResult>>,
         is_forced_failure: bool,
+        heartbeat_task: bool,
     ) -> Result<RunUpdateAct, Box<NextPageReq>> {
         let activation_was_only_eviction = self.activation_is_eviction();
         if activation_was_only_eviction && !commands.is_empty() {
@@ -504,6 +505,7 @@ impl ManagedRun {
                 resp_chan,
                 is_forced_failure,
                 versioning_behavior,
+                heartbeat_task,
             };
 
             // Verify we can actually apply the next workflow task, which will happen as part of
@@ -673,6 +675,7 @@ impl ManagedRun {
                     VersioningBehavior::Unspecified, // Doesn't matter since we're failing wf
                     resp_chan,
                     true,
+                    false,
                 )
                 .unwrap_or_else(|e| {
                     dbg_panic!("Got next page request when auto-failing workflow: {e:?}");
@@ -748,7 +751,10 @@ impl ManagedRun {
         let completing_heartbeat_autocomplete =
             matches!(self.activation, Some(OutstandingActivation::Autocomplete))
                 && self.waiting_on_la.is_some();
+        // Lang decides a task heartbeat from a count or a clock, so replay must not depend on it.
+        let lang_heartbeat = completion.heartbeat_task && !self.wfm.machines.replaying;
         let completing_la_heartbeat = completing_heartbeat_autocomplete
+            || lang_heartbeat
             || self
                 .waiting_on_la
                 .as_ref()
@@ -1634,6 +1640,8 @@ struct RunActivationCompletion {
     /// unblock. Must always be `Some` when initialized.
     resp_chan: Option<oneshot::Sender<ActivationCompleteResult>>,
     versioning_behavior: VersioningBehavior,
+    /// Lang asked to complete the workflow task now while local activities run.
+    heartbeat_task: bool,
 }
 #[derive(Debug, derive_more::From)]
 enum ActOrFulfill {

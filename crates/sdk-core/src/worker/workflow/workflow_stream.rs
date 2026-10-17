@@ -306,6 +306,7 @@ impl WFStream {
                     commands,
                     used_flags,
                     versioning_behavior,
+                    heartbeat_task,
                     ..
                 } => match rh.successful_completion(
                     commands,
@@ -313,6 +314,7 @@ impl WFStream {
                     versioning_behavior,
                     complete.response_tx,
                     false,
+                    heartbeat_task,
                 ) {
                     Ok(acts) => acts,
                     Err(npr) => {
