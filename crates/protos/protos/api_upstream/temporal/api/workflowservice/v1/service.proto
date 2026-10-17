@@ -2039,4 +2039,82 @@ service WorkflowService {
             value: "workflow:{workflow_execution.workflow_id}"
         };
     }
+
+    // AttachStreamCallback attaches a callback to the notifier of a stream. The callback receives the
+    // stream's progress while it is open and one completion when it closes. A Nexus handler whose
+    // operation returns a stream calls it with the caller's callback when the operation starts. It
+    // starts the notifier when the stream has none.
+    //
+    // (-- api-linter: core::0127::http-annotation=disabled
+    //     aip.dev/not-precedent: SDKs reach the stream notifier through gRPC. --)
+    rpc AttachStreamCallback (AttachStreamCallbackRequest) returns (AttachStreamCallbackResponse) {
+    }
+
+    // DetachStreamCallback removes a callback from the notifier of a stream. The notifier completes
+    // the callback's operation as canceled and sends it no more progress. A Nexus handler calls it
+    // when the caller cancels the operation.
+    //
+    // (-- api-linter: core::0127::http-annotation=disabled
+    //     aip.dev/not-precedent: SDKs reach the stream notifier through gRPC. --)
+    rpc DetachStreamCallback (DetachStreamCallbackRequest) returns (DetachStreamCallbackResponse) {
+    }
+
+    // WaitStreamCallback asks the notifier of a stream to wake one idle callback once, when the
+    // notifier's counter passes `after_counter`. If it passed already, the wake goes out at once.
+    // After the delivery the callback is idle again. A reader calls it when a read finds nothing.
+    // The handler of a stream operation calls it for its caller, and a Workflow reader's Worker
+    // for its `workflow_target`. So a busy stream that the reader keeps up with sends the reader
+    // nothing. Waiting on a callback that is not idle changes nothing.
+    //
+    // (-- api-linter: core::0127::http-annotation=disabled
+    //     aip.dev/not-precedent: SDKs reach the stream notifier through System Nexus or gRPC. --)
+    rpc WaitStreamCallback (WaitStreamCallbackRequest) returns (WaitStreamCallbackResponse) {
+        option (nexusannotations.v1.operation).tags = "exposed";
+    }
+
+    // NotifyStream tells the notifier of a stream that the stream moved, or that it closed. The
+    // notifier passes the latest notification on to every attached callback as progress, and on close
+    // completes them. Producers fold their notifications and keep at most one call in flight.
+    //
+    // A notification that does not close the stream starts nothing. When the stream has no
+    // notifier, nobody waits on it, and the server drops the notification. A close starts a notifier
+    // when the stream has none, so a callback that attaches later still gets the close outcome.
+    //
+    // (-- api-linter: core::0127::http-annotation=disabled
+    //     aip.dev/not-precedent: SDKs reach the stream notifier through gRPC. --)
+    rpc NotifyStream (NotifyStreamRequest) returns (NotifyStreamResponse) {
+    }
+
+    // DescribeStreamNotifier returns the state of the notifier of a stream and its callbacks. It is
+    // for operators and tools.
+    //
+    // (-- api-linter: core::0127::http-annotation=disabled
+    //     aip.dev/not-precedent: SDKs reach the stream notifier through gRPC. --)
+    rpc DescribeStreamNotifier (DescribeStreamNotifierRequest) returns (DescribeStreamNotifierResponse) {
+    }
+
+    // PollStreamNotifier waits until the notifier of a stream has a counter above `after_counter`,
+    // or the stream is closed. It returns with no change after a wait limit set by the server
+    // (`streamnotifier.pollMaxWait`). A client that reads a stream calls it after a read that
+    // found nothing, in place of another blocking read on the store. It starts the notifier when the
+    // stream has none. The client reads the stream once more after the poll starts, since a
+    // notification that came before the notifier existed was dropped.
+    //
+    // (-- api-linter: core::0127::http-annotation=disabled
+    //     aip.dev/not-precedent: SDKs reach the stream notifier through gRPC. --)
+    rpc PollStreamNotifier (PollStreamNotifierRequest) returns (PollStreamNotifierResponse) {
+    }
+
+    // NotifyStreams tells the notifiers of many streams in one namespace that they moved. It acts as
+    // one NotifyStream without close per entry. A stream with no notifier drops its entry, as
+    // NotifyStream does. A driver that reads the store's notification log calls it with the newest
+    // counter of each stream in a batch. The server checks and applies each entry on its own and
+    // answers each in `results`, so a bad entry doesn't hold up the others. The call fails only for
+    // the request as a whole, such as an empty batch or one that is too large. Sending an entry
+    // again is safe, since a notifier ignores a counter at or below the one it holds.
+    //
+    // (-- api-linter: core::0127::http-annotation=disabled
+    //     aip.dev/not-precedent: SDKs reach the stream notifier through gRPC. --)
+    rpc NotifyStreams (NotifyStreamsRequest) returns (NotifyStreamsResponse) {
+    }
 }
