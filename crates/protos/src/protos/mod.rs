@@ -3059,6 +3059,25 @@ mod sdk_helpers {
             }
         }
 
+        mod on_complete_request {
+            // The server writes the receiver state by its field number, so a renumbered field
+            // would hand the completion handler no state, or another field's bytes. Core builds no
+            // type for the notification service, so the test reads the vendored proto.
+            #[test]
+            fn the_receiver_state_keeps_its_field_number() {
+                let proto = include_str!(
+                    "../../protos/api_upstream/temporal/api/notificationservice/v1/\
+                     request_response.proto"
+                );
+                let message = proto
+                    .split("message OnCompleteRequest {")
+                    .nth(1)
+                    .and_then(|rest| rest.split("\n}").next())
+                    .expect("the proto declares OnCompleteRequest");
+                assert!(message.contains("bytes receiver_state = 4;"), "{message}");
+            }
+        }
+
         #[test]
         fn start_from_poll_resp_standalone_activity_populates_run_id() {
             let resp = PollActivityTaskQueueResponse {
