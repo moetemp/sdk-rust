@@ -1119,6 +1119,9 @@ where
                     ActivationJobResult::None
                 }
                 Some(ActivationVariant::RemoveFromCache(_)) => ActivationJobResult::None,
+                // This runtime has no use for attachments yet. Dropping them changes no command,
+                // so replay stays the same.
+                Some(ActivationVariant::WorkflowTaskAttachments(_)) => ActivationJobResult::None,
                 None => {
                     return Err(Box::new(Failure {
                         message: "Activation job missing variant".to_string(),

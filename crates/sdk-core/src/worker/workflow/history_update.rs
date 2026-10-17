@@ -741,10 +741,14 @@ fn find_end_index_of_next_wft_seq(
                     if let Some(next_next_event) = events.get(ix + 2) {
                         if !saw_command
                             && next_next_event.event_type() == EventType::WorkflowTaskScheduled
+                            && !scheduled_with_attachments(next_next_event)
                         {
                             // If we've never seen an interesting event and the next two events are
                             // a completion followed immediately again by scheduled, then this is a
-                            // WFT heartbeat and also doesn't conclude the sequence.
+                            // WFT heartbeat and also doesn't conclude the sequence. A task
+                            // scheduled with attachments had an activation of its own live, so
+                            // folding it into this one on replay would hand lang the attachments
+                            // too early.
                             continue;
                         } else {
                             // If we see an update accepted command after WFT completed, we want to
@@ -799,6 +803,13 @@ fn find_end_index_of_next_wft_seq(
     }
 
     NextWFTSeqEndIndex::Incomplete(last_index)
+}
+
+fn scheduled_with_attachments(e: &HistoryEvent) -> bool {
+    matches!(
+        &e.attributes,
+        Some(Attributes::WorkflowTaskScheduledEventAttributes(a)) if !a.attachments.is_empty()
+    )
 }
 
 #[cfg(test)]
@@ -939,6 +950,43 @@ mod tests {
         assert_eq!(seq.len(), 4);
         let seq = next_check_peek(&mut update, 27);
         assert_eq!(seq.len(), 2);
+    }
+
+    #[test]
+    fn a_task_scheduled_with_attachments_ends_a_heartbeat_chain() {
+        let history = |with_attachments: bool| {
+            let mut t = TestHistoryBuilder::default();
+            t.add_by_type(EventType::WorkflowExecutionStarted);
+            t.add_full_wf_task();
+            t.add_full_wf_task(); // wft started 6
+            if with_attachments {
+                t.add_workflow_task_scheduled_with_attachments(vec![Default::default()]);
+                t.add_workflow_task_started();
+            } else {
+                t.add_workflow_task_scheduled_and_started();
+            }
+            t.add_workflow_task_completed(); // wft started 9
+            t.add_we_signaled("whee", vec![]);
+            t.add_full_wf_task();
+            t.add_workflow_execution_completed();
+            t.as_history_update()
+        };
+
+        let mut heartbeat = history(false);
+        next_check_peek(&mut heartbeat, 0);
+        let seq = next_check_peek(&mut heartbeat, 6);
+        assert_eq!(seq.last().unwrap().event_id, 13);
+
+        let mut attached = history(true);
+        next_check_peek(&mut attached, 0);
+        let seq = next_check_peek(&mut attached, 6);
+        assert_eq!(
+            seq.last().unwrap().event_id,
+            9,
+            "the task with attachments must end the sequence at its own started event"
+        );
+        let seq = next_check_peek(&mut attached, 9);
+        assert_eq!(seq.last().unwrap().event_id, 13);
     }
 
     #[test]

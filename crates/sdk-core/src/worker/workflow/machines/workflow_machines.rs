@@ -60,7 +60,7 @@ use temporalio_common::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
             workflow_activation::{
                 self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation,
-                WorkflowTaskHistoryInfo, workflow_activation_job,
+                WorkflowTaskAttachments, WorkflowTaskHistoryInfo, workflow_activation_job,
             },
             workflow_commands::ContinueAsNewWorkflowExecution,
         },
@@ -111,6 +111,9 @@ pub(crate) struct WorkflowMachines {
     last_history_from_server: HistoryUpdate,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
+    /// The attachments of the scheduled events of the task being applied. A failed task's
+    /// scheduled event and its retry's are applied together, and both count.
+    pending_task_attachments: Vec<prost_types::Any>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
     /// The id of the last WorkflowTaskStarted event applied from History.
@@ -301,6 +304,7 @@ impl WorkflowMachines {
         Self {
             last_history_from_server: basics.history,
             protocol_msgs: vec![],
+            pending_task_attachments: vec![],
             workflow_id: basics.workflow_id,
             workflow_type: basics.workflow_type,
             run_id: basics.run_id,
@@ -521,6 +525,21 @@ impl WorkflowMachines {
                 completed_started_event_ids: self.history_completed_tasks.iter().copied().collect(),
             }),
         }
+    }
+
+    /// Hands lang one job with the attachments of this task's scheduled events. They come from
+    /// History, so replay hands lang the same job at the same point.
+    fn deliver_task_attachments(&mut self) {
+        if self.pending_task_attachments.is_empty() {
+            return;
+        }
+        let attachments = std::mem::take(&mut self.pending_task_attachments);
+        self.drive_me.send_job(
+            workflow_activation_job::Variant::WorkflowTaskAttachments(WorkflowTaskAttachments {
+                attachments,
+            })
+            .into(),
+        );
     }
 
     pub(crate) fn has_pending_jobs(&self) -> bool {
@@ -814,6 +833,7 @@ impl WorkflowMachines {
             }
             self.last_processed_event = eid;
         }
+        self.deliver_task_attachments();
 
         // Needed to delay mutation of self until after we've iterated over peeked events.
         #[allow(clippy::large_enum_variant)]
@@ -1090,6 +1110,13 @@ impl WorkflowMachines {
                 }
             }
             Ok(EventType::WorkflowTaskScheduled) => {
+                if let Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(
+                    ref attrs,
+                )) = event_dat.event.attributes
+                {
+                    self.pending_task_attachments
+                        .extend(attrs.attachments.iter().cloned());
+                }
                 let wf_task_sm = WorkflowTaskMachine::new(self.next_started_event_id);
                 let key = self.all_machines.insert(wf_task_sm.into());
                 self.submachine_handle_event(key, event_dat)?;

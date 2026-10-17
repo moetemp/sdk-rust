@@ -1251,6 +1251,9 @@ pub mod coresdk {
                         workflow_activation_job::Variant::ResolveNexusOperation(_) => {
                             write!(f, "ResolveNexusOperation")
                         }
+                        workflow_activation_job::Variant::WorkflowTaskAttachments(a) => {
+                            write!(f, "WorkflowTaskAttachments({})", a.attachments.len())
+                        }
                     }
                 }
             }

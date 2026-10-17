@@ -7,6 +7,7 @@ syntax = "proto3";
 package coresdk.workflow_activation;
 option ruby_package = "Temporalio::Internal::Bridge::Api::WorkflowActivation";
 
+import "google/protobuf/any.proto";
 import "google/protobuf/timestamp.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
@@ -159,6 +160,8 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // Attachments from the scheduled events of this Workflow Task.
+        WorkflowTaskAttachments workflow_task_attachments = 17;
         // Remove the workflow identified by the [WorkflowActivation] containing this job from the
         // cache after performing the activation. It is guaranteed that this will be the only job
         // in the activation if present.
@@ -401,6 +404,15 @@ message ResolveNexusOperation {
     // Sequence number as provided by lang in the corresponding ScheduleNexusOperation command
     uint32 seq = 1;
     nexus.NexusOperationResult result = 2;
+}
+
+// The attachments the server put on the scheduled events of a Workflow Task.
+//
+// Core issues at most one per Workflow Task, in the task's first activation, after the task's
+// other events. It comes from History, so replay issues the same job at the same point.
+message WorkflowTaskAttachments {
+    // In event order. A failed task's scheduled event and its retry's both count.
+    repeated google.protobuf.Any attachments = 1;
 }
 
 message RemoveFromCache {
