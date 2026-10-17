@@ -238,6 +238,7 @@ impl WorkflowFuture {
                         commands: activation_cmds,
                         used_internal_flags: vec![],
                         versioning_behavior: VersioningBehavior::Unspecified.into(),
+                        heartbeat_task: false,
                     },
                 )),
                 ..Default::default()

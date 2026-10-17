@@ -33,6 +33,12 @@ message Success {
     repeated uint32 used_internal_flags = 6;
     // The versioning behavior this workflow is currently using
     temporal.api.enums.v1.VersioningBehavior versioning_behavior = 7;
+    // Asks Core to complete the workflow task now if local activities are still running, as it
+    // does at a local activity heartbeat. The completion carries the commands and markers so far
+    // and asks the server for a new task, and the local activities run on. Lang sets it from a
+    // count or a clock, so Core ignores it while replaying. Without running local activities,
+    // the task completes as it would anyway.
+    bool heartbeat_task = 8;
 }
 
 // Failure to activate or execute a workflow
