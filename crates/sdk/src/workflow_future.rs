@@ -336,6 +336,11 @@ impl WorkflowFuture {
                         .context("Nexus operation must have result")?;
                     push_polled_context!(ActivationJobContext::Passive);
                 }
+                // This SDK has no use for attachments yet. Dropping them changes no command, so
+                // replay stays the same.
+                Variant::WorkflowTaskAttachments(_) => {
+                    push_polled_context!(ActivationJobContext::Passive);
+                }
                 Variant::RemoveFromCache(_) => {
                     unreachable!("Cache removal should happen higher up");
                 }

@@ -22620,6 +22620,14 @@
           "type": "integer",
           "format": "int32",
           "title": "Starting at 1, how many attempts there have been to complete this task"
+        },
+        "attachments": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "$ref": "#/definitions/protobufAny"
+          },
+          "description": "Data the server attaches to this task for the Workflow, such as wakes for its stream\nreaders or progress of its Nexus operations. Opaque to the SDK core. Counts toward the\nHistory size limit.\n"
         }
       }
     },

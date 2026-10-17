@@ -111,6 +111,17 @@ impl TestHistoryBuilder {
         self.workflow_task_scheduled_event_id = self.add_by_type(EventType::WorkflowTaskScheduled);
     }
 
+    /// Add a workflow task scheduled event that carries the server's attachments.
+    pub fn add_workflow_task_scheduled_with_attachments(
+        &mut self,
+        attachments: Vec<prost_types::Any>,
+    ) {
+        self.workflow_task_scheduled_event_id = self.add(WorkflowTaskScheduledEventAttributes {
+            attachments,
+            ..Default::default()
+        });
+    }
+
     /// Add a workflow task started event.
     pub fn add_workflow_task_started(&mut self) {
         self.final_workflow_task_started_event_id = self.add(WorkflowTaskStartedEventAttributes {
