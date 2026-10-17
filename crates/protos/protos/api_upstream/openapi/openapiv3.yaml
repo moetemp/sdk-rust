@@ -21255,6 +21255,14 @@ components:
           type: integer
           description: Starting at 1, how many attempts there have been to complete this task
           format: int32
+        attachments:
+          type: array
+          items:
+            $ref: '#/components/schemas/GoogleProtobufAny'
+          description: |-
+            Data the server attaches to this task for the Workflow, such as wakes for its stream
+             readers or progress of its Nexus operations. Opaque to the SDK core. Counts toward the
+             History size limit.
     WorkflowTaskStartedEventAttributes:
       type: object
       properties:
