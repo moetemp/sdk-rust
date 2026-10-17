@@ -40,6 +40,7 @@ const SERDE_DERIVE_PREFIXES: &[&str] = &[
     ".temporal.api.rules",
     ".temporal.api.schedule",
     ".temporal.api.sdk",
+    ".temporal.api.stream",
     ".temporal.api.taskqueue",
     ".temporal.api.testservice",
     ".temporal.api.update",
