@@ -969,6 +969,8 @@ struct WFStreamOutput {
     fetch_histories: VecDeque<HistoryFetchReq>,
 }
 
+// An activation is the common action, so a box would add an allocation to each one.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, derive_more::Display)]
 enum WorkflowStreamAction {
     Activation(ActivationOrAuto),

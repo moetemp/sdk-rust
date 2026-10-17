@@ -59,14 +59,15 @@ use temporalio_common::{
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
             workflow_activation::{
-                self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
+                self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation,
+                WorkflowTaskHistoryInfo, workflow_activation_job,
             },
             workflow_commands::ContinueAsNewWorkflowExecution,
         },
         temporal::api::{
             command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
             common::v1::SearchAttributes,
-            enums::v1::EventType,
+            enums::v1::{EventType, TimeoutType},
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
@@ -76,6 +77,28 @@ use temporalio_common::{
 };
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
+
+/// How many completed Workflow Tasks an activation names.
+const COMPLETED_TASKS_IN_ACTIVATION: usize = 8;
+
+/// The Workflow Task attempts that `event` shows ran and did not complete.
+///
+/// The server writes a failed or timed-out event only for a first attempt, and for every attempt
+/// on a sticky queue. Each later attempt that fails adds one to the attempt of the next
+/// WorkflowTaskScheduled event, so attempt `a` at 2 or above follows one written failure and
+/// `a - 2` unwritten ones. A schedule-to-start timeout means no Worker ran the task.
+fn failed_task_attempts_in(event: &HistoryEvent) -> u32 {
+    match &event.attributes {
+        Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(attrs)) => {
+            u32::try_from(attrs.attempt.saturating_sub(2)).unwrap_or(0)
+        }
+        Some(history_event::Attributes::WorkflowTaskFailedEventAttributes(_)) => 1,
+        Some(history_event::Attributes::WorkflowTaskTimedOutEventAttributes(attrs)) => {
+            u32::from(attrs.timeout_type() != TimeoutType::ScheduleToStart)
+        }
+        _ => 0,
+    }
+}
 
 slotmap::new_key_type! { struct MachineKey; }
 /// Handles all the logic for driving a workflow. It orchestrates many state machines that together
@@ -90,6 +113,12 @@ pub(crate) struct WorkflowMachines {
     protocol_msgs: Vec<IncomingProtocolMessage>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
+    /// The id of the last WorkflowTaskStarted event applied from History.
+    history_task_started: i64,
+    /// The Workflow Task attempts since the last completed task that ran and did not complete.
+    history_failed_task_attempts: u32,
+    /// The WorkflowTaskStarted event ids of the last completed tasks, newest first.
+    history_completed_tasks: std::collections::VecDeque<i64>,
     /// The event id of the next workflow task started event that the machines need to process.
     /// Eventually, this number should reach the started id in the latest history update, but
     /// we must incrementally apply the history while communicating with lang.
@@ -280,6 +309,9 @@ impl WorkflowMachines {
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
             current_started_event_id: 0,
+            history_task_started: 0,
+            history_failed_task_attempts: 0,
+            history_completed_tasks: Default::default(),
             next_started_event_id: 0,
             last_processed_event: 0,
             workflow_start_time: None,
@@ -483,6 +515,11 @@ impl WorkflowMachines {
                 .to_owned(),
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
+            workflow_task: Some(WorkflowTaskHistoryInfo {
+                started_event_id: self.history_task_started,
+                failed_attempts: self.history_failed_task_attempts,
+                completed_started_event_ids: self.history_completed_tasks.iter().copied().collect(),
+            }),
         }
     }
 
@@ -524,6 +561,8 @@ impl WorkflowMachines {
     pub(crate) fn reset_last_started_id(&mut self, id: i64) {
         debug!("Resetting back to event id {} due to speculative WFT", id);
         self.current_started_event_id = id;
+        // History never keeps the rejected task, so the activation must name the kept one.
+        self.history_task_started = id;
         // We must reset the last event we "processed" to be after the last WFT we really completed
         // + any command events (since the SDK "processed" those when it emitted the commands). This
         // is also equal to what we just processed in the speculative task, minus two, since we
@@ -674,6 +713,22 @@ impl WorkflowMachines {
                     self.last_processed_event,
                     eid
                 ));
+            }
+            match event.event_type() {
+                EventType::WorkflowTaskStarted => self.history_task_started = eid,
+                // The started event right before it is the completed task's own.
+                EventType::WorkflowTaskCompleted => {
+                    self.history_failed_task_attempts = 0;
+                    self.history_completed_tasks
+                        .push_front(self.history_task_started);
+                    self.history_completed_tasks
+                        .truncate(COMPLETED_TASKS_IN_ACTIVATION);
+                }
+                _ => {
+                    self.history_failed_task_attempts = self
+                        .history_failed_task_attempts
+                        .saturating_add(failed_task_attempts_in(&event))
+                }
             }
             let next_event = history.peek();
 
