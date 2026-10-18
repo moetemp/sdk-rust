@@ -10,6 +10,7 @@ import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
 import "temporal/api/common/v1/message.proto";
 import "temporal/sdk/core/common/common.proto";
+import "temporal/sdk/core/workflow_activation/workflow_activation.proto";
 
 message ActivityTask {
     // A unique identifier for this task
@@ -65,6 +66,10 @@ message Start {
     bool is_local = 17;
     // Run ID of this activity execution. Only set for standalone activities.
     string run_id = 19;
+    // For a local activity, the Workflow Task in which Core dispatched this execution, from
+    // History. A rerun after a failed task dispatches in a later task, so lang can key the side
+    // effects of each execution by it. Unset for other activities.
+    coresdk.workflow_activation.WorkflowTaskHistoryInfo workflow_task = 20;
 }
 
 // Attempt to cancel a running activity
