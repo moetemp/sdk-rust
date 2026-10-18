@@ -21,7 +21,7 @@ use temporalio_common::protos::{
         activity_task::activity_task,
         workflow_activation::{
             WorkflowActivation, WorkflowActivationJob, WorkflowTaskAttachments,
-            workflow_activation_job,
+            WorkflowTaskHistoryInfo, workflow_activation_job,
         },
         workflow_commands::{
             ActivityCancellationType, CompleteWorkflowExecution, workflow_command,
@@ -437,4 +437,90 @@ async fn a_cut_then_an_attachment_replays_in_the_live_order(#[case] heartbeat_ta
     core.complete_execution(&activation.run_id).await;
     drain_pollers_and_shutdown(&core).await;
     assert!(reported.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_lang_heartbeat_inside_a_chain_that_reaches_the_live_task_replays() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(WFT_TIMEOUT);
+    // Lang's heartbeat with only a local activity scheduled, so the task has no commands.
+    t.add_full_wf_task();
+    // Core's own heartbeat.
+    t.add_full_wf_task();
+    // A Worker restart times the next task out, and a new Worker gets the retry.
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_timed_out();
+    t.add_workflow_task_scheduled();
+    let scheduled = t.current_event_id();
+    t.modify_event(scheduled, |e| {
+        if let Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(a)) =
+            e.attributes.as_mut()
+        {
+            a.attempt = 2;
+        }
+    });
+    t.add_workflow_task_started();
+    let (core, reported) = recording_worker(t, [ResponseType::AllHistory], 1);
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert!(is_init(&activation), "{activation:?}");
+    assert!(activation.is_replaying);
+    assert_eq!(
+        activation.workflow_task,
+        Some(WorkflowTaskHistoryInfo {
+            started_event_id: 6,
+            failed_attempts: 0,
+            completed_started_event_ids: vec![3],
+        })
+    );
+    core.complete_workflow_activation(completion(
+        &activation.run_id,
+        vec![schedule_local_activity_cmd(
+            1,
+            "1",
+            ActivityCancellationType::TryCancel,
+            Duration::from_secs(60),
+        )],
+        true,
+    ))
+    .await
+    .unwrap();
+    let task = core.poll_activity_task().await.unwrap();
+    assert!(matches!(
+        &task.variant,
+        Some(activity_task::Variant::Start(start)) if start.is_local
+    ));
+    assert!(reported.lock().unwrap().is_empty());
+    core.complete_activity_task(ActivityTaskCompletion {
+        task_token: task.task_token,
+        result: Some(ActivityExecutionResult::ok(b"done".to_vec().into())),
+    })
+    .await
+    .unwrap();
+
+    let activation = core.poll_workflow_activation().await.unwrap();
+    assert!(resolves_la_1(&activation), "{activation:?}");
+    assert!(!activation.is_replaying);
+    assert_eq!(
+        activation.workflow_task,
+        Some(WorkflowTaskHistoryInfo {
+            started_event_id: 12,
+            failed_attempts: 1,
+            completed_started_event_ids: vec![6, 3],
+        })
+    );
+    core.complete_execution(&activation.run_id).await;
+    drain_pollers_and_shutdown(&core).await;
+    let reported = reported.lock().unwrap();
+    let [only] = reported.as_slice() else {
+        panic!("expected one completion, got {reported:?}");
+    };
+    assert!(!only.force_create_new_workflow_task);
+    assert_eq!(
+        command_types(only),
+        [
+            CommandType::RecordMarker,
+            CommandType::CompleteWorkflowExecution
+        ]
+    );
 }
