@@ -39,6 +39,9 @@ relevant information.
   replay get the same values, so lang can key idempotent side effects by it.
 * Core hands lang the server's attachments on a workflow task as one `WorkflowTaskAttachments`
   activation job after the task's other jobs. A live run and a replay get it at the same point.
+* Lang can set `heartbeat_task` on a successful activation completion to complete the workflow
+  task while local activities still run, as Core does at a local activity heartbeat. Core ignores
+  the flag on replay.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
