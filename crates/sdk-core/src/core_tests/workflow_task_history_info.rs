@@ -12,6 +12,9 @@ use crate::{
 use std::time::Duration;
 use temporalio_common::protos::{
     coresdk::{
+        ActivityTaskCompletion,
+        activity_result::ActivityExecutionResult,
+        activity_task::activity_task,
         workflow_activation::{
             WorkflowActivation, WorkflowActivationJob, WorkflowTaskHistoryInfo,
             workflow_activation_job,
@@ -339,5 +342,74 @@ async fn a_rejected_speculative_task_is_never_a_completed_task() {
     );
     assert_eq!(fired.workflow_task, Some(task(8, 0, &[3])));
     worker.complete_execution(&fired.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_heartbeat_chain_that_reaches_the_live_task_replays_its_completed_part() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
+    t.add_full_wf_task();
+    // A Local Activity heartbeat, then a Worker restart that times its task out.
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_timed_out();
+    t.add_workflow_task_scheduled();
+    let scheduled = t.current_event_id();
+    t.modify_event(scheduled, |e| {
+        if let Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(a)) =
+            e.attributes.as_mut()
+        {
+            a.attempt = 2;
+        }
+    });
+    t.add_workflow_task_started();
+    let mut mock = build_mock_pollers(MockPollCfg::from_resps(t, [ResponseType::AllHistory]));
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        first.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::InitializeWorkflow(_)),
+        }]
+    );
+    assert!(first.is_replaying);
+    assert_eq!(first.workflow_task, Some(task(3, 0, &[])));
+    complete(
+        &worker,
+        &first,
+        vec![schedule_local_activity_cmd(
+            1,
+            "1",
+            ActivityCancellationType::TryCancel,
+            Duration::from_secs(60),
+        )],
+    )
+    .await;
+
+    let la = worker.poll_activity_task().await.unwrap();
+    assert_matches!(
+        &la.variant,
+        Some(activity_task::Variant::Start(start)) if start.is_local
+    );
+    worker
+        .complete_activity_task(ActivityTaskCompletion {
+            task_token: la.task_token,
+            result: Some(ActivityExecutionResult::ok(vec![1].into())),
+        })
+        .await
+        .unwrap();
+
+    let resolved = worker.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        resolved.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(_)),
+        }]
+    );
+    assert!(!resolved.is_replaying);
+    assert_eq!(resolved.workflow_task, Some(task(9, 1, &[3])));
+    worker.complete_execution(&resolved.run_id).await;
     worker.drain_pollers_and_shutdown().await;
 }
