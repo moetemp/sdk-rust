@@ -33,11 +33,18 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* `Connection::raw_unary` makes a unary gRPC call by method path, with the request and the
+  response as encoded protobuf. It keeps the connection's TLS, API key, headers, interceptors,
+  metrics and retry policy, so you can call a method the client does not list.
+
 ### Breaking Changes
 * Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
   differs from the command that produced it.
 
 ### Fixed
+* Workflow code rebuilt from history in the middle of a local activity heartbeat chain sees the
+  local activity results that history already records as replayed rather than live.
 * Workers using a custom metrics backend now report task-slot and poller counts correctly in
   worker heartbeats, rather than reporting zero when the backend does not expose its labels.
 * Local activities still running when their workflow is evicted or the worker shuts down now
