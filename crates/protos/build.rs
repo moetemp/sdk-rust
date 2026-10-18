@@ -163,6 +163,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "coresdk.external_data.LocalActivityMarkerData.backoff",
             "#[serde(with = \"sdk_helpers::opt_duration\")]",
         )
+        // JSON histories exported before this field existed must still load.
+        .field_attribute(
+            "temporal.api.history.v1.WorkflowTaskScheduledEventAttributes.attachments",
+            "#[cfg_attr(feature = \"serde_serialize\", serde(default))]",
+        )
         .skip_debug(["temporal.api.common.v1.Payload"]);
 
     for prefix in SERDE_DERIVE_PREFIXES {
