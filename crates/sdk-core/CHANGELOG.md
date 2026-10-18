@@ -39,6 +39,8 @@ relevant information.
   replay get the same values, so lang can key idempotent side effects by it.
 * Core hands lang the server's attachments on a workflow task as one `WorkflowTaskAttachments`
   activation job after the task's other jobs. A live run and a replay get it at the same point.
+* A local activity's task names the workflow task in which core dispatched it. A rerun after a
+  failed task always names a later task, so lang can key each run's side effects by it.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
