@@ -33,11 +33,21 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* Each workflow activation names its workflow task as history defines it, with the task's started
+  event, its failed attempts and the completed tasks it covers. A live run, a cache miss and a
+  replay get the same values, so lang can key idempotent side effects by it.
+* Core hands lang the server's attachments on a workflow task as one `WorkflowTaskAttachments`
+  activation job after the task's other jobs. A live run and a replay get it at the same point.
+
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
   nondeterminism while retaining compatibility with histories recorded before these checks.
 
 ### Fixed
+* A workflow rebuilt from history in the middle of a local activity heartbeat chain replays the
+  part of the chain that history already records, and only the live task runs live. Previously the
+  whole chain ran as live work.
 * Worker heartbeats now report correct task-slot and poller counts when using buffered or custom
   metrics backends, including the Python SDK's `MetricBuffer`. Previously these counts could
   remain `0` because heartbeat accounting depended on reading labels from backend-owned attributes.
