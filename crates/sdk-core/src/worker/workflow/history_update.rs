@@ -699,6 +699,8 @@ fn find_end_index_of_next_wft_seq(
     let mut saw_command_or_started = false;
     let mut saw_command = false;
     let mut wft_started_event_id_to_index = vec![];
+    // The started event of the last task a heartbeat chain folded in so far.
+    let mut last_heartbeat_ix = None;
     for (ix, e) in events.iter().enumerate() {
         last_index = ix;
 
@@ -745,6 +747,7 @@ fn find_end_index_of_next_wft_seq(
                             // If we've never seen an interesting event and the next two events are
                             // a completion followed immediately again by scheduled, then this is a
                             // WFT heartbeat and also doesn't conclude the sequence.
+                            last_heartbeat_ix = Some(ix);
                             continue;
                         } else {
                             // If we see an update accepted command after WFT completed, we want to
@@ -793,11 +796,24 @@ fn find_end_index_of_next_wft_seq(
                 continue;
             }
             if saw_command_or_started {
+                // A heartbeat chain that reaches the live task ends at its last completed task.
+                // Lang's output for the chain is in History, so that part must replay, and only
+                // the live tail runs live.
+                if has_last_wft
+                    && ix + 1 == events.len()
+                    && let Some(heartbeat_ix) = last_heartbeat_ix
+                {
+                    return NextWFTSeqEndIndex::Complete(heartbeat_ix);
+                }
                 return NextWFTSeqEndIndex::Complete(ix);
             }
         }
     }
 
+    // The same rule for a chain that started with no command.
+    if has_last_wft && let Some(heartbeat_ix) = last_heartbeat_ix {
+        return NextWFTSeqEndIndex::Complete(heartbeat_ix);
+    }
     NextWFTSeqEndIndex::Incomplete(last_index)
 }
 
@@ -939,6 +955,23 @@ mod tests {
         assert_eq!(seq.len(), 4);
         let seq = next_check_peek(&mut update, 27);
         assert_eq!(seq.len(), 2);
+    }
+
+    #[test]
+    fn a_heartbeat_chain_that_reaches_the_live_task_ends_at_its_last_completed_task() {
+        let mut t = TestHistoryBuilder::default();
+        t.add_by_type(EventType::WorkflowExecutionStarted);
+        t.add_full_wf_task();
+        t.add_full_wf_task(); // wft started 6
+        t.add_workflow_task_scheduled_and_started();
+        t.add_workflow_task_timed_out();
+        t.add_workflow_task_scheduled_and_started(); // wft started 12
+        let mut update = t.as_history_update();
+        let seq = next_check_peek(&mut update, 0);
+        assert_eq!(seq.last().unwrap().event_id, 6);
+        let seq = next_check_peek(&mut update, 6);
+        assert_eq!(seq.first().unwrap().event_id, 7);
+        assert_eq!(seq.last().unwrap().event_id, 12);
     }
 
     #[test]
