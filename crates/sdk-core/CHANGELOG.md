@@ -44,6 +44,8 @@ relevant information.
   the flag on replay.
 * Core keeps `progress_operation` on the Nexus callbacks it decodes from lang, and its vendored
   protos include `receiver_state` on the Nexus `OnCompleteRequest`.
+* A local activity's task names the workflow task in which core dispatched it. A rerun after a
+  failed task always names a later task, so lang can key each run's side effects by it.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting

@@ -355,6 +355,7 @@ pub mod coresdk {
                             priority: r.priority,
                             is_local: false,
                             run_id: r.activity_run_id,
+                            workflow_task: None,
                         },
                     )),
                 }

@@ -388,10 +388,12 @@ async fn a_heartbeat_chain_that_reaches_the_live_task_replays_its_completed_part
     )
     .await;
 
+    // The replayed task scheduled it, but the live task runs it.
     let la = worker.poll_activity_task().await.unwrap();
     assert_matches!(
         &la.variant,
-        Some(activity_task::Variant::Start(start)) if start.is_local
+        Some(activity_task::Variant::Start(start))
+            if start.is_local && start.workflow_task == Some(task(9, 1, &[3]))
     );
     worker
         .complete_activity_task(ActivityTaskCompletion {
@@ -410,6 +412,58 @@ async fn a_heartbeat_chain_that_reaches_the_live_task_replays_its_completed_part
     );
     assert!(!resolved.is_replaying);
     assert_eq!(resolved.workflow_task, Some(task(9, 1, &[3])));
+    worker.complete_execution(&resolved.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_local_activity_names_the_live_task_that_scheduled_it() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let mut mock = build_mock_pollers(MockPollCfg::from_resps(t, [ResponseType::AllHistory]));
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(!fired.is_replaying);
+    complete(
+        &worker,
+        &fired,
+        vec![schedule_local_activity_cmd(
+            1,
+            "1",
+            ActivityCancellationType::TryCancel,
+            Duration::from_secs(60),
+        )],
+    )
+    .await;
+
+    let la = worker.poll_activity_task().await.unwrap();
+    assert_matches!(
+        &la.variant,
+        Some(activity_task::Variant::Start(start))
+            if start.workflow_task == fired.workflow_task
+                && start.workflow_task == Some(task(8, 0, &[3]))
+    );
+    worker
+        .complete_activity_task(ActivityTaskCompletion {
+            task_token: la.task_token,
+            result: Some(ActivityExecutionResult::ok(vec![1].into())),
+        })
+        .await
+        .unwrap();
+    let resolved = worker.poll_workflow_activation().await.unwrap();
     worker.complete_execution(&resolved.run_id).await;
     worker.drain_pollers_and_shutdown().await;
 }
