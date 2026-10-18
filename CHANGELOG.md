@@ -33,6 +33,11 @@ relevant information.
 
 ## Unreleased
 
+### Added
+* `Connection::raw_unary` makes a unary gRPC call by method path, with the request and the
+  response as encoded protobuf. It keeps the connection's TLS, API key, headers, interceptors,
+  metrics and retry policy, so you can call a method the client does not list.
+
 ### Breaking Changes
 * Workflow replay now reports nondeterminism when a scheduled Nexus operation's service or operation
   differs from the command that produced it.
