@@ -42,6 +42,8 @@ relevant information.
 * Lang can set `heartbeat_task` on a successful activation completion to complete the workflow
   task while local activities still run, as Core does at a local activity heartbeat. Core ignores
   the flag on replay.
+* A local activity's task names the workflow task in which core dispatched it. A rerun after a
+  failed task always names a later task, so lang can key each run's side effects by it.
 
 ### Breaking Changes
 * Replay detects changes to the service or operation of scheduled Nexus operations, reporting
