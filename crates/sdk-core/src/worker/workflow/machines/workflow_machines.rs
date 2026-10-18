@@ -420,8 +420,24 @@ impl WorkflowMachines {
 
     /// Drain all queued local activities that need executing or cancellation
     pub(crate) fn drain_queued_local_activities(&mut self) -> Vec<LocalActRequest> {
-        self.local_activity_data
-            .take_all_reqs(&self.workflow_type, &self.workflow_id, &self.run_id)
+        // A local activity that replay scheduled without a marker queues only once the live task
+        // starts, so this names the live task.
+        let workflow_task = self.workflow_task_history_info();
+        self.local_activity_data.take_all_reqs(
+            &self.workflow_type,
+            &self.workflow_id,
+            &self.run_id,
+            &workflow_task,
+        )
+    }
+
+    /// The Workflow Task that History has applied up to now.
+    fn workflow_task_history_info(&self) -> WorkflowTaskHistoryInfo {
+        WorkflowTaskHistoryInfo {
+            started_event_id: self.history_task_started,
+            failed_attempts: self.history_failed_task_attempts,
+            completed_started_event_ids: self.history_completed_tasks.iter().copied().collect(),
+        }
     }
 
     /// Returns the number of local activities we know we need to execute but have not yet finished
@@ -515,11 +531,7 @@ impl WorkflowMachines {
                 .to_owned(),
             suggest_continue_as_new_reasons: self.suggest_continue_as_new_reasons.clone(),
             target_worker_deployment_version_changed: self.target_worker_deployment_version_changed,
-            workflow_task: Some(WorkflowTaskHistoryInfo {
-                started_event_id: self.history_task_started,
-                failed_attempts: self.history_failed_task_attempts,
-                completed_started_event_ids: self.history_completed_tasks.iter().copied().collect(),
-            }),
+            workflow_task: Some(self.workflow_task_history_info()),
         }
     }
 

@@ -7,7 +7,10 @@ use std::{
     collections::{HashSet, VecDeque},
     time::SystemTime,
 };
-use temporalio_common::protos::temporal::api::common::v1::WorkflowExecution;
+use temporalio_common::protos::{
+    coresdk::workflow_activation::WorkflowTaskHistoryInfo,
+    temporal::api::common::v1::WorkflowExecution,
+};
 
 struct Preresolution {
     seq: u32,
@@ -58,6 +61,7 @@ impl LocalActivityData {
         wf_type: &str,
         wf_id: &str,
         run_id: &str,
+        workflow_task: &WorkflowTaskHistoryInfo,
     ) -> Vec<LocalActRequest> {
         if self.am_terminating {
             return vec![LocalActRequest::CancelAllInRun(run_id.to_string())];
@@ -76,6 +80,7 @@ impl LocalActivityData {
                         workflow_id: wf_id.to_string(),
                         run_id: run_id.to_string(),
                     },
+                    workflow_task: workflow_task.clone(),
                 })
             }))
             .collect()
