@@ -717,6 +717,14 @@ fn find_end_index_of_next_wft_seq(
         if e.event_type() == EventType::WorkflowExecutionStarted {
             saw_command_or_started = true;
         }
+        // A task scheduled with attachments had an activation of its own live, so folding it into
+        // a heartbeat chain on replay would hand lang the attachments too early. A retry can put
+        // it anywhere in the chain, not only right after a completion.
+        if let Some(heartbeat_ix) = last_heartbeat_ix
+            && scheduled_with_attachments(e)
+        {
+            return NextWFTSeqEndIndex::Complete(heartbeat_ix);
+        }
         if e.is_final_wf_execution_event() {
             return NextWFTSeqEndIndex::Complete(last_index);
         }
@@ -743,14 +751,10 @@ fn find_end_index_of_next_wft_seq(
                     if let Some(next_next_event) = events.get(ix + 2) {
                         if !saw_command
                             && next_next_event.event_type() == EventType::WorkflowTaskScheduled
-                            && !scheduled_with_attachments(next_next_event)
                         {
                             // If we've never seen an interesting event and the next two events are
                             // a completion followed immediately again by scheduled, then this is a
-                            // WFT heartbeat and also doesn't conclude the sequence. A task
-                            // scheduled with attachments had an activation of its own live, so
-                            // folding it into this one on replay would hand lang the attachments
-                            // too early.
+                            // WFT heartbeat and also doesn't conclude the sequence.
                             last_heartbeat_ix = Some(ix);
                             continue;
                         } else {

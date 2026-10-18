@@ -13,6 +13,7 @@ use temporalio_common::{
             workflow_activation::{
                 WorkflowActivation, WorkflowTaskAttachments, workflow_activation_job,
             },
+            workflow_commands::CompleteWorkflowExecution,
             workflow_completion::WorkflowActivationCompletion,
         },
         temporal::api::{
@@ -192,4 +193,42 @@ async fn attachments_share_the_activation_and_come_after_resolutions() {
         job_names(&attached),
         ["Signal(go)", "FireTimer(1)", "WorkflowTaskAttachments(1)"]
     );
+}
+
+/// A heartbeat task that a sticky Worker did not finish, then its retry scheduled with attachments.
+/// The server writes the retry at attempt 1, so it sits inside the heartbeat chain and not right
+/// after a completion.
+#[tokio::test]
+async fn a_sticky_retry_with_attachments_ends_a_heartbeat_chain_on_replay() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_timed_out();
+    t.add_workflow_task_scheduled_with_attachments(vec![attachment("w")]);
+    t.add_workflow_task_started();
+    t.add_workflow_task_completed();
+    t.add_full_wf_task();
+    t.add_workflow_execution_completed();
+    let worker = worker(t, vec![ResponseType::AllHistory]);
+
+    let init = worker.poll_workflow_activation().await.unwrap();
+    assert!(init.is_replaying);
+    assert!(attachment_jobs(&init).is_empty(), "{:?}", job_names(&init));
+    complete_empty(&worker, &init.run_id).await;
+
+    let attached = worker.poll_workflow_activation().await.unwrap();
+    assert_eq!(
+        attachment_jobs(&attached),
+        vec![job_of(&["w"])],
+        "{:?}",
+        job_names(&attached)
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmd(
+            attached.run_id.clone(),
+            CompleteWorkflowExecution { result: None }.into(),
+        ))
+        .await
+        .unwrap();
 }
