@@ -38,6 +38,8 @@ relevant information.
   differs from the command that produced it.
 
 ### Fixed
+* Workflow code rebuilt from history in the middle of a local activity heartbeat chain sees the
+  local activity results that history already records as replayed rather than live.
 * Workers using a custom metrics backend now report task-slot and poller counts correctly in
   worker heartbeats, rather than reporting zero when the backend does not expose its labels.
 * Local activities still running when their workflow is evicted or the worker shuts down now
