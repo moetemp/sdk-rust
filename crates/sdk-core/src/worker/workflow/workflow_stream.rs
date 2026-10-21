@@ -36,6 +36,7 @@ pub(super) struct WFStream {
     history_fetch_refcounter: Arc<HistfetchRC>,
     shutdown_token: CancellationToken,
     ignore_evicts_on_shutdown: bool,
+    wft_interceptor: Option<Arc<dyn WorkflowTaskInterceptor>>,
 
     metrics: MetricsContext,
 }
@@ -97,6 +98,11 @@ impl WFStream {
             ),
             shutdown_token: basics.shutdown_token,
             ignore_evicts_on_shutdown: basics.worker_config.ignore_evicts_on_shutdown,
+            wft_interceptor: basics
+                .worker_config
+                .extension
+                .as_ref()
+                .and_then(|e| e.workflow_task_interceptor()),
             metrics: basics.metrics,
             runs_needing_fetching: Default::default(),
             history_fetch_refcounter: Arc::new(HistfetchRC {}),
@@ -405,6 +411,9 @@ impl WFStream {
             if should_evict {
                 debug!(run_id=%run_id, "Evicting run");
                 self.runs.remove(run_id);
+                if let Some(interceptor) = &self.wft_interceptor {
+                    interceptor.on_evicted(run_id);
+                }
             }
             let maybe_ready_wft = maybe_buffered
                 .get_next_wft()

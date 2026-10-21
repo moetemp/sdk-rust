@@ -50,6 +50,10 @@ pub use worker::{
     WorkerConfigBuilder, WorkerTuner, WorkerValidationError, WorkerVersioningStrategy,
     WorkflowErrorType, WorkflowSlotKind,
 };
+pub use worker::{
+    RunCloseKind, WorkerExtension, WorkflowTaskCompletionInfo, WorkflowTaskFailedInfo,
+    WorkflowTaskInterceptError, WorkflowTaskInterceptor,
+};
 
 use crate::{
     replay::{HistoryForReplay, ReplayWorkerInput},

@@ -1,0 +1,581 @@
+//! The hooks a [WorkflowTaskInterceptor] gets around each workflow task completion.
+
+use crate::{
+    WorkerExtension, WorkflowTaskCompletionInfo, WorkflowTaskFailedInfo,
+    WorkflowTaskInterceptError, WorkflowTaskInterceptor, init_replay_worker,
+    replay::{HistoryForReplay, ReplayWorkerInput, TestHistoryBuilder, canned_histories},
+    test_help::{
+        MockPollCfg, PollWFTRespExt, ResponseType, WorkerExt, WorkerTestHelpers,
+        build_mock_pollers, hist_to_poll_resp, mock_worker, schedule_local_activity_cmd,
+        start_timer_cmd, test_worker_cfg,
+    },
+    worker::client::mocks::mock_worker_client,
+};
+use futures_util::stream;
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+use temporalio_common::protos::{
+    coresdk::{
+        ActivityTaskCompletion,
+        activity_result::ActivityExecutionResult,
+        activity_task::activity_task,
+        workflow_activation::{WorkflowActivation, workflow_activation_job},
+        workflow_commands::{
+            ActivityCancellationType, CompleteWorkflowExecution, UpdateResponse,
+            update_response::Response, workflow_command,
+        },
+        workflow_completion::WorkflowActivationCompletion,
+    },
+    temporal::api::{
+        enums::v1::EventType, workflowservice::v1::RespondWorkflowTaskCompletedResponse,
+    },
+};
+
+/// What the hooks and the mock server saw, in order.
+#[derive(Default)]
+struct Recorder {
+    log: Mutex<Vec<String>>,
+    infos: Mutex<Vec<WorkflowTaskCompletionInfo>>,
+    /// `before_complete` fails for the tasks with these started event ids.
+    fail_before: Vec<i64>,
+    /// `before_complete` waits this long first.
+    before_delay: Option<Duration>,
+}
+
+impl Recorder {
+    fn push(&self, entry: impl Into<String>) {
+        self.log.lock().unwrap().push(entry.into());
+    }
+
+    fn log(&self) -> Vec<String> {
+        self.log.lock().unwrap().clone()
+    }
+
+    fn infos(&self) -> Vec<WorkflowTaskCompletionInfo> {
+        self.infos.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl WorkflowTaskInterceptor for Recorder {
+    async fn before_complete(
+        &self,
+        task: &WorkflowTaskCompletionInfo,
+    ) -> Result<(), WorkflowTaskInterceptError> {
+        self.push(format!("before {}", task.started_event_id));
+        self.infos.lock().unwrap().push(task.clone());
+        if let Some(delay) = self.before_delay {
+            tokio::time::sleep(delay).await;
+        }
+        if self.fail_before.contains(&task.started_event_id) {
+            return Err(WorkflowTaskInterceptError::new("store down"));
+        }
+        Ok(())
+    }
+
+    async fn after_complete(&self, task: &WorkflowTaskCompletionInfo, accepted: bool) {
+        self.push(format!("after {} {accepted}", task.started_event_id));
+    }
+
+    fn on_task_failed(&self, task: &WorkflowTaskFailedInfo) {
+        self.push(format!("failed {} {}", task.attempt, task.reported));
+    }
+
+    fn on_evicted(&self, _run_id: &str) {
+        self.push("evicted");
+    }
+}
+
+struct Extension(Arc<Recorder>);
+
+impl WorkerExtension for Extension {
+    fn name(&self) -> &str {
+        "recorder"
+    }
+
+    fn workflow_task_interceptor(&self) -> Option<Arc<dyn WorkflowTaskInterceptor>> {
+        Some(self.0.clone())
+    }
+}
+
+/// Builds a worker with the recorder as its interceptor. The mock server logs each completion it
+/// gets, and answers with `answer`.
+fn worker_with(
+    mut cfg: MockPollCfg,
+    recorder: &Arc<Recorder>,
+    mut answer: impl FnMut(usize) -> Result<RespondWorkflowTaskCompletedResponse, tonic::Status>
+    + Send
+    + 'static,
+) -> crate::Worker {
+    // An empty poll stream would start shutdown before the run is evicted.
+    cfg.make_poll_stream_interminable = true;
+    let log = recorder.clone();
+    let mut completions = 0;
+    cfg.completion_mock_fn = Some(Box::new(move |c| {
+        completions += 1;
+        log.push(format!(
+            "sent commands={} force_new={}",
+            c.commands.len(),
+            c.force_create_new_workflow_task
+        ));
+        answer(completions)
+    }));
+    let mut mock = build_mock_pollers(cfg);
+    let extension: Arc<dyn WorkerExtension> = Arc::new(Extension(recorder.clone()));
+    mock.worker_cfg(|wc| {
+        wc.max_cached_workflows = 1;
+        wc.extension = Some(extension);
+    });
+    mock_worker(mock)
+}
+
+fn accept(_: usize) -> Result<RespondWorkflowTaskCompletedResponse, tonic::Status> {
+    Ok(Default::default())
+}
+
+async fn complete(
+    worker: &crate::Worker,
+    activation: &WorkflowActivation,
+    commands: Vec<workflow_command::Variant>,
+) {
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+            activation.run_id.clone(),
+            commands,
+        ))
+        .await
+        .unwrap();
+}
+
+/// Completes the run, then answers the eviction that follows.
+async fn complete_and_evict(worker: &crate::Worker, run_id: &str) {
+    worker.complete_execution(run_id).await;
+    let eviction = worker.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        eviction.jobs[0].variant,
+        Some(workflow_activation_job::Variant::RemoveFromCache(_))
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+}
+
+fn timer_then_complete() -> TestHistoryBuilder {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(10));
+    t.add_full_wf_task();
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    t
+}
+
+#[tokio::test]
+async fn hooks_run_before_and_after_each_completion() {
+    let recorder = Arc::new(Recorder::default());
+    let worker = worker_with(
+        MockPollCfg::from_resp_batches(
+            "fakeid",
+            timer_then_complete(),
+            [1, 2],
+            mock_worker_client(),
+        ),
+        &recorder,
+        accept,
+    );
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let received = Instant::now();
+    complete(
+        &worker,
+        &first,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    let second = worker.poll_workflow_activation().await.unwrap();
+    complete_and_evict(&worker, &second.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(
+        recorder.log(),
+        [
+            "before 3",
+            "sent commands=1 force_new=false",
+            "after 3 true",
+            "before 8",
+            "sent commands=1 force_new=false",
+            "after 8 true",
+            "evicted",
+        ]
+    );
+    let infos = recorder.infos();
+    assert_eq!(infos[0].run_id, first.run_id);
+    assert_eq!(infos[0].workflow_id, "fakeid");
+    assert_eq!(
+        infos[0].namespace,
+        test_worker_cfg().build().unwrap().namespace
+    );
+    assert_eq!(infos[0].attempt, 1);
+    assert!(infos[0].started_time.is_some());
+    assert_eq!(infos[0].closes_run, None);
+    assert_eq!(infos[1].closes_run, Some(crate::RunCloseKind::Completed));
+    // The hook gets nine of the ten seconds of the task timeout, from the task's receipt.
+    let left = infos[0].deadline - received;
+    assert!(left <= Duration::from_secs(9), "{left:?}");
+    assert!(left > Duration::from_secs(8), "{left:?}");
+    assert!(infos[1].deadline > infos[0].deadline);
+}
+
+#[tokio::test]
+async fn an_error_fails_the_task_and_evicts_the_run() {
+    let recorder = Arc::new(Recorder {
+        fail_before: vec![3],
+        ..Default::default()
+    });
+    let mut cfg =
+        MockPollCfg::from_resp_batches("fakeid", timer_then_complete(), [1], mock_worker_client());
+    cfg.num_expected_fails = 1;
+    cfg.num_expected_completions = Some(0.into());
+    let worker = worker_with(cfg, &recorder, accept);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    let eviction = worker.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        eviction.jobs[0].variant,
+        Some(workflow_activation_job::Variant::RemoveFromCache(_))
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(recorder.log(), ["before 3", "failed 1 true", "evicted"]);
+}
+
+#[tokio::test]
+async fn a_hook_that_misses_the_deadline_fails_the_task() {
+    let recorder = Arc::new(Recorder {
+        before_delay: Some(Duration::from_secs(2)),
+        ..Default::default()
+    });
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(1));
+    t.add_workflow_task_scheduled_and_started();
+    let mut cfg = MockPollCfg::from_resp_batches("fakeid", t, [1], mock_worker_client());
+    cfg.num_expected_fails = 1;
+    cfg.num_expected_completions = Some(0.into());
+    let worker = worker_with(cfg, &recorder, accept);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let started = Instant::now();
+    complete(
+        &worker,
+        &first,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let eviction = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(recorder.log(), ["before 3", "failed 1 true", "evicted"]);
+}
+
+#[tokio::test]
+async fn a_refused_completion_is_not_accepted() {
+    let recorder = Arc::new(Recorder::default());
+    let mut cfg =
+        MockPollCfg::from_resp_batches("fakeid", timer_then_complete(), [1], mock_worker_client());
+    cfg.num_expected_completions = Some(1.into());
+    let worker = worker_with(cfg, &recorder, |_| {
+        Err(tonic::Status::invalid_argument("UnhandledCommand"))
+    });
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    let eviction = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(
+        recorder.log(),
+        [
+            "before 3",
+            "sent commands=1 force_new=false",
+            "after 3 false",
+            "evicted"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_speculative_task_is_not_accepted() {
+    let wfid = "fakeid";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    let mut spec_task_hist = t.clone();
+    spec_task_hist.add_workflow_task_scheduled_and_started();
+    let mut real_hist = t.clone();
+    real_hist.add_timer_fired(timer_started, "1".to_string());
+    real_hist.add_workflow_task_scheduled_and_started();
+
+    let update_id = "upd-1";
+    let mut speculative_task = hist_to_poll_resp(&spec_task_hist, wfid, ResponseType::OneTask(2));
+    speculative_task.add_update_request(update_id, 1);
+    let cfg = MockPollCfg::from_resp_batches(
+        wfid,
+        real_hist,
+        [
+            ResponseType::ToTaskNum(1),
+            speculative_task.into(),
+            ResponseType::OneTask(2),
+        ],
+        mock_worker_client(),
+    );
+    let recorder = Arc::new(Recorder::default());
+    let worker = worker_with(cfg, &recorder, |n| {
+        let mut r = RespondWorkflowTaskCompletedResponse::default();
+        if n == 2 {
+            // The rejection drops the speculative task from History.
+            r.reset_history_event_id = 3;
+        }
+        Ok(r)
+    });
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    let update = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &update,
+        vec![
+            UpdateResponse {
+                protocol_instance_id: update_id.to_string(),
+                response: Some(Response::Rejected(Default::default())),
+            }
+            .into(),
+        ],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    complete_and_evict(&worker, &fired.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(
+        recorder.log(),
+        [
+            "before 3",
+            "sent commands=1 force_new=false",
+            "after 3 true",
+            "before 7",
+            "sent commands=0 force_new=false",
+            "after 7 false",
+            "before 8",
+            "sent commands=1 force_new=false",
+            "after 8 true",
+            "evicted",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_local_activity_heartbeat_completion_runs_the_hooks() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(1));
+    t.add_full_wf_task();
+    t.add_workflow_task_scheduled_and_started();
+    let cfg = MockPollCfg::from_resp_batches("fakeid", t, [1, 2], mock_worker_client());
+    let recorder = Arc::new(Recorder::default());
+    let worker = worker_with(cfg, &recorder, accept);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![schedule_local_activity_cmd(
+            1,
+            "1",
+            ActivityCancellationType::TryCancel,
+            Duration::from_secs(60),
+        )],
+    )
+    .await;
+    let la = worker.poll_activity_task().await.unwrap();
+    assert_matches!(&la.variant, Some(activity_task::Variant::Start(s)) if s.is_local);
+    // Core heartbeats the task at 80% of its one-second timeout, with no lang activation.
+    let resolved = {
+        let wf_poll = worker.poll_workflow_activation();
+        tokio::pin!(wf_poll);
+        tokio::select! {
+            act = &mut wf_poll => panic!("Unexpected activation {act:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(1500)) => {}
+        }
+        assert_eq!(
+            recorder.log(),
+            ["before 3", "sent commands=0 force_new=true", "after 3 true"]
+        );
+        worker
+            .complete_activity_task(ActivityTaskCompletion {
+                task_token: la.task_token,
+                result: Some(ActivityExecutionResult::ok(vec![1].into())),
+            })
+            .await
+            .unwrap();
+        wf_poll.await.unwrap()
+    };
+    complete_and_evict(&worker, &resolved.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(
+        recorder.log(),
+        [
+            "before 3",
+            "sent commands=0 force_new=true",
+            "after 3 true",
+            "before 6",
+            "sent commands=2 force_new=false",
+            "after 6 true",
+            "evicted",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_eviction_with_output_runs_the_hooks_before_on_evicted() {
+    let mut t = TestHistoryBuilder::default();
+    // Keep the LA heartbeat from firing mid-test.
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
+    t.add_workflow_task_scheduled_and_started();
+    let cfg = MockPollCfg::from_resp_batches("fakeid", t, [1], mock_worker_client());
+    let recorder = Arc::new(Recorder::default());
+    let worker = worker_with(cfg, &recorder, accept);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    let run_id = first.run_id.clone();
+    let la_cmd = |seq: u32| {
+        schedule_local_activity_cmd(
+            seq,
+            &seq.to_string(),
+            ActivityCancellationType::WaitCancellationCompleted,
+            Duration::from_secs(60),
+        )
+    };
+    complete(&worker, &first, vec![la_cmd(1), la_cmd(2)]).await;
+    let mut tokens = vec![];
+    for _ in 0..2 {
+        let task = worker.poll_activity_task().await.unwrap();
+        let Some(activity_task::Variant::Start(start)) = &task.variant else {
+            panic!("Expected LA start, got {task:?}");
+        };
+        tokens.push((start.activity_id.clone(), task.task_token));
+    }
+    tokens.sort();
+    let (_, first_token) = tokens.remove(0);
+    worker
+        .complete_activity_task(ActivityTaskCompletion {
+            task_token: first_token,
+            result: Some(ActivityExecutionResult::ok(vec![1].into())),
+        })
+        .await
+        .unwrap();
+    // The marker of the first LA is output that waits on the second one.
+    let resolved = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &resolved, vec![]).await;
+    assert!(recorder.log().is_empty());
+
+    worker.request_workflow_eviction(&run_id);
+    let cancel = worker.poll_activity_task().await.unwrap();
+    assert_matches!(cancel.variant, Some(activity_task::Variant::Cancel(_)));
+    worker
+        .complete_activity_task(ActivityTaskCompletion {
+            task_token: cancel.task_token,
+            result: Some(ActivityExecutionResult::cancel_from_details(None)),
+        })
+        .await
+        .unwrap();
+    let eviction = worker.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        eviction.jobs[0].variant,
+        Some(workflow_activation_job::Variant::RemoveFromCache(_))
+    );
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(
+        recorder.log(),
+        [
+            "before 3",
+            "sent commands=1 force_new=true",
+            "after 3 true",
+            "evicted"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn the_replay_worker_never_calls_the_hooks() {
+    let recorder = Arc::new(Recorder::default());
+    let extension: Arc<dyn WorkerExtension> = Arc::new(Extension(recorder.clone()));
+    let mut cfg = test_worker_cfg().build().unwrap();
+    cfg.extension = Some(extension);
+    let worker = init_replay_worker(ReplayWorkerInput::new(
+        cfg,
+        stream::iter([HistoryForReplay::from(canned_histories::single_timer("1"))]),
+    ))
+    .unwrap();
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &fired,
+        vec![CompleteWorkflowExecution { result: None }.into()],
+    )
+    .await;
+    while let Ok(activation) = worker.poll_workflow_activation().await {
+        worker
+            .complete_workflow_activation(WorkflowActivationCompletion::empty(activation.run_id))
+            .await
+            .unwrap();
+    }
+    worker.shutdown().await;
+
+    assert!(recorder.log().is_empty());
+}
