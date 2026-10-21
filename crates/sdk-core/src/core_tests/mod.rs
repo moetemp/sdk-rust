@@ -5,6 +5,7 @@ mod replay_flag;
 mod updates;
 mod workers;
 mod workflow_cancels;
+mod workflow_task_interceptor;
 mod workflow_tasks;
 
 use crate::{
