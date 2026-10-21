@@ -201,6 +201,7 @@ impl ManagedRun {
         let wft_info = WorkflowTaskInfo {
             attempt: work.attempt,
             started_event_id: work.update.wft_started_id,
+            previous_started_event_id: work.update.previous_wft_started_id,
             started_time: work.started_time,
             received: work.received,
             task_token: work.task_token,
@@ -1304,6 +1305,8 @@ impl ManagedRun {
         let wft = self.wft.as_ref()?;
         let machines = &self.wfm.machines;
         let started_info = machines.get_started_info();
+        let (previous_completed, failed_tasks) =
+            machines.task_history_facts(wft.info.previous_started_event_id);
         let wft_timeout = started_info
             .and_then(|i| i.workflow_task_timeout)
             .unwrap_or(DEFAULT_WFT_TIMEOUT);
@@ -1321,6 +1324,8 @@ impl ManagedRun {
                 .started_event_id(wft.info.started_event_id)
                 .attempt(wft.info.attempt)
                 .maybe_started_time(wft.info.started_time)
+                .maybe_previous_completed(previous_completed)
+                .failed_tasks(failed_tasks)
                 .maybe_closes_run(run_close_kind(commands))
                 .deadline(
                     wft.info.received + wft_timeout.mul_f32(WFT_INTERCEPTOR_DEADLINE_FRACTION),

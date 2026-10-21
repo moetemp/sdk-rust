@@ -12,8 +12,8 @@ mod workflow;
 pub(crate) const PAYLOADS_TOO_LARGE_FAILURE_TYPE: &str = "PayloadsTooLarge";
 
 pub use extension::{
-    RunCloseKind, WorkerExtension, WorkflowTaskCompletionInfo, WorkflowTaskFailedInfo,
-    WorkflowTaskInterceptError, WorkflowTaskInterceptor,
+    RunCloseKind, WorkerExtension, WorkflowTaskCompletionInfo, WorkflowTaskEpoch,
+    WorkflowTaskFailedInfo, WorkflowTaskInterceptError, WorkflowTaskInterceptor,
 };
 use temporalio_client::{Connection, PayloadErrorLimits, worker::NamespaceDescriptionSource};
 use temporalio_common::{

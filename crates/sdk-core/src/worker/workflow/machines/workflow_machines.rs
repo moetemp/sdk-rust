@@ -23,6 +23,7 @@ use crate::{
     telemetry::{VecDisplayer, metrics::MetricsContext},
     worker::{
         ExecutingLAId, LocalActRequest, LocalActivityExecutionResult, LocalActivityResolution,
+        WorkflowTaskEpoch,
         workflow::{
             CommandAnnotations, CommandID, DrivenWorkflow, HistoryUpdate, InternalFlagsRef,
             LocalResolution, OutgoingJob, ProtoCommandExt, RunBasics, WFCommand, WFCommandVariant,
@@ -77,6 +78,53 @@ use temporalio_common::{
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 
+/// The workflow task events of History that a workflow task interceptor needs.
+#[derive(Default)]
+struct TaskHistory {
+    /// The attempt of the last WorkflowTaskScheduled event.
+    scheduled_attempt: u32,
+    /// The task of the last WorkflowTaskStarted event.
+    started: Option<WorkflowTaskEpoch>,
+    /// The task of the last WorkflowTaskCompleted event.
+    completed: Option<WorkflowTaskEpoch>,
+    /// Started event ids of all the failed and timed-out tasks of the run.
+    failed: Vec<i64>,
+}
+
+impl TaskHistory {
+    fn apply(&mut self, event: &HistoryEvent) {
+        match &event.attributes {
+            Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(a)) => {
+                self.scheduled_attempt = u32::try_from(a.attempt).unwrap_or_default();
+            }
+            Some(history_event::Attributes::WorkflowTaskStartedEventAttributes(_)) => {
+                self.started = Some(
+                    WorkflowTaskEpoch::builder()
+                        .started_event_id(event.event_id)
+                        .attempt(self.scheduled_attempt)
+                        .maybe_started_time(event.event_time.and_then(|t| t.try_into().ok()))
+                        .build(),
+                );
+            }
+            Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(_)) => {
+                self.completed = self.started.clone();
+            }
+            Some(history_event::Attributes::WorkflowTaskFailedEventAttributes(a))
+                if a.started_event_id > 0 =>
+            {
+                self.failed.push(a.started_event_id);
+            }
+            // A schedule-to-start timeout has no started event.
+            Some(history_event::Attributes::WorkflowTaskTimedOutEventAttributes(a))
+                if a.started_event_id > 0 =>
+            {
+                self.failed.push(a.started_event_id);
+            }
+            _ => {}
+        }
+    }
+}
+
 slotmap::new_key_type! { struct MachineKey; }
 /// Handles all the logic for driving a workflow. It orchestrates many state machines that together
 /// comprise the logic of an executing workflow. One instance will exist per currently executing
@@ -90,6 +138,8 @@ pub(crate) struct WorkflowMachines {
     protocol_msgs: Vec<IncomingProtocolMessage>,
     /// EventId of the last handled WorkflowTaskStarted event
     current_started_event_id: i64,
+    /// The workflow task facts that History shows, for a workflow task interceptor.
+    task_history: TaskHistory,
     /// The event id of the next workflow task started event that the machines need to process.
     /// Eventually, this number should reach the started id in the latest history update, but
     /// we must incrementally apply the history while communicating with lang.
@@ -287,6 +337,7 @@ impl WorkflowMachines {
             metrics: basics.metrics,
             // In an ideal world one could say ..Default::default() here and it'd still work.
             current_started_event_id: 0,
+            task_history: Default::default(),
             next_started_event_id: 0,
             last_processed_event: 0,
             workflow_start_time: None,
@@ -411,6 +462,28 @@ impl WorkflowMachines {
     /// Returns start info for the workflow if it has started
     pub(crate) fn get_started_info(&self) -> Option<&WorkflowStartedInfo> {
         self.drive_me.get_started_info()
+    }
+
+    /// The completed task with the given started event id, and all the failed tasks of the run.
+    pub(crate) fn task_history_facts(
+        &self,
+        previous_started_event_id: i64,
+    ) -> (Option<WorkflowTaskEpoch>, Vec<i64>) {
+        let completed = self.task_history.completed.as_ref();
+        let previous = (previous_started_event_id > 0).then(|| match completed {
+            Some(epoch) if epoch.started_event_id == previous_started_event_id => epoch.clone(),
+            _ => {
+                warn!(
+                    previous_started_event_id,
+                    "History has no completed workflow task with this started event"
+                );
+                WorkflowTaskEpoch::builder()
+                    .started_event_id(previous_started_event_id)
+                    .attempt(0)
+                    .build()
+            }
+        });
+        (previous, self.task_history.failed.clone())
     }
 
     pub(crate) fn get_last_wft_started_id(&self) -> i64 {
@@ -716,6 +789,7 @@ impl WorkflowMachines {
                     eid
                 ));
             }
+            self.task_history.apply(&event);
             let next_event = history.peek();
 
             // This definition of replaying here is that we are no longer replaying as soon as we

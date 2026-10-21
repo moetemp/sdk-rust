@@ -1165,6 +1165,7 @@ struct WorkflowTaskInfo {
     attempt: u32,
     /// From the poll response, like the attempt.
     started_event_id: i64,
+    previous_started_event_id: i64,
     started_time: Option<SystemTime>,
     received: Instant,
     /// Exists to allow easy tagging of spans with workflow ids. Is duplicative of info inside the
