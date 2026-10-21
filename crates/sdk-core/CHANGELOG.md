@@ -41,6 +41,8 @@ relevant information.
   the hooks.
 * The info a `WorkflowTaskInterceptor` gets names the run's last completed workflow task and the
   tasks that history shows as failed or timed out since then.
+  a hook that misses the task's deadline, fails the workflow task. Core waits at most five
+  seconds on `after_complete`. The replay worker never calls the hooks.
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency
