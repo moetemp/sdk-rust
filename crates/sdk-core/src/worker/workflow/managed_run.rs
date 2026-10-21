@@ -1340,6 +1340,12 @@ impl ManagedRun {
     /// learn by itself which task dispatched it.
     fn stamp_dispatching_task(&self, requests: &mut [LocalActRequest]) {
         let Some(wft) = self.wft.as_ref() else {
+            if requests
+                .iter()
+                .any(|r| matches!(r, LocalActRequest::New(_)))
+            {
+                dbg_panic!("Local activities were dispatched with no workflow task");
+            }
             return;
         };
         let task = WorkflowTaskAttempt {
