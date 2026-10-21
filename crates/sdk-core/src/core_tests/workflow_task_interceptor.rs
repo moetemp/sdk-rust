@@ -1,7 +1,7 @@
 //! The hooks a [WorkflowTaskInterceptor] gets around each workflow task completion.
 
 use crate::{
-    WorkerExtension, WorkflowTaskCompletionInfo, WorkflowTaskFailedInfo,
+    WorkerExtension, WorkflowTaskCompletionInfo, WorkflowTaskEpoch, WorkflowTaskFailedInfo,
     WorkflowTaskInterceptError, WorkflowTaskInterceptor, init_replay_worker,
     replay::{HistoryForReplay, ReplayWorkerInput, TestHistoryBuilder, canned_histories},
     test_help::{
@@ -29,7 +29,9 @@ use temporalio_common::protos::{
         workflow_completion::WorkflowActivationCompletion,
     },
     temporal::api::{
-        enums::v1::EventType, workflowservice::v1::RespondWorkflowTaskCompletedResponse,
+        enums::v1::{EventType, TimeoutType, WorkflowTaskFailedCause},
+        history::v1::{WorkflowTaskTimedOutEventAttributes, history_event},
+        workflowservice::v1::RespondWorkflowTaskCompletedResponse,
     },
 };
 
@@ -129,6 +131,51 @@ fn worker_with(
         wc.extension = Some(extension);
     });
     mock_worker(mock)
+}
+
+fn started_ids(epoch: &Option<WorkflowTaskEpoch>) -> Option<i64> {
+    epoch.as_ref().map(|e| e.started_event_id)
+}
+
+/// Sets the attempt of the last WorkflowTaskScheduled event.
+fn set_scheduled_attempt(t: &mut TestHistoryBuilder, attempt: i32) {
+    let scheduled = t.current_event_id() - 1;
+    t.modify_event(scheduled, |e| {
+        if let Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(a)) =
+            e.attributes.as_mut()
+        {
+            a.attempt = attempt;
+        }
+    });
+}
+
+/// Replays the task that starts the timer, then completes the run in the live task. Returns the
+/// info of the live task.
+async fn live_task_after_timer(
+    history: TestHistoryBuilder,
+    responses: Vec<ResponseType>,
+) -> WorkflowTaskCompletionInfo {
+    let recorder = Arc::new(Recorder::default());
+    let worker = worker_with(
+        MockPollCfg::from_resp_batches("fakeid", history, responses, mock_worker_client()),
+        &recorder,
+        accept,
+    );
+    let first = worker.poll_workflow_activation().await.unwrap();
+    assert!(first.is_replaying);
+    complete(
+        &worker,
+        &first,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(!fired.is_replaying);
+    complete_and_evict(&worker, &fired.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+    let mut infos = recorder.infos();
+    assert_eq!(infos.len(), 1);
+    infos.remove(0)
 }
 
 fn accept(_: usize) -> Result<RespondWorkflowTaskCompletedResponse, tonic::Status> {
@@ -404,6 +451,10 @@ async fn a_dropped_speculative_task_is_not_accepted() {
             "evicted",
         ]
     );
+    // History never keeps the dropped task, so the next task follows the first one.
+    let infos = recorder.infos();
+    assert_eq!(started_ids(&infos[2].previous_completed), Some(3));
+    assert!(infos[2].failed_tasks.is_empty());
 }
 
 #[tokio::test]
@@ -466,6 +517,10 @@ async fn the_local_activity_heartbeat_completion_runs_the_hooks() {
             "evicted",
         ]
     );
+    // The heartbeat completed the first task, so the next one follows it.
+    let infos = recorder.infos();
+    assert_eq!(infos[0].previous_completed, None);
+    assert_eq!(started_ids(&infos[1].previous_completed), Some(3));
 }
 
 #[tokio::test]
@@ -578,4 +633,138 @@ async fn the_replay_worker_never_calls_the_hooks() {
     worker.shutdown().await;
 
     assert!(recorder.log().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_attempt_is_a_failed_task() {
+    let mut t = timer_then_complete();
+    // Task 3 completed on its third attempt, which the server wrote when it completed.
+    t.modify_event(2, |e| {
+        if let Some(history_event::Attributes::WorkflowTaskScheduledEventAttributes(a)) =
+            e.attributes.as_mut()
+        {
+            a.attempt = 3;
+        }
+    });
+    // Task 8 fails, and the server writes its retry as attempt 2.
+    t.add_workflow_task_failed_with_failure(
+        WorkflowTaskFailedCause::Unspecified,
+        Default::default(),
+    );
+    t.add_workflow_task_scheduled_and_started();
+    set_scheduled_attempt(&mut t, 2);
+    let info = live_task_after_timer(t, vec![ResponseType::AllHistory]).await;
+
+    assert_eq!(info.started_event_id, 11);
+    let previous = info.previous_completed.unwrap();
+    assert_eq!(previous.started_event_id, 3);
+    assert_eq!(previous.attempt, 3);
+    assert!(previous.started_time.is_some());
+    assert_eq!(info.failed_tasks, [8]);
+}
+
+#[tokio::test]
+async fn timed_out_attempts_are_failed_tasks_unless_no_worker_started_them() {
+    let mut t = timer_then_complete();
+    t.add_workflow_task_timed_out();
+    // A sticky retry that no worker picks up times out before it starts.
+    t.add_workflow_task_scheduled();
+    let scheduled = t.current_event_id();
+    t.add(WorkflowTaskTimedOutEventAttributes {
+        scheduled_event_id: scheduled,
+        timeout_type: TimeoutType::ScheduleToStart as i32,
+        ..Default::default()
+    });
+    t.add_workflow_task_scheduled_and_started();
+    let info = live_task_after_timer(t, vec![ResponseType::AllHistory]).await;
+
+    assert_eq!(info.started_event_id, 13);
+    assert_eq!(info.failed_tasks, [8]);
+}
+
+#[tokio::test]
+async fn a_refused_completion_shows_up_as_a_failed_task_of_the_retry() {
+    let mut t = timer_then_complete();
+    let refused = hist_to_poll_resp(&t, "fakeid", ResponseType::AllHistory).resp;
+    // The server refuses task 8 with UNHANDLED_COMMAND and writes the failure.
+    t.add_workflow_task_failed_with_failure(
+        WorkflowTaskFailedCause::UnhandledCommand,
+        Default::default(),
+    );
+    t.add_workflow_task_scheduled_and_started();
+    let recorder = Arc::new(Recorder::default());
+    let worker = worker_with(
+        MockPollCfg::from_resp_batches(
+            "fakeid",
+            t.clone(),
+            [ResponseType::Raw(refused), ResponseType::AllHistory],
+            mock_worker_client(),
+        ),
+        &recorder,
+        |n| {
+            if n == 1 {
+                Err(tonic::Status::invalid_argument("UnhandledCommand"))
+            } else {
+                Ok(Default::default())
+            }
+        },
+    );
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    worker.complete_execution(&fired.run_id).await;
+    let eviction = worker.poll_workflow_activation().await.unwrap();
+    worker
+        .complete_workflow_activation(WorkflowActivationCompletion::empty(eviction.run_id))
+        .await
+        .unwrap();
+    // The retry replays the run from History.
+    let replay = worker.poll_workflow_activation().await.unwrap();
+    assert!(replay.is_replaying);
+    complete(
+        &worker,
+        &replay,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    complete_and_evict(&worker, &fired.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(
+        recorder.log(),
+        [
+            "before 8",
+            "sent commands=1 force_new=false",
+            "after 8 false",
+            "evicted",
+            "before 11",
+            "sent commands=1 force_new=false",
+            "after 11 true",
+            "evicted",
+        ]
+    );
+    let infos = recorder.infos();
+    assert!(infos[0].failed_tasks.is_empty());
+    assert_eq!(started_ids(&infos[1].previous_completed), Some(3));
+    assert_eq!(infos[1].failed_tasks, [8]);
+}
+
+#[tokio::test]
+async fn a_reset_shows_the_reset_task_as_failed() {
+    let mut t = timer_then_complete();
+    // A reset to task 8 fails it in the new run and schedules a new task.
+    t.add_workflow_task_failed_new_id(WorkflowTaskFailedCause::ResetWorkflow, "new-run");
+    t.add_workflow_task_scheduled_and_started();
+    let info = live_task_after_timer(t, vec![ResponseType::AllHistory]).await;
+
+    assert_eq!(info.started_event_id, 11);
+    assert_eq!(started_ids(&info.previous_completed), Some(3));
+    assert_eq!(info.failed_tasks, [8]);
 }

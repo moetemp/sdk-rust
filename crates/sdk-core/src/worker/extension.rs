@@ -74,12 +74,32 @@ pub struct WorkflowTaskCompletionInfo {
     /// The time the server started the task, from the poll response. Unset if the server did not
     /// send it.
     pub started_time: Option<SystemTime>,
+    /// The last task of the run that completed, from the poll response's
+    /// `previous_started_event_id` and that task's events. Unset before the first completion.
+    pub previous_completed: Option<WorkflowTaskEpoch>,
+    /// The started event ids of the tasks that History shows as failed or timed out since
+    /// `previous_completed`, oldest first. Attempts after the first that fail leave no event, so
+    /// they are not here.
+    #[builder(default)]
+    pub failed_tasks: Vec<i64>,
     /// Set when the completion has a command that closes the run. Continue-as-new does not
     /// count.
     pub closes_run: Option<RunCloseKind>,
     /// When the hook must have returned, so that the task does not time out on the server. Core
     /// measures it from the local receipt of the task, with a margin.
     pub deadline: Instant,
+}
+
+/// One attempt of a workflow task, as History records it.
+#[derive(Clone, Debug, PartialEq, Eq, bon::Builder)]
+#[non_exhaustive]
+pub struct WorkflowTaskEpoch {
+    /// The id of the task's `WorkflowTaskStarted` event.
+    pub started_event_id: i64,
+    /// The attempt of the task's `WorkflowTaskScheduled` event. Zero if Core no longer has it.
+    pub attempt: u32,
+    /// The time of the task's `WorkflowTaskStarted` event.
+    pub started_time: Option<SystemTime>,
 }
 
 /// The command with which a completion closes its run.

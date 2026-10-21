@@ -39,6 +39,8 @@ relevant information.
   and the completion of output buffered before an eviction. An error from `before_complete`, or
   a hook that misses the task's deadline, fails the workflow task. The replay worker never calls
   the hooks.
+* The info a `WorkflowTaskInterceptor` gets names the run's last completed workflow task and the
+  tasks that history shows as failed or timed out since then.
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency
