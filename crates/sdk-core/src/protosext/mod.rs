@@ -12,7 +12,7 @@ use std::{
     collections::HashMap,
     convert::TryFrom,
     fmt::{Debug, Display, Formatter},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 use temporalio_common::protos::{
     constants::{LOCAL_ACTIVITY_MARKER_NAME, PATCH_MARKER_NAME},
@@ -59,6 +59,8 @@ pub(crate) struct ValidPollWFTQResponse {
     pub(crate) started_event_id: i64,
     /// When the server started the task. From the `started_time` field.
     pub(crate) started_time: Option<SystemTime>,
+    /// When the worker received the task, before it waits on a busy run or a history fetch.
+    pub(crate) received: Instant,
     /// If this is present, `history` will be empty. This is not a very "tight" design, but it's
     /// enforced at construction time. From the `query` field.
     pub(crate) legacy_query: Option<WorkflowQuery>,
@@ -134,6 +136,7 @@ impl TryFrom<PollWorkflowTaskQueueResponse> for ValidPollWFTQResponse {
                     previous_started_event_id,
                     started_event_id,
                     started_time: started_time.and_then(|t| t.try_into().ok()),
+                    received: Instant::now(),
                     legacy_query: query,
                     query_requests,
                     messages,

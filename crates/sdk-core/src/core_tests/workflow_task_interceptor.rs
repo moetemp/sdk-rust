@@ -44,6 +44,8 @@ struct Recorder {
     fail_before: Vec<i64>,
     /// `before_complete` waits this long first.
     before_delay: Option<Duration>,
+    /// `after_complete` never returns for the tasks with these started event ids.
+    hang_after: Vec<i64>,
 }
 
 impl Recorder {
@@ -79,6 +81,9 @@ impl WorkflowTaskInterceptor for Recorder {
 
     async fn after_complete(&self, task: &WorkflowTaskCompletionInfo, accepted: bool) {
         self.push(format!("after {} {accepted}", task.started_event_id));
+        if self.hang_after.contains(&task.started_event_id) {
+            futures_util::future::pending::<()>().await;
+        }
     }
 
     fn on_task_failed(&self, task: &WorkflowTaskFailedInfo) {
@@ -767,4 +772,105 @@ async fn a_reset_shows_the_reset_task_as_failed() {
     assert_eq!(info.started_event_id, 11);
     assert_eq!(started_ids(&info.previous_completed), Some(3));
     assert_eq!(info.failed_tasks, [8]);
+}
+
+#[tokio::test]
+async fn a_hung_after_complete_does_not_stall_the_run() {
+    let recorder = Arc::new(Recorder {
+        hang_after: vec![3],
+        ..Default::default()
+    });
+    let worker = worker_with(
+        MockPollCfg::from_resp_batches(
+            "fakeid",
+            timer_then_complete(),
+            [1, 2],
+            mock_worker_client(),
+        ),
+        &recorder,
+        accept,
+    );
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    let second = worker.poll_workflow_activation().await.unwrap();
+    complete_and_evict(&worker, &second.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(
+        recorder.log(),
+        [
+            "before 3",
+            "sent commands=1 force_new=false",
+            "after 3 true",
+            "before 8",
+            "sent commands=1 force_new=false",
+            "after 8 true",
+            "evicted",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_failed_task_before_an_earlier_completion_stays_listed() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(10));
+    // Task 3 fails, and task 6 completes without touching what task 3 wrote.
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_failed_with_failure(
+        WorkflowTaskFailedCause::Unspecified,
+        Default::default(),
+    );
+    t.add_full_wf_task();
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let info = live_task_after_timer(t, vec![ResponseType::AllHistory]).await;
+
+    assert_eq!(info.started_event_id, 11);
+    assert_eq!(started_ids(&info.previous_completed), Some(6));
+    assert_eq!(info.failed_tasks, [3]);
+}
+
+#[tokio::test]
+async fn a_sticky_task_after_a_failure_lists_it() {
+    let mut t = timer_then_complete();
+    // Task 8 times out while the run stays cached, so the next task is a partial history.
+    t.add_workflow_task_timed_out();
+    t.add_workflow_task_scheduled_and_started();
+    let recorder = Arc::new(Recorder::default());
+    let worker = worker_with(
+        MockPollCfg::from_resp_batches(
+            "fakeid",
+            t,
+            [ResponseType::ToTaskNum(1), ResponseType::OneTask(2)],
+            mock_worker_client(),
+        ),
+        &recorder,
+        accept,
+    );
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(!fired.is_replaying);
+    complete_and_evict(&worker, &fired.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    let infos = recorder.infos();
+    assert_eq!(infos.len(), 2);
+    let last = &infos[1];
+    assert_eq!(last.started_event_id, 11);
+    assert_eq!(started_ids(&last.previous_completed), Some(3));
+    assert_eq!(last.failed_tasks, [8]);
 }

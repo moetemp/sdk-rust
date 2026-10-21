@@ -47,6 +47,9 @@ relevant information.
 * A local activity's `ActivityTask.Start` has `workflow_task` (field 20), with the started event
   id, attempt and start time of the workflow task in which Core dispatched it. Retries that Core
   runs on its own keep the value.
+  tasks of the run that history shows as failed or timed out.
+  a hook that misses the task's deadline, fails the workflow task. Core waits at most five
+  seconds on `after_complete`. The replay worker never calls the hooks.
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency

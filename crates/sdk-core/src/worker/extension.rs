@@ -76,7 +76,12 @@ impl ExtensionError {
 /// Hooks around each `RespondWorkflowTaskCompleted` call that Core makes for a run.
 ///
 /// Core calls the hooks of one run in order, and the next workflow task of that run waits until
-/// they return. Other runs are not blocked. The replay worker never calls them.
+/// they return. Core waits at most five seconds on [WorkflowTaskInterceptor::after_complete], so
+/// long work such as retries must run in the background. The replay worker never calls the hooks.
+///
+/// A completion that lang sends waits only on its own run. Core sends the local activity heartbeat
+/// completion from within the poll for the next activation, so while its hooks run, that poll
+/// gives no activation to other runs.
 #[async_trait::async_trait]
 pub trait WorkflowTaskInterceptor: Send + Sync + 'static {
     /// Called before every `RespondWorkflowTaskCompleted` for the run. This includes the
@@ -119,8 +124,8 @@ pub struct WorkflowTaskCompletionInfo {
     pub first_execution_run_id: String,
     /// The workflow type.
     pub workflow_type: String,
-    /// The id of the task's `WorkflowTaskStarted` event, from the poll response. A transient
-    /// attempt has no such event yet, so it shares the id with the earlier attempts.
+    /// The id of the task's `WorkflowTaskStarted` event, from the poll response. The server writes
+    /// no events for transient attempts, so attempts after the second of one task share an id.
     pub started_event_id: i64,
     /// The task's attempt, from the poll response.
     pub attempt: u32,
@@ -130,9 +135,10 @@ pub struct WorkflowTaskCompletionInfo {
     /// The last task of the run that completed, from the poll response's
     /// `previous_started_event_id` and that task's events. Unset before the first completion.
     pub previous_completed: Option<WorkflowTaskEpoch>,
-    /// The started event ids of the tasks that History shows as failed or timed out since
-    /// `previous_completed`, oldest first. Attempts after the first that fail leave no event, so
-    /// they are not here.
+    /// The started event ids of all the tasks of the run that History shows as failed or timed
+    /// out, oldest first. It includes the task a reset failed, which belongs to the reset run.
+    /// Attempts after the first that fail leave no event, so they are not here. The list is the
+    /// same after a cache miss, since replay applies all of History.
     #[builder(default)]
     pub failed_tasks: Vec<i64>,
     /// Set when the completion has a command that closes the run. Continue-as-new does not
