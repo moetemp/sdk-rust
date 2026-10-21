@@ -44,6 +44,9 @@ relevant information.
 * A `WorkerExtension` has `call` and `call_async`, which take a method name and encoded input. A
   bridge can route a generic lang call to them, so the extension needs no bridge function of its
   own. Core never calls them.
+  tasks of the run that history shows as failed or timed out.
+  a hook that misses the task's deadline, fails the workflow task. Core waits at most five
+  seconds on `after_complete`. The replay worker never calls the hooks.
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency
