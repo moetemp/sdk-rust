@@ -82,9 +82,10 @@ pub struct WorkflowTaskCompletionInfo {
     /// The last task of the run that completed, from the poll response's
     /// `previous_started_event_id` and that task's events. Unset before the first completion.
     pub previous_completed: Option<WorkflowTaskEpoch>,
-    /// The started event ids of the tasks that History shows as failed or timed out since
-    /// `previous_completed`, oldest first. Attempts after the first that fail leave no event, so
-    /// they are not here.
+    /// The started event ids of all the tasks of the run that History shows as failed or timed
+    /// out, oldest first. It includes the task a reset failed, which belongs to the reset run.
+    /// Attempts after the first that fail leave no event, so they are not here. The list is the
+    /// same after a cache miss, since replay applies all of History.
     #[builder(default)]
     pub failed_tasks: Vec<i64>,
     /// Set when the completion has a command that closes the run. Continue-as-new does not

@@ -40,7 +40,7 @@ relevant information.
   a hook that misses the task's deadline, fails the workflow task. The replay worker never calls
   the hooks.
 * The info a `WorkflowTaskInterceptor` gets names the run's last completed workflow task and the
-  tasks that history shows as failed or timed out since then.
+  tasks of the run that history shows as failed or timed out.
   a hook that misses the task's deadline, fails the workflow task. Core waits at most five
   seconds on `after_complete`. The replay worker never calls the hooks.
 

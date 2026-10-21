@@ -87,7 +87,7 @@ struct TaskHistory {
     started: Option<WorkflowTaskEpoch>,
     /// The task of the last WorkflowTaskCompleted event.
     completed: Option<WorkflowTaskEpoch>,
-    /// Started event ids of the failed and timed-out tasks since `completed`.
+    /// Started event ids of all the failed and timed-out tasks of the run.
     failed: Vec<i64>,
 }
 
@@ -108,7 +108,6 @@ impl TaskHistory {
             }
             Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(_)) => {
                 self.completed = self.started.clone();
-                self.failed.clear();
             }
             Some(history_event::Attributes::WorkflowTaskFailedEventAttributes(a))
                 if a.started_event_id > 0 =>
@@ -465,8 +464,7 @@ impl WorkflowMachines {
         self.drive_me.get_started_info()
     }
 
-    /// The completed task with the given started event id, and the failed tasks since the last
-    /// completed task.
+    /// The completed task with the given started event id, and all the failed tasks of the run.
     pub(crate) fn task_history_facts(
         &self,
         previous_started_event_id: i64,
