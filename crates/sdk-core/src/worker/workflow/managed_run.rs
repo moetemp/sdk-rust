@@ -32,6 +32,7 @@ use std::{
 use temporalio_common::protos::{
     TaskToken,
     coresdk::{
+        activity_task::WorkflowTaskAttempt,
         common::ExternalStorageMetrics,
         workflow_activation::{
             RemoveFromCache, WorkflowActivation, query_to_job, remove_from_cache::EvictionReason,
@@ -793,7 +794,8 @@ impl ManagedRun {
             if !completion.activation_was_eviction && !self.am_broken {
                 self.wfm.apply_next_task_if_ready()?;
             }
-            let new_local_acts = self.wfm.drain_queued_local_activities();
+            let mut new_local_acts = self.wfm.drain_queued_local_activities();
+            self.stamp_dispatching_task(&mut new_local_acts);
             self.sink_la_requests(new_local_acts)?;
 
             if self.wfm.machines.outstanding_local_activity_count() == 0 {
@@ -1332,6 +1334,30 @@ impl ManagedRun {
                 )
                 .build(),
         )
+    }
+
+    /// Names the current workflow task on each new local activity, since a local activity cannot
+    /// learn by itself which task dispatched it.
+    fn stamp_dispatching_task(&self, requests: &mut [LocalActRequest]) {
+        let Some(wft) = self.wft.as_ref() else {
+            if requests
+                .iter()
+                .any(|r| matches!(r, LocalActRequest::New(_)))
+            {
+                dbg_panic!("Local activities were dispatched with no workflow task");
+            }
+            return;
+        };
+        let task = WorkflowTaskAttempt {
+            started_event_id: wft.info.started_event_id,
+            attempt: wft.info.attempt,
+            started_time: wft.info.started_time.map(Into::into),
+        };
+        for request in requests {
+            if let LocalActRequest::New(new_la) = request {
+                new_la.workflow_task = Some(task);
+            }
+        }
     }
 
     /// Pump some local activity requests into the sink, applying any immediate results to the
