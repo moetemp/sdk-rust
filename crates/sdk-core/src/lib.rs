@@ -51,7 +51,7 @@ pub use worker::{
     WorkflowErrorType, WorkflowSlotKind,
 };
 pub use worker::{
-    RunCloseKind, WorkerExtension, WorkflowTaskCompletionInfo, WorkflowTaskEpoch,
+    ExtensionError, RunCloseKind, WorkerExtension, WorkflowTaskCompletionInfo, WorkflowTaskEpoch,
     WorkflowTaskFailedInfo, WorkflowTaskInterceptError, WorkflowTaskInterceptor,
 };
 

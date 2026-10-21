@@ -41,6 +41,9 @@ relevant information.
   the hooks.
 * The info a `WorkflowTaskInterceptor` gets names the run's last completed workflow task and the
   tasks that history shows as failed or timed out since then.
+* A `WorkerExtension` has `call` and `call_async`, which take a method name and encoded input. A
+  bridge can route a generic lang call to them, so the extension needs no bridge function of its
+  own. Core never calls them.
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency
