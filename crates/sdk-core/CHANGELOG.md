@@ -37,8 +37,8 @@ relevant information.
 * A worker can take a `WorkerExtension` whose `WorkflowTaskInterceptor` runs before and after
   each workflow task completion Core sends, including the local activity heartbeat completion
   and the completion of output buffered before an eviction. An error from `before_complete`, or
-  a hook that misses the task's deadline, fails the workflow task. The replay worker never calls
-  the hooks.
+  a hook that misses the task's deadline, fails the workflow task. Core waits at most five
+  seconds on `after_complete`. The replay worker never calls the hooks.
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency

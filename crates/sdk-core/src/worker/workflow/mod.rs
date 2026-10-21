@@ -121,6 +121,8 @@ const WFT_HEARTBEAT_TIMEOUT_FRACTION: f32 = 0.8;
 /// What percentage of a WFT timeout may pass before `before_complete` must have returned. It is
 /// above the heartbeat fraction, so a heartbeat completion still has time for the hook.
 const WFT_INTERCEPTOR_DEADLINE_FRACTION: f32 = 0.9;
+/// How long Core waits on `after_complete` before it goes on with the run.
+const WFT_INTERCEPTOR_AFTER_COMPLETE_TIMEOUT: Duration = Duration::from_secs(5);
 
 type Result<T, E = WFMachinesError> = result::Result<T, E>;
 type BoxedActivationStream = BoxStream<'static, Result<WorkflowStreamAction, PollError>>;
@@ -397,13 +399,17 @@ impl Workflows {
                     },
                 metrics: run_metrics,
             } => {
-                if self.wft_interceptor.is_some() && task_info.is_none() {
-                    dbg_panic!("Workflow task completion is missing its interceptor info");
-                }
                 let interceptor = self.wft_interceptor.as_deref().zip(task_info.as_deref());
-                if let Some((interceptor, info)) = interceptor
-                    && let Err(message) = run_before_complete(interceptor, info).await
-                {
+                let before = match (interceptor, self.wft_interceptor.is_some()) {
+                    (Some((interceptor, info)), _) => run_before_complete(interceptor, info).await,
+                    (None, false) => Ok(()),
+                    // Completing without the hook would skip it, so fail the task instead.
+                    (None, true) => {
+                        dbg_panic!("Workflow task completion is missing its interceptor info");
+                        Err("Workflow task completion is missing its interceptor info".to_string())
+                    }
+                };
+                if let Err(message) = before {
                     warn!(run_id, error = %message, "Workflow task interceptor failed the task");
                     // The machines already count this task as completed, so the run must replay.
                     self.request_eviction(
@@ -546,7 +552,7 @@ impl Workflows {
                 })
                 .await;
                 if let Some((interceptor, info)) = interceptor {
-                    interceptor.after_complete(info, accepted).await;
+                    run_after_complete(interceptor, info, accepted).await;
                 }
                 WFTReportStatus::Reported {
                     reset_last_started_to,
@@ -1084,6 +1090,7 @@ struct PreparedWFT {
     task_token: TaskToken,
     attempt: u32,
     started_time: Option<SystemTime>,
+    received: Instant,
     execution: WorkflowExecution,
     workflow_type: String,
     legacy_query: Option<WorkflowQuery>,
@@ -1159,6 +1166,7 @@ struct WorkflowTaskInfo {
     /// From the poll response, like the attempt.
     started_event_id: i64,
     started_time: Option<SystemTime>,
+    received: Instant,
     /// Exists to allow easy tagging of spans with workflow ids. Is duplicative of info inside the
     /// run machines themselves, but that can't be accessed easily. Would be nice to somehow have a
     /// shared repository, or refcounts, or whatever, for strings like these that get duped all
@@ -1281,6 +1289,22 @@ async fn run_before_complete(
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.message),
         Err(_) => Err("Workflow task interceptor missed the task deadline".to_string()),
+    }
+}
+
+/// Runs the `after_complete` hook. The run's next task waits on it, so a hung hook must not stall
+/// the run.
+async fn run_after_complete(
+    interceptor: &dyn WorkflowTaskInterceptor,
+    info: &WorkflowTaskCompletionInfo,
+    accepted: bool,
+) {
+    let after = interceptor.after_complete(info, accepted);
+    if tokio::time::timeout(WFT_INTERCEPTOR_AFTER_COMPLETE_TIMEOUT, after)
+        .await
+        .is_err()
+    {
+        warn!(run_id = %info.run_id, "Workflow task interceptor timed out after the completion");
     }
 }
 

@@ -46,11 +46,12 @@ use temporalio_common::protos::{
         failure::v1::Failure,
     },
 };
-
-/// The server's default workflow task timeout, for a run whose start event has none.
-const DEFAULT_WFT_TIMEOUT: Duration = Duration::from_secs(10);
 use tokio::sync::oneshot;
 use tracing::Span;
+
+/// The server's default workflow task timeout. The start event always has the timeout, so this
+/// only keeps the hook's deadline finite if it is missing.
+const DEFAULT_WFT_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 pub(super) type RunUpdateAct = Option<ActivationOrAuto>;
@@ -201,6 +202,7 @@ impl ManagedRun {
             attempt: work.attempt,
             started_event_id: work.update.wft_started_id,
             started_time: work.started_time,
+            received: work.received,
             task_token: work.task_token,
             wf_id: work.execution.workflow_id.clone(),
         };
@@ -1295,7 +1297,10 @@ impl ManagedRun {
     /// The facts a workflow task interceptor gets about the task being completed. `None` when the
     /// worker has no extension, or the run has no task.
     fn completion_info(&self, commands: &[ProtoCommand]) -> Option<WorkflowTaskCompletionInfo> {
-        self.config.extension.as_ref()?;
+        self.config
+            .extension
+            .as_ref()?
+            .workflow_task_interceptor()?;
         let wft = self.wft.as_ref()?;
         let machines = &self.wfm.machines;
         let started_info = machines.get_started_info();
@@ -1317,7 +1322,9 @@ impl ManagedRun {
                 .attempt(wft.info.attempt)
                 .maybe_started_time(wft.info.started_time)
                 .maybe_closes_run(run_close_kind(commands))
-                .deadline(wft.start_time + wft_timeout.mul_f32(WFT_INTERCEPTOR_DEADLINE_FRACTION))
+                .deadline(
+                    wft.info.received + wft_timeout.mul_f32(WFT_INTERCEPTOR_DEADLINE_FRACTION),
+                )
                 .build(),
         )
     }

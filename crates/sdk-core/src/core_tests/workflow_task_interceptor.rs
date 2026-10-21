@@ -42,6 +42,8 @@ struct Recorder {
     fail_before: Vec<i64>,
     /// `before_complete` waits this long first.
     before_delay: Option<Duration>,
+    /// `after_complete` never returns for the tasks with these started event ids.
+    hang_after: Vec<i64>,
 }
 
 impl Recorder {
@@ -77,6 +79,9 @@ impl WorkflowTaskInterceptor for Recorder {
 
     async fn after_complete(&self, task: &WorkflowTaskCompletionInfo, accepted: bool) {
         self.push(format!("after {} {accepted}", task.started_event_id));
+        if self.hang_after.contains(&task.started_event_id) {
+            futures_util::future::pending::<()>().await;
+        }
     }
 
     fn on_task_failed(&self, task: &WorkflowTaskFailedInfo) {
@@ -578,4 +583,46 @@ async fn the_replay_worker_never_calls_the_hooks() {
     worker.shutdown().await;
 
     assert!(recorder.log().is_empty());
+}
+
+#[tokio::test]
+async fn a_hung_after_complete_does_not_stall_the_run() {
+    let recorder = Arc::new(Recorder {
+        hang_after: vec![3],
+        ..Default::default()
+    });
+    let worker = worker_with(
+        MockPollCfg::from_resp_batches(
+            "fakeid",
+            timer_then_complete(),
+            [1, 2],
+            mock_worker_client(),
+        ),
+        &recorder,
+        accept,
+    );
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    let second = worker.poll_workflow_activation().await.unwrap();
+    complete_and_evict(&worker, &second.run_id).await;
+    worker.drain_pollers_and_shutdown().await;
+
+    assert_eq!(
+        recorder.log(),
+        [
+            "before 3",
+            "sent commands=1 force_new=false",
+            "after 3 true",
+            "before 8",
+            "sent commands=1 force_new=false",
+            "after 8 true",
+            "evicted",
+        ]
+    );
 }
