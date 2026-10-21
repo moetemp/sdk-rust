@@ -41,6 +41,9 @@ relevant information.
   seconds on `after_complete`. The replay worker never calls the hooks.
 * The info a `WorkflowTaskInterceptor` gets has the run's last completed Workflow Task and the
   tasks of the run that history shows as failed or timed out.
+* A `WorkerExtension` has `call` and `call_async`, which take a method name and encoded input. A
+  bridge can route a generic lang call to them, so the extension needs no bridge function of its
+  own. Core never calls them.
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency
