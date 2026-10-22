@@ -34,13 +34,7 @@ relevant information.
 ## Unreleased
 
 ### Added
-* A worker can take a `WorkerExtension` whose `WorkflowTaskInterceptor` runs before and after
-  each Workflow Task completion Core sends, including the Local Activity heartbeat completion
-  and the completion of output buffered before an eviction. An error from `before_complete`, or
-  a hook that misses the task's deadline, fails the Workflow Task. Core waits at most five
-  seconds on `after_complete`. The replay worker never calls the hooks.
-* The info a `WorkflowTaskInterceptor` gets has the run's last completed Workflow Task and the
-  tasks of the run that history shows as failed or timed out.
+* A worker can take a `WorkerExtension`, a plugin component that the replay worker leaves out.
 * A `WorkerExtension` has `call` and `call_async`, which take a method name and encoded input. A
   bridge can route a generic lang call to them, so the extension needs no bridge function of its
   own. Core never calls them.
