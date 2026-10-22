@@ -35,6 +35,7 @@ relevant information.
 
 ### Changed
 * Updated workflow and activity macros to syn 3 for improved Rust syntax compatibility.
+
 ### Added
 * `Connection::raw_unary` makes a unary gRPC call by method path, with the request and the
   response as encoded protobuf. It keeps the connection's TLS, API key, headers, interceptors,
