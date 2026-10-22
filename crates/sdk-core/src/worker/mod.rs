@@ -302,7 +302,8 @@ pub struct WorkerConfig {
     #[builder(default = false)]
     pub disable_payload_error_limit: bool,
 
-    /// A plugin component that lang calls by method name. See [WorkerExtension].
+    /// A plugin component that lang calls by method name, and that gets the worker's connection.
+    /// See [WorkerExtension].
     pub extension: Option<Arc<dyn WorkerExtension>>,
 }
 
@@ -717,6 +718,9 @@ impl Worker {
             &mut new_connection,
             self.config.client_identity_override.clone(),
         );
+        if let Some(extension) = &self.config.extension {
+            extension.attach(new_connection.clone());
+        }
 
         self.client.replace_connection(new_connection);
         *self.client_worker_registrator.client.write() = self.client.clone();
