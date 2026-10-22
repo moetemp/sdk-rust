@@ -27,8 +27,7 @@ use crate::{
     worker::{
         ActivitySlotKind, CompleteWfError, LocalActRequest, LocalActivityExecutionResult,
         LocalActivityResolution, NamespaceCapabilities, PollError, PostActivateHookData,
-        RunCloseKind, WorkflowSlotKind, WorkflowTaskCompletionInfo, WorkflowTaskFailedInfo,
-        WorkflowTaskInterceptor,
+        WorkflowSlotKind,
         activities::{ActivitiesFromWFTsHandle, LocalActivityManager},
         client::{
             LegacyQueryResult, REQUEST_TOO_LARGE_KEY, WorkerClient, WorkflowTaskCompletion,
@@ -89,7 +88,7 @@ use temporalio_common::{
                 Memo, MeteringMetadata, RetryPolicy, SearchAttributes, WorkflowExecution,
             },
             enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
-            failure::v1::{ApplicationFailureInfo, Failure as ApiFailure, failure::FailureInfo},
+            failure::v1::{ApplicationFailureInfo, failure::FailureInfo},
             protocol::v1::Message as ProtocolMessage,
             query::v1::WorkflowQuery,
             sdk::v1::{EventGroupMarker, UserMetadata, WorkflowTaskCompletedMetadata},
@@ -118,11 +117,6 @@ pub const LEGACY_QUERY_ID: &str = "legacy_query";
 /// What percentage of a WFT timeout we are willing to wait before sending a WFT heartbeat when
 /// necessary.
 const WFT_HEARTBEAT_TIMEOUT_FRACTION: f32 = 0.8;
-/// What percentage of a WFT timeout may pass before `before_complete` must have returned. It is
-/// above the heartbeat fraction, so a heartbeat completion still has time for the hook.
-const WFT_INTERCEPTOR_DEADLINE_FRACTION: f32 = 0.9;
-/// How long Core waits on `after_complete` before it goes on with the run.
-const WFT_INTERCEPTOR_AFTER_COMPLETE_TIMEOUT: Duration = Duration::from_secs(5);
 
 type Result<T, E = WFMachinesError> = result::Result<T, E>;
 type BoxedActivationStream = BoxStream<'static, Result<WorkflowStreamAction, PollError>>;
@@ -153,7 +147,6 @@ pub(crate) struct Workflows {
     default_versioning_behavior: Option<VersioningBehavior>,
     namespace_capabilities: Arc<NamespaceCapabilities>,
     shutdown_token: CancellationToken,
-    wft_interceptor: Option<Arc<dyn WorkflowTaskInterceptor>>,
 }
 
 pub(crate) struct WorkflowBasics {
@@ -203,11 +196,6 @@ impl Workflows {
         let default_versioning_behavior = basics.default_versioning_behavior;
         let namespace_capabilities = basics.namespace_capabilities.clone();
         let shutdown_token = basics.shutdown_token.clone();
-        let wft_interceptor = basics
-            .worker_config
-            .extension
-            .as_ref()
-            .and_then(|e| e.workflow_task_interceptor());
         let extracted_wft_stream = WFTExtractor::build(
             client.clone(),
             basics.worker_config.fetching_concurrency,
@@ -305,7 +293,6 @@ impl Workflows {
             default_versioning_behavior,
             namespace_capabilities,
             shutdown_token,
-            wft_interceptor,
         }
     }
 
@@ -395,46 +382,9 @@ impl Workflows {
                         sdk_metadata,
                         mut versioning_behavior,
                         attempt,
-                        task_info,
                     },
                 metrics: run_metrics,
             } => {
-                let interceptor = self.wft_interceptor.as_deref().zip(task_info.as_deref());
-                let before = match (interceptor, self.wft_interceptor.is_some()) {
-                    (Some((interceptor, info)), _) => run_before_complete(interceptor, info).await,
-                    (None, false) => Ok(()),
-                    // Completing without the hook would skip it, so fail the task instead.
-                    (None, true) => {
-                        dbg_panic!("Workflow task completion is missing its interceptor info");
-                        Err("Workflow task completion is missing its interceptor info".to_string())
-                    }
-                };
-                if let Err(message) = before {
-                    warn!(run_id, error = %message, "Workflow task interceptor failed the task");
-                    // The machines already count this task as completed, so the run must replay.
-                    self.request_eviction(
-                        run_id,
-                        "Workflow task interceptor failed the task",
-                        EvictionReason::Fatal,
-                    );
-                    return self
-                        .handle_activation_failed(
-                            run_id,
-                            completion_time,
-                            FailedActivationWFTReport::new(
-                                task_token,
-                                attempt,
-                                WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
-                                Failure {
-                                    failure: Some(ApiFailure::application_failure(message, false)),
-                                    ..Default::default()
-                                },
-                                WftFailureKind::Task,
-                                &run_metrics,
-                            ),
-                        )
-                        .await;
-                }
                 let reserved_act_permits =
                     self.reserve_activity_slots_for_outgoing_commands(commands.as_mut_slice());
                 debug!(commands=%commands.display(), query_responses=%query_responses.display(),
@@ -481,7 +431,6 @@ impl Workflows {
                 completion.sticky_attributes = sticky_attrs;
 
                 let mut reset_last_started_to = None;
-                let mut accepted = false;
                 self.handle_wft_reporting_errs(run_id, || async {
                     match self
                         .client
@@ -494,8 +443,6 @@ impl Workflows {
                             }
                             if response.reset_history_event_id > 0 {
                                 reset_last_started_to = Some(response.reset_history_event_id);
-                            } else {
-                                accepted = true;
                             }
                             if let Some(wft) = response.workflow_task {
                                 *wft_from_complete = Some(validate_wft(wft)?);
@@ -551,9 +498,6 @@ impl Workflows {
                     Ok(())
                 })
                 .await;
-                if let Some((interceptor, info)) = interceptor {
-                    run_after_complete(interceptor, info, accepted).await;
-                }
                 WFTReportStatus::Reported {
                     reset_last_started_to,
                     completion_time,
@@ -605,11 +549,9 @@ impl Workflows {
             WftFailureKind::Task if attempt > 1 => {
                 debug!(run_id=%run_id, attempt, failure=?failure,
                        "Not reporting workflow task failure on non-first attempt");
-                self.notify_task_failed(run_id, attempt, false);
                 return WFTReportStatus::DropWft { completion_time };
             }
             WftFailureKind::Task => {
-                self.notify_task_failed(run_id, attempt, true);
                 warn!(run_id=%run_id, failure=?failure, "Failing workflow task");
                 self.handle_wft_reporting_errs(run_id, || async {
                     self.client
@@ -622,18 +564,6 @@ impl Workflows {
         WFTReportStatus::Reported {
             reset_last_started_to: None,
             completion_time,
-        }
-    }
-
-    fn notify_task_failed(&self, run_id: &str, attempt: u32, reported: bool) {
-        if let Some(interceptor) = self.wft_interceptor.as_deref() {
-            interceptor.on_task_failed(
-                &WorkflowTaskFailedInfo::builder()
-                    .run_id(run_id)
-                    .attempt(attempt)
-                    .reported(reported)
-                    .build(),
-            );
         }
     }
 
@@ -1090,7 +1020,6 @@ struct PreparedWFT {
     task_token: TaskToken,
     attempt: u32,
     started_time: Option<SystemTime>,
-    received: Instant,
     execution: WorkflowExecution,
     workflow_type: String,
     legacy_query: Option<WorkflowQuery>,
@@ -1165,9 +1094,7 @@ struct WorkflowTaskInfo {
     attempt: u32,
     /// From the poll response, like the attempt.
     started_event_id: i64,
-    previous_started_event_id: i64,
     started_time: Option<SystemTime>,
-    received: Instant,
     /// Exists to allow easy tagging of spans with workflow ids. Is duplicative of info inside the
     /// run machines themselves, but that can't be accessed easily. Would be nice to somehow have a
     /// shared repository, or refcounts, or whatever, for strings like these that get duped all
@@ -1255,8 +1182,6 @@ pub(crate) enum ActivationAction {
         sdk_metadata: WorkflowTaskCompletedMetadata,
         versioning_behavior: VersioningBehavior,
         attempt: u32,
-        /// Set when the worker has a workflow task interceptor.
-        task_info: Option<Box<WorkflowTaskCompletionInfo>>,
     },
     /// We should respond to a legacy query request
     RespondLegacyQuery { result: Box<QueryResult> },
@@ -1278,53 +1203,6 @@ impl EvictionRequestResult {
             }
         }
     }
-}
-
-/// Runs the `before_complete` hook within the task's deadline, returning the failure message.
-async fn run_before_complete(
-    interceptor: &dyn WorkflowTaskInterceptor,
-    info: &WorkflowTaskCompletionInfo,
-) -> Result<(), String> {
-    let deadline = tokio::time::Instant::from_std(info.deadline);
-    match tokio::time::timeout_at(deadline, interceptor.before_complete(info)).await {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(e.message),
-        Err(_) => Err("Workflow task interceptor missed the task deadline".to_string()),
-    }
-}
-
-/// Runs the `after_complete` hook. The run's next task waits on it, so a hung hook must not stall
-/// the run.
-async fn run_after_complete(
-    interceptor: &dyn WorkflowTaskInterceptor,
-    info: &WorkflowTaskCompletionInfo,
-    accepted: bool,
-) {
-    let after = interceptor.after_complete(info, accepted);
-    if tokio::time::timeout(WFT_INTERCEPTOR_AFTER_COMPLETE_TIMEOUT, after)
-        .await
-        .is_err()
-    {
-        warn!(run_id = %info.run_id, "Workflow task interceptor timed out after the completion");
-    }
-}
-
-/// The way the commands close the run, if they do.
-fn run_close_kind(commands: &[ProtoCommand]) -> Option<RunCloseKind> {
-    commands
-        .iter()
-        .find_map(|cmd| match cmd.attributes.as_ref() {
-            Some(Attributes::CompleteWorkflowExecutionCommandAttributes(_)) => {
-                Some(RunCloseKind::Completed)
-            }
-            Some(Attributes::FailWorkflowExecutionCommandAttributes(_)) => {
-                Some(RunCloseKind::Failed)
-            }
-            Some(Attributes::CancelWorkflowExecutionCommandAttributes(_)) => {
-                Some(RunCloseKind::Cancelled)
-            }
-            _ => None,
-        })
 }
 
 #[allow(clippy::type_complexity)]
@@ -1822,7 +1700,6 @@ enum CommandID {
 #[derive(Debug, Clone)]
 struct WorkflowStartedInfo {
     workflow_task_timeout: Option<Duration>,
-    first_execution_run_id: String,
     memo: Option<Memo>,
     search_attrs: Option<SearchAttributes>,
     retry_policy: Option<RetryPolicy>,
