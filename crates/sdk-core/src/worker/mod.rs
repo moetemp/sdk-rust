@@ -11,10 +11,7 @@ mod workflow;
 /// the error limit, shared so every conversion site reports the same identifier.
 pub(crate) const PAYLOADS_TOO_LARGE_FAILURE_TYPE: &str = "PayloadsTooLarge";
 
-pub use extension::{
-    ExtensionError, RunCloseKind, WorkerExtension, WorkflowTaskCompletionInfo, WorkflowTaskEpoch,
-    WorkflowTaskFailedInfo, WorkflowTaskInterceptError, WorkflowTaskInterceptor,
-};
+pub use extension::{ExtensionError, WorkerExtension};
 use temporalio_client::{Connection, PayloadErrorLimits, worker::NamespaceDescriptionSource};
 use temporalio_common::{
     protos::{
@@ -305,8 +302,7 @@ pub struct WorkerConfig {
     #[builder(default = false)]
     pub disable_payload_error_limit: bool,
 
-    /// A plugin component that Core calls at fixed points of the workflow task lifecycle. See
-    /// [WorkerExtension].
+    /// A plugin component that lang calls by method name. See [WorkerExtension].
     pub extension: Option<Arc<dyn WorkerExtension>>,
 }
 
