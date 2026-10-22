@@ -5,6 +5,7 @@ use std::{
     sync::Arc,
     time::{Instant, SystemTime},
 };
+use temporalio_client::Connection;
 
 /// A component that lang passes to the worker through [crate::WorkerConfig::extension].
 ///
@@ -21,6 +22,12 @@ pub trait WorkerExtension: Send + Sync + 'static {
     fn workflow_task_interceptor(&self) -> Option<Arc<dyn WorkflowTaskInterceptor>> {
         None
     }
+
+    /// Gives the extension the worker's client connection. Core calls it once when the worker
+    /// starts, before any poll, and again with the new connection after
+    /// [crate::Worker::replace_client]. The extension then calls the server with the worker's
+    /// TLS, API key and headers, and it needs no connection of its own. It must not block.
+    fn attach(&self, _connection: Connection) {}
 
     /// Runs `method` with encoded input and returns the encoded output. It must not block, since
     /// lang may call it from workflow code.

@@ -721,6 +721,9 @@ impl Worker {
             &mut new_connection,
             self.config.client_identity_override.clone(),
         );
+        if let Some(extension) = &self.config.extension {
+            extension.attach(new_connection.clone());
+        }
 
         self.client.replace_connection(new_connection);
         *self.client_worker_registrator.client.write() = self.client.clone();

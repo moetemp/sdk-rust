@@ -99,6 +99,9 @@ pub fn init_worker(
         &mut connection,
         worker_config.client_identity_override.clone(),
     );
+    if let Some(extension) = &worker_config.extension {
+        extension.attach(connection.clone());
+    }
     let client = SharedReplaceableClient::new(connection);
     let client_ident = client.inner_cow().identity().to_owned();
     if client_ident.is_empty() {
