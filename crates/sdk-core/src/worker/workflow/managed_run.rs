@@ -4,7 +4,7 @@ use crate::{
     internal_flags::CoreInternalFlags,
     protosext::{WorkflowActivationExt, protocol_messages::IncomingProtocolMessage},
     worker::{
-        LEGACY_QUERY_ID, LocalActRequest, WorkflowErrorType, WorkflowTaskCompletionInfo,
+        LEGACY_QUERY_ID, LocalActRequest, WorkflowErrorType,
         workflow::{
             ActivationAction, ActivationCompleteOutcome, ActivationCompleteResult,
             ActivationOrAuto, BufferedTasks, DrivenWorkflow, EvictionRequestResult,
@@ -12,11 +12,10 @@ use crate::{
             LocalActivityRequestSink, LocalResolution, NextPageReq, OutstandingActivation,
             OutstandingTask, PermittedWFT, RequestEvictMsg, RunBasics,
             ServerCommandsWithWorkflowInfo, TaskStorageMetrics, WFCommand, WFCommandVariant,
-            WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFT_INTERCEPTOR_DEADLINE_FRACTION,
-            WFTReportStatus, WftFailureKind, WorkflowTaskInfo,
+            WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION, WFTReportStatus, WftFailureKind,
+            WorkflowTaskInfo,
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
-            run_close_kind,
         },
     },
 };
@@ -42,17 +41,12 @@ use temporalio_common::protos::{
         workflow_completion,
     },
     temporal::api::{
-        command::v1::Command as ProtoCommand,
         enums::v1::{VersioningBehavior, WorkflowTaskFailedCause},
         failure::v1::Failure,
     },
 };
 use tokio::sync::oneshot;
 use tracing::Span;
-
-/// The server's default workflow task timeout. The start event always has the timeout, so this
-/// only keeps the hook's deadline finite if it is missing.
-const DEFAULT_WFT_TIMEOUT: Duration = Duration::from_secs(10);
 
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 pub(super) type RunUpdateAct = Option<ActivationOrAuto>;
@@ -202,9 +196,7 @@ impl ManagedRun {
         let wft_info = WorkflowTaskInfo {
             attempt: work.attempt,
             started_event_id: work.update.wft_started_id,
-            previous_started_event_id: work.update.previous_wft_started_id,
             started_time: work.started_time,
-            received: work.received,
             task_token: work.task_token,
             wf_id: work.execution.workflow_id.clone(),
         };
@@ -1244,7 +1236,7 @@ impl ManagedRun {
             force_new_wft = true;
         }
 
-        let mut outcome = if should_respond || has_query_responses {
+        let outcome = if should_respond || has_query_responses {
             // Broken evictions cannot pass should_respond or contain query responses. Keep this
             // fallback to avoid sending buffered output if those invariants regress.
             let (commands, messages) = if self.am_broken && data.activation_was_eviction {
@@ -1268,7 +1260,6 @@ impl ManagedRun {
                     sdk_metadata: machines_wft_response.metadata_for_complete(),
                     versioning_behavior: data.versioning_behavior,
                     attempt,
-                    task_info: None,
                 },
                 metrics: self.metrics.clone(),
             })
@@ -1276,18 +1267,6 @@ impl ManagedRun {
             ActivationCompleteOutcome::DoNothing
         };
         let replaying = machines_wft_response.replaying;
-        if let ActivationCompleteOutcome::ReportWFTSuccess(ServerCommandsWithWorkflowInfo {
-            action:
-                ActivationAction::WftComplete {
-                    commands,
-                    task_info,
-                    ..
-                },
-            ..
-        }) = &mut outcome
-        {
-            *task_info = self.completion_info(commands).map(Box::new);
-        }
         if matches!(outcome, ActivationCompleteOutcome::ReportWFTSuccess(_)) {
             self.wfm.wft_completion_reported();
         }
@@ -1295,45 +1274,6 @@ impl ManagedRun {
             result: ActivationCompleteResult { outcome, replaying },
             resp_chan,
         }
-    }
-
-    /// The facts a workflow task interceptor gets about the task being completed. `None` when the
-    /// worker has no extension, or the run has no task.
-    fn completion_info(&self, commands: &[ProtoCommand]) -> Option<WorkflowTaskCompletionInfo> {
-        self.config
-            .extension
-            .as_ref()?
-            .workflow_task_interceptor()?;
-        let wft = self.wft.as_ref()?;
-        let machines = &self.wfm.machines;
-        let started_info = machines.get_started_info();
-        let (previous_completed, failed_tasks) =
-            machines.task_history_facts(wft.info.previous_started_event_id);
-        let wft_timeout = started_info
-            .and_then(|i| i.workflow_task_timeout)
-            .unwrap_or(DEFAULT_WFT_TIMEOUT);
-        Some(
-            WorkflowTaskCompletionInfo::builder()
-                .namespace(self.config.namespace.clone())
-                .workflow_id(machines.workflow_id.clone())
-                .run_id(machines.run_id.clone())
-                .first_execution_run_id(
-                    started_info
-                        .map(|i| i.first_execution_run_id.clone())
-                        .unwrap_or_default(),
-                )
-                .workflow_type(machines.workflow_type.clone())
-                .started_event_id(wft.info.started_event_id)
-                .attempt(wft.info.attempt)
-                .maybe_started_time(wft.info.started_time)
-                .maybe_previous_completed(previous_completed)
-                .failed_tasks(failed_tasks)
-                .maybe_closes_run(run_close_kind(commands))
-                .deadline(
-                    wft.info.received + wft_timeout.mul_f32(WFT_INTERCEPTOR_DEADLINE_FRACTION),
-                )
-                .build(),
-        )
     }
 
     /// Names the current workflow task on each new local activity, since a local activity cannot
