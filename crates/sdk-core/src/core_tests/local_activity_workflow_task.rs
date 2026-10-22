@@ -111,6 +111,8 @@ async fn a_local_activity_names_the_live_task_that_dispatched_it() {
             started_event_id: 8,
             attempt: 1,
             started_time: Some(started_time.into()),
+            previous_started_event_id: 3,
+            failed_tasks: vec![],
         })
     );
     finish(worker, la).await;
@@ -135,6 +137,10 @@ async fn a_rerun_after_a_timed_out_task_names_the_later_task() {
     // History has no marker for it, so it runs again, dispatched by the live task.
     let la = worker.poll_activity_task().await.unwrap();
     assert_eq!(dispatching(start_of(&la)), (9, 1));
+    // The start also names the last completed task and the task that timed out.
+    let task = start_of(&la).workflow_task.as_ref().unwrap();
+    assert_eq!(task.previous_started_event_id, 3);
+    assert_eq!(task.failed_tasks, [6]);
     finish(worker, la).await;
 }
 
