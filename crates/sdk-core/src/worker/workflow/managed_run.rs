@@ -197,6 +197,7 @@ impl ManagedRun {
             attempt: work.attempt,
             started_event_id: work.update.wft_started_id,
             started_time: work.started_time,
+            previous_started_event_id: work.update.previous_wft_started_id,
             task_token: work.task_token,
             wf_id: work.execution.workflow_id.clone(),
         };
@@ -1292,10 +1293,12 @@ impl ManagedRun {
             started_event_id: wft.info.started_event_id,
             attempt: wft.info.attempt,
             started_time: wft.info.started_time.map(Into::into),
+            previous_started_event_id: wft.info.previous_started_event_id,
+            failed_tasks: self.wfm.machines.failed_wft_started_ids(),
         };
         for request in requests {
             if let LocalActRequest::New(new_la) = request {
-                new_la.workflow_task = Some(task);
+                new_la.workflow_task = Some(task.clone());
             }
         }
     }

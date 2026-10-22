@@ -1095,6 +1095,8 @@ struct WorkflowTaskInfo {
     /// From the poll response, like the attempt.
     started_event_id: i64,
     started_time: Option<SystemTime>,
+    /// The started event id of the run's last completed task, from the poll response.
+    previous_started_event_id: i64,
     /// Exists to allow easy tagging of spans with workflow ids. Is duplicative of info inside the
     /// run machines themselves, but that can't be accessed easily. Would be nice to somehow have a
     /// shared repository, or refcounts, or whatever, for strings like these that get duped all
