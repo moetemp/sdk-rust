@@ -78,6 +78,10 @@ use temporalio_common::{
 type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 
 slotmap::new_key_type! { struct MachineKey; }
+
+/// The most failed workflow tasks that a local activity start names.
+const MAX_FAILED_WFTS: usize = 100;
+
 /// Handles all the logic for driving a workflow. It orchestrates many state machines that together
 /// comprise the logic of an executing workflow. One instance will exist per currently executing
 /// (or cached) workflow on the worker.
@@ -86,6 +90,9 @@ pub(crate) struct WorkflowMachines {
     /// kept because the lang side polls & completes for every workflow task, but we do not need
     /// to poll the server that often during replay.
     last_history_from_server: HistoryUpdate,
+    /// The started event ids of the run's failed and timed out workflow tasks, for the local
+    /// activities that need to know which tasks never completed.
+    failed_wft_started_ids: VecDeque<i64>,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
     /// EventId of the last handled WorkflowTaskStarted event
@@ -276,6 +283,7 @@ impl WorkflowMachines {
         };
         Self {
             last_history_from_server: basics.history,
+            failed_wft_started_ids: VecDeque::new(),
             protocol_msgs: vec![],
             workflow_id: basics.workflow_id,
             workflow_type: basics.workflow_type,
@@ -345,6 +353,7 @@ impl WorkflowMachines {
     }
 
     pub(crate) fn new_history_from_server(&mut self, update: HistoryUpdate) -> Result<()> {
+        self.note_failed_wfts(update.get_events());
         self.last_history_from_server = update;
         self.replaying = self.preparing_legacy_query
             || self.last_history_from_server.previous_wft_started_id > 0;
@@ -415,6 +424,38 @@ impl WorkflowMachines {
 
     pub(crate) fn get_last_wft_started_id(&self) -> i64 {
         self.current_started_event_id
+    }
+
+    pub(crate) fn failed_wft_started_ids(&self) -> Vec<i64> {
+        self.failed_wft_started_ids.iter().copied().collect()
+    }
+
+    /// Only the last ones are kept, which bounds the list on a long run. A local activity's task
+    /// facts only need the failed tasks since its run's last write to a Stream.
+    fn note_failed_wfts(&mut self, events: &[HistoryEvent]) {
+        for event in events {
+            let started = match &event.attributes {
+                Some(history_event::Attributes::WorkflowTaskFailedEventAttributes(a)) => {
+                    a.started_event_id
+                }
+                Some(history_event::Attributes::WorkflowTaskTimedOutEventAttributes(a)) => {
+                    a.started_event_id
+                }
+                _ => continue,
+            };
+            // A page of history may come again after a cache miss.
+            if self
+                .failed_wft_started_ids
+                .back()
+                .is_some_and(|&last| last >= started)
+            {
+                continue;
+            }
+            if self.failed_wft_started_ids.len() == MAX_FAILED_WFTS {
+                self.failed_wft_started_ids.pop_front();
+            }
+            self.failed_wft_started_ids.push_back(started);
+        }
     }
 
     pub(crate) fn history_size_bytes(&self) -> u64 {
