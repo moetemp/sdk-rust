@@ -1,6 +1,5 @@
 mod activities;
 pub(crate) mod client;
-mod extension;
 pub(crate) mod heartbeat;
 mod nexus;
 mod slot_provider;
@@ -11,7 +10,6 @@ mod workflow;
 /// the error limit, shared so every conversion site reports the same identifier.
 pub(crate) const PAYLOADS_TOO_LARGE_FAILURE_TYPE: &str = "PayloadsTooLarge";
 
-pub use extension::{ExtensionError, WorkerExtension};
 use temporalio_client::{Connection, PayloadErrorLimits, worker::NamespaceDescriptionSource};
 use temporalio_common::{
     protos::{
@@ -301,10 +299,6 @@ pub struct WorkerConfig {
     /// NOTE: Experimental
     #[builder(default = false)]
     pub disable_payload_error_limit: bool,
-
-    /// A plugin component that lang calls by method name, and that gets the worker's connection.
-    /// See [WorkerExtension].
-    pub extension: Option<Arc<dyn WorkerExtension>>,
 }
 
 impl WorkerConfig {
@@ -718,9 +712,6 @@ impl Worker {
             &mut new_connection,
             self.config.client_identity_override.clone(),
         );
-        if let Some(extension) = &self.config.extension {
-            extension.attach(new_connection.clone());
-        }
 
         self.client.replace_connection(new_connection);
         *self.client_worker_registrator.client.write() = self.client.clone();
