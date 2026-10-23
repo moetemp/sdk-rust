@@ -1,6 +1,5 @@
 mod activities;
 pub(crate) mod client;
-mod extension;
 pub(crate) mod heartbeat;
 mod nexus;
 mod slot_provider;
@@ -11,7 +10,6 @@ mod workflow;
 /// the error limit, shared so every conversion site reports the same identifier.
 pub(crate) const PAYLOADS_TOO_LARGE_FAILURE_TYPE: &str = "PayloadsTooLarge";
 
-pub use extension::{ExtensionError, WorkerExtension};
 use temporalio_client::{Connection, PayloadErrorLimits, worker::NamespaceDescriptionSource};
 use temporalio_common::{
     protos::{
@@ -301,9 +299,6 @@ pub struct WorkerConfig {
     /// NOTE: Experimental
     #[builder(default = false)]
     pub disable_payload_error_limit: bool,
-
-    /// A plugin component that lang calls by method name. See [WorkerExtension].
-    pub extension: Option<Arc<dyn WorkerExtension>>,
 }
 
 impl WorkerConfig {

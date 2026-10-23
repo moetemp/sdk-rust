@@ -50,7 +50,6 @@ pub use worker::{
     WorkerConfigBuilder, WorkerTuner, WorkerValidationError, WorkerVersioningStrategy,
     WorkflowErrorType, WorkflowSlotKind,
 };
-pub use worker::{ExtensionError, WorkerExtension};
 
 use crate::{
     replay::{HistoryForReplay, ReplayWorkerInput},
