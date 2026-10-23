@@ -79,8 +79,6 @@ where
         self.config.workflow_task_poller_behavior = Some(PollerBehavior::SimpleMaximum(1));
         self.config.task_types = WorkerTaskTypes::workflow_only();
         self.config.skip_client_worker_set_check = true;
-        // Replay must not repeat the side effects of the hooks.
-        self.config.extension = None;
         let historator = Historator::new(self.history_stream);
         let post_activate = historator.get_post_activate_hook();
         let shutdown_tok = historator.get_shutdown_setter();
