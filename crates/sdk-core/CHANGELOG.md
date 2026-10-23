@@ -34,10 +34,6 @@ relevant information.
 ## Unreleased
 
 ### Added
-* A worker can take a `WorkerExtension`, a plugin component that the replay worker leaves out.
-* A `WorkerExtension` has `call` and `call_async`, which take a method name and encoded input. A
-  bridge can route a generic lang call to them, so the extension needs no bridge function of its
-  own. Core never calls them.
 * A Local Activity's `ActivityTask.Start` has `workflow_task` (field 20), with the started event
   id, attempt and start time of the Workflow Task in which Core dispatched it. Retries that Core
   runs on its own keep the value.
