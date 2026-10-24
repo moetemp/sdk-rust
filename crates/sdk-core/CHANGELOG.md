@@ -50,8 +50,6 @@ relevant information.
   nondeterminism while retaining compatibility with histories recorded before these checks.
 
 ### Fixed
-* With the workflow cache off, the eviction after a terminal completion that the server accepted
-  has reason `WORKFLOW_EXECUTION_ENDING`, as with a cache, not `CACHE_FULL`.
 * Dev and test server startup now stops waiting at the configured deadline even if a readiness
   request stalls. Timeout messages include the last connection failure when available.
 * Workers with large workflow caches avoid unnecessary CPU usage when no workflow tasks are waiting
