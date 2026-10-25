@@ -65,6 +65,24 @@ message Start {
     bool is_local = 17;
     // Run ID of this activity execution. Only set for standalone activities.
     string run_id = 19;
+    // For a local activity, the workflow task in which Core dispatched this execution. Retries that
+    // Core runs locally keep the value. Unset for other activities.
+    WorkflowTaskAttempt workflow_task = 20;
+}
+
+// One attempt of a workflow task, from the poll response and the history of that attempt.
+message WorkflowTaskAttempt {
+    // The event id of the task's WorkflowTaskStarted event.
+    int64 started_event_id = 1;
+    uint32 attempt = 2;
+    // When the server started the task.
+    google.protobuf.Timestamp started_time = 3;
+    // The started event id of the run's last completed workflow task, from the poll response.
+    // 0 when no task of the run has completed.
+    int64 previous_started_event_id = 4;
+    // The started event ids of the run's failed and timed out workflow tasks, in event order. Core
+    // sets only the last 100, so that each start stays small.
+    repeated int64 failed_tasks = 5;
 }
 
 // Attempt to cancel a running activity
