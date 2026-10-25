@@ -1092,7 +1092,7 @@ pub(crate) enum OutstandingActivation {
 struct WorkflowTaskInfo {
     task_token: TaskToken,
     attempt: u32,
-    /// From the poll response, like the attempt.
+    /// From the poll response.
     started_event_id: i64,
     started_time: Option<SystemTime>,
     /// The started event id of the run's last completed task, from the poll response.

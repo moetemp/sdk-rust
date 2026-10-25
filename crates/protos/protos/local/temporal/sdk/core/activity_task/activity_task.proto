@@ -65,14 +65,14 @@ message Start {
     bool is_local = 17;
     // Run ID of this activity execution. Only set for standalone activities.
     string run_id = 19;
-    // For a local activity, the workflow task in which Core dispatched this execution. Retries
-    // that Core runs without a new task keep it. Unset for other activities.
+    // For a local activity, the workflow task in which Core dispatched this execution. The retries
+    // that Core runs without a new workflow task have the same value. Unset for other activities.
     WorkflowTaskAttempt workflow_task = 20;
 }
 
-// One attempt of a workflow task, with the values from the poll response that started it.
+// One attempt of a workflow task, from the poll response and the history of that attempt.
 message WorkflowTaskAttempt {
-    // The id of the task's WorkflowTaskStarted event.
+    // The event id of the task's WorkflowTaskStarted event.
     int64 started_event_id = 1;
     uint32 attempt = 2;
     // When the server started the task.
@@ -80,8 +80,8 @@ message WorkflowTaskAttempt {
     // The started event id of the run's last completed workflow task, from the poll response.
     // 0 when no task of the run has completed.
     int64 previous_started_event_id = 4;
-    // The started event ids of the run's failed and timed out workflow tasks in history, in event
-    // order. It holds the last 100 only, to keep each start small.
+    // The started event ids of the run's failed and timed out workflow tasks, in event order. Core
+    // sets only the last 100, so that each start stays small.
     repeated int64 failed_tasks = 5;
 }
 
