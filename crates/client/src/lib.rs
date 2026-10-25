@@ -991,7 +991,8 @@ pub struct TemporalServiceClient {
     cloud_svc_client: Box<dyn CloudService>,
     test_svc_client: Box<dyn TestService>,
     health_svc_client: Box<dyn HealthService>,
-    /// Calls by method path on the same service. A client built from mock services has none.
+    /// Makes calls by method path on the same gRPC service. It's `None` for a client built from
+    /// mock services.
     raw_unary: Option<Box<dyn raw::RawUnaryService>>,
 }
 

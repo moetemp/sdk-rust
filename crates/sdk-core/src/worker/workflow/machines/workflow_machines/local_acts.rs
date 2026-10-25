@@ -70,7 +70,7 @@ impl LocalActivityData {
                 self.executing.insert(sa.seq);
                 LocalActRequest::New(NewLocalAct {
                     schedule_time: SystemTime::now(),
-                    // The run stamps the task that dispatches the request.
+                    // `ManagedRun` sets this when it dispatches the request.
                     workflow_task: None,
                     schedule_cmd: sa,
                     workflow_type: wf_type.to_string(),

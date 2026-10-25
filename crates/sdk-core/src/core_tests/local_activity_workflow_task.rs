@@ -1,11 +1,11 @@
-//! The workflow task that each local activity start names.
-
 use crate::{
-    replay::TestHistoryBuilder,
+    replay::{DEFAULT_ACTIVITY_TYPE, TestHistoryBuilder},
     test_help::{
-        MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers, build_mock_pollers, mock_worker,
-        schedule_local_activity_cmd, start_timer_cmd,
+        MockPollCfg, ResponseType, WorkerExt, WorkerTestHelpers, build_mock_pollers,
+        hist_to_poll_resp, mock_worker, schedule_local_activity_cmd, single_hist_mock_sg,
+        start_timer_cmd,
     },
+    worker::client::mocks::mock_worker_client,
 };
 use std::time::{Duration, SystemTime};
 use temporalio_common::protos::{
@@ -17,7 +17,12 @@ use temporalio_common::protos::{
         workflow_commands::{ActivityCancellationType, ScheduleLocalActivity, workflow_command},
         workflow_completion::WorkflowActivationCompletion,
     },
-    temporal::api::{common::v1::RetryPolicy, enums::v1::EventType, failure::v1::Failure},
+    temporal::api::{
+        common::v1::RetryPolicy,
+        enums::v1::{EventType, WorkflowTaskFailedCause},
+        failure::v1::Failure,
+        workflowservice::v1::GetWorkflowExecutionHistoryResponse,
+    },
 };
 
 async fn complete(
@@ -34,10 +39,10 @@ async fn complete(
         .unwrap();
 }
 
-fn la_cmd() -> workflow_command::Variant {
+fn la_cmd(seq: u32) -> workflow_command::Variant {
     schedule_local_activity_cmd(
-        1,
-        "1",
+        seq,
+        &seq.to_string(),
         ActivityCancellationType::TryCancel,
         Duration::from_secs(60),
     )
@@ -100,7 +105,7 @@ async fn a_local_activity_names_the_live_task_that_dispatched_it() {
     .await;
     let fired = worker.poll_workflow_activation().await.unwrap();
     assert!(!fired.is_replaying);
-    complete(&worker, &fired, vec![la_cmd()]).await;
+    complete(&worker, &fired, vec![la_cmd(1)]).await;
 
     let la = worker.poll_activity_task().await.unwrap();
     let start = start_of(&la);
@@ -123,7 +128,7 @@ async fn a_rerun_after_a_timed_out_task_names_the_later_task() {
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
     t.add_full_wf_task();
-    // The task after it ran the local activity, then the worker died and the task timed out.
+    // The second task ran the local activity. Then the worker stopped and the task timed out.
     t.add_workflow_task_scheduled_and_started();
     t.add_workflow_task_timed_out();
     t.add_workflow_task_scheduled_and_started();
@@ -132,12 +137,11 @@ async fn a_rerun_after_a_timed_out_task_names_the_later_task() {
     let worker = mock_worker(mock);
 
     let first = worker.poll_workflow_activation().await.unwrap();
-    complete(&worker, &first, vec![la_cmd()]).await;
+    complete(&worker, &first, vec![la_cmd(1)]).await;
 
-    // History has no marker for it, so it runs again, dispatched by the live task.
+    // History has no marker for the local activity, so it runs again in the current task.
     let la = worker.poll_activity_task().await.unwrap();
     assert_eq!(dispatching(start_of(&la)), (9, 1));
-    // The start also names the last completed task and the task that timed out.
     let task = start_of(&la).workflow_task.as_ref().unwrap();
     assert_eq!(task.previous_started_event_id, 3);
     assert_eq!(task.failed_tasks, [6]);
@@ -192,4 +196,174 @@ async fn a_retry_that_core_runs_keeps_the_dispatching_task() {
     assert_eq!(start_of(&second_attempt).attempt, 2);
     assert_eq!(dispatching(start_of(&second_attempt)), (3, 1));
     finish(worker, second_attempt).await;
+}
+
+#[tokio::test]
+async fn local_activities_of_one_activation_name_the_same_task() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let mut mock = build_mock_pollers(MockPollCfg::from_resps(t, [ResponseType::AllHistory]));
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &first, vec![la_cmd(1), la_cmd(2)]).await;
+
+    let one = worker.poll_activity_task().await.unwrap();
+    let two = worker.poll_activity_task().await.unwrap();
+    assert_eq!(dispatching(start_of(&one)), (3, 1));
+    assert_eq!(start_of(&one).workflow_task, start_of(&two).workflow_task);
+    worker
+        .complete_activity_task(ActivityTaskCompletion {
+            task_token: one.task_token,
+            result: Some(ActivityExecutionResult::ok(vec![1].into())),
+        })
+        .await
+        .unwrap();
+    let resolved = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &resolved, vec![]).await;
+    finish(worker, two).await;
+}
+
+#[tokio::test]
+async fn a_reschedule_after_a_backoff_timer_names_the_later_task() {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    // The first attempt failed with a backoff past the local retry threshold.
+    t.add_local_activity_marker(
+        1,
+        "1",
+        None,
+        Some(Failure::application_failure("retry me".to_string(), false)),
+        |m| m.backoff = Some(Duration::from_secs(10).try_into().unwrap()),
+    );
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let mut mock = build_mock_pollers(MockPollCfg::from_resps(t, [ResponseType::AllHistory]));
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(&worker, &first, vec![la_cmd(1)]).await;
+    let backoff = worker.poll_workflow_activation().await.unwrap();
+    assert!(backoff.is_replaying);
+    complete(
+        &worker,
+        &backoff,
+        vec![start_timer_cmd(1, Duration::from_secs(10))],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(!fired.is_replaying);
+    complete(
+        &worker,
+        &fired,
+        vec![
+            ScheduleLocalActivity {
+                seq: 2,
+                activity_id: "1".to_string(),
+                activity_type: DEFAULT_ACTIVITY_TYPE.to_string(),
+                attempt: 2,
+                original_schedule_time: Some(SystemTime::now().into()),
+                start_to_close_timeout: Some(Duration::from_secs(60).try_into().unwrap()),
+                ..Default::default()
+            }
+            .into(),
+        ],
+    )
+    .await;
+
+    let la = worker.poll_activity_task().await.unwrap();
+    assert_eq!(start_of(&la).attempt, 2);
+    assert_eq!(dispatching(start_of(&la)), (9, 1));
+    assert_eq!(
+        start_of(&la)
+            .workflow_task
+            .as_ref()
+            .unwrap()
+            .previous_started_event_id,
+        3
+    );
+    finish(worker, la).await;
+}
+
+#[tokio::test]
+async fn failed_tasks_from_every_history_page_are_named() {
+    let wf_id = "fake_wf_id";
+    let mut t = TestHistoryBuilder::default();
+    t.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
+    t.add_full_wf_task();
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    t.add_timer_fired(timer_started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_failed_with_failure(
+        WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure,
+        Failure::default(),
+    );
+    t.add_full_wf_task();
+    let timer_started = t.add_by_type(EventType::TimerStarted);
+    let second_page_end = timer_started as usize;
+    t.add_timer_fired(timer_started, "2".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_timed_out();
+    t.add_workflow_task_scheduled_and_started();
+
+    // The poll response has the first page and each history fetch adds one page. The failed task
+    // is on the second page and the timed out task is on the last.
+    let mut first_page = hist_to_poll_resp(&t, wf_id, ResponseType::AllHistory).resp;
+    first_page.history.as_mut().unwrap().events.truncate(6);
+    first_page.next_page_token = vec![1];
+    let mut second_page: GetWorkflowExecutionHistoryResponse =
+        t.get_full_history_info().unwrap().into();
+    second_page
+        .history
+        .as_mut()
+        .unwrap()
+        .events
+        .truncate(second_page_end);
+    second_page.next_page_token = vec![2];
+    let last_page: GetWorkflowExecutionHistoryResponse = t.get_full_history_info().unwrap().into();
+    let mut client = mock_worker_client();
+    client
+        .expect_get_workflow_execution_history()
+        .returning(move |_, _, _| Ok(second_page.clone()))
+        .times(1);
+    client
+        .expect_get_workflow_execution_history()
+        .returning(move |_, _, _| Ok(last_page.clone()))
+        .times(1);
+    let mut mock = single_hist_mock_sg(wf_id, t, [ResponseType::Raw(first_page)], client, true);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let worker = mock_worker(mock);
+
+    let first = worker.poll_workflow_activation().await.unwrap();
+    complete(
+        &worker,
+        &first,
+        vec![start_timer_cmd(1, Duration::from_secs(1))],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(fired.is_replaying);
+    complete(
+        &worker,
+        &fired,
+        vec![start_timer_cmd(2, Duration::from_secs(1))],
+    )
+    .await;
+    let fired = worker.poll_workflow_activation().await.unwrap();
+    assert!(!fired.is_replaying);
+    complete(&worker, &fired, vec![la_cmd(1)]).await;
+
+    let la = worker.poll_activity_task().await.unwrap();
+    let task = start_of(&la).workflow_task.as_ref().unwrap();
+    assert_eq!(
+        (task.started_event_id, task.previous_started_event_id),
+        (19, 11)
+    );
+    assert_eq!(task.failed_tasks, [8, 16]);
+    finish(worker, la).await;
 }
