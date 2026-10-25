@@ -227,6 +227,7 @@ impl ActivityContext {
             is_local,
             priority,
             run_id,
+            workflow_task: _,
         } = task;
         let deadline = calculate_deadline(
             scheduled_time.as_ref(),
