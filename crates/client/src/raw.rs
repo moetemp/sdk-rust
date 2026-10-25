@@ -1,6 +1,5 @@
-//! Unary gRPC calls by method path, with encoded protobuf in and out. A crate that generates its
-//! own messages can call a method this client does not list, and keep the connection's TLS, API
-//! key, headers, interceptors, metrics and retries.
+//! Unary gRPC calls by method path, with encoded protobuf messages. A crate that generates its own
+//! messages can use them to call a method that this client doesn't list.
 
 use crate::{Connection, grpc::RawGrpcCaller};
 use bytes::{Buf, BufMut, Bytes};
@@ -93,11 +92,11 @@ impl Decoder for BytesCodec {
 impl Connection {
     /// Makes a unary gRPC call to the method at `path`, such as
     /// `/temporal.api.workflowservice.v1.WorkflowService/GetSystemInfo`, with `request` as the
-    /// encoded request message. Answers with the encoded response message.
+    /// encoded request message. Returns the encoded response message.
     ///
-    /// The call goes through the same stack as the listed methods, with the connection's TLS,
-    /// API key, headers, interceptors, metrics and retry policy. `path` also names the call for
-    /// the retry policy. Request extensions and metadata work as on a listed method. Set the
+    /// The call uses the same stack as the listed methods, with the connection's TLS, API key,
+    /// headers, interceptors, metrics and retry policy. The retry policy uses `path` as the call
+    /// name. Request extensions and metadata work as they do on a listed method. Set the
     /// `temporal-namespace` metadata to route by namespace, as the listed methods do.
     pub async fn raw_unary(
         &self,
@@ -128,11 +127,11 @@ mod tests {
     use tonic::{Code, Request, Status};
     use url::Url;
 
-    /// What the server saw of each call that the system info read did not make.
+    /// The requests that the server got, other than the `GetSystemInfo` call of the connect.
     type Seen = Arc<Mutex<Vec<GrpcRequest>>>;
 
-    /// A connection whose server answers each call with `answer`, after the connect's own
-    /// system info read.
+    /// A connection to a server that answers each call with `answer`, other than the
+    /// `GetSystemInfo` call of the connect.
     async fn connection(
         answer: impl Fn(&GrpcRequest, usize) -> Result<Vec<u8>, Status> + Send + Sync + 'static,
     ) -> (Connection, Seen) {
