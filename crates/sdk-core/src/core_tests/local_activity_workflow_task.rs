@@ -1,5 +1,3 @@
-//! The workflow task that each local activity start names.
-
 use crate::{
     replay::{DEFAULT_ACTIVITY_TYPE, TestHistoryBuilder},
     test_help::{
@@ -130,7 +128,7 @@ async fn a_rerun_after_a_timed_out_task_names_the_later_task() {
     let mut t = TestHistoryBuilder::default();
     t.add_wfe_started_with_wft_timeout(Duration::from_secs(60));
     t.add_full_wf_task();
-    // The task after it ran the local activity, then the worker died and the task timed out.
+    // The second task ran the local activity. Then the worker stopped and the task timed out.
     t.add_workflow_task_scheduled_and_started();
     t.add_workflow_task_timed_out();
     t.add_workflow_task_scheduled_and_started();
@@ -141,10 +139,9 @@ async fn a_rerun_after_a_timed_out_task_names_the_later_task() {
     let first = worker.poll_workflow_activation().await.unwrap();
     complete(&worker, &first, vec![la_cmd(1)]).await;
 
-    // History has no marker for it, so it runs again, dispatched by the live task.
+    // History has no marker for the local activity, so it runs again in the current task.
     let la = worker.poll_activity_task().await.unwrap();
     assert_eq!(dispatching(start_of(&la)), (9, 1));
-    // The start also names the last completed task and the task that timed out.
     let task = start_of(&la).workflow_task.as_ref().unwrap();
     assert_eq!(task.previous_started_event_id, 3);
     assert_eq!(task.failed_tasks, [6]);
@@ -314,8 +311,8 @@ async fn failed_tasks_from_every_history_page_are_named() {
     t.add_workflow_task_timed_out();
     t.add_workflow_task_scheduled_and_started();
 
-    // The poll has the first page, and each fetch returns one more. The failed task is on the
-    // second page and the timed out task on the last.
+    // The poll response has the first page and each history fetch adds one page. The failed task
+    // is on the second page and the timed out task is on the last.
     let mut first_page = hist_to_poll_resp(&t, wf_id, ResponseType::AllHistory).resp;
     first_page.history.as_mut().unwrap().events.truncate(6);
     first_page.next_page_token = vec![1];

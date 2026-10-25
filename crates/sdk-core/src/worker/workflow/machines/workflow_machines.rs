@@ -79,7 +79,7 @@ type Result<T, E = WFMachinesError> = std::result::Result<T, E>;
 
 slotmap::new_key_type! { struct MachineKey; }
 
-/// The most failed workflow tasks that a local activity start names.
+/// The maximum number of failed workflow tasks in a local activity start.
 const MAX_FAILED_WFTS: usize = 100;
 
 /// Handles all the logic for driving a workflow. It orchestrates many state machines that together
@@ -90,8 +90,8 @@ pub(crate) struct WorkflowMachines {
     /// kept because the lang side polls & completes for every workflow task, but we do not need
     /// to poll the server that often during replay.
     last_history_from_server: HistoryUpdate,
-    /// The started event ids of the run's failed and timed out workflow tasks, for the local
-    /// activities that need to know which tasks never completed.
+    /// The started event ids of the run's failed and timed out workflow tasks. Each local activity
+    /// start has them, so that the activity knows which tasks never completed.
     failed_wft_started_ids: VecDeque<i64>,
     /// Protocol messages that have yet to be processed for the current WFT.
     protocol_msgs: Vec<IncomingProtocolMessage>,
@@ -430,8 +430,7 @@ impl WorkflowMachines {
         self.failed_wft_started_ids.iter().copied().collect()
     }
 
-    /// Only the last ones are kept, which bounds the list on a long run. A local activity's task
-    /// facts only need the failed tasks since its run's last write to a Stream.
+    /// Keeps only the last `MAX_FAILED_WFTS` ids, so that the list stays small on a long run.
     fn note_failed_wfts(&mut self, events: &[HistoryEvent]) {
         for event in events {
             let started = match &event.attributes {
@@ -443,7 +442,7 @@ impl WorkflowMachines {
                 }
                 _ => continue,
             };
-            // A page of history may come again after a cache miss.
+            // Core can get the same page of history again after a cache miss.
             if self
                 .failed_wft_started_ids
                 .back()

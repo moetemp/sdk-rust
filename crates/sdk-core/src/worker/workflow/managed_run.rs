@@ -1277,8 +1277,8 @@ impl ManagedRun {
         }
     }
 
-    /// Names the current workflow task on each new local activity, since a local activity cannot
-    /// learn by itself which task dispatched it.
+    /// Sets the current workflow task on each new local activity request. The activity can't find
+    /// out by itself which task dispatched it.
     fn stamp_dispatching_task(&self, requests: &mut [LocalActRequest]) {
         let Some(wft) = self.wft.as_ref() else {
             if requests

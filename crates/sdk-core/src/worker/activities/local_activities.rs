@@ -141,7 +141,7 @@ pub(crate) struct NewLocalAct {
     pub(crate) workflow_type: String,
     pub(crate) workflow_exec_info: WorkflowExecution,
     pub(crate) schedule_time: SystemTime,
-    /// The workflow task in which the run dispatched this request. Retries keep it.
+    /// The workflow task in which the run dispatched this request. Retries reuse it.
     pub(crate) workflow_task: Option<WorkflowTaskAttempt>,
 }
 

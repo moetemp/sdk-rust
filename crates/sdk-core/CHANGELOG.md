@@ -35,10 +35,10 @@ relevant information.
 
 ### Added
 * A Local Activity's `ActivityTask.Start` has `workflow_task` (field 20), with the started event
-  id, attempt and start time of the Workflow Task in which Core dispatched it. It also has
-  `previous_started_event_id`, the started event id of the run's last completed Workflow Task,
-  and `failed_tasks`, the started event ids of the run's last 100 failed or timed out Workflow
-  Tasks. Retries that Core runs on its own keep the value.
+  id, attempt and start time of the Workflow Task in which Core dispatched it. `workflow_task`
+  also has `previous_started_event_id`, the started event id of the run's last completed Workflow
+  Task, and `failed_tasks`, the started event ids of the run's last 100 failed or timed out
+  Workflow Tasks. The retries that Core runs without a new Workflow Task have the same value.
 
 ### Security
 * Ephemeral server downloads now use `zip` 9.0 for ZIP extraction, replacing the 8.x dependency
