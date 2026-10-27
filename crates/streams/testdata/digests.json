@@ -1,0 +1,70 @@
+[
+  {
+    "name": "empty batch",
+    "records": [],
+    "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "name": "one record, no body",
+    "records": [
+      {}
+    ],
+    "digest": "374708fff7719dd5979ec875d56cd2286f6d3cf7ec317a3b25632aab28ec37bb"
+  },
+  {
+    "name": "one record",
+    "records": [
+      {
+        "data": "68656c6c6f"
+      }
+    ],
+    "digest": "609a82caa03fe78b373c978368bfcb14197a342fe415ef445198073f92e4b73a"
+  },
+  {
+    "name": "metadata in key order",
+    "records": [
+      {
+        "metadata": {
+          "encoding": "6a736f6e2f706c61696e",
+          "a": "00ff"
+        },
+        "data": "7b2278223a317d"
+      }
+    ],
+    "digest": "b438e8a18956b66aa399da9931c23d43556f91e04d10970baf4ee10531affd72"
+  },
+  {
+    "name": "two records",
+    "records": [
+      {
+        "data": "01"
+      },
+      {
+        "data": "0203"
+      }
+    ],
+    "digest": "f08b6d85893e9026826830e71090af1d871ba3e5bde81db7140e4f7ad0aa7253"
+  },
+  {
+    "name": "metadata key and value split one way",
+    "records": [
+      {
+        "metadata": {
+          "ab": "63"
+        }
+      }
+    ],
+    "digest": "e3e0ddc9c08424c049146d94322bfbfcd3cc6080b008b61d780de17e06d2b060"
+  },
+  {
+    "name": "metadata key and value split another way",
+    "records": [
+      {
+        "metadata": {
+          "a": "6263"
+        }
+      }
+    ],
+    "digest": "2acccfabca3a8ac2d8650d3428febd7ac072553ce35712405ec3bc825ff7c224"
+  }
+]
