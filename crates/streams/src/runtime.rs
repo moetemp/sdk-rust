@@ -4,7 +4,10 @@ use crate::{
     Reason, StreamError, StreamResult,
     memory::MemoryStore,
     metrics::Metrics,
-    proto::{AppendRecordsRequest, CloseStreamRequest, DescribeStreamRequest, MemoryStreamConfig},
+    proto::{
+        AppendRecordsRequest, CloseStreamRequest, DescribeStreamRequest, MemoryStreamConfig,
+        ReadRecordsRequest,
+    },
     service::StreamService,
     store::{DEFAULT_RETENTION, DEFAULT_SAFETY_TTL, Store},
 };
@@ -130,6 +133,10 @@ impl StreamRuntime {
                 .encode_to_vec(),
             "CloseStream" => service
                 .close_stream(decode::<CloseStreamRequest>(input)?)
+                .await?
+                .encode_to_vec(),
+            "ReadRecords" => service
+                .read_records(decode::<ReadRecordsRequest>(input)?)
                 .await?
                 .encode_to_vec(),
             "DescribeStream" => service
