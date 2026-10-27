@@ -11,13 +11,18 @@ pub mod epoch;
 mod error;
 pub mod ids;
 pub mod memory;
+mod metrics;
 pub mod offset;
 pub mod protos;
+mod record;
+mod runtime;
+mod service;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
 pub use error::{Reason, StreamError, StreamResult};
+pub use runtime::{MEMORY_RUNTIME_NAME, MemoryStreamRuntime, StoreFactory, StreamRuntime};
 
 /// The protos that lang and the crate exchange.
 pub mod proto {

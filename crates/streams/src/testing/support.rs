@@ -5,7 +5,7 @@
 
 use super::{RawKeys, backends};
 use crate::{
-    StreamResult,
+    StreamResult, StreamRuntime,
     digest::batch_digest,
     epoch::withdraws,
     ids::local_activity_producer_id,
@@ -354,4 +354,39 @@ impl Target {
             .close(&self.namespace, stream, producer, &record)
             .await
     }
+}
+
+/// One runtime under test, the namespace its cases use, and what its backend gives.
+pub(crate) struct Runtime {
+    pub(crate) ext: Arc<StreamRuntime>,
+    /// The namespace of a backend that has fixed ones, such as the server. `None` lets the case
+    /// make one of its own.
+    pub(crate) namespace: Option<String>,
+    pub(crate) gives: Needs,
+}
+
+/// A runtime on each backend under test that gives `needs`.
+pub(crate) async fn runtimes(needs: Needs) -> Vec<Runtime> {
+    backends()
+        .into_iter()
+        .filter(|backend| backend.gives().gives(needs))
+        .map(|backend| Runtime {
+            ext: backend.runtime(""),
+            namespace: None,
+            gives: backend.gives(),
+        })
+        .collect()
+}
+
+/// A runtime on each backend under test.
+pub(crate) fn stream_runtimes() -> Vec<Arc<StreamRuntime>> {
+    named_runtimes("")
+}
+
+/// A runtime on each backend under test, whose refs name `backend`.
+pub(crate) fn named_runtimes(backend: &str) -> Vec<Arc<StreamRuntime>> {
+    backends()
+        .into_iter()
+        .map(|test_backend| test_backend.runtime(backend))
+        .collect()
 }
