@@ -5,11 +5,14 @@ use crate::{
     memory::MemoryStore,
     metrics::Metrics,
     proto::{
-        AppendRecordsRequest, CloseStreamRequest, DescribeStreamRequest, MemoryStreamConfig,
-        ReadRecordsRequest,
+        AppendRecordsRequest, CloseStreamRequest, CloseWriterRequest, CloseWriterResponse,
+        CloseWritersRequest, CloseWritersResponse, DescribeStreamRequest, FreeWriterRequest,
+        FreeWriterResponse, MemoryStreamConfig, OpenWriterRequest, OpenWriterResponse,
+        ReadRecordsRequest, WriteRecordsRequest, WriteRecordsResponse,
     },
     service::StreamService,
     store::{DEFAULT_RETENTION, DEFAULT_SAFETY_TTL, Store},
+    writer::Writers,
 };
 use prost::Message;
 use std::{sync::Arc, time::Duration};
@@ -44,6 +47,7 @@ pub(crate) struct Shared {
     metrics: Metrics,
     factory: Arc<dyn StoreFactory>,
     service: OnceCell<Arc<StreamService>>,
+    writers: Writers,
 }
 
 impl Shared {
@@ -97,6 +101,7 @@ impl StreamRuntime {
             metrics: Metrics::new(&meter),
             factory,
             service: OnceCell::new(),
+            writers: Writers::default(),
         });
         Arc::new(Self { shared })
     }
@@ -121,9 +126,21 @@ impl StreamRuntime {
         &self.shared.backend
     }
 
+    /// Releases one handle of a writer with no wait, as the `FreeWriter` method does. A bridge
+    /// calls it from a finalizer, which has no async runtime to await on.
+    pub fn free_writer(&self, writer_id: u64) -> StreamResult<()> {
+        self.shared.writers.free(writer_id)
+    }
+
     /// Runs one method on encoded input and returns the encoded output. The bridge raises an error
     /// with [StreamError::code] and [StreamError::details].
     pub async fn call(&self, method: &str, input: &[u8]) -> StreamResult<Vec<u8>> {
+        // `FreeWriter` needs no Store, so it works when the Store is down too.
+        if method == "FreeWriter" {
+            let request = decode::<FreeWriterRequest>(input)?;
+            self.free_writer(request.writer_id)?;
+            return Ok(FreeWriterResponse {}.encode_to_vec());
+        }
         let service = self.shared.service().await?;
         let output = match method {
             "CreateStream" => service.create_stream(decode(input)?).await?.encode_to_vec(),
@@ -143,6 +160,37 @@ impl StreamRuntime {
                 .describe_stream(decode::<DescribeStreamRequest>(input)?)
                 .await?
                 .encode_to_vec(),
+            "OpenWriter" => {
+                let request = decode::<OpenWriterRequest>(input)?;
+                let writer_id = self.shared.writers.open(service, request).await?;
+                OpenWriterResponse { writer_id }.encode_to_vec()
+            }
+            "WriteRecords" => {
+                let request = decode::<WriteRecordsRequest>(input)?;
+                let (first_offset, last_offset) = self
+                    .shared
+                    .writers
+                    .write(request.writer_id, request.records)
+                    .await?;
+                WriteRecordsResponse {
+                    first_offset,
+                    last_offset,
+                }
+                .encode_to_vec()
+            }
+            "CloseWriters" => {
+                decode::<CloseWritersRequest>(input)?;
+                let failed = self.shared.writers.close_all().await;
+                CloseWritersResponse {
+                    failed: failed as i32,
+                }
+                .encode_to_vec()
+            }
+            "CloseWriter" => {
+                let request = decode::<CloseWriterRequest>(input)?;
+                let last_offset = self.shared.writers.close(request.writer_id).await?;
+                CloseWriterResponse { last_offset }.encode_to_vec()
+            }
             _ => {
                 return Err(StreamError::new(
                     Reason::Unsupported,
