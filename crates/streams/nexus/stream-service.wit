@@ -349,6 +349,7 @@ interface stream-service {
       producer: option<producer>,
       %result: option<payload>,
       failure: option<failure>,
+      status: option<stream-close-status>,
       previous-completed-task: option<workflow-task-epoch>,
       failed-tasks: list<s64>,
     );
