@@ -89,9 +89,9 @@ interface stream-service {
   /// @nexus.doc "The Producer of a batch."
   /// @nexus.proto "temporal.api.stream.v1.Producer"
   record producer {
-    kind: option<stream-producer-kind>,
     /// @nexus.doc "Stable across attempts. The proposal gives the form per kind."
     id: string,
+    kind: option<stream-producer-kind>,
     epoch: option<producer-epoch>,
     /// @nexus.doc "The run of the Producer, so nobody parses the id. Empty for a client."
     run-id: option<string>,
@@ -112,29 +112,21 @@ interface stream-service {
     body: payload,
   }
 
-  /// @nexus.proto "temporal.api.enums.v1.StreamRecordKind"
-  enum stream-record-kind {
-    stream-record-kind-unspecified,
-    stream-record-kind-data,
-    stream-record-kind-superseded,
-    stream-record-kind-close,
-  }
-
   // An Activity or Local Activity item withdraws the Records of its Producer with a lower epoch. A
   // Workflow item, with this task t in epoch and the previous completed task c, withdraws the
   // Records of the run and of its Local Activities whose task-started-event-id is in failed-tasks
   // or strictly between c and t. It also withdraws those at the started event id of c or of t with
   // a lower epoch than c or t. No task in that range can have completed.
-  /// @nexus.doc "Which earlier Records a SUPERSEDED Record withdraws."
+  /// @nexus.doc "Which earlier Records a Superseded item withdraws."
   /// @nexus.proto "temporal.api.stream.v1.Supersession"
   record supersession {
-    producer-kind: option<stream-producer-kind>,
     producer-id: string,
+    /// @nexus.doc "Workflow only. Started event ids of failed or timed out Workflow Tasks."
+    failed-tasks: list<s64>,
+    producer-kind: option<stream-producer-kind>,
     epoch: option<producer-epoch>,
     /// @nexus.doc "Workflow only. The previous completed Workflow Task of the run."
     previous-completed-task: option<workflow-task-epoch>,
-    /// @nexus.doc "Workflow only. Started event ids of failed or timed out Workflow Tasks."
-    failed-tasks: list<s64>,
     /// @nexus.doc "Workflow retry only. The previous run, all of whose Records are withdrawn."
     withdraw-run: option<string>,
     /// @nexus.doc "The withdrawing Producer's run, so no Reader parses ids. Empty for a client."
@@ -152,25 +144,43 @@ interface stream-service {
     stream-close-status-timed-out,
   }
 
+  /// @nexus.doc "One Record that a Producer appended."
+  /// @nexus.proto "temporal.api.stream.v1.StreamData"
+  record stream-data {
+    /// @nexus.doc "The value. It goes through the payload codec."
+    body: payload,
+    producer: option<producer>,
+  }
+
+  /// @nexus.doc "The close of a Stream. A read gives it last."
+  /// @nexus.proto "temporal.api.stream.v1.StreamClose"
+  record stream-close {
+    /// @nexus.doc "The Producer that closed the Stream."
+    producer: option<producer>,
+    %result: option<payload>,
+    failure: option<failure>,
+    /// @nexus.doc "Set together with the result or the failure."
+    status: option<stream-close-status>,
+  }
+
+  // The read builds a Superseded item from a flagged batch.
+  /// @nexus.doc "A read item: a Record, a Superseded item or the close."
+  /// @nexus.proto "temporal.api.stream.v1.StreamRecord.item"
+  variant stream-item {
+    data(stream-data),
+    superseded(supersession),
+    close(stream-close),
+  }
+
   // An offset is the Redis entry id packed as ms << 20 | seq. It is ordered and unique in one
   // Stream, and sparse. Offsets have gaps, so they don't count Records. A read names its Stream, so
   // the read checks the offset against that Stream.
-  /// @nexus.doc "One Record that a read gives."
+  /// @nexus.doc "One item that a read gives."
   /// @nexus.proto "temporal.api.stream.v1.StreamRecord"
   record stream-record {
-    kind: option<stream-record-kind>,
-    /// @nexus.doc "The place of this Record in the Stream. Ordered and unique, with gaps."
+    item: stream-item,
+    /// @nexus.doc "The place of this item in the Stream. Ordered and unique, with gaps."
     offset: option<s64>,
-    producer: option<producer>,
-    /// @nexus.doc "Set on a data Record."
-    body: option<payload>,
-    /// @nexus.doc "Set on a SUPERSEDED Record, which the read builds from a flagged batch."
-    supersession: option<supersession>,
-    /// @nexus.doc "Set on a close Record with an outcome."
-    close-result: option<payload>,
-    close-failure: option<failure>,
-    /// @nexus.doc "Set on a close Record, together with the result or the failure."
-    close-status: option<stream-close-status>,
   }
 
   /// @nexus.doc "Create a Stream, or get the one that exists, which keeps its Retention."
@@ -184,11 +194,11 @@ interface stream-service {
     withdraw-run: option<string>,
     /// @nexus.doc "The Workflow run that owns the Stream. The Workflow transport sets it."
     owner: option<producer>,
+    /// @nexus.doc "The Stream's ref, with the owner fields."
+    %ref: option<stream-ref>,
     // Native only. Brook's Stores don't read it.
     /// @nexus.omit
     close-with-run: placeholder,
-    /// @nexus.doc "The Stream's ref, with the owner fields."
-    %ref: option<stream-ref>,
     /// @nexus.omit
     namespace: placeholder,
     // Native only. Brook's Stores don't read it.
@@ -210,16 +220,16 @@ interface stream-service {
   ///   "Append. FAILED_PRECONDITION if closed, fenced or format too new. NOT_FOUND if absent."
   /// @nexus.proto "temporal.api.streamservice.v1.AppendRecordsRequest"
   record append-records-request {
-    %stream: option<stream-ref>,
+    %stream: stream-ref,
+    records: list<append-record>,
+    /// @nexus.doc "Local Activity only. The run's failed or timed out Workflow Tasks."
+    failed-tasks: list<s64>,
     /// @nexus.doc "Required outside a Workflow. In a Workflow the transport sets it."
     producer: option<producer>,
     /// @nexus.doc "The batch number in this epoch, 1 or more. It is part of the dedupe key."
     sequence: option<s64>,
-    records: list<append-record>,
     /// @nexus.doc "Local Activity only. The run's last completed Workflow Task."
     previous-completed-task: option<workflow-task-epoch>,
-    /// @nexus.doc "Local Activity only. The run's failed or timed out Workflow Tasks."
-    failed-tasks: list<s64>,
     /// @nexus.doc "Retry run only. The previous run, whose Records this withdraws."
     withdraw-run: option<string>,
     /// @nexus.omit
@@ -240,7 +250,9 @@ interface stream-service {
   /// @nexus.doc "Close a Stream. Readers drain what is left, then end. Later appends are refused."
   /// @nexus.proto "temporal.api.streamservice.v1.CloseStreamRequest"
   record close-stream-request {
-    %stream: option<stream-ref>,
+    %stream: stream-ref,
+    /// @nexus.doc "Workflow only. The run's failed or timed out Workflow Tasks."
+    failed-tasks: list<s64>,
     producer: option<producer>,
     %result: option<payload>,
     failure: option<failure>,
@@ -248,8 +260,6 @@ interface stream-service {
     status: option<stream-close-status>,
     /// @nexus.doc "Workflow only. The previous completed Workflow Task of the run."
     previous-completed-task: option<workflow-task-epoch>,
-    /// @nexus.doc "Workflow only. The run's failed or timed out Workflow Tasks."
-    failed-tasks: list<s64>,
     /// @nexus.omit
     namespace: placeholder,
     // Native only. Brook's Stores don't read them.
@@ -273,7 +283,7 @@ interface stream-service {
   /// @nexus.doc "Read Records from an offset."
   /// @nexus.proto "temporal.api.streamservice.v1.ReadRecordsRequest"
   record read-records-request {
-    %stream: option<stream-ref>,
+    %stream: stream-ref,
     /// @nexus.doc "Start offset. Empty uses start. INVALID_ARGUMENT past the newest offset + 1."
     from-offset: option<s64>,
     /// @nexus.doc "Where to start when from-offset is empty. Unspecified is the beginning."
@@ -313,7 +323,7 @@ interface stream-service {
 
   /// @nexus.proto "temporal.api.streamservice.v1.DescribeStreamRequest"
   record describe-stream-request {
-    %stream: option<stream-ref>,
+    %stream: stream-ref,
     /// @nexus.omit
     namespace: placeholder,
   }
@@ -332,9 +342,9 @@ interface stream-service {
   resource %stream {
     constructor(%stream: stream-ref, created: option<bool>, status: option<stream-status>);
 
-    /// @nexus.doc "Append Records. The answer has the first and the last offset."
+    /// @nexus.doc "Publish Records. The answer has the first and the last offset."
     /// @nexus.operation "append-records"
-    append-records: func(
+    publish: func(
       producer: option<producer>,
       sequence: option<s64>,
       records: list<append-record>,
@@ -356,7 +366,7 @@ interface stream-service {
 
     /// @nexus.doc "Read one page of Records. The poll iterator reads them all."
     /// @nexus.operation "read-records"
-    read-records: func(
+    read: func(
       from-offset: option<s64>,
       start: option<stream-read-start>,
       max-records: option<s32>,
@@ -394,4 +404,32 @@ interface stream-service {
 
   /// @nexus.operation name="DescribeStream"
   describe-stream: func(request: describe-stream-request) -> describe-stream-response;
+
+  // No operation returns these. A failed call carries them, so each SDK can raise one error type
+  // per reason.
+  /// @nexus.doc "Why a Stream call failed. Each reason has one gRPC status code."
+  /// @nexus.proto "temporal.api.enums.v1.StreamErrorReason"
+  enum stream-error-reason {
+    stream-error-reason-unspecified,
+    stream-error-reason-not-found,
+    stream-error-reason-expired,
+    stream-error-reason-closed,
+    stream-error-reason-fenced,
+    stream-error-reason-sequence,
+    stream-error-reason-seq-divergent,
+    stream-error-reason-not-owner,
+    stream-error-reason-format-too-new,
+    stream-error-reason-offset,
+    stream-error-reason-too-large,
+    stream-error-reason-invalid,
+    stream-error-reason-storage,
+    stream-error-reason-unknown-writer,
+    stream-error-reason-unsupported,
+  }
+
+  /// @nexus.doc "The details of a failed Stream call."
+  /// @nexus.proto "temporal.api.stream.v1.StreamErrorDetails"
+  record stream-error-details {
+    reason: option<stream-error-reason>,
+  }
 }

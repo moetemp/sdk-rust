@@ -20,7 +20,9 @@ interface stream-writer {
   /// @nexus.doc "Open a writer for one Producer of one Stream."
   /// @nexus.proto "temporal.sdk.streams.v1.OpenWriterRequest"
   record open-writer-request {
-    %stream: option<stream-ref>,
+    %stream: stream-ref,
+    /// @nexus.doc "Local Activity only. The run's failed or timed out Workflow Tasks."
+    failed-tasks: list<s64>,
     producer: option<producer>,
     /// @nexus.doc "A write sends at most this many Records in one batch. Zero is 1000."
     max-batch-size: option<s32>,
@@ -28,16 +30,14 @@ interface stream-writer {
     max-retry-duration: option<duration>,
     /// @nexus.doc "Local Activity only. The run's last completed Workflow Task."
     previous-completed-task: option<workflow-task-epoch>,
-    /// @nexus.doc "Local Activity only. The run's failed or timed out Workflow Tasks."
-    failed-tasks: list<s64>,
     /// @nexus.omit
     namespace: placeholder,
   }
 
   /// @nexus.proto "temporal.sdk.streams.v1.WriteRecordsRequest"
   record write-records-request {
-    writer-id: option<u64>,
     records: list<append-record>,
+    writer-id: option<u64>,
   }
 
   /// @nexus.proto "temporal.sdk.streams.v1.WriteRecordsResponse"
