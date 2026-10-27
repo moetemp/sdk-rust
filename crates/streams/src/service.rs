@@ -1,20 +1,36 @@
-//! The Stream service operations on the Store, for Activities, clients and the Local Activity that
-//! runs each Workflow call.
+//! The five Stream service operations on the Store, for Activities, clients and the Local
+//! Activity that runs each Workflow call.
 
 use crate::{
     Reason, StreamError, StreamResult,
     digest::batch_digest,
+    epoch::withdraws,
     ids::{check_producer, check_stream_id},
     metrics::Metrics,
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        Producer, StreamProducerKind, StreamRef, StreamStatus,
+        Producer, ReadRecordsRequest, ReadRecordsResponse, StreamProducerKind, StreamReadStart,
+        StreamRecord, StreamRef, StreamStatus, Supersession, stream_record::Item,
     },
     record::{caller_status, close_record, data_records, supersession},
-    store::{Batch, Capabilities, CreateOutcome, MAX_SEQUENCE, Owner, Store, Withdrawal},
+    store::{
+        Batch, Capabilities, CreateOutcome, FORMAT_VERSION, MAX_SEQUENCE, Owner, Store,
+        StreamState, Withdrawal,
+    },
 };
+use prost::Message;
 use std::{sync::Arc, time::Duration};
+use tokio::time::Instant;
+
+/// The longest wait of one read, for new Records and for the create.
+pub const MAX_WAIT: Duration = Duration::from_secs(60);
+/// The maximum number of Records in one read.
+pub const MAX_RECORDS: usize = 1000;
+/// The maximum number of log entries that a read of the last Records scans.
+const MAX_SCAN: usize = 10 * MAX_RECORDS;
+/// How often a read looks again for a Stream that nobody created yet.
+const CREATE_POLL: Duration = Duration::from_millis(100);
 
 /// The Stream service on one Store.
 pub(crate) struct StreamService {
@@ -244,6 +260,318 @@ impl StreamService {
             retention: Some(proto_duration(state.retention)),
         })
     }
+
+    /// A long poll that returns the Records it found, the close Record, or nothing after `wait`.
+    pub(crate) async fn read_records(
+        &self,
+        request: ReadRecordsRequest,
+    ) -> StreamResult<ReadRecordsResponse> {
+        let id = stream_id(request.stream.as_ref())?.to_string();
+        let namespace = request.namespace.as_str();
+        if request.from_offset < 0 {
+            return Err(StreamError::new(Reason::Offset, "The offset is below zero"));
+        }
+        let max_bytes = max_bytes(request.max_bytes)?;
+        if request.last < 0 {
+            return Err(StreamError::invalid("last must be 0 or more"));
+        }
+        if request.last > 0 {
+            if request.wake_only || request.from_offset > 0 {
+                return Err(StreamError::invalid(
+                    "A read of the last Records takes no from_offset and no wake_only",
+                ));
+            }
+            return self.read_last(request, max_bytes).await;
+        }
+        if request.wake_only || request.to_offset != 0 {
+            return Err(StreamError::new(
+                Reason::Unsupported,
+                "The Store reads no to_offset or wake_only, which the native backend serves",
+            ));
+        }
+        let max = match request.max_records {
+            n if n <= 0 => MAX_RECORDS,
+            n => (n as usize).min(MAX_RECORDS),
+        };
+        let started = Instant::now();
+        let wait = duration(request.wait).unwrap_or_default().min(MAX_WAIT);
+        let create_wait = duration(request.create_wait)
+            .unwrap_or_default()
+            .min(MAX_WAIT);
+        let deadline = started + wait;
+
+        let mut state = self.created(namespace, &id, started + create_wait).await?;
+        if state.version > FORMAT_VERSION {
+            return Err(StreamError::new(
+                Reason::FormatTooNew,
+                format!("format {} is newer than {FORMAT_VERSION}", state.version),
+            ));
+        }
+        let from = match request.from_offset {
+            0 if request.start == StreamReadStart::End as i32 => state.newest + 1,
+            from => from,
+        };
+        if from > state.newest + 1 {
+            return Err(StreamError::new(
+                Reason::Offset,
+                format!(
+                    "The offset {from} is past the newest offset + 1, {}",
+                    state.newest + 1
+                ),
+            ));
+        }
+        loop {
+            check_expiry(&state, from)?;
+            if let Some(page) = self
+                .page(namespace, &id, &state, from, (max, max_bytes))
+                .await?
+            {
+                return Ok(page);
+            }
+            if deadline <= Instant::now() {
+                return Ok(ReadRecordsResponse {
+                    next_offset: from,
+                    ..Default::default()
+                });
+            }
+            let after = (from - 1).max(state.newest);
+            self.metrics.read_waits(true);
+            let woke = self.store.wait_after(namespace, &id, after, deadline).await;
+            self.metrics.read_waits(false);
+            woke?;
+            state = self.store.read(namespace, &id, 0, 0).await?.0;
+        }
+    }
+
+    /// The newest `last` Records, oldest first, and the close Record at the end when the Stream is
+    /// closed. A Record that a newer `Superseded` item withdraws doesn't count. It never waits for
+    /// new Records.
+    async fn read_last(
+        &self,
+        request: ReadRecordsRequest,
+        max_bytes: usize,
+    ) -> StreamResult<ReadRecordsResponse> {
+        let id = stream_id(request.stream.as_ref())?.to_string();
+        let namespace = request.namespace.as_str();
+        let count = (request.last as usize).min(MAX_RECORDS);
+        let create_wait = duration(request.create_wait)
+            .unwrap_or_default()
+            .min(MAX_WAIT);
+        let state = self
+            .created(namespace, &id, Instant::now() + create_wait)
+            .await?;
+        if state.version > FORMAT_VERSION {
+            return Err(StreamError::new(
+                Reason::FormatTooNew,
+                format!("format {} is newer than {FORMAT_VERSION}", state.version),
+            ));
+        }
+        check_expiry(&state, 0)?;
+        let retained = state.retained_from();
+        let (mut picked, mut close) = (vec![], None);
+        let mut withdrawals: Vec<Supersession> = vec![];
+        let (mut bytes, mut scanned) = (0, 0);
+        let mut before = state.newest;
+        'scan: while before >= retained && picked.len() < count && scanned < MAX_SCAN {
+            let entries = self
+                .store
+                .read_back(namespace, &id, before, count.clamp(16, MAX_RECORDS))
+                .await?;
+            if entries.is_empty() {
+                break;
+            }
+            scanned += entries.len();
+            for entry in entries {
+                if entry.offset < retained {
+                    break 'scan;
+                }
+                before = entry.offset - 1;
+                // An entry's `Superseded` item withdraws earlier Records, not the entry's own.
+                if let Some(record) = entry.record {
+                    let record = decode(&record, entry.offset)?;
+                    let size = record.encoded_len();
+                    // The close Record ends the page and doesn't count toward the byte cap.
+                    if matches!(record.item, Some(Item::Close(_))) {
+                        close = Some(record);
+                    } else if !withdrawals.iter().any(|s| withdraws(s, &record)) {
+                        // A Record over the cap is still returned alone, so that the read always
+                        // returns a Record.
+                        if !picked.is_empty() && bytes + size > max_bytes {
+                            break 'scan;
+                        }
+                        bytes += size;
+                        picked.push(record);
+                        if picked.len() == count {
+                            break 'scan;
+                        }
+                    }
+                }
+                if let Some(supersession) = entry.supersession {
+                    withdrawals.push(
+                        Supersession::decode(supersession.as_slice())
+                            .map_err(|error| StreamError::storage(error.to_string()))?,
+                    );
+                }
+            }
+        }
+        picked.reverse();
+        picked.extend(close);
+        Ok(ReadRecordsResponse {
+            records: picked,
+            next_offset: state.newest + 1,
+            done: state.closed_at.is_some(),
+            ..Default::default()
+        })
+    }
+
+    /// The state of a Stream, after waiting up to `until` for its create.
+    async fn created(
+        &self,
+        namespace: &str,
+        id: &str,
+        until: Instant,
+    ) -> StreamResult<StreamState> {
+        loop {
+            let (state, _) = self.store.read(namespace, id, 0, 0).await?;
+            if state.exists {
+                return Ok(state);
+            }
+            let now = Instant::now();
+            if now >= until {
+                return Err(StreamError::new(
+                    Reason::NotFound,
+                    "Nobody created the Stream",
+                ));
+            }
+            tokio::time::sleep(CREATE_POLL.min(until - now)).await;
+        }
+    }
+
+    /// The Records from `from`, or `None` when there is none yet. A page that ends in the close
+    /// Record is done. `(max, max_bytes)` caps the items and their bytes.
+    async fn page(
+        &self,
+        namespace: &str,
+        id: &str,
+        state: &StreamState,
+        from: i64,
+        (max, max_bytes): (usize, usize),
+    ) -> StreamResult<Option<ReadRecordsResponse>> {
+        // A read past the close returns the close Record again, so that every read ends with it.
+        if let Some(closed_at) = state.closed_at.filter(|at| from > *at) {
+            let (_, entries) = self.store.read(namespace, id, closed_at, 1).await?;
+            let mut records = vec![];
+            for entry in entries {
+                if let Some(bytes) = entry.record {
+                    records.push(decode(&bytes, entry.offset)?);
+                }
+            }
+            let page = ReadRecordsResponse {
+                records,
+                next_offset: from,
+                done: true,
+                ..Default::default()
+            };
+            return Ok(Some(page));
+        }
+        // A read from the start skips the Records that the Retention hides. A read from an offset
+        // fails on them, since the Reader asked for those Records.
+        let retained = state.retained_from();
+        let mut start = if from > 0 { from } else { retained };
+        let mut records = vec![];
+        let mut next = from;
+        let (mut done, mut full) = (false, false);
+        let mut bytes = 0;
+        while records.len() < max && !done && !full {
+            let (chunk_state, entries) = self.store.read(namespace, id, start, max).await?;
+            // A trim after the state read leaves a gap before these entries.
+            check_expiry(&chunk_state, if from > 0 { start } else { 0 })?;
+            if entries.is_empty() {
+                break;
+            }
+            for entry in entries {
+                if entry.offset < retained {
+                    if from > 0 {
+                        return Err(expired());
+                    }
+                    next = entry.offset + 1;
+                    start = next;
+                    continue;
+                }
+                let mut items = vec![];
+                if let Some(bytes) = entry.supersession {
+                    let supersession = Supersession::decode(bytes.as_slice())
+                        .map_err(|error| StreamError::storage(error.to_string()))?;
+                    items.push(StreamRecord {
+                        offset: entry.offset,
+                        item: Some(Item::Superseded(supersession)),
+                    });
+                }
+                if let Some(bytes) = entry.record {
+                    let record = decode(&bytes, entry.offset)?;
+                    done = matches!(record.item, Some(Item::Close(_)));
+                    items.push(record);
+                }
+                // An entry over the cap is still returned alone, so that the read always makes
+                // progress. The next read starts at the entry that didn't fit.
+                let size: usize = items.iter().map(Message::encoded_len).sum();
+                if !records.is_empty() && bytes + size > max_bytes {
+                    (done, full) = (false, true);
+                    next = entry.offset;
+                    break;
+                }
+                bytes += size;
+                records.extend(items);
+                next = entry.offset + 1;
+                start = next;
+                if done || records.len() >= max {
+                    break;
+                }
+            }
+        }
+        if records.is_empty() {
+            return Ok(None);
+        }
+        let page = ReadRecordsResponse {
+            records,
+            next_offset: next,
+            done,
+            ..Default::default()
+        };
+        Ok(Some(page))
+    }
+}
+
+fn decode(bytes: &[u8], offset: i64) -> StreamResult<StreamRecord> {
+    let mut record = StreamRecord::decode(bytes)
+        .map_err(|error| StreamError::storage(format!("A stored Record is bad: {error}")))?;
+    record.offset = offset;
+    Ok(record)
+}
+
+/// Fails a read whose Records the Retention or the expiry removed, so that the Reader always sees
+/// the gap. A read from the start of the Stream has no gap.
+///
+/// A Tombstone fails every read. An open Stream that expired gets no more Records, so the Reader
+/// would wait forever. A closed one lost its log and its close Record.
+fn check_expiry(state: &StreamState, from: i64) -> StreamResult<()> {
+    if state.expired() || (from > 0 && state.trimmed >= from) {
+        return Err(expired());
+    }
+    Ok(())
+}
+
+/// The byte cap of a page, from a request's `max_bytes`. Zero is no cap.
+fn max_bytes(value: i64) -> StreamResult<usize> {
+    match value {
+        0 => Ok(usize::MAX),
+        n if n < 0 => Err(StreamError::invalid("max_bytes must be 0 or more")),
+        n => Ok(usize::try_from(n).unwrap_or(usize::MAX)),
+    }
+}
+
+fn expired() -> StreamError {
+    StreamError::new(Reason::Expired, "The Records at the offset expired")
 }
 
 /// A Store answer that may have withdrawn Records.
