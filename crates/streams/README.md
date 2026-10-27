@@ -19,6 +19,15 @@ Workflow makes each Stream call from a Local Activity. Core has no Stream code.
   `testdata/gen_vectors.py` writes them from a second implementation. Each SDK, each Store and the
   server run the same files.
 
+## The runtime
+
+`StreamRuntime` serves the Stream service on one Store. A Store crate builds it with
+`StreamRuntime::new` and a `StoreFactory`, which connects the Store on the runtime's first call
+that needs it. So a bridge can build the runtime with no async runtime, and a Workflow that never
+publishes never connects. `MemoryStreamRuntime` builds it on the memory Store, from a
+`MemoryStreamConfig`. That message has the field numbers of the same fields in the Redis config,
+so a bridge can send the memory runtime the config it builds for Redis.
+
 ## Stores and the shared suites
 
 The memory Store is for tests. It keeps the key layout of the Redis Store and applies the same rules
