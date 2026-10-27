@@ -15,6 +15,9 @@ Workflow makes each Stream call from a Local Activity. Core has no Stream code.
   needs no file outside itself.
 - `protos/temporal/sdk/streams/v1/runtime.proto` has the crate's own calls, such as the writer
   calls.
+- `nexus/stream-service.wit` is the Stream service as a System Nexus service, with the messages of
+  the protos above. Each SDK copies it and generates its bindings with nexgen. A test checks that
+  every line is at most 100 columns.
 - `testdata/*.json` are the shared vectors. They cover Stream ids, Producer ids, Store keys and
   meta fields, offsets, epoch keys, the withdrawal rule and the batch digest of a dedupe entry.
   `testdata/gen_vectors.py` writes them from a second implementation. Each SDK, each Store and the
