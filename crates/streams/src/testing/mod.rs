@@ -3,15 +3,19 @@
 
 mod support;
 
+pub mod service;
 pub mod store;
 
 pub use support::Needs;
 
 use crate::{
+    MemoryStreamRuntime, StreamRuntime,
     memory::MemoryStore,
+    proto::MemoryStreamConfig,
     store::{DEFAULT_RETENTION, DEFAULT_SAFETY_TTL, Store},
 };
 use futures_util::{FutureExt, future::join_all};
+use prost::Message;
 use std::{future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc};
 
 /// The state under a Store's calls, which some cases read or change.
@@ -36,6 +40,8 @@ pub trait TestBackend: Send + Sync {
     fn gives(&self) -> Needs;
     /// A Store for one case, and the state under it.
     async fn connect(&self) -> (Arc<dyn Store>, Arc<dyn RawKeys>);
+    /// A runtime on the backend, whose refs name `backend`.
+    fn runtime(&self, backend: &str) -> Arc<StreamRuntime>;
 }
 
 /// The memory Store, with a new Store for each case.
@@ -51,6 +57,15 @@ impl TestBackend for MemoryBackend {
     async fn connect(&self) -> (Arc<dyn Store>, Arc<dyn RawKeys>) {
         let store = Arc::new(MemoryStore::new(DEFAULT_RETENTION, DEFAULT_SAFETY_TTL));
         (store.clone(), store)
+    }
+
+    // Through the config bytes, as a bridge builds it.
+    fn runtime(&self, backend: &str) -> Arc<StreamRuntime> {
+        let config = MemoryStreamConfig {
+            backend: backend.to_string(),
+            ..Default::default()
+        };
+        MemoryStreamRuntime::from_config_bytes(&config.encode_to_vec(), None).unwrap()
     }
 }
 
@@ -131,5 +146,10 @@ mod tests {
     #[tokio::test]
     async fn the_store_suite_passes_on_the_memory_store() {
         run(vec![Arc::new(MemoryBackend)], store::CASES).await;
+    }
+
+    #[tokio::test]
+    async fn the_service_suite_passes_on_the_memory_store() {
+        run(vec![Arc::new(MemoryBackend)], service::CASES).await;
     }
 }
