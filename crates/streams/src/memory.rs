@@ -4,8 +4,8 @@
 
 use crate::{
     Reason, StreamError, StreamResult,
-    epoch::epoch_key,
-    ids::StreamKeys,
+    epoch::{epoch_key, task_key, task_of},
+    ids::{StreamKeys, encode_part},
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{Producer, StreamProducerKind, StreamRef},
     store::{
@@ -85,6 +85,35 @@ fn id_text((ms, seq): (u64, u64)) -> String {
 fn parse_id(text: &str) -> Option<(u64, u64)> {
     let (ms, seq) = text.split_once('-')?;
     Some((ms.parse().ok()?, seq.parse().ok()?))
+}
+
+fn words(text: Option<&String>) -> Vec<String> {
+    text.map(|text| text.split_whitespace().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+fn started(task_key: &str) -> i64 {
+    i64::from_str_radix(&task_key[..16], 16).unwrap_or(0)
+}
+
+/// The orphan rule over a run's open Local Activity tasks, as `orphan_tasks` in `lib.lua`.
+fn orphan_tasks(open: &[String], t: &str, c: &str, failed: &[i64]) -> (Vec<String>, Vec<String>) {
+    let ts = started(t);
+    let cs = if c.is_empty() { 0 } else { started(c) };
+    let (mut withdrawn, mut kept) = (vec![], vec![]);
+    for key in open {
+        let s = started(key);
+        if failed.contains(&s)
+            || (cs < s && s < ts)
+            || (s == ts && key.as_str() < t)
+            || (!c.is_empty() && s == cs && key.as_str() < c)
+        {
+            withdrawn.push(key.clone());
+        } else if c.is_empty() || key.as_str() > c {
+            kept.push(key.clone());
+        }
+    }
+    (withdrawn, kept)
 }
 
 impl Keys {
@@ -244,6 +273,14 @@ impl Keys {
         }
     }
 
+    fn withdraw_run(&mut self, run: &str) -> bool {
+        if run.is_empty() || self.get(&format!("wr|{run}")).is_some() {
+            return false;
+        }
+        self.set(&format!("wr|{run}"), "1");
+        self.get(&format!("run|{run}")).is_some()
+    }
+
     /// Refuses `count` entries whose ids would not fit an offset. The ids go on from the newest id
     /// the Stream gave, as `check_ids_fit` in `lib.lua`.
     fn check_ids_fit(&self, now: i64, count: u64) -> StreamResult<()> {
@@ -375,6 +412,14 @@ impl MemoryStore {
     }
 }
 
+fn encode_run(run_id: &str) -> String {
+    if run_id.is_empty() {
+        String::new()
+    } else {
+        encode_part(run_id)
+    }
+}
+
 fn offsets(first: &str, last: &str) -> StreamResult<Option<(i64, i64)>> {
     if first.is_empty() || last.is_empty() {
         return Ok(None);
@@ -388,7 +433,7 @@ fn offsets(first: &str, last: &str) -> StreamResult<Option<(i64, i64)>> {
 #[async_trait::async_trait]
 impl Store for MemoryStore {
     fn capabilities(&self) -> Capabilities {
-        Capabilities::ALL.without(Capabilities::RUN_FENCE)
+        Capabilities::ALL
     }
 
     fn default_retention(&self) -> Duration {
@@ -401,7 +446,7 @@ impl Store for MemoryStore {
         stream: &StreamRef,
         retention: Option<Duration>,
         owner: Owner,
-        _withdrawal: &Withdrawal<'_>,
+        withdrawal: &Withdrawal<'_>,
     ) -> StreamResult<Created> {
         let stream_id = stream.id.as_str();
         let retention = millis(retention.filter(|r| !r.is_zero()).unwrap_or(self.retention));
@@ -410,6 +455,7 @@ impl Store for MemoryStore {
             Owner::Client => "client",
         };
         let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
+        let withdrawn_run = encode_run(withdrawal.withdraw_run);
         let chain = if owner == "wf" {
             owner_chain(stream)
         } else {
@@ -423,21 +469,42 @@ impl Store for MemoryStore {
                 if !chain.is_empty() {
                     keys.set("oc", chain.clone());
                 }
+                keys.withdraw_run(&withdrawn_run);
                 keys.refresh(now, safety, tombstone);
-                return Ok((CreateOutcome::Created, retention));
+                return Ok((CreateOutcome::Created, retention, false));
             };
             keys.check_live(now)?;
             keys.check_identity(owner, &chain)?;
             if keys.get("closed").is_some() {
                 return Err(refuse(Reason::Closed, "the Stream is closed"));
             }
-            Ok((CreateOutcome::Exists, stored.parse().unwrap_or(0)))
+            if !withdrawn_run.is_empty() {
+                keys.check_ids_fit(now, 1)?;
+            }
+            let mut flagged = false;
+            if keys.withdraw_run(&withdrawn_run) {
+                keys.trim(now);
+                let id = keys.add(
+                    now,
+                    Fields {
+                        record: None,
+                        supersession: Some(withdrawal.supersession.to_vec()),
+                    },
+                );
+                keys.set("newest", id);
+                keys.refresh(now, safety, tombstone);
+                flagged = true;
+            }
+            Ok((CreateOutcome::Exists, stored.parse().unwrap_or(0), flagged))
         });
-        let (outcome, stored) = created?;
+        let (outcome, stored, flagged) = created?;
+        if flagged {
+            self.appended.notify_waiters();
+        }
         Ok(Created {
             outcome,
             retention: Duration::from_millis(stored.max(0) as u64),
-            flagged: false,
+            flagged,
         })
     }
 
@@ -450,11 +517,27 @@ impl Store for MemoryStore {
         let stream_id = stream.id.as_str();
         let producer = batch.producer;
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
+        let run = encode_run(&producer.run_id);
         let withdrawal = &batch.withdrawal;
+        let withdrawn_run = encode_run(withdrawal.withdraw_run);
         let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
         let sequence = batch.sequence;
         let suffix = format!("|{}|{}", producer.kind, producer.id);
         let member = format!("{}|{}", producer.kind, producer.id);
+        let local_activity = producer.kind == StreamProducerKind::LocalActivity as i32;
+        let task = if local_activity {
+            task_key(&task_of(&producer.epoch.unwrap_or_default()))
+        } else {
+            String::new()
+        };
+        let facts = withdrawal
+            .tasks
+            .filter(|_| local_activity && !run.is_empty());
+        let completed = facts
+            .and_then(|facts| facts.completed)
+            .map(task_key)
+            .unwrap_or_default();
+        let (open_field, gone_field) = (format!("oa|{run}"), format!("ow|{run}"));
         let appended = self.with(namespace, stream_id, |keys, now| {
             if !(1..=MAX_SEQUENCE).contains(&sequence) {
                 return Err(refuse(
@@ -490,6 +573,12 @@ impl Store for MemoryStore {
             if keys.get("closed").is_some() {
                 return Err(refuse(Reason::Closed, "the Stream is closed"));
             }
+            if !run.is_empty() && keys.get(&format!("wr|{run}")).is_some() {
+                return Err(refuse(
+                    Reason::Fenced,
+                    "a Workflow retry withdrew the run of the Producer",
+                ));
+            }
             if keys
                 .get(&format!("e{suffix}"))
                 .is_some_and(|newest| epoch.as_str() < newest.as_str())
@@ -499,19 +588,49 @@ impl Store for MemoryStore {
                     "the epoch is lower than the newest one of the Producer",
                 ));
             }
+            if local_activity && !run.is_empty() && words(keys.get(&gone_field)).contains(&task) {
+                return Err(refuse(
+                    Reason::Fenced,
+                    "a Superseded item withdrew the Workflow Task of the call",
+                ));
+            }
             let records = batch.records.len() as u64;
-            keys.check_ids_fit(now, records + 1)?;
+            keys.check_ids_fit(now, records + 2)?;
 
             // A client's newer epoch only fences, as in `append.lua`.
-            let flagged = producer.kind != StreamProducerKind::Client as i32
+            let mut flagged = producer.kind != StreamProducerKind::Client as i32
                 && keys
                     .get(&format!("h{suffix}"))
                     .is_some_and(|holds| holds.as_str() < epoch.as_str());
+            if keys.withdraw_run(&withdrawn_run) {
+                flagged = true;
+            }
+            let (withdrawn, mut open) = match facts {
+                Some(facts) => orphan_tasks(
+                    &words(keys.get(&open_field)),
+                    &task,
+                    &completed,
+                    facts.failed_tasks,
+                ),
+                None => (vec![], vec![]),
+            };
 
             keys.trim(now);
             keys.prune(now);
             let at = keys.next_ms(now);
             let (mut first, mut last) = (String::new(), String::new());
+            // The orphan item has an entry of its own, as in `append.lua`.
+            let mut orphan = String::new();
+            if let (false, Some(facts)) = (withdrawn.is_empty(), facts) {
+                orphan = keys.add(
+                    now,
+                    Fields {
+                        record: None,
+                        supersession: Some(facts.supersession.to_vec()),
+                    },
+                );
+                last = orphan.clone();
+            }
             if records == 0 && flagged {
                 last = keys.add(
                     now,
@@ -536,6 +655,9 @@ impl Store for MemoryStore {
                 }
             }
 
+            if first.is_empty() {
+                first = orphan;
+            }
             keys.set(&format!("e{suffix}"), epoch.clone());
             keys.set(
                 &format!("d{suffix}"),
@@ -546,12 +668,30 @@ impl Store for MemoryStore {
             } else if flagged {
                 keys.meta.remove(&format!("h{suffix}"));
             }
+            if !run.is_empty() && records > 0 {
+                keys.set(&format!("run|{run}"), "1");
+            }
+            if facts.is_some() {
+                if records > 0 && !open.contains(&task) {
+                    open.push(task.clone());
+                }
+                if open.is_empty() {
+                    keys.meta.remove(&open_field);
+                } else {
+                    keys.set(&open_field, open.join(" "));
+                }
+                if !withdrawn.is_empty() {
+                    let mut all = words(keys.get(&gone_field));
+                    all.extend(withdrawn.iter().cloned());
+                    keys.set(&gone_field, all.join(" "));
+                }
+            }
             if !last.is_empty() {
                 keys.set("newest", last.clone());
             }
             keys.producers.insert(member.clone(), at);
             keys.refresh(now, safety, tombstone);
-            Ok((false, first, last, flagged))
+            Ok((false, first, last, flagged || !withdrawn.is_empty()))
         });
         let (resend, first, last, flagged) = appended?;
         if !resend && !last.is_empty() {
@@ -573,6 +713,7 @@ impl Store for MemoryStore {
     ) -> StreamResult<Closed> {
         let stream_id = stream.id.as_str();
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
+        let run = encode_run(&producer.run_id);
         let suffix = format!("|{}|{}", producer.kind, producer.id);
         let tombstone = millis(TOMBSTONE);
         let chain = owner_chain(stream);
@@ -582,6 +723,12 @@ impl Store for MemoryStore {
             if keys.get("closed").is_some() {
                 let id = keys.get("close_id").cloned().unwrap_or_default();
                 return Ok((id, true));
+            }
+            if !run.is_empty() && keys.get(&format!("wr|{run}")).is_some() {
+                return Err(refuse(
+                    Reason::Fenced,
+                    "a Workflow retry withdrew the run of the Producer",
+                ));
             }
             if keys
                 .get(&format!("e{suffix}"))
