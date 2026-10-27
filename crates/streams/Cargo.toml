@@ -12,10 +12,12 @@ keywords = ["temporal", "workflow", "streams"]
 categories = ["development-tools"]
 
 [dependencies]
+async-trait = "0.1"
 prost = { workspace = true }
 prost-types = { workspace = true }
 sha2 = "0.10"
 thiserror = { workspace = true }
+tokio = { version = "1.47", default-features = false, features = ["rt", "sync", "time"] }
 tonic = { workspace = true }
 
 [dependencies.temporalio-common]
