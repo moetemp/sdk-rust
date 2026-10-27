@@ -19,3 +19,11 @@ Workflow makes each Stream call from a Local Activity. Core has no Stream code.
   meta fields, offsets, epoch keys, the withdrawal rule and the batch digest of a dedupe entry.
   `testdata/gen_vectors.py` writes them from a second implementation. Each SDK, each Store and the
   server run the same files.
+
+## Stores and the shared suites
+
+The memory Store is for tests. It keeps the key layout of the Redis Store and applies the same rules
+in the same order. The `test-support` feature exports the shared suites in `testing`. A Store crate
+implements `testing::TestBackend` for its Store and runs each suite with `testing::run`, so that
+every Store keeps one set of rules. This crate runs them on the memory Store in its unit tests.
+
