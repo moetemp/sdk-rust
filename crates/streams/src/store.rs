@@ -10,6 +10,13 @@ use std::time::Duration;
 use temporalio_common::protos::temporal::api::enums::v1::ExecutionType;
 use tokio::time::Instant;
 
+/// The Retention of a Stream whose create sets none, when a Store's options set no other.
+pub const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How long an open Workflow-owned Stream stays after its last write, when a Store's options set
+/// no other.
+pub const DEFAULT_SAFETY_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
 /// The format version this crate writes. A Stream with a higher one refuses writes.
 pub const FORMAT_VERSION: u32 = 1;
 /// The maximum size of a stored Record, in bytes.
