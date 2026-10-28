@@ -292,3 +292,71 @@ message WorkflowCloseRequest {
     // The runtime sets `namespace` and `producer`. Payloads are in their stored form.
     temporal.api.streamservice.v1.CloseStreamRequest close = 3;
 }
+
+// Method `OpenReader`, synchronous. Opens one read of a Stream for `ReadNext`. The reader keeps the
+// resume point, the offsets that it gave, the create wait and the end rules.
+message OpenReaderRequest {
+    string namespace = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // Start at this offset. Zero starts at `start`.
+    int64 from_offset = 3;
+    // END reads only the Records after the newest one.
+    temporal.api.enums.v1.StreamReadStart start = 4;
+    // Start with the newest `last` Records. Not with `from_offset`.
+    int32 last = 5;
+    // Wait for new Records at the newest one. Otherwise the read ends there.
+    bool wait_new_records = 6;
+    // How long the read waits for a Stream that nobody created yet. Empty fails at once with
+    // NOT_FOUND.
+    google.protobuf.Duration create_wait = 7;
+    // The most Record bytes in one page. Zero is no cap.
+    int64 max_bytes = 8;
+}
+
+message OpenReaderResponse {
+    uint64 reader_id = 1;
+}
+
+// Method `ReadNext`, asynchronous. Reads pages until one has items, the read ends or `max_wait`
+// passes, and returns that page. A dropped call leaves the reader as it was.
+message ReadNextRequest {
+    uint64 reader_id = 1;
+    // The longest wait of this call, below the caller's RPC timeout. Empty is 60 s.
+    google.protobuf.Duration max_wait = 2;
+}
+
+message ReaderItem {
+    temporal.api.stream.v1.StreamRecord record = 1;
+    // The resume point after this item. After a Superseded item it is the item's own offset,
+    // since the first Record of its batch has the same offset and comes next.
+    int64 next_offset = 2;
+    // Superseded only. The offsets of the Records that this read gave and the item withdraws, in
+    // order.
+    repeated int64 withdrawn_offsets = 3;
+}
+
+message ReaderPage {
+    repeated ReaderItem items = 1;
+    // The resume point after the page. Zero before the first page of a read from END or of a read
+    // with `last`.
+    int64 next_offset = 2;
+    // The read ended, at the close or at the newest Record of a read that doesn't wait.
+    bool done = 3;
+}
+
+// Method `FreeReader`, synchronous, with `FreeResponse`. Frees the reader. A `ReadNext` in flight
+// still completes.
+message FreeReaderRequest {
+    uint64 reader_id = 1;
+}
+
+// Method `Withdraws`, static. Whether a Superseded item withdraws the earlier Records of a
+// Producer, such as Records from an earlier read.
+message WithdrawsRequest {
+    temporal.api.stream.v1.Supersession supersession = 1;
+    temporal.api.stream.v1.Producer producer = 2;
+}
+
+message WithdrawsResponse {
+    bool withdraws = 1;
+}

@@ -14,6 +14,7 @@ pub mod memory;
 mod metrics;
 pub mod offset;
 pub mod protos;
+mod reader;
 mod record;
 mod runtime;
 mod scope;

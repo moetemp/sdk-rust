@@ -91,9 +91,14 @@ pub fn withdraws(supersession: &Supersession, record: &StreamRecord) -> bool {
     let Some(Item::Data(data)) = &record.item else {
         return false;
     };
-    let Some(producer) = data.producer.as_ref() else {
-        return false;
-    };
+    data.producer
+        .as_ref()
+        .is_some_and(|producer| withdraws_producer(supersession, producer))
+}
+
+/// Whether a `Superseded` item withdraws the earlier Records of `producer`, by the rule of
+/// [withdraws].
+pub fn withdraws_producer(supersession: &Supersession, producer: &Producer) -> bool {
     if !supersession.withdraw_run.is_empty() && producer.run_id == supersession.withdraw_run {
         return true;
     }

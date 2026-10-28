@@ -1,13 +1,14 @@
 //! The shared test vectors, which `testdata/gen_vectors.py` writes from a second implementation.
 //! Every SDK that builds ids or reads Records runs the same files.
 
+use prost::Message;
 use prost_types::Timestamp;
 use serde_json::Value;
 use temporalio_common::protos::temporal::api::common::v1::{
     Payload, payload::ExternalPayloadDetails,
 };
 use temporalio_streams::{
-    derive_producer,
+    call_static, derive_producer,
     digest::batch_digest,
     epoch::{epoch_key, task_key, withdraws},
     ids::{self, StreamKeys, fields},
@@ -15,7 +16,8 @@ use temporalio_streams::{
     proto::{
         ActivityContext, AppendRecord, DeriveProducerRequest, Producer, ProducerEpoch,
         ProducerPurpose, StreamData, StreamProducerKind, StreamRecord, Supersession,
-        WorkflowTaskAttempt, WorkflowTaskEpoch, stream_record::Item,
+        WithdrawsRequest, WithdrawsResponse, WorkflowTaskAttempt, WorkflowTaskEpoch,
+        stream_record::Item,
     },
 };
 
@@ -257,24 +259,34 @@ fn the_appendix_e_withdrawals_match() {
             run_id: s["run_id"].as_str().unwrap_or_default().to_string(),
         };
         let p = &case["record"]["producer"];
+        let producer = Producer {
+            kind: kind(text(p, "kind")) as i32,
+            id: text(p, "id").to_string(),
+            epoch: p.get("epoch").map(epoch),
+            run_id: p["run_id"].as_str().unwrap_or_default().to_string(),
+        };
         let record = StreamRecord {
             item: Some(Item::Data(StreamData {
-                producer: Some(Producer {
-                    kind: kind(text(p, "kind")) as i32,
-                    id: text(p, "id").to_string(),
-                    epoch: p.get("epoch").map(epoch),
-                    run_id: p["run_id"].as_str().unwrap_or_default().to_string(),
-                }),
+                producer: Some(producer.clone()),
                 ..Default::default()
             })),
             ..Default::default()
         };
+        let expected = case["withdraws"].as_bool().unwrap();
         assert_eq!(
             withdraws(&supersession, &record),
-            case["withdraws"].as_bool().unwrap(),
+            expected,
             "{}",
             text(case, "name")
         );
+        // The static method that lang calls for Records of an earlier read applies the same rule.
+        let request = WithdrawsRequest {
+            supersession: Some(supersession),
+            producer: Some(producer),
+        };
+        let output = call_static("Withdraws", &request.encode_to_vec()).unwrap();
+        let answer = WithdrawsResponse::decode(output.as_slice()).unwrap();
+        assert_eq!(answer.withdraws, expected, "{}", text(case, "name"));
     }
 }
 

@@ -1,12 +1,14 @@
 //! The static calls, which need no runtime object and no Store. These are the Producer of an
-//! Activity attempt and the scoped Stream id. So every SDK derives them by one rule.
+//! Activity attempt, the scoped Stream id and the withdrawal rule. So every SDK applies one rule.
 
 use crate::{
-    Reason, StreamError, StreamResult, ids,
+    Reason, StreamError, StreamResult,
+    epoch::withdraws_producer,
+    ids,
     proto::{
         ActivityContext, DeriveProducerRequest, DeriveProducerResponse, Producer, ProducerEpoch,
         ProducerPurpose, ScopedStreamIdRequest, ScopedStreamIdResponse, StreamProducerKind,
-        WorkflowTaskEpoch,
+        WithdrawsRequest, WithdrawsResponse, WorkflowTaskEpoch,
     },
     runtime::decode,
 };
@@ -17,6 +19,18 @@ use prost::Message;
 pub fn call_static(method: &str, input: &[u8]) -> StreamResult<Vec<u8>> {
     match method {
         "DeriveProducer" => Ok(derive_producer(decode(input)?)?.encode_to_vec()),
+        "Withdraws" => {
+            let request = decode::<WithdrawsRequest>(input)?;
+            let supersession = request
+                .supersession
+                .ok_or_else(|| StreamError::invalid("The request has no Superseded item"))?;
+            Ok(WithdrawsResponse {
+                withdraws: request
+                    .producer
+                    .is_some_and(|producer| withdraws_producer(&supersession, &producer)),
+            }
+            .encode_to_vec())
+        }
         "ScopedStreamId" => {
             let request = decode::<ScopedStreamIdRequest>(input)?;
             Ok(ScopedStreamIdResponse {
@@ -37,7 +51,7 @@ pub fn call_static(method: &str, input: &[u8]) -> StreamResult<Vec<u8>> {
 
 /// Whether [call_static] runs the method.
 pub(crate) fn is_static(method: &str) -> bool {
-    matches!(method, "DeriveProducer" | "ScopedStreamId")
+    matches!(method, "DeriveProducer" | "ScopedStreamId" | "Withdraws")
 }
 
 /// The Producer of an Activity attempt, from the facts that lang copies from its Activity info. A

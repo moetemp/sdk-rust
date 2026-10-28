@@ -7,10 +7,12 @@ use crate::{
     proto::{
         AppendRecordsRequest, CloseScopeRequest, CloseStreamRequest, CloseWriterRequest,
         CloseWriterResponse, CloseWritersRequest, CloseWritersResponse, DescribeStreamRequest,
-        FreeResponse, FreeScopeRequest, FreeWriterRequest, FreeWriterResponse, MemoryStreamConfig,
-        OpenWriterRequest, OpenWriterResponse, ReadRecordsRequest, ShutdownRequest,
-        WorkflowAppendRequest, WriteRecordsRequest, WriteRecordsResponse,
+        FreeReaderRequest, FreeResponse, FreeScopeRequest, FreeWriterRequest, FreeWriterResponse,
+        MemoryStreamConfig, OpenReaderResponse, OpenWriterRequest, OpenWriterResponse,
+        ReadRecordsRequest, ShutdownRequest, WorkflowAppendRequest, WriteRecordsRequest,
+        WriteRecordsResponse,
     },
+    reader::Readers,
     scope::Scopes,
     service::StreamService,
     store::{DEFAULT_RETENTION, DEFAULT_SAFETY_TTL, Store},
@@ -59,6 +61,7 @@ pub(crate) struct Shared {
     pub(crate) writers: Writers,
     pub(crate) scopes: Scopes,
     pub(crate) pending: Pending,
+    pub(crate) readers: Readers,
     shut_down: AtomicBool,
     /// Set when a `Shutdown` ends every scope and writer. Then the `Free` methods do nothing.
     finished: AtomicBool,
@@ -134,6 +137,7 @@ impl StreamRuntime {
             writers: Writers::default(),
             scopes: Scopes::default(),
             pending: Pending::default(),
+            readers: Readers::default(),
             shut_down: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         });
@@ -268,9 +272,11 @@ impl StreamRuntime {
                 .await?
                 .encode_to_vec(),
             "WorkflowClose" => shared.workflow_close(decode(input)?).await?.encode_to_vec(),
+            "ReadNext" => shared.read_next(decode(input)?).await?.encode_to_vec(),
             "Shutdown" => {
                 decode::<ShutdownRequest>(input)?;
                 shared.shut_down.store(true, Ordering::SeqCst);
+                shared.readers.clear();
                 let closed = shared.close_everything().await;
                 shared.finished.store(true, Ordering::SeqCst);
                 closed.encode_to_vec()
@@ -310,6 +316,15 @@ impl StreamRuntime {
             "WorkflowAppendPending" => Ok(shared
                 .workflow_append_pending(&decode::<WorkflowAppendRequest>(input)?)?
                 .encode_to_vec()),
+            "OpenReader" => {
+                let reader_id = shared.open_reader(decode(input)?)?;
+                Ok(OpenReaderResponse { reader_id }.encode_to_vec())
+            }
+            "FreeReader" => {
+                let request = decode::<FreeReaderRequest>(input)?;
+                shared.readers.free(request.reader_id)?;
+                Ok(FreeResponse {}.encode_to_vec())
+            }
             "FreeScope" => {
                 let request = decode::<FreeScopeRequest>(input)?;
                 shared.free_scope(request.scope_id)?;
