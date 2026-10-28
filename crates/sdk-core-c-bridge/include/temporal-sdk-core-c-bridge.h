@@ -113,6 +113,11 @@ typedef struct TemporalCoreRuntime TemporalCoreRuntime;
 
 typedef struct TemporalCoreSlotReserveCompletionCtx TemporalCoreSlotReserveCompletionCtx;
 
+/**
+ * The Stream runtime of one backend. Free it with `temporal_core_stream_runtime_free`.
+ */
+typedef struct TemporalCoreStreamRuntime TemporalCoreStreamRuntime;
+
 typedef struct TemporalCoreWorker TemporalCoreWorker;
 
 typedef struct TemporalCoreWorkerReplayPusher TemporalCoreWorkerReplayPusher;
@@ -569,6 +574,35 @@ typedef struct TemporalCoreRuntimeOptions {
    */
   bool disable_environment_info;
 } TemporalCoreRuntimeOptions;
+
+/**
+ * If `fail` is set, `runtime` is null, and the caller frees `fail`.
+ */
+typedef struct TemporalCoreStreamRuntimeOrFail {
+  struct TemporalCoreStreamRuntime *runtime;
+  const struct TemporalCoreByteArray *fail;
+} TemporalCoreStreamRuntimeOrFail;
+
+/**
+ * The callback of an asynchronous call, with the fields of `StreamCallResult`. It runs on a Tokio
+ * thread, or at once in a build with no `streams` feature.
+ */
+typedef void (*TemporalCoreStreamCallCallback)(void *user_data,
+                                               const struct TemporalCoreByteArray *success,
+                                               uint32_t status_code,
+                                               const struct TemporalCoreByteArray *failure_message,
+                                               const struct TemporalCoreByteArray *failure_details);
+
+/**
+ * On failure, `status_code` is the gRPC code, and `failure_details` is the encoded
+ * `StreamErrorDetails`, which a cancel (code 1) doesn't set. The caller frees each array.
+ */
+typedef struct TemporalCoreStreamCallResult {
+  const struct TemporalCoreByteArray *success;
+  uint32_t status_code;
+  const struct TemporalCoreByteArray *failure_message;
+  const struct TemporalCoreByteArray *failure_details;
+} TemporalCoreStreamCallResult;
 
 typedef struct TemporalCoreTestServerOptions {
   /**
@@ -1100,6 +1134,44 @@ struct TemporalCoreByteArrayRef temporal_core_forwarded_log_message(const struct
 uint64_t temporal_core_forwarded_log_timestamp_millis(const struct TemporalCoreForwardedLog *log);
 
 struct TemporalCoreByteArrayRef temporal_core_forwarded_log_fields_json(const struct TemporalCoreForwardedLog *log);
+
+/**
+ * Builds the Stream runtime of `kind`, `memory` or `redis`, from its encoded config. A build with
+ * no `streams` feature has no kind, and one with no `streams-redis` has no `redis`.
+ */
+struct TemporalCoreStreamRuntimeOrFail temporal_core_stream_runtime_new(struct TemporalCoreRuntime *runtime,
+                                                                        struct TemporalCoreByteArrayRef kind,
+                                                                        struct TemporalCoreByteArrayRef config);
+
+/**
+ * The Stream runtime holds the runtime, so either can be freed first. Free neither from inside
+ * a callback, since a Tokio thread can't drop the last Core runtime.
+ */
+void temporal_core_stream_runtime_free(struct TemporalCoreStreamRuntime *runtime);
+
+/**
+ * Runs a method on Core's Tokio runtime and calls `callback` with the result. The call copies the
+ * method and the input, so only the user data must live until the callback.
+ */
+void temporal_core_stream_call(struct TemporalCoreStreamRuntime *runtime,
+                               struct TemporalCoreByteArrayRef method,
+                               struct TemporalCoreByteArrayRef input,
+                               const struct TemporalCoreCancellationToken *cancel,
+                               void *user_data,
+                               TemporalCoreStreamCallCallback callback);
+
+/**
+ * Runs a method that never waits, such as a `Free` method, on the caller's thread.
+ */
+struct TemporalCoreStreamCallResult temporal_core_stream_call_sync(struct TemporalCoreStreamRuntime *runtime,
+                                                                   struct TemporalCoreByteArrayRef method,
+                                                                   struct TemporalCoreByteArrayRef input);
+
+/**
+ * Runs a static method, such as `DeriveProducer`, which needs no Stream runtime.
+ */
+struct TemporalCoreStreamCallResult temporal_core_stream_call_static(struct TemporalCoreByteArrayRef method,
+                                                                     struct TemporalCoreByteArrayRef input);
 
 /**
  * Runtime must live as long as server. Options and user data must live through

@@ -45,6 +45,16 @@ unreachable_pub = "warn"
 [workspace.lints.clippy]
 dbg_macro = "warn"
 
+# `temporalio-streams-redis` isn't on crates.io yet, so the C bridge's optional dependency on it
+# comes from git. Its own dependencies on the Stream and common crates take this workspace's copies.
+[patch.crates-io]
+temporalio-common = { path = "crates/common" }
+temporalio-streams = { path = "crates/streams" }
+
+[patch.crates-io.temporalio-streams-redis]
+git = "https://github.com/temporal-community/sdk-streams"
+rev = "21cc10b3372a84b5c0f3c669a28a20c335214879"
+
 [profile.release-lto]
 inherits = "release"
 lto = true
