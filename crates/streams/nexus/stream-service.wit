@@ -30,7 +30,7 @@ interface stream-service {
   /// @nexus.doc "Identifies one Stream. The id is opaque to callers."
   /// @nexus.proto "temporal.api.stream.v1.StreamRef"
   record stream-ref {
-    /// @nexus.doc "The Stream id. 1 to 4096 bytes after encoding."
+    /// @nexus.doc "The Stream id, 1 to 4096 bytes."
     id: string,
     /// @nexus.doc "The owning Workflow run chain or Standalone Activity. Empty on a client ref."
     owner: option<execution>,
@@ -172,9 +172,8 @@ interface stream-service {
     close(stream-close),
   }
 
-  // An offset is the Redis entry id packed as ms << 20 | seq. It is ordered and unique in one
-  // Stream, and sparse. Offsets have gaps, so they don't count Records. A read names its Stream, so
-  // the read checks the offset against that Stream.
+  // An offset is ordered and unique in one Stream, and sparse. Offsets have gaps, so they don't
+  // count Records. A read names its Stream, so the read checks the offset against that Stream.
   /// @nexus.doc "One item that a read gives."
   /// @nexus.proto "temporal.api.stream.v1.StreamRecord"
   record stream-record {
@@ -183,10 +182,11 @@ interface stream-service {
     offset: option<s64>,
   }
 
-  /// @nexus.doc "Create a Stream, or get the one that exists, which keeps its Retention."
+  /// @nexus.doc
+  ///   "Create a Stream, or get the open one. A closed, expired or another owner's Stream fails."
   /// @nexus.proto "temporal.api.streamservice.v1.CreateStreamRequest"
   record create-stream-request {
-    /// @nexus.doc "Required on Redis and memory. On native, empty asks the server for an id."
+    /// @nexus.doc "The Stream id. Required, and never empty."
     stream-id: string,
     /// @nexus.doc "The age after which a Record is dropped. Empty is the Store default."
     retention: option<duration>,
@@ -194,7 +194,7 @@ interface stream-service {
     withdraw-run: option<string>,
     /// @nexus.doc "The Workflow run that owns the Stream. The Workflow transport sets it."
     owner: option<producer>,
-    /// @nexus.doc "The Stream's ref, with the owner fields."
+    /// @nexus.doc "The ref, whose id is stream-id. A create with an owner needs the ref's owner."
     %ref: option<stream-ref>,
     // Native only. Brook's Stores don't read it.
     /// @nexus.omit
@@ -284,11 +284,11 @@ interface stream-service {
   /// @nexus.proto "temporal.api.streamservice.v1.ReadRecordsRequest"
   record read-records-request {
     %stream: stream-ref,
-    /// @nexus.doc "Start offset. Empty uses start. INVALID_ARGUMENT past the newest offset + 1."
+    /// @nexus.doc "Start offset. Empty uses start. OUT_OF_RANGE past the newest offset + 1."
     from-offset: option<s64>,
     /// @nexus.doc "Where to start when from-offset is empty. Unspecified is the beginning."
     start: option<stream-read-start>,
-    /// @nexus.doc "At most this many Records. 1 to 1000."
+    /// @nexus.doc "At most this many items, Superseded items included. 1 to 1000."
     max-records: option<s32>,
     /// @nexus.doc "How long to wait for a new Record before an empty answer. At most 60 s."
     wait: option<duration>,
@@ -331,16 +331,16 @@ interface stream-service {
   /// @nexus.proto "temporal.api.streamservice.v1.DescribeStreamResponse"
   record describe-stream-response {
     status: option<stream-status>,
-    /// @nexus.doc "The offset of the newest Record. Empty when the Stream has no Record."
+    /// @nexus.doc "The newest offset, of a Record, a Superseded item or the close. Empty for none."
     last-offset: option<s64>,
     retention: option<duration>,
   }
 
   // A handle never changes, since offsets are values that its methods return. Only a create's
-  // response sets created and status, so a handle built from a ref has neither.
+  // response sets created, so a handle built from a ref has none.
   /// @nexus.doc "A handle on one Stream. Build it from a stream-ref, or get it from a create."
   resource %stream {
-    constructor(%stream: stream-ref, created: option<bool>, status: option<stream-status>);
+    constructor(%stream: stream-ref, created: option<bool>);
 
     /// @nexus.doc "Publish Records. The answer has the first and the last offset."
     /// @nexus.operation "append-records"
@@ -372,6 +372,8 @@ interface stream-service {
       max-records: option<s32>,
       wait: option<duration>,
       create-wait: option<duration>,
+      last: option<s32>,
+      max-bytes: option<s64>,
     ) -> read-records-response;
 
     /// @nexus.doc "Describe the Stream's status, newest offset and Retention."
@@ -379,8 +381,7 @@ interface stream-service {
     describe: func() -> describe-stream-response;
   }
 
-  // created is false when the Stream existed, whatever its Retention. status is closed when an
-  // earlier create and close used the id.
+  // created is false when the Stream existed, whatever its Retention.
   /// @nexus.proto "temporal.api.streamservice.v1.CreateStreamResponse"
   type create-stream-result = own<%stream>;
 
