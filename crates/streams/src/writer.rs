@@ -29,6 +29,7 @@ use tokio::time::Instant;
 
 const DEFAULT_BATCH: usize = 1000;
 const DEFAULT_RETRY: Duration = Duration::from_secs(10);
+const LONGEST_RETRY: Duration = Duration::from_secs(24 * 60 * 60);
 const FIRST_BACKOFF: Duration = Duration::from_millis(50);
 
 /// The last `sequence` of any batch in this process. Every writer numbers its batches from it, so
@@ -182,7 +183,27 @@ type WriterKey = (String, String, String, String);
 struct Open {
     writer: Arc<Writer>,
     key: WriterKey,
-    handles: usize,
+    /// The handles of each holder. Lang's `CloseWriters` releases lang's only.
+    lang: usize,
+    scoped: usize,
+}
+
+impl Open {
+    fn handles(&mut self, holder: Holder) -> &mut usize {
+        match holder {
+            Holder::Lang => &mut self.lang,
+            Holder::Scope => &mut self.scoped,
+        }
+    }
+}
+
+/// Who holds a handle of a writer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Holder {
+    /// Lang, through `OpenWriter`.
+    Lang,
+    /// A Producer scope.
+    Scope,
 }
 
 #[derive(Default)]
@@ -193,20 +214,30 @@ struct Table {
 }
 
 impl Table {
-    /// Releases one handle of a writer, or every handle with `all`. Returns the writer when it has
-    /// no handle left, so that the caller ends it.
-    fn release(&mut self, id: u64, all: bool) -> StreamResult<Option<Arc<Writer>>> {
-        let open = self
-            .open
-            .get_mut(&id)
-            .ok_or_else(|| StreamError::new(Reason::UnknownWriter, format!("No writer {id}")))?;
-        open.handles -= 1;
-        if open.handles > 0 && !all {
+    /// Releases one handle of a writer. Returns the writer when it has no handle left, so that the
+    /// caller ends it.
+    fn release(&mut self, id: u64, holder: Holder) -> StreamResult<Option<Arc<Writer>>> {
+        let unknown = || StreamError::new(Reason::UnknownWriter, format!("No writer {id}"));
+        let open = self.open.get_mut(&id).ok_or_else(unknown)?;
+        // A holder with no handle left, such as lang after `CloseWriters`, takes none of another.
+        let handles = open.handles(holder);
+        *handles = handles.checked_sub(1).ok_or_else(unknown)?;
+        if open.lang + open.scoped > 0 {
             return Ok(None);
         }
-        let open = self.open.remove(&id).expect("found above");
+        Ok(Some(self.remove(id)))
+    }
+
+    fn add_handle(&mut self, key: &WriterKey, holder: Holder) -> Option<u64> {
+        let id = self.by_producer.get(key).copied()?;
+        *self.open.get_mut(&id).expect("indexed").handles(holder) += 1;
+        Some(id)
+    }
+
+    fn remove(&mut self, id: u64) -> Arc<Writer> {
+        let open = self.open.remove(&id).expect("found by the caller");
         self.by_producer.remove(&open.key);
-        Ok(Some(open.writer))
+        open.writer
     }
 }
 
@@ -226,6 +257,7 @@ impl Writers {
         &self,
         service: &Arc<StreamService>,
         request: OpenWriterRequest,
+        holder: Holder,
     ) -> StreamResult<u64> {
         let stream = request
             .stream
@@ -245,7 +277,7 @@ impl Writers {
             producer.id.clone(),
             crate::epoch::epoch_key(&epoch),
         );
-        if let Some(id) = self.share(&key) {
+        if let Some(id) = self.share(&key, holder) {
             return Ok(id);
         }
         let writer = Arc::new(Writer {
@@ -258,7 +290,9 @@ impl Writers {
                 n if n > 0 => n as usize,
                 _ => DEFAULT_BATCH,
             },
-            max_retry: duration(request.max_retry_duration).unwrap_or(DEFAULT_RETRY),
+            // A retry of more than a day counts as a day, so that `Instant` math can't overflow.
+            max_retry: (duration(request.max_retry_duration).unwrap_or(DEFAULT_RETRY))
+                .min(LONGEST_RETRY),
             service: service.clone(),
             state: Mutex::default(),
             writing: tokio::sync::Mutex::new(()),
@@ -286,8 +320,7 @@ impl Writers {
             }
         }
         let mut table = self.table.lock();
-        if let Some(id) = table.by_producer.get(&key).copied() {
-            table.open.get_mut(&id).expect("indexed").handles += 1;
+        if let Some(id) = table.add_handle(&key, holder) {
             return Ok(id);
         }
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
@@ -297,18 +330,21 @@ impl Writers {
             Open {
                 writer,
                 key,
-                handles: 1,
+                lang: usize::from(holder == Holder::Lang),
+                scoped: usize::from(holder == Holder::Scope),
             },
         );
         Ok(id)
     }
 
+    #[cfg(test)]
+    pub(crate) fn open_count(&self) -> usize {
+        self.table.lock().open.len()
+    }
+
     /// Adds a handle to the open writer of `key`, if there is one.
-    fn share(&self, key: &WriterKey) -> Option<u64> {
-        let mut table = self.table.lock();
-        let id = table.by_producer.get(key).copied()?;
-        table.open.get_mut(&id).expect("indexed").handles += 1;
-        Some(id)
+    fn share(&self, key: &WriterKey, holder: Holder) -> Option<u64> {
+        self.table.lock().add_handle(key, holder)
     }
 
     fn get(&self, id: u64) -> StreamResult<Arc<Writer>> {
@@ -344,15 +380,27 @@ impl Writers {
         writer.write(records).await
     }
 
-    /// Closes every open writer, whatever its handles. Returns how many had failed.
+    /// Releases every handle that lang holds, and ends each writer with no handle left. Returns
+    /// how many of those had failed. Scopes release their own handles when they end.
     pub(crate) async fn close_all(&self) -> usize {
-        let ids: Vec<u64> = self.table.lock().open.keys().copied().collect();
+        let ended: Vec<Arc<Writer>> = {
+            let mut table = self.table.lock();
+            let ids: Vec<u64> = table.open.keys().copied().collect();
+            let mut ended = vec![];
+            for id in ids {
+                let open = table.open.get_mut(&id).expect("listed");
+                open.lang = 0;
+                if open.scoped == 0 {
+                    let writer = table.remove(id);
+                    // Closed at once, so a dropped call still ends every writer it took.
+                    writer.state.lock().closed = true;
+                    ended.push(writer);
+                }
+            }
+            ended
+        };
         let mut failed = 0;
-        for id in ids {
-            let released = self.table.lock().release(id, true);
-            let Ok(Some(writer)) = released else {
-                continue;
-            };
+        for writer in ended {
             if end(&writer).await.is_err() {
                 failed += 1;
             }
@@ -362,9 +410,9 @@ impl Writers {
 
     /// Releases one handle. The last one waits for a write in flight, then drops the writer.
     /// Returns its last offset, or the error it failed with.
-    pub(crate) async fn close(&self, id: u64) -> StreamResult<i64> {
+    pub(crate) async fn close(&self, id: u64, holder: Holder) -> StreamResult<i64> {
         let writer = self.get(id)?;
-        if self.table.lock().release(id, false)?.is_none() {
+        if self.table.lock().release(id, holder)?.is_none() {
             let state = writer.state.lock();
             return match &state.failed {
                 Some(error) => Err(error.clone()),
@@ -376,8 +424,8 @@ impl Writers {
 
     /// Releases one handle with no wait, for a handle that lang drops. A write in flight still
     /// completes, and a write that waits behind it is refused once no handle is left.
-    pub(crate) fn free(&self, id: u64) -> StreamResult<()> {
-        if let Some(writer) = self.table.lock().release(id, false)? {
+    pub(crate) fn free(&self, id: u64, holder: Holder) -> StreamResult<()> {
+        if let Some(writer) = self.table.lock().release(id, holder)? {
             writer.state.lock().closed = true;
         }
         Ok(())

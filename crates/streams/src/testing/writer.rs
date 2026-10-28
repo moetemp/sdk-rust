@@ -4,10 +4,10 @@
 
 use super::{
     case,
-    support::{Needs, stores_for},
+    support::{Flaky, Needs, stores_for},
 };
 use crate::{
-    MemoryStreamRuntime, StreamError, StreamResult, StreamRuntime,
+    MemoryStreamRuntime, StreamError, StreamRuntime,
     epoch::withdraws,
     ids::{
         activity_producer_id, client_producer_id, local_activity_producer_id,
@@ -19,10 +19,6 @@ use crate::{
         ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse, StreamErrorDetails,
         StreamProducerKind, StreamRecord, StreamRef, WorkflowTaskEpoch, WriteRecordsRequest,
         WriteRecordsResponse, stream_record::Item,
-    },
-    store::{
-        Appended, Batch, Capabilities, Closed, Created, Entry, Owner, Store, StreamState,
-        Withdrawal,
     },
 };
 use prost::Message;
@@ -432,109 +428,6 @@ async fn closing_every_writer_drops_them_all() {
     }
 }
 
-/// A Store over another one, whose appends fail. It can write an append and lose its answer, as on
-/// a dropped connection, and it refuses every append while it is down.
-struct Flaky {
-    inner: Arc<dyn Store>,
-    lose_next: AtomicBool,
-    down: AtomicBool,
-}
-
-impl Flaky {
-    /// A Store that is up, over `inner`.
-    fn new(inner: Arc<dyn Store>) -> Self {
-        Self {
-            inner,
-            lose_next: AtomicBool::new(false),
-            down: AtomicBool::new(false),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl Store for Flaky {
-    fn capabilities(&self) -> Capabilities {
-        self.inner.capabilities()
-    }
-
-    fn default_retention(&self) -> Duration {
-        self.inner.default_retention()
-    }
-
-    async fn create(
-        &self,
-        namespace: &str,
-        stream: &StreamRef,
-        retention: Option<Duration>,
-        owner: Owner,
-        withdrawal: &Withdrawal<'_>,
-    ) -> StreamResult<Created> {
-        self.inner
-            .create(namespace, stream, retention, owner, withdrawal)
-            .await
-    }
-
-    async fn append(
-        &self,
-        namespace: &str,
-        stream: &StreamRef,
-        batch: &Batch<'_>,
-    ) -> StreamResult<Appended> {
-        if self.down.load(Ordering::SeqCst) {
-            return Err(StreamError::storage("the Store is down"));
-        }
-        let appended = self.inner.append(namespace, stream, batch).await?;
-        if self.lose_next.swap(false, Ordering::SeqCst) {
-            return Err(StreamError::storage("the answer was lost"));
-        }
-        Ok(appended)
-    }
-
-    async fn read(
-        &self,
-        namespace: &str,
-        stream_id: &str,
-        from: i64,
-        count: usize,
-    ) -> StreamResult<(StreamState, Vec<Entry>)> {
-        self.inner.read(namespace, stream_id, from, count).await
-    }
-
-    async fn wait_after(
-        &self,
-        namespace: &str,
-        stream_id: &str,
-        after: i64,
-        deadline: tokio::time::Instant,
-    ) -> StreamResult<bool> {
-        self.inner
-            .wait_after(namespace, stream_id, after, deadline)
-            .await
-    }
-
-    async fn close(
-        &self,
-        namespace: &str,
-        stream: &StreamRef,
-        producer: &Producer,
-        record: &[u8],
-    ) -> StreamResult<Closed> {
-        self.inner.close(namespace, stream, producer, record).await
-    }
-
-    async fn read_back(
-        &self,
-        namespace: &str,
-        stream_id: &str,
-        before: i64,
-        count: usize,
-    ) -> StreamResult<Vec<Entry>> {
-        self.inner
-            .read_back(namespace, stream_id, before, count)
-            .await
-    }
-}
-
 /// A case on each backend under test, on a [Flaky] Store over the backend's Store, with its Stream
 /// created.
 async fn flaky_cases(lose_next: bool) -> Vec<(Arc<Flaky>, Case)> {
@@ -663,6 +556,20 @@ async fn a_local_activity_writer_withdraws_the_records_of_a_failed_task() {
     }
 }
 
+/// A huge retry duration counts as a day, so that the retry math doesn't overflow.
+async fn a_huge_retry_duration_doesnt_overflow() {
+    for case in cases().await {
+        let huge = Some(prost_types::Duration {
+            seconds: i64::MAX,
+            nanos: 0,
+        });
+        let writer = case
+            .open(activity(2), |r| r.max_retry_duration = huge)
+            .await;
+        case.write(writer, &["a"]).await.unwrap();
+    }
+}
+
 /// The cases of the suite, in file order.
 pub const CASES: &[super::Case] = &[
     case!(a_write_is_in_the_store_when_it_answers_its_offsets),
@@ -680,4 +587,5 @@ pub const CASES: &[super::Case] = &[
     case!(a_writer_writes_again_after_a_store_outage),
     case!(a_write_that_waits_behind_a_close_is_refused),
     case!(a_local_activity_writer_withdraws_the_records_of_a_failed_task),
+    case!(a_huge_retry_duration_doesnt_overflow),
 ];

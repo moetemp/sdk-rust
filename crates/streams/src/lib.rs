@@ -16,6 +16,7 @@ pub mod offset;
 pub mod protos;
 mod record;
 mod runtime;
+mod scope;
 mod sdk;
 mod service;
 pub mod store;

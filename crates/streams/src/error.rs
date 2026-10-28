@@ -1,6 +1,6 @@
 //! The error of every failed call, and its form for lang.
 
-use crate::proto::{StreamErrorDetails, StreamErrorReason};
+use crate::proto::{StreamErrorDetails, StreamErrorReason, StreamFailure};
 use prost::Message;
 use tonic::Code;
 
@@ -38,9 +38,10 @@ pub enum Reason {
     Invalid,
     /// The Store failed or did not answer.
     Storage,
-    /// No writer has the id.
+    /// No writer has the id. A scope, reader or buffer id that the runtime doesn't have gives it
+    /// too.
     UnknownWriter,
-    /// The Store lacks a capability that the call needs.
+    /// The Store lacks a capability that the call needs, or the runtime shut down.
     Unsupported,
 }
 
@@ -145,6 +146,14 @@ impl StreamError {
             reason: self.reason.proto() as i32,
         }
         .encode_to_vec()
+    }
+
+    /// The error as a response reports it, when a failed write doesn't fail the call.
+    pub fn failure(&self) -> StreamFailure {
+        StreamFailure {
+            reason: self.reason.proto() as i32,
+            message: self.message.clone(),
+        }
     }
 }
 

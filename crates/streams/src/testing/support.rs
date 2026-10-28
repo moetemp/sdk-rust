@@ -5,7 +5,7 @@
 
 use super::{RawKeys, backends};
 use crate::{
-    StreamResult, StreamRuntime,
+    StreamError, StreamResult, StreamRuntime,
     digest::batch_digest,
     epoch::withdraws,
     ids::local_activity_producer_id,
@@ -13,13 +13,19 @@ use crate::{
         AppendRecord, Producer, ProducerEpoch, StreamClose, StreamData, StreamProducerKind,
         StreamRecord, StreamRef, Supersession, stream_record::Item,
     },
-    store::{Appended, Batch, Closed, Entry, Owner, Store, Withdrawal},
+    store::{
+        Appended, Batch, Capabilities, Closed, Created, Entry, Owner, Store, StreamState,
+        Withdrawal,
+    },
 };
 use prost::Message;
 use prost_types::Timestamp;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 use temporalio_common::protos::temporal::api::{common::v1::Execution, enums::v1::ExecutionType};
 
@@ -399,4 +405,113 @@ pub(crate) fn named_runtimes(backend: &str) -> Vec<Arc<StreamRuntime>> {
         .into_iter()
         .map(|test_backend| test_backend.runtime(backend))
         .collect()
+}
+
+/// A Store over another one, whose appends fail. It can write an append and lose its answer, as on
+/// a dropped connection, and it refuses every append while it is down.
+pub(crate) struct Flaky {
+    pub(crate) inner: Arc<dyn Store>,
+    pub(crate) lose_next: AtomicBool,
+    pub(crate) down: AtomicBool,
+    /// The appends that it takes before it goes down. Below zero is never.
+    pub(crate) down_after: AtomicI64,
+}
+
+impl Flaky {
+    /// A Store that is up, over `inner`.
+    pub(crate) fn new(inner: Arc<dyn Store>) -> Self {
+        Self {
+            inner,
+            lose_next: AtomicBool::new(false),
+            down: AtomicBool::new(false),
+            down_after: AtomicI64::new(-1),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Store for Flaky {
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn default_retention(&self) -> Duration {
+        self.inner.default_retention()
+    }
+
+    async fn create(
+        &self,
+        namespace: &str,
+        stream: &StreamRef,
+        retention: Option<Duration>,
+        owner: Owner,
+        withdrawal: &Withdrawal<'_>,
+    ) -> StreamResult<Created> {
+        self.inner
+            .create(namespace, stream, retention, owner, withdrawal)
+            .await
+    }
+
+    async fn append(
+        &self,
+        namespace: &str,
+        stream: &StreamRef,
+        batch: &Batch<'_>,
+    ) -> StreamResult<Appended> {
+        if self.down_after.fetch_sub(1, Ordering::SeqCst) == 0 {
+            self.down.store(true, Ordering::SeqCst);
+        }
+        if self.down.load(Ordering::SeqCst) {
+            return Err(StreamError::storage("the Store is down"));
+        }
+        let appended = self.inner.append(namespace, stream, batch).await?;
+        if self.lose_next.swap(false, Ordering::SeqCst) {
+            return Err(StreamError::storage("the answer was lost"));
+        }
+        Ok(appended)
+    }
+
+    async fn read(
+        &self,
+        namespace: &str,
+        stream_id: &str,
+        from: i64,
+        count: usize,
+    ) -> StreamResult<(StreamState, Vec<Entry>)> {
+        self.inner.read(namespace, stream_id, from, count).await
+    }
+
+    async fn wait_after(
+        &self,
+        namespace: &str,
+        stream_id: &str,
+        after: i64,
+        deadline: tokio::time::Instant,
+    ) -> StreamResult<bool> {
+        self.inner
+            .wait_after(namespace, stream_id, after, deadline)
+            .await
+    }
+
+    async fn close(
+        &self,
+        namespace: &str,
+        stream: &StreamRef,
+        producer: &Producer,
+        record: &[u8],
+    ) -> StreamResult<Closed> {
+        self.inner.close(namespace, stream, producer, record).await
+    }
+
+    async fn read_back(
+        &self,
+        namespace: &str,
+        stream_id: &str,
+        before: i64,
+        count: usize,
+    ) -> StreamResult<Vec<Entry>> {
+        self.inner
+            .read_back(namespace, stream_id, before, count)
+            .await
+    }
 }

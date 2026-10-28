@@ -35,6 +35,11 @@ pub fn call_static(method: &str, input: &[u8]) -> StreamResult<Vec<u8>> {
     }
 }
 
+/// Whether [call_static] runs the method.
+pub(crate) fn is_static(method: &str) -> bool {
+    matches!(method, "DeriveProducer" | "ScopedStreamId")
+}
+
 /// The Producer of an Activity attempt, from the facts that lang copies from its Activity info. A
 /// Workflow write keeps attempt 1, so the attempts in one Workflow Task resend one batch.
 pub fn derive_producer(request: DeriveProducerRequest) -> StreamResult<DeriveProducerResponse> {

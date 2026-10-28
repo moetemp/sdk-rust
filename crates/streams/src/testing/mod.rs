@@ -1,8 +1,9 @@
 //! The shared suites of the Stream rules. Each Store crate runs them on its own backends, so that
 //! every Store keeps the same rules. This crate runs them on the memory Store.
 
-mod support;
+pub(crate) mod support;
 
+pub mod scope;
 pub mod service;
 pub mod store;
 pub mod writer;
@@ -157,5 +158,10 @@ mod tests {
     #[tokio::test]
     async fn the_writer_suite_passes_on_the_memory_store() {
         run(vec![Arc::new(MemoryBackend)], writer::CASES).await;
+    }
+
+    #[tokio::test]
+    async fn the_scope_suite_passes_on_the_memory_store() {
+        run(vec![Arc::new(MemoryBackend)], scope::CASES).await;
     }
 }

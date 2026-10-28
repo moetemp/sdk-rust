@@ -6,7 +6,9 @@ package temporal.sdk.streams.v1;
 
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
+import "temporal/api/enums/v1/stream.proto";
 import "temporal/api/stream/v1/message.proto";
+import "temporal/api/streamservice/v1/request_response.proto";
 
 // The settings of the memory Stream runtime, for tests. Each field has the number of the same
 // field in the config of the other Stores, such as Redis, so a backend can send that config here
@@ -159,4 +161,90 @@ message ScopedStreamIdRequest {
 
 message ScopedStreamIdResponse {
     string id = 1;
+}
+
+// Method `OpenActivityScope`, asynchronous. Opens the scope of one Activity attempt, which writes
+// as the Producer of `DeriveProducer`, with one writer for each Stream. `CloseScope` ends it.
+message OpenActivityScopeRequest {
+    string namespace = 1;
+    ActivityContext context = 2;
+    // The Streams in the attempt's arguments. From attempt 2, the open withdraws the earlier
+    // attempts' Records on each. A missing, closed or expired Stream doesn't fail it.
+    repeated temporal.api.stream.v1.StreamRef streams = 3;
+}
+
+// Method `OpenClientScope`, synchronous. Opens the scope of the client Producer `client:<name>` at
+// `epoch`, or with no name `client:<identity>:<key>` at epoch 1, with a new key for each scope.
+message OpenClientScopeRequest {
+    string namespace = 1;
+    string identity = 2;
+    string name = 3;
+    // 1 or more, with a name only.
+    int32 epoch = 4;
+}
+
+message OpenScopeResponse {
+    uint64 scope_id = 1;
+    temporal.api.stream.v1.Producer producer = 2;
+}
+
+// Method `Publish`, asynchronous. Appends Records as the scope's Producer and answers when the
+// Store has them. The first publish to a Stream opens the scope's writer, as `OpenWriter` does.
+message PublishRequest {
+    uint64 scope_id = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // The bodies are in their stored form, after lang's converter and codec.
+    repeated temporal.api.stream.v1.AppendRecord records = 3;
+}
+
+message PublishResponse {
+    // The offsets of the first and the last Record. Zero when the request has no Record.
+    int64 first_offset = 1;
+    int64 last_offset = 2;
+}
+
+// Method `CloseStreamAs`, asynchronous, with `CloseStreamResponse`. Closes the scope's writer for
+// the Stream, then the Stream, as the scope's Producer. An Activity scope fails with NOT_OWNER.
+message CloseStreamAsRequest {
+    uint64 scope_id = 1;
+    // The runtime sets `namespace` and `producer` from the scope. Payloads are in their stored
+    // form.
+    temporal.api.streamservice.v1.CloseStreamRequest close = 2;
+}
+
+// Method `CloseScope`, asynchronous. Closes every writer of the scope and frees it. A failed
+// writer doesn't fail the call. The response counts it instead.
+message CloseScopeRequest {
+    uint64 scope_id = 1;
+}
+
+message CloseScopeResponse {
+    int32 failed_writers = 1;
+    // The first failure, if any.
+    StreamFailure failure = 2;
+}
+
+// A failure that a response reports, as lang raises it from a failed call.
+message StreamFailure {
+    temporal.api.enums.v1.StreamErrorReason reason = 1;
+    string message = 2;
+}
+
+// Method `FreeScope`, synchronous. Frees the scope and releases its writers with no wait, such as
+// from a finalizer. A write in flight still completes.
+message FreeScopeRequest {
+    uint64 scope_id = 1;
+}
+
+// The response of `FreeScope` and the other `Free` methods, which do nothing once a shutdown ended.
+message FreeResponse {
+}
+
+// Method `Shutdown`, asynchronous. Closes every scope and writer, for the backend's shutdown. Then
+// only `Shutdown`, the static and the `Free` methods run. A dropped one runs again.
+message ShutdownRequest {
+}
+
+message ShutdownResponse {
+    int32 failed_writers = 1;
 }
