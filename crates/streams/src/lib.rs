@@ -22,6 +22,7 @@ mod service;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
+mod workflow;
 mod writer;
 
 pub use error::{Reason, StreamError, StreamResult};

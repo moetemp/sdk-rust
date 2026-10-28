@@ -9,11 +9,12 @@ use crate::{
         CloseWriterResponse, CloseWritersRequest, CloseWritersResponse, DescribeStreamRequest,
         FreeResponse, FreeScopeRequest, FreeWriterRequest, FreeWriterResponse, MemoryStreamConfig,
         OpenWriterRequest, OpenWriterResponse, ReadRecordsRequest, ShutdownRequest,
-        WriteRecordsRequest, WriteRecordsResponse,
+        WorkflowAppendRequest, WriteRecordsRequest, WriteRecordsResponse,
     },
     scope::Scopes,
     service::StreamService,
     store::{DEFAULT_RETENTION, DEFAULT_SAFETY_TTL, Store},
+    workflow::Pending,
     writer::{Holder, Writers},
 };
 use prost::Message;
@@ -57,6 +58,7 @@ pub(crate) struct Shared {
     service: OnceCell<Arc<StreamService>>,
     pub(crate) writers: Writers,
     pub(crate) scopes: Scopes,
+    pub(crate) pending: Pending,
     shut_down: AtomicBool,
     /// Set when a `Shutdown` ends every scope and writer. Then the `Free` methods do nothing.
     finished: AtomicBool,
@@ -131,6 +133,7 @@ impl StreamRuntime {
             service: OnceCell::new(),
             writers: Writers::default(),
             scopes: Scopes::default(),
+            pending: Pending::default(),
             shut_down: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         });
@@ -260,6 +263,11 @@ impl StreamRuntime {
                 let request = decode::<CloseScopeRequest>(input)?;
                 shared.close_scope(request.scope_id).await?.encode_to_vec()
             }
+            "WorkflowAppend" => shared
+                .workflow_append(decode(input)?)
+                .await?
+                .encode_to_vec(),
+            "WorkflowClose" => shared.workflow_close(decode(input)?).await?.encode_to_vec(),
             "Shutdown" => {
                 decode::<ShutdownRequest>(input)?;
                 shared.shut_down.store(true, Ordering::SeqCst);
@@ -299,6 +307,9 @@ impl StreamRuntime {
                 Ok(FreeWriterResponse {}.encode_to_vec())
             }
             "OpenClientScope" => Ok(shared.open_client_scope(decode(input)?)?.encode_to_vec()),
+            "WorkflowAppendPending" => Ok(shared
+                .workflow_append_pending(&decode::<WorkflowAppendRequest>(input)?)?
+                .encode_to_vec()),
             "FreeScope" => {
                 let request = decode::<FreeScopeRequest>(input)?;
                 shared.free_scope(request.scope_id)?;

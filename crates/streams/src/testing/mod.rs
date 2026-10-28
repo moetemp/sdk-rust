@@ -6,6 +6,7 @@ pub(crate) mod support;
 pub mod scope;
 pub mod service;
 pub mod store;
+pub mod workflow;
 pub mod writer;
 
 pub use support::Needs;
@@ -163,5 +164,10 @@ mod tests {
     #[tokio::test]
     async fn the_scope_suite_passes_on_the_memory_store() {
         run(vec![Arc::new(MemoryBackend)], scope::CASES).await;
+    }
+
+    #[tokio::test]
+    async fn the_workflow_suite_passes_on_the_memory_store() {
+        run(vec![Arc::new(MemoryBackend)], workflow::CASES).await;
     }
 }

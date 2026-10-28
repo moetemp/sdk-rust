@@ -248,3 +248,47 @@ message ShutdownRequest {
 message ShutdownResponse {
     int32 failed_writers = 1;
 }
+
+// Method `WorkflowAppend`, asynchronous. The append Local Activity of Workflow code. The attempts
+// in one Workflow Task resend the batches that the runtime keeps, even after a random codec.
+message WorkflowAppendRequest {
+    string namespace = 1;
+    // The Local Activity's own context.
+    ActivityContext context = 2;
+    // The merged request, with bodies in their stored form. The runtime sets the Producer. No
+    // records resend the kept batches, or fail as STORAGE when the runtime has none.
+    temporal.api.streamservice.v1.AppendRecordsRequest append = 3;
+    // The Record count of each merged publish, in order. When the codec grew the Records past the
+    // Store's limits, each publish goes in a batch of its own.
+    repeated int32 counts = 4;
+}
+
+message WorkflowAppendResponse {
+    // One for each merged publish, in order.
+    repeated PublishOutcome outcomes = 1;
+}
+
+message PublishOutcome {
+    oneof outcome {
+        // The offset of the publish's last Record.
+        int64 last_offset = 1;
+        // The Store refused the publish's batch alone, as TOO_LARGE. Other refusals fail the call.
+        StreamFailure failure = 2;
+    }
+}
+
+// Method `WorkflowAppendPending`, synchronous, with a `WorkflowAppendRequest` with no records. It
+// tells whether the runtime keeps the append's batches, so lang can skip the codec.
+message WorkflowAppendPendingResponse {
+    bool pending = 1;
+}
+
+// Method `WorkflowClose`, asynchronous, with `CloseStreamResponse`. The close Activity of Workflow
+// code. It closes as `wf:<run id>`, the run that scheduled it, and only a Stream of its Workflow.
+message WorkflowCloseRequest {
+    string namespace = 1;
+    // The close Activity's own context.
+    ActivityContext context = 2;
+    // The runtime sets `namespace` and `producer`. Payloads are in their stored form.
+    temporal.api.streamservice.v1.CloseStreamRequest close = 3;
+}
