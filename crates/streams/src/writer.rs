@@ -88,42 +88,46 @@ impl Writer {
 
     /// Appends `records` now and returns the offsets of the first and the last one. Records past
     /// the Store's batch limit go in more batches, in order.
-    async fn write(&self, mut records: Vec<AppendRecord>) -> StreamResult<(i64, i64)> {
+    async fn write(&self, mut records: Vec<AppendRecord>) -> Written {
         let _writing = self.writing.lock().await;
+        let mut written = Written::default();
         // A close that started while this write waited has ended the writer.
         if self.state.lock().closed {
-            return Err(StreamError::new(
+            written.error = Some(StreamError::new(
                 Reason::UnknownWriter,
                 "The writer closed while the write waited",
             ));
+            return written;
         }
-        let (mut first, mut last) = (0, 0);
-        while !records.is_empty() {
+        while !records.is_empty() && written.error.is_none() {
             let count = self.batch_len(records.iter());
             let rest = records.split_off(count);
             if let Some(error) = &self.state.lock().failed {
-                return Err(error.clone());
+                written.error = Some(error.clone());
+                break;
             }
             let sequence = next_sequence();
-            let (batch_first, batch_last) = match self.send(records, sequence).await {
-                Ok(offsets) => offsets,
+            match self.send(records, sequence).await {
+                Ok((batch_first, batch_last)) => {
+                    if written.first == 0 {
+                        written.first = batch_first;
+                    }
+                    written.last = batch_last;
+                    written.records += count;
+                }
                 // The next write takes a higher `sequence`, so the Store refuses a late copy of
                 // this batch after it.
-                Err(error) if error.reason == Reason::Storage => return Err(error),
+                Err(error) if error.reason == Reason::Storage => written.error = Some(error),
                 Err(error) => {
                     self.state.lock().failed = Some(error.clone());
-                    return Err(error);
+                    written.error = Some(error);
                 }
-            };
-            if first == 0 {
-                first = batch_first;
             }
-            last = batch_last;
             records = rest;
         }
         let mut state = self.state.lock();
-        state.last_offset = state.last_offset.max(last);
-        Ok((first, last))
+        state.last_offset = state.last_offset.max(written.last);
+        written
     }
 
     /// Appends one batch and returns its first and last offset. After a Store failure it sends the
@@ -174,6 +178,15 @@ fn check_sizes(producer: &Producer, records: &[AppendRecord]) -> StreamResult<()
         ));
     }
     Ok(())
+}
+
+/// What a write wrote. A write that failed after some batches has their Records and offsets.
+#[derive(Default)]
+pub(crate) struct Written {
+    pub(crate) first: i64,
+    pub(crate) last: i64,
+    pub(crate) records: usize,
+    pub(crate) error: Option<StreamError>,
 }
 
 /// The namespace, Stream id, Producer id and epoch key of a writer.
@@ -363,20 +376,38 @@ impl Writers {
         id: u64,
         records: Vec<AppendRecord>,
     ) -> StreamResult<(i64, i64)> {
-        let writer = self.get(id)?;
+        let written = self.write_counted(id, records).await;
+        match written.error {
+            Some(error) => Err(error),
+            None => Ok((written.first, written.last)),
+        }
+    }
+
+    /// Writes as [Self::write] does, and also tells how many Records went in before a failure.
+    pub(crate) async fn write_counted(&self, id: u64, records: Vec<AppendRecord>) -> Written {
+        let refused = |error| Written {
+            error: Some(error),
+            ..Default::default()
+        };
+        let writer = match self.get(id) {
+            Ok(writer) => writer,
+            Err(error) => return refused(error),
+        };
         {
             let state = writer.state.lock();
             if let Some(error) = &state.failed {
-                return Err(error.clone());
+                return refused(error.clone());
             }
             if state.closed {
-                return Err(StreamError::new(
+                return refused(StreamError::new(
                     Reason::UnknownWriter,
                     format!("Writer {id} is closed"),
                 ));
             }
         }
-        check_sizes(&writer.producer, &records)?;
+        if let Err(error) = check_sizes(&writer.producer, &records) {
+            return refused(error);
+        }
         writer.write(records).await
     }
 

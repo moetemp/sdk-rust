@@ -24,7 +24,7 @@ prost-types = { workspace = true }
 serde_json = { workspace = true, optional = true }
 sha2 = "0.10"
 thiserror = { workspace = true }
-tokio = { version = "1.47", default-features = false, features = ["rt", "sync", "time"] }
+tokio = { version = "1.47", default-features = false, features = ["macros", "rt", "sync", "time"] }
 tonic = { workspace = true }
 
 [dependencies.temporalio-common]

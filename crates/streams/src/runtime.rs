@@ -2,13 +2,16 @@
 
 use crate::{
     Reason, StreamError, StreamResult,
+    buffer::Buffers,
     memory::MemoryStore,
     metrics::Metrics,
     proto::{
-        AppendRecordsRequest, CloseScopeRequest, CloseStreamRequest, CloseWriterRequest,
-        CloseWriterResponse, CloseWritersRequest, CloseWritersResponse, DescribeStreamRequest,
-        FreeReaderRequest, FreeResponse, FreeScopeRequest, FreeWriterRequest, FreeWriterResponse,
-        MemoryStreamConfig, OpenReaderResponse, OpenWriterRequest, OpenWriterResponse,
+        AppendRecordsRequest, BufferFlushRequest, BufferNextBatchRequest, BufferPushRequest,
+        BufferPushResponse, BufferWriteResponse, CloseScopeRequest, CloseStreamRequest,
+        CloseWriterRequest, CloseWriterResponse, CloseWritersRequest, CloseWritersResponse,
+        DescribeStreamRequest, FreeBufferRequest, FreeReaderRequest, FreeResponse,
+        FreeScopeRequest, FreeWriterRequest, FreeWriterResponse, MemoryStreamConfig,
+        OpenBufferResponse, OpenReaderResponse, OpenWriterRequest, OpenWriterResponse,
         ReadRecordsRequest, ShutdownRequest, WorkflowAppendRequest, WriteRecordsRequest,
         WriteRecordsResponse,
     },
@@ -22,7 +25,7 @@ use crate::{
 use prost::Message;
 use std::{
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -62,6 +65,10 @@ pub(crate) struct Shared {
     pub(crate) scopes: Scopes,
     pub(crate) pending: Pending,
     pub(crate) readers: Readers,
+    pub(crate) buffers: Buffers,
+    /// The Tokio runtime of the build or of the first asynchronous call, for the writes of an
+    /// encoded buffer.
+    handle: OnceLock<tokio::runtime::Handle>,
     shut_down: AtomicBool,
     /// Set when a `Shutdown` ends every scope and writer. Then the `Free` methods do nothing.
     finished: AtomicBool,
@@ -96,6 +103,19 @@ impl Shared {
                 }))
             })
             .await
+    }
+
+    /// The Tokio runtime to spawn on. The runtime's own comes first, since it lives as long as the
+    /// runtime.
+    pub(crate) fn tokio_handle(&self) -> Option<tokio::runtime::Handle> {
+        (self.handle.get().cloned()).or_else(|| tokio::runtime::Handle::try_current().ok())
+    }
+}
+
+impl Drop for Shared {
+    fn drop(&mut self) {
+        // The pumps of encoded buffers hold no reference to the runtime, so this stops them.
+        self.buffers.free_all();
     }
 }
 
@@ -138,6 +158,10 @@ impl StreamRuntime {
             scopes: Scopes::default(),
             pending: Pending::default(),
             readers: Readers::default(),
+            buffers: Buffers::default(),
+            handle: tokio::runtime::Handle::try_current()
+                .map(OnceLock::from)
+                .unwrap_or_default(),
             shut_down: AtomicBool::new(false),
             finished: AtomicBool::new(false),
         });
@@ -183,6 +207,12 @@ impl StreamRuntime {
     /// with [StreamError::code] and [StreamError::details].
     pub async fn call(&self, method: &str, input: &[u8]) -> StreamResult<Vec<u8>> {
         self.check_open(method)?;
+        if let (None, Ok(handle)) = (
+            self.shared.handle.get(),
+            tokio::runtime::Handle::try_current(),
+        ) {
+            let _ = self.shared.handle.set(handle);
+        }
         // The methods of `call_sync` don't connect, so they work when the Store is down too.
         let service = || self.shared.service();
         let shared = &self.shared;
@@ -273,6 +303,24 @@ impl StreamRuntime {
                 .encode_to_vec(),
             "WorkflowClose" => shared.workflow_close(decode(input)?).await?.encode_to_vec(),
             "ReadNext" => shared.read_next(decode(input)?).await?.encode_to_vec(),
+            "BufferNextBatch" => {
+                let request = decode::<BufferNextBatchRequest>(input)?;
+                shared
+                    .buffer_next_batch(request.buffer_id)
+                    .await?
+                    .encode_to_vec()
+            }
+            "BufferWrite" => {
+                shared.buffer_write(decode(input)?).await?;
+                BufferWriteResponse {}.encode_to_vec()
+            }
+            "BufferFlush" => {
+                let request = decode::<BufferFlushRequest>(input)?;
+                shared
+                    .buffer_flush(request.buffer_id)
+                    .await?
+                    .encode_to_vec()
+            }
             "Shutdown" => {
                 decode::<ShutdownRequest>(input)?;
                 shared.shut_down.store(true, Ordering::SeqCst);
@@ -320,6 +368,20 @@ impl StreamRuntime {
                 let reader_id = shared.open_reader(decode(input)?)?;
                 Ok(OpenReaderResponse { reader_id }.encode_to_vec())
             }
+            "OpenBuffer" => {
+                let buffer_id = shared.open_buffer(decode(input)?)?;
+                Ok(OpenBufferResponse { buffer_id }.encode_to_vec())
+            }
+            "BufferPush" => {
+                let request = decode::<BufferPushRequest>(input)?;
+                shared.buffer_push(request.buffer_id, request.records)?;
+                Ok(BufferPushResponse {}.encode_to_vec())
+            }
+            "FreeBuffer" => {
+                let request = decode::<FreeBufferRequest>(input)?;
+                shared.buffers.free(request.buffer_id)?;
+                Ok(FreeResponse {}.encode_to_vec())
+            }
             "FreeReader" => {
                 let request = decode::<FreeReaderRequest>(input)?;
                 shared.readers.free(request.reader_id)?;
@@ -334,14 +396,15 @@ impl StreamRuntime {
         }
     }
 
-    /// Refuses every method after `Shutdown`, except `Shutdown`, the `Free` methods and the static
-    /// ones.
+    /// Refuses every method after `Shutdown`, except `Shutdown`, the `Free` methods, the static
+    /// ones and the pump calls.
     fn check_open(&self, method: &str) -> StreamResult<()> {
-        // A dropped `Shutdown` leaves work that the next one does.
+        // A dropped `Shutdown` leaves work that the next one does. The shutdown flushes the
+        // buffers, so lang's codec pumps keep running.
         if !self.shared.is_shut_down()
             || method.starts_with("Free")
             || crate::sdk::is_static(method)
-            || method == "Shutdown"
+            || matches!(method, "Shutdown" | "BufferNextBatch" | "BufferWrite")
         {
             return Ok(());
         }

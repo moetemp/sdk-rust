@@ -1,5 +1,5 @@
 //! Producer scopes. A scope is the Producer of one Activity attempt or one client, and the writers
-//! that write as it, one for each Stream. Lang keeps only the scope id.
+//! and buffers that write as it, with one writer for each Stream. Lang keeps only the scope id.
 
 use crate::{
     Reason, StreamError, StreamResult, derive_producer, ids,
@@ -37,6 +37,9 @@ pub(crate) struct Scope {
 #[derive(Default)]
 struct ScopeWriters {
     by_stream: HashMap<String, u64>,
+    buffers: Vec<u64>,
+    /// Set when the scope's close or free starts. Then the scope takes no new buffer.
+    closing: bool,
     /// Set by the close or free of the scope. A writer that opens after it is released at once.
     ended: bool,
 }
@@ -102,6 +105,33 @@ impl Scope {
         }
         writers.by_stream.insert(stream.id.clone(), id);
         Ok(id)
+    }
+
+    pub(crate) fn add_buffer(&self, id: u64) -> StreamResult<()> {
+        let mut writers = self.writers.lock();
+        if writers.closing {
+            return Err(unknown_scope());
+        }
+        writers.buffers.push(id);
+        Ok(())
+    }
+
+    pub(crate) fn remove_buffer(&self, id: u64) {
+        self.writers.lock().buffers.retain(|buffer| *buffer != id);
+    }
+
+    /// Starts the close of the scope and returns its first buffer, which the caller ends.
+    fn first_buffer(&self) -> Option<u64> {
+        let mut writers = self.writers.lock();
+        writers.closing = true;
+        writers.buffers.first().copied()
+    }
+
+    /// Starts the close of the scope and returns its buffers, which the caller frees.
+    fn take_buffers(&self) -> Vec<u64> {
+        let mut writers = self.writers.lock();
+        writers.closing = true;
+        std::mem::take(&mut writers.buffers)
     }
 
     /// Ends the scope and returns its writers, which the caller frees.
@@ -359,6 +389,7 @@ impl Shared {
         Ok(self.end_scope(&scope, None).await)
     }
 
+    /// Flushes and frees the scope's buffers first, since their writes need its writers.
     async fn end_scope(
         &self,
         scope: &Scope,
@@ -371,6 +402,14 @@ impl Shared {
             armed: true,
         };
         let mut response = CloseScopeResponse::default();
+        while let Some(buffer) = scope.first_buffer() {
+            let failed = self.end_buffer(buffer).await;
+            scope.remove_buffer(buffer);
+            if let Some(failure) = failed {
+                response.failed_buffers += 1;
+                response.failure.get_or_insert(failure);
+            }
+        }
         while let Some(writer) = scope.take_writer() {
             if let Err(error) = self.writers.close(writer, Holder::Scope).await {
                 response.failed_writers += 1;
@@ -389,6 +428,10 @@ impl Shared {
 
     /// Releases what the scope holds, with no wait.
     fn release(&self, scope: &Scope) {
+        for buffer in scope.take_buffers() {
+            // Lang may have freed the buffer already.
+            let _ = self.buffers.free(buffer);
+        }
         for writer in scope.end() {
             let _ = self.writers.free(writer, Holder::Scope);
         }
@@ -400,7 +443,9 @@ impl Shared {
         // One scope at a time, so that a dropped shutdown leaves the rest for the next one.
         while let Some((id, scope)) = self.scopes.take_any() {
             let requeue = Some((id, scope.clone()));
-            response.failed_writers += self.end_scope(&scope, requeue).await.failed_writers;
+            let closed = self.end_scope(&scope, requeue).await;
+            response.failed_writers += closed.failed_writers;
+            response.failed_buffers += closed.failed_buffers;
         }
         response.failed_writers += self.writers.close_all().await as i32;
         response
@@ -415,7 +460,8 @@ mod tests {
         memory::MemoryStore,
         proto::{
             ActivityContext, AppendRecord, CloseScopeRequest, CloseScopeResponse,
-            CreateStreamRequest, FreeScopeRequest, ShutdownRequest,
+            CreateStreamRequest, FreeBufferRequest, FreeScopeRequest, OpenBufferRequest,
+            OpenBufferResponse, ShutdownRequest,
         },
         testing::support::Flaky,
     };
@@ -639,6 +685,35 @@ mod tests {
         for write in writes {
             let _ = write.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_freed_buffer_leaves_its_scope() {
+        let (_, ext) = flaky().await;
+        let open = OpenClientScopeRequest::default().encode_to_vec();
+        let scope_id =
+            OpenScopeResponse::decode(ext.call_sync("OpenClientScope", &open).unwrap().as_slice())
+                .unwrap()
+                .scope_id;
+        for _ in 0..3 {
+            let open = OpenBufferRequest {
+                scope_id,
+                stream: stream("a"),
+                ..Default::default()
+            };
+            let opened = OpenBufferResponse::decode(
+                ext.call_sync("OpenBuffer", &open.encode_to_vec())
+                    .unwrap()
+                    .as_slice(),
+            )
+            .unwrap();
+            let free = FreeBufferRequest {
+                buffer_id: opened.buffer_id,
+            };
+            ext.call_sync("FreeBuffer", &free.encode_to_vec()).unwrap();
+        }
+        let scope = ext.shared().scopes.get(scope_id).unwrap();
+        assert!(scope.writers.lock().buffers.is_empty());
     }
 
     #[tokio::test]

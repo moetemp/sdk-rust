@@ -3,6 +3,7 @@
 
 pub(crate) mod support;
 
+pub mod buffer;
 pub mod reader;
 pub mod scope;
 pub mod service;
@@ -175,5 +176,10 @@ mod tests {
     #[tokio::test]
     async fn the_reader_suite_passes_on_the_memory_store() {
         run(vec![Arc::new(MemoryBackend)], reader::CASES).await;
+    }
+
+    #[tokio::test]
+    async fn the_buffer_suite_passes_on_the_memory_store() {
+        run(vec![Arc::new(MemoryBackend)], buffer::CASES).await;
     }
 }

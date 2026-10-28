@@ -5,7 +5,7 @@
 
 use super::{RawKeys, backends};
 use crate::{
-    StreamError, StreamResult, StreamRuntime,
+    Reason, StreamError, StreamResult, StreamRuntime,
     digest::batch_digest,
     epoch::withdraws,
     ids::local_activity_producer_id,
@@ -415,6 +415,11 @@ pub(crate) struct Flaky {
     pub(crate) down: AtomicBool,
     /// The appends that it takes before it goes down. Below zero is never.
     pub(crate) down_after: AtomicI64,
+    /// The appends that it takes before it refuses every later one as `CLOSED`. Below zero is no
+    /// limit.
+    pub(crate) appends_left: AtomicI64,
+    /// Panics in the next append, as a bug in a Store would.
+    pub(crate) panic_next: AtomicBool,
 }
 
 impl Flaky {
@@ -425,6 +430,8 @@ impl Flaky {
             lose_next: AtomicBool::new(false),
             down: AtomicBool::new(false),
             down_after: AtomicI64::new(-1),
+            appends_left: AtomicI64::new(-1),
+            panic_next: AtomicBool::new(false),
         }
     }
 }
@@ -458,11 +465,19 @@ impl Store for Flaky {
         stream: &StreamRef,
         batch: &Batch<'_>,
     ) -> StreamResult<Appended> {
+        assert!(
+            !self.panic_next.swap(false, Ordering::SeqCst),
+            "the Store panics"
+        );
         if self.down_after.fetch_sub(1, Ordering::SeqCst) == 0 {
             self.down.store(true, Ordering::SeqCst);
         }
         if self.down.load(Ordering::SeqCst) {
             return Err(StreamError::storage("the Store is down"));
+        }
+        if self.appends_left.fetch_sub(1, Ordering::SeqCst) == 0 {
+            self.appends_left.store(0, Ordering::SeqCst);
+            return Err(StreamError::new(Reason::Closed, "the Store refuses"));
         }
         let appended = self.inner.append(namespace, stream, batch).await?;
         if self.lose_next.swap(false, Ordering::SeqCst) {

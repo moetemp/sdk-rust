@@ -212,16 +212,18 @@ message CloseStreamAsRequest {
     temporal.api.streamservice.v1.CloseStreamRequest close = 2;
 }
 
-// Method `CloseScope`, asynchronous. Closes every writer of the scope and frees it. A failed
-// writer doesn't fail the call. The response counts it instead.
+// Method `CloseScope`, asynchronous. Flushes and frees the scope's buffers, closes its writers and
+// frees the scope. A failed writer or buffer doesn't fail the call. The response counts it instead.
 message CloseScopeRequest {
     uint64 scope_id = 1;
 }
 
 message CloseScopeResponse {
     int32 failed_writers = 1;
-    // The first failure, if any.
+    // The first failure, if any. A buffer's comes first.
     StreamFailure failure = 2;
+    // The buffers whose failure no `BufferPush` or `BufferFlush` gave lang yet.
+    int32 failed_buffers = 3;
 }
 
 // A failure that a response reports, as lang raises it from a failed call.
@@ -240,13 +242,14 @@ message FreeScopeRequest {
 message FreeResponse {
 }
 
-// Method `Shutdown`, asynchronous. Closes every scope and writer, for the backend's shutdown. Then
-// only `Shutdown`, the static and the `Free` methods run. A dropped one runs again.
+// Method `Shutdown`, asynchronous. Closes every scope, buffer and writer. Then only `Shutdown`,
+// the static and the `Free` methods, and the pump calls run. A dropped one runs again.
 message ShutdownRequest {
 }
 
 message ShutdownResponse {
     int32 failed_writers = 1;
+    int32 failed_buffers = 2;
 }
 
 // Method `WorkflowAppend`, asynchronous. The append Local Activity of Workflow code. The attempts
@@ -359,4 +362,87 @@ message WithdrawsRequest {
 
 message WithdrawsResponse {
     bool withdraws = 1;
+}
+
+// Method `OpenBuffer`, synchronous. Opens a buffered publisher of one Stream, which writes as the
+// scope's Producer, one batch at a time. A failed batch fails the buffer, so a reader sees no gap.
+message OpenBufferRequest {
+    uint64 scope_id = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // A batch is due this long after its first value, or at once for a flush. Empty is 100 ms.
+    google.protobuf.Duration max_delay = 3;
+    // A batch is due at once with this many values. Zero is 1000.
+    int32 max_batch = 4;
+    // Set when lang has no codec, so the runtime writes each batch. Unset, lang's pump runs each
+    // batch through its codec with `BufferNextBatch` and `BufferWrite` until `done`.
+    bool encoded = 5;
+}
+
+message OpenBufferResponse {
+    uint64 buffer_id = 1;
+}
+
+// Method `BufferPush`, synchronous. Adds values to the buffer and returns at once. After a failed
+// batch it fails with the batch's error.
+message BufferPushRequest {
+    uint64 buffer_id = 1;
+    repeated temporal.api.stream.v1.AppendRecord records = 2;
+}
+
+message BufferPushResponse {
+}
+
+// Method `BufferNextBatch`, asynchronous. Waits for the next due batch and takes it, for lang's
+// codec pump. A batch that no `BufferWrite` started yet comes again, for a pump that lang restarts.
+message BufferNextBatchRequest {
+    uint64 buffer_id = 1;
+}
+
+message BufferBatch {
+    uint64 batch_id = 1;
+    // The bodies before lang's codec.
+    repeated temporal.api.stream.v1.AppendRecord records = 2;
+    // The buffer is freed or failed, so the pump stops.
+    bool done = 3;
+}
+
+// Method `BufferWrite`, asynchronous. Writes the batch in flight after lang's codec, or fails the
+// buffer with the codec's error. A failed write fails the buffer. A stale batch fails the call.
+message BufferWriteRequest {
+    uint64 buffer_id = 1;
+    uint64 batch_id = 2;
+    oneof body {
+        BufferRecords records = 3;
+        string codec_error = 4;
+    }
+}
+
+message BufferRecords {
+    // The bodies after lang's codec, one for each value of the batch. Another count fails the call
+    // and the buffer.
+    repeated temporal.api.stream.v1.AppendRecord records = 1;
+}
+
+message BufferWriteResponse {
+}
+
+// Method `BufferFlush`, asynchronous. Waits until every value pushed before the call is written or
+// failed. It is the backpressure point of a caller that pushes faster than the Store writes.
+message BufferFlushRequest {
+    uint64 buffer_id = 1;
+}
+
+message BufferFlushResponse {
+    // The offset of the newest Record that the buffer wrote. Zero if it wrote none.
+    int64 last_offset = 1;
+    // The values that a failed batch left unwritten.
+    int64 unwritten = 2;
+    // The failure of the buffer, if any.
+    StreamFailure failure = 3;
+}
+
+// Method `FreeBuffer`, synchronous, with `FreeResponse`. Frees the buffer with no wait, and drops
+// the values that no write took. A write in flight still completes.
+message FreeBufferRequest {
+    uint64 buffer_id = 1;
 }

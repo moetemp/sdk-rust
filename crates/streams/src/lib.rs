@@ -6,6 +6,7 @@
 //! client and calls it with an operation name and proto bytes. Core has no hook for it. A Workflow
 //! makes each call from a Local Activity.
 
+mod buffer;
 pub mod digest;
 pub mod epoch;
 mod error;
