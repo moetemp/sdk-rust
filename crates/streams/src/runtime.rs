@@ -1,7 +1,7 @@
 //! The Stream runtime, a plain object that lang's bridge builds per client and calls by name.
 
 use crate::{
-    Reason, StreamError, StreamResult,
+    StreamError, StreamResult,
     memory::MemoryStore,
     metrics::Metrics,
     proto::{
@@ -132,37 +132,40 @@ impl StreamRuntime {
         self.shared.writers.free(writer_id)
     }
 
-    /// Runs one method on encoded input and returns the encoded output. The bridge raises an error
+    /// Runs any method on encoded input and returns the encoded output. The bridge raises an error
     /// with [StreamError::code] and [StreamError::details].
     pub async fn call(&self, method: &str, input: &[u8]) -> StreamResult<Vec<u8>> {
-        // `FreeWriter` needs no Store, so it works when the Store is down too.
-        if method == "FreeWriter" {
-            let request = decode::<FreeWriterRequest>(input)?;
-            self.free_writer(request.writer_id)?;
-            return Ok(FreeWriterResponse {}.encode_to_vec());
-        }
-        let service = self.shared.service().await?;
+        // The methods of `call_sync` don't connect, so they work when the Store is down too.
+        let service = || self.shared.service();
         let output = match method {
-            "CreateStream" => service.create_stream(decode(input)?).await?.encode_to_vec(),
-            "AppendRecords" => service
+            "CreateStream" => service()
+                .await?
+                .create_stream(decode(input)?)
+                .await?
+                .encode_to_vec(),
+            "AppendRecords" => service()
+                .await?
                 .append_records(decode::<AppendRecordsRequest>(input)?)
                 .await?
                 .encode_to_vec(),
-            "CloseStream" => service
+            "CloseStream" => service()
+                .await?
                 .close_stream(decode::<CloseStreamRequest>(input)?)
                 .await?
                 .encode_to_vec(),
-            "ReadRecords" => service
+            "ReadRecords" => service()
+                .await?
                 .read_records(decode::<ReadRecordsRequest>(input)?)
                 .await?
                 .encode_to_vec(),
-            "DescribeStream" => service
+            "DescribeStream" => service()
+                .await?
                 .describe_stream(decode::<DescribeStreamRequest>(input)?)
                 .await?
                 .encode_to_vec(),
             "OpenWriter" => {
                 let request = decode::<OpenWriterRequest>(input)?;
-                let writer_id = self.shared.writers.open(service, request).await?;
+                let writer_id = self.shared.writers.open(service().await?, request).await?;
                 OpenWriterResponse { writer_id }.encode_to_vec()
             }
             "WriteRecords" => {
@@ -191,14 +194,22 @@ impl StreamRuntime {
                 let last_offset = self.shared.writers.close(request.writer_id).await?;
                 CloseWriterResponse { last_offset }.encode_to_vec()
             }
-            _ => {
-                return Err(StreamError::new(
-                    Reason::Unsupported,
-                    format!("Unknown method {method}"),
-                ));
-            }
+            _ => return self.call_sync(method, input),
         };
         Ok(output)
+    }
+
+    /// Runs a method that never waits, with no async runtime entered, so a finalizer can call it.
+    /// `runtime.proto` marks these methods as synchronous or static.
+    pub fn call_sync(&self, method: &str, input: &[u8]) -> StreamResult<Vec<u8>> {
+        match method {
+            "FreeWriter" => {
+                let request = decode::<FreeWriterRequest>(input)?;
+                self.free_writer(request.writer_id)?;
+                Ok(FreeWriterResponse {}.encode_to_vec())
+            }
+            _ => crate::call_static(method, input),
+        }
     }
 }
 

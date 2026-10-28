@@ -1,11 +1,11 @@
 syntax = "proto3";
 
-// The messages of the crate's own calls, in addition to the five Stream service operations. Lang
-// sends them through the bridge's call on the runtime object, by the method name in each comment.
-// Field numbers are part of the contract with every SDK.
+// The crate's own calls. Lang sends an asynchronous method through `call`, a synchronous one
+// through `call_sync`, and a static one through `call_static`. Field numbers are the contract.
 package temporal.sdk.streams.v1;
 
 import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
 import "temporal/api/stream/v1/message.proto";
 
 // The settings of the memory Stream runtime, for tests. Each field has the number of the same
@@ -75,9 +75,8 @@ message CloseWriterResponse {
     int64 last_offset = 1;
 }
 
-// Method `FreeWriter`. Releases one handle of the writer with no wait, for a handle that lang
-// drops, such as from a finalizer. The bridge may also call it with no async runtime. A write in
-// flight still completes. The writer's error, if any, is lost.
+// Method `FreeWriter`, synchronous. Releases one handle of the writer with no wait, such as from a
+// finalizer. A write in flight still completes, and the writer's error is lost.
 message FreeWriterRequest {
     uint64 writer_id = 1;
 }
@@ -93,4 +92,71 @@ message CloseWritersRequest {
 message CloseWritersResponse {
     // The writers that had failed.
     int32 failed = 1;
+}
+
+// The Workflow Task that dispatched a Local Activity. It has the field numbers and types of Core's
+// `coresdk.activity_task.WorkflowTaskAttempt`, so lang passes those bytes as they are.
+message WorkflowTaskAttempt {
+    int64 started_event_id = 1;
+    uint32 attempt = 2;
+    google.protobuf.Timestamp started_time = 3;
+    // The run's last completed task, 0 when no task completed.
+    int64 previous_started_event_id = 4;
+    repeated int64 failed_tasks = 5;
+    uint32 previous_attempt = 6;
+    google.protobuf.Timestamp previous_started_time = 7;
+}
+
+// The Activity attempt that writes or reads. Lang copies it from its Activity info.
+message ActivityContext {
+    bool is_local = 1;
+    // True for an Activity that a Workflow scheduled, false for a Standalone Activity.
+    bool in_workflow = 2;
+    string workflow_id = 3;
+    string workflow_run_id = 4;
+    string activity_id = 5;
+    // Standalone Activity only.
+    string activity_run_id = 6;
+    int32 attempt = 7;
+    google.protobuf.Timestamp current_attempt_scheduled_time = 8;
+    // The value of the `__temporal_stream_key` header. Empty when the header is absent.
+    string call_key = 9;
+    // Local Activity only. Core's `Start.workflow_task`.
+    WorkflowTaskAttempt workflow_task = 10;
+}
+
+enum ProducerPurpose {
+    PRODUCER_PURPOSE_UNSPECIFIED = 0;
+    // The create and append Local Activities of Workflow code. Every attempt in one Workflow Task
+    // writes at attempt 1, so the Store dedupes a retry.
+    PRODUCER_PURPOSE_WORKFLOW_WRITE = 1;
+    // An Activity's own writes. A higher attempt withdraws the earlier attempts' Records.
+    PRODUCER_PURPOSE_ACTIVITY_WRITER = 2;
+}
+
+// Method `DeriveProducer`, static. The Producer of an Activity attempt, by the one rule of every
+// SDK. It refuses a Local Activity with no `workflow_task`.
+message DeriveProducerRequest {
+    ActivityContext context = 1;
+    ProducerPurpose purpose = 2;
+}
+
+message DeriveProducerResponse {
+    temporal.api.stream.v1.Producer producer = 1;
+    // Local Activity only. Each batch sends them, so the Store withdraws the run's orphaned Local
+    // Activity Records. The task is always set, with 0 before the run's first completed task.
+    temporal.api.stream.v1.WorkflowTaskEpoch previous_completed_task = 2;
+    repeated int64 failed_tasks = 3;
+}
+
+// Method `ScopedStreamId`, static. The id of a Stream that a Workflow creates with a name, for code
+// outside a Workflow. Workflow code builds the same id itself.
+message ScopedStreamIdRequest {
+    string workflow_id = 1;
+    string first_execution_run_id = 2;
+    string name = 3;
+}
+
+message ScopedStreamIdResponse {
+    string id = 1;
 }

@@ -7,13 +7,15 @@ use temporalio_common::protos::temporal::api::common::v1::{
     Payload, payload::ExternalPayloadDetails,
 };
 use temporalio_streams::{
+    derive_producer,
     digest::batch_digest,
     epoch::{epoch_key, task_key, withdraws},
     ids::{self, StreamKeys, fields},
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{
-        AppendRecord, Producer, ProducerEpoch, StreamData, StreamProducerKind, StreamRecord,
-        Supersession, WorkflowTaskEpoch, stream_record::Item,
+        ActivityContext, AppendRecord, DeriveProducerRequest, Producer, ProducerEpoch,
+        ProducerPurpose, StreamData, StreamProducerKind, StreamRecord, Supersession,
+        WorkflowTaskAttempt, WorkflowTaskEpoch, stream_record::Item,
     },
 };
 
@@ -115,6 +117,82 @@ fn producer_ids_match() {
         ids::named_client_producer_id(field("named_client", "name")),
         id("named_client")
     );
+}
+
+fn task_epoch(value: &Value) -> WorkflowTaskEpoch {
+    WorkflowTaskEpoch {
+        started_event_id: number(value, "started_event_id"),
+        attempt: number(value, "attempt") as i32,
+        started_time: time(&value["started_time"]),
+    }
+}
+
+fn numbers(value: &Value) -> Vec<i64> {
+    value
+        .as_array()
+        .map(|list| list.iter().map(|v| v.as_i64().unwrap()).collect())
+        .unwrap_or_default()
+}
+
+fn activity_context(value: &Value) -> ActivityContext {
+    let field = |name: &str| value[name].as_str().unwrap_or_default().to_string();
+    ActivityContext {
+        is_local: value["is_local"].as_bool().unwrap_or_default(),
+        in_workflow: value["in_workflow"].as_bool().unwrap_or_default(),
+        workflow_id: field("workflow_id"),
+        workflow_run_id: field("workflow_run_id"),
+        activity_id: field("activity_id"),
+        activity_run_id: field("activity_run_id"),
+        attempt: number(value, "attempt") as i32,
+        current_attempt_scheduled_time: time(&value["current_attempt_scheduled_time"]),
+        call_key: field("call_key"),
+        workflow_task: value.get("workflow_task").map(|task| WorkflowTaskAttempt {
+            started_event_id: number(task, "started_event_id"),
+            attempt: number(task, "attempt") as u32,
+            started_time: time(&task["started_time"]),
+            previous_started_event_id: number(task, "previous_started_event_id"),
+            failed_tasks: numbers(&task["failed_tasks"]),
+            previous_attempt: number(task, "previous_attempt") as u32,
+            previous_started_time: time(&task["previous_started_time"]),
+        }),
+    }
+}
+
+#[test]
+fn the_producer_of_each_activity_kind_matches() {
+    for case in load("producers.json").as_array().unwrap() {
+        let name = text(case, "name");
+        let purpose = match text(case, "purpose") {
+            "workflow_write" => ProducerPurpose::WorkflowWrite,
+            _ => ProducerPurpose::ActivityWriter,
+        };
+        let derived = derive_producer(DeriveProducerRequest {
+            context: Some(activity_context(&case["context"])),
+            purpose: purpose as i32,
+        });
+        if let Some(error) = case["error"].as_str() {
+            assert_eq!(derived.unwrap_err().reason.token(), error, "{name}");
+            continue;
+        }
+        let derived = derived.unwrap();
+        let p = &case["producer"];
+        let expected = Producer {
+            kind: kind(text(p, "kind")) as i32,
+            id: text(p, "id").to_string(),
+            epoch: Some(epoch(&p["epoch"])),
+            run_id: text(p, "run_id").to_string(),
+        };
+        assert_eq!(derived.producer, Some(expected), "{name}");
+        let completed = case["previous_completed_task"]
+            .as_object()
+            .map(|_| task_epoch(&case["previous_completed_task"]));
+        assert_eq!(derived.previous_completed_task, completed, "{name}");
+        assert_eq!(
+            derived.failed_tasks,
+            numbers(&case["failed_tasks"]),
+            "{name}"
+        );
+    }
 }
 
 #[test]

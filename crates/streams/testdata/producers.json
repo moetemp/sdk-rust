@@ -1,0 +1,280 @@
+[
+  {
+    "name": "a Workflow write keeps attempt 1",
+    "context": {
+      "is_local": true,
+      "in_workflow": true,
+      "workflow_id": "agent:1",
+      "workflow_run_id": "run/1",
+      "activity_id": "4",
+      "attempt": 3,
+      "call_key": "k 7",
+      "workflow_task": {
+        "started_event_id": 15,
+        "attempt": 2,
+        "started_time": [
+          1760000000,
+          5
+        ],
+        "previous_started_event_id": 9,
+        "failed_tasks": [
+          12,
+          13
+        ],
+        "previous_attempt": 1,
+        "previous_started_time": [
+          1759999990,
+          0
+        ]
+      }
+    },
+    "purpose": "workflow_write",
+    "producer": {
+      "kind": "local_activity",
+      "id": "la:run%2F1:k%207",
+      "run_id": "run/1",
+      "epoch": {
+        "task_started_event_id": 15,
+        "task_attempt": 2,
+        "task_started_time": [
+          1760000000,
+          5
+        ],
+        "attempt": 1
+      }
+    },
+    "previous_completed_task": {
+      "started_event_id": 9,
+      "attempt": 1,
+      "started_time": [
+        1759999990,
+        0
+      ]
+    },
+    "failed_tasks": [
+      12,
+      13
+    ]
+  },
+  {
+    "name": "a Local Activity writer takes its attempt",
+    "context": {
+      "is_local": true,
+      "in_workflow": true,
+      "workflow_id": "agent:1",
+      "workflow_run_id": "run/1",
+      "activity_id": "4",
+      "attempt": 3,
+      "call_key": "k 7",
+      "workflow_task": {
+        "started_event_id": 15,
+        "attempt": 2,
+        "started_time": [
+          1760000000,
+          5
+        ],
+        "previous_started_event_id": 9,
+        "failed_tasks": [
+          12,
+          13
+        ],
+        "previous_attempt": 1,
+        "previous_started_time": [
+          1759999990,
+          0
+        ]
+      }
+    },
+    "purpose": "activity_writer",
+    "producer": {
+      "kind": "local_activity",
+      "id": "la:run%2F1:k%207",
+      "run_id": "run/1",
+      "epoch": {
+        "task_started_event_id": 15,
+        "task_attempt": 2,
+        "task_started_time": [
+          1760000000,
+          5
+        ],
+        "attempt": 3
+      }
+    },
+    "previous_completed_task": {
+      "started_event_id": 9,
+      "attempt": 1,
+      "started_time": [
+        1759999990,
+        0
+      ]
+    },
+    "failed_tasks": [
+      12,
+      13
+    ]
+  },
+  {
+    "name": "a run's first task has a completed task of 0",
+    "context": {
+      "is_local": true,
+      "in_workflow": true,
+      "workflow_id": "agent:1",
+      "workflow_run_id": "run/1",
+      "activity_id": "4",
+      "attempt": 3,
+      "call_key": "k 7",
+      "workflow_task": {
+        "started_event_id": 3,
+        "attempt": 1,
+        "started_time": [
+          1760000000,
+          0
+        ]
+      }
+    },
+    "purpose": "workflow_write",
+    "producer": {
+      "kind": "local_activity",
+      "id": "la:run%2F1:k%207",
+      "run_id": "run/1",
+      "epoch": {
+        "task_started_event_id": 3,
+        "task_attempt": 1,
+        "task_started_time": [
+          1760000000,
+          0
+        ],
+        "attempt": 1
+      }
+    },
+    "previous_completed_task": {
+      "started_event_id": 0,
+      "attempt": 0,
+      "started_time": null
+    },
+    "failed_tasks": []
+  },
+  {
+    "name": "a Local Activity with no task is refused",
+    "context": {
+      "is_local": true,
+      "in_workflow": true,
+      "workflow_id": "agent:1",
+      "workflow_run_id": "run/1",
+      "activity_id": "4",
+      "attempt": 3,
+      "call_key": "k 7"
+    },
+    "purpose": "workflow_write",
+    "error": "stream_invalid"
+  },
+  {
+    "name": "an Activity takes its scheduled time and attempt",
+    "context": {
+      "is_local": false,
+      "in_workflow": true,
+      "workflow_id": "agent:1",
+      "workflow_run_id": "run/1",
+      "activity_id": "a/1",
+      "attempt": 2,
+      "current_attempt_scheduled_time": [
+        1760000050,
+        7
+      ],
+      "call_key": "k 7"
+    },
+    "purpose": "activity_writer",
+    "producer": {
+      "kind": "activity",
+      "id": "act:run%2F1:a%2F1:k%207",
+      "run_id": "run/1",
+      "epoch": {
+        "attempt_scheduled_time": [
+          1760000050,
+          7
+        ],
+        "attempt": 2
+      }
+    },
+    "previous_completed_task": null,
+    "failed_tasks": []
+  },
+  {
+    "name": "an Activity with no key header has an empty key",
+    "context": {
+      "is_local": false,
+      "in_workflow": true,
+      "workflow_id": "agent:1",
+      "workflow_run_id": "run/1",
+      "activity_id": "a/1",
+      "attempt": 2,
+      "current_attempt_scheduled_time": [
+        1760000050,
+        7
+      ],
+      "call_key": ""
+    },
+    "purpose": "activity_writer",
+    "producer": {
+      "kind": "activity",
+      "id": "act:run%2F1:a%2F1:",
+      "run_id": "run/1",
+      "epoch": {
+        "attempt_scheduled_time": [
+          1760000050,
+          7
+        ],
+        "attempt": 2
+      }
+    },
+    "previous_completed_task": null,
+    "failed_tasks": []
+  },
+  {
+    "name": "a Standalone Activity has no run",
+    "context": {
+      "is_local": false,
+      "in_workflow": false,
+      "activity_id": "sa 1",
+      "activity_run_id": "ar:1",
+      "attempt": 1,
+      "current_attempt_scheduled_time": [
+        1760000060,
+        0
+      ]
+    },
+    "purpose": "activity_writer",
+    "producer": {
+      "kind": "standalone_activity",
+      "id": "sa:sa%201:ar%3A1",
+      "run_id": "",
+      "epoch": {
+        "attempt_scheduled_time": [
+          1760000060,
+          0
+        ],
+        "attempt": 1
+      }
+    },
+    "previous_completed_task": null,
+    "failed_tasks": []
+  },
+  {
+    "name": "an Activity doesn't write for Workflow code",
+    "context": {
+      "is_local": false,
+      "in_workflow": true,
+      "workflow_id": "agent:1",
+      "workflow_run_id": "run/1",
+      "activity_id": "a/1",
+      "attempt": 2,
+      "current_attempt_scheduled_time": [
+        1760000050,
+        7
+      ],
+      "call_key": "k 7"
+    },
+    "purpose": "workflow_write",
+    "error": "stream_invalid"
+  }
+]

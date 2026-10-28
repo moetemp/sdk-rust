@@ -14,14 +14,14 @@ Workflow makes each Stream call from a Local Activity. Core has no Stream code.
   of `temporalio-protos`, and that map to the types of `temporalio-common`. So the packaged crate
   needs no file outside itself.
 - `protos/temporal/sdk/streams/v1/runtime.proto` has the crate's own calls, such as the writer
-  calls.
+  calls. Each SDK generates it with its own protoc pipeline.
 - `nexus/stream-service.wit` is the Stream service as a System Nexus service, with the messages of
   the protos above. Each SDK copies it and generates its bindings with nexgen. A test checks that
   every line is at most 100 columns.
-- `testdata/*.json` are the shared vectors. They cover Stream ids, Producer ids, Store keys and
-  meta fields, offsets, epoch keys, the withdrawal rule and the batch digest of a dedupe entry.
-  `testdata/gen_vectors.py` writes them from a second implementation. Each SDK, each Store and the
-  server run the same files.
+- `testdata/*.json` are the shared vectors. They cover Stream ids, Producer ids, the Producer of
+  each Activity kind, Store keys and meta fields, offsets, epoch keys, the withdrawal rule and the
+  batch digest of a dedupe entry. `testdata/gen_vectors.py` writes them from a second
+  implementation. Each SDK, each Store and the server run the same files.
 
 ## The runtime
 
@@ -31,6 +31,11 @@ that needs it. So a bridge can build the runtime with no async runtime, and a Wo
 publishes never connects. `MemoryStreamRuntime` builds it on the memory Store, from a
 `MemoryStreamConfig`. That message has the field numbers of the same fields in the Redis config,
 so a bridge can send the memory runtime the config it builds for Redis.
+
+A bridge exposes three calls. `StreamRuntime::call` runs any method and may wait on the Store.
+`StreamRuntime::call_sync` runs a method that never waits, with no async runtime entered, such as
+a `Free*` method from a finalizer. `call_static` runs a pure method, such as `DeriveProducer`, with
+no runtime object. `runtime.proto` names the kind of each method.
 
 ## Stores and the shared suites
 

@@ -387,9 +387,115 @@ def withdrawal_examples():
     return cases
 
 
+def derive_producer(context, purpose):
+    """The Producer of an Activity attempt, as the static method DeriveProducer gives it."""
+    if context.get("is_local"):
+        task = context.get("workflow_task")
+        if task is None:
+            return {"error": "stream_invalid"}
+        run = context["workflow_run_id"]
+        epoch = {
+            "task_started_event_id": task["started_event_id"],
+            "task_attempt": task["attempt"],
+            "task_started_time": task.get("started_time"),
+            "attempt": 1 if purpose == "workflow_write" else context["attempt"],
+        }
+        return {
+            "producer": {
+                "kind": "local_activity",
+                "id": "la:" + join(run, context.get("call_key", "")),
+                "run_id": run,
+                "epoch": epoch,
+            },
+            "previous_completed_task": {
+                "started_event_id": task.get("previous_started_event_id", 0),
+                "attempt": task.get("previous_attempt", 0),
+                "started_time": task.get("previous_started_time"),
+            },
+            "failed_tasks": task.get("failed_tasks", []),
+        }
+    if purpose == "workflow_write":
+        return {"error": "stream_invalid"}
+    epoch = {
+        "attempt_scheduled_time": context.get("current_attempt_scheduled_time"),
+        "attempt": context["attempt"],
+    }
+    if context.get("in_workflow"):
+        run = context["workflow_run_id"]
+        key = join(run, context["activity_id"], context.get("call_key", ""))
+        producer = {"kind": "activity", "id": "act:" + key, "run_id": run}
+    else:
+        key = join(context["activity_id"], context["activity_run_id"])
+        producer = {"kind": "standalone_activity", "id": "sa:" + key, "run_id": ""}
+    producer["epoch"] = epoch
+    return {"producer": producer, "previous_completed_task": None, "failed_tasks": []}
+
+
+def producers():
+    task = {
+        "started_event_id": 15,
+        "attempt": 2,
+        "started_time": [1760000000, 5],
+        "previous_started_event_id": 9,
+        "failed_tasks": [12, 13],
+        "previous_attempt": 1,
+        "previous_started_time": [1759999990, 0],
+    }
+    local = {
+        "is_local": True,
+        "in_workflow": True,
+        "workflow_id": "agent:1",
+        "workflow_run_id": "run/1",
+        "activity_id": "4",
+        "attempt": 3,
+        "call_key": "k 7",
+        "workflow_task": task,
+    }
+    first_task = {
+        **local,
+        "workflow_task": {"started_event_id": 3, "attempt": 1, "started_time": [1760000000, 0]},
+    }
+    activity = {
+        "is_local": False,
+        "in_workflow": True,
+        "workflow_id": "agent:1",
+        "workflow_run_id": "run/1",
+        "activity_id": "a/1",
+        "attempt": 2,
+        "current_attempt_scheduled_time": [1760000050, 7],
+        "call_key": "k 7",
+    }
+    standalone = {
+        "is_local": False,
+        "in_workflow": False,
+        "activity_id": "sa 1",
+        "activity_run_id": "ar:1",
+        "attempt": 1,
+        "current_attempt_scheduled_time": [1760000060, 0],
+    }
+    cases = []
+    for name, context, purpose in [
+        ("a Workflow write keeps attempt 1", local, "workflow_write"),
+        ("a Local Activity writer takes its attempt", local, "activity_writer"),
+        ("a run's first task has a completed task of 0", first_task, "workflow_write"),
+        ("a Local Activity with no task is refused", {**local, "workflow_task": None},
+         "workflow_write"),
+        ("an Activity takes its scheduled time and attempt", activity, "activity_writer"),
+        ("an Activity with no key header has an empty key", {**activity, "call_key": ""},
+         "activity_writer"),
+        ("a Standalone Activity has no run", standalone, "activity_writer"),
+        ("an Activity doesn't write for Workflow code", activity, "workflow_write"),
+    ]:
+        context = {key: value for key, value in context.items() if value is not None}
+        cases.append({"name": name, "context": context, "purpose": purpose,
+                      **derive_producer(context, purpose)})
+    return cases
+
+
 def main():
     for name, value in [
         ("ids.json", ids()),
+        ("producers.json", producers()),
         ("offsets.json", offsets()),
         ("epochs.json", epochs()),
         ("fields.json", fields()),

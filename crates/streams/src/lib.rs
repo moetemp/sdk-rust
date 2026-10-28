@@ -16,6 +16,7 @@ pub mod offset;
 pub mod protos;
 mod record;
 mod runtime;
+mod sdk;
 mod service;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
@@ -24,6 +25,7 @@ mod writer;
 
 pub use error::{Reason, StreamError, StreamResult};
 pub use runtime::{MEMORY_RUNTIME_NAME, MemoryStreamRuntime, StoreFactory, StreamRuntime};
+pub use sdk::{call_static, derive_producer};
 pub use service::{MAX_RECORDS, MAX_WAIT};
 
 /// The protos that lang and the crate exchange.
