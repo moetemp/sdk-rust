@@ -434,7 +434,8 @@ interface stream-service {
   /// @nexus.doc
   ///   "A long poll. NOT_FOUND for an uncreated Stream. Workflow code reads from a Local Activity."
   /// @nexus.operation name="ReadRecords"
-  /// @nexus.poll python="next_read_request" items="records" python-resume="resume_read_request"
+  /// @nexus.poll python="next_read_request" typescript="nextReadRequest"
+  ///   dotnet="StreamPoll.NextReadRequest" items="records" python-resume="resume_read_request"
   ///   target="client"
   read-records: func(request: read-records-request) -> read-records-response;
 
