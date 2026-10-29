@@ -1,5 +1,5 @@
-// Draft. The Stream service as a System Nexus service, for the Brook API proposal. Each record maps
-// to a message of the protos under ../protos/temporal/api (stream/v1, streamservice/v1 and the
+// Draft. The Stream service as a System Nexus service, for the Streams API proposal. Each record
+// maps to a message of the protos under ../protos/temporal/api (stream/v1, streamservice/v1 and the
 // Stream enums in enums/v1). This file is the source. Each SDK copies it and generates its Workflow
 // API and its client with nexgen (`--targets workflow,client --system-nexus`).
 package temporal:nexus@1.0.0;
@@ -113,7 +113,7 @@ interface stream-service {
   /// @nexus.proto "temporal.api.stream.v1.AppendRecord"
   /// @nexus.unwrap
   record append-record {
-    /// @nexus.doc "The value. It goes through the payload codec."
+    /// @nexus.doc "The value."
     body: body-t,
   }
 
@@ -152,7 +152,7 @@ interface stream-service {
   /// @nexus.doc "One Record that a Producer appended."
   /// @nexus.proto "temporal.api.stream.v1.StreamData"
   record stream-data {
-    /// @nexus.doc "The value. It goes through the payload codec."
+    /// @nexus.doc "The value."
     body: body-t,
     producer: option<producer>,
   }
@@ -211,12 +211,12 @@ interface stream-service {
     /// @nexus.doc "The ref, whose id is stream-id. A create with an owner needs the ref's owner."
     /// @nexus.flatten-in-api fields="backend" fill="id=stream-id"
     %ref: option<stream-ref>,
-    // Native only. Brook's Stores don't read it.
+    // Native only. The SDK Stores don't read it.
     /// @nexus.omit
     close-with-run: placeholder,
     /// @nexus.omit
     namespace: placeholder,
-    // Native only. Brook's Stores don't read it.
+    // Native only. The SDK Stores don't read it.
     /// @nexus.omit
     task-token: placeholder,
   }
@@ -263,7 +263,7 @@ interface stream-service {
     withdraw-run: option<string>,
     /// @nexus.omit
     namespace: placeholder,
-    // Native only. Brook's Stores don't read them.
+    // Native only. The SDK Stores don't read them.
     /// @nexus.omit
     defer-withdrawal: placeholder,
     /// @nexus.omit
@@ -300,7 +300,7 @@ interface stream-service {
     previous-completed-task: option<workflow-task-epoch>,
     /// @nexus.omit
     namespace: placeholder,
-    // Native only. Brook's Stores don't read them.
+    // Native only. The SDK Stores don't read them.
     /// @nexus.omit
     withdraw-run: placeholder,
     /// @nexus.omit
@@ -326,19 +326,22 @@ interface stream-service {
     from-offset: option<s64>,
     /// @nexus.doc "Where to start when from-offset is empty. Unspecified is the beginning."
     start: option<stream-read-start>,
-    /// @nexus.doc "At most this many items, Superseded items included. 1 to 1000."
+    /// @nexus.doc
+    ///   "About this many items per page, 1 to 1000. A Superseded item stays with its Record."
     max-records: option<s32>,
     /// @nexus.doc "How long to wait for a new Record before an empty answer. At most 60 s."
     wait: option<duration>,
     /// @nexus.doc "How long to wait for an uncreated Stream. Empty fails at once. At most 60 s."
     create-wait: option<duration>,
+    // Replay needs a fixed range, so the Workflow API omits `last`.
     /// @nexus.doc "Read the newest this many Records, oldest first. No from-offset. No wait."
+    /// @nexus.api-omit target="workflow"
     last: option<s32>,
     /// @nexus.doc "The maximum Record bytes in a page. A larger Record is still returned alone."
     max-bytes: option<s64>,
     /// @nexus.omit
     namespace: placeholder,
-    // Native only. Brook's Stores refuse to-offset and wake-only.
+    // Native only. The SDK Stores refuse to-offset and wake-only.
     /// @nexus.omit
     to-offset: placeholder,
     /// @nexus.omit
@@ -354,7 +357,7 @@ interface stream-service {
     next-offset: option<s64>,
     /// @nexus.doc "True after the close Record. No later read gives a Record."
     done: option<bool>,
-    // Native only. Brook's Stores never set it.
+    // Native only. The SDK Stores never set it.
     /// @nexus.omit
     continue-as-new-suggested: placeholder,
   }
@@ -404,7 +407,6 @@ interface stream-service {
       max-records: option<s32>,
       wait: option<duration>,
       create-wait: option<duration>,
-      last: option<s32>,
       max-bytes: option<s64>,
     ) -> read-records-response;
 
@@ -443,10 +445,10 @@ interface stream-service {
   // of its reason, or the base class for a reason with no class.
   /// @nexus.doc "Why a Stream call failed. Each reason has one gRPC status code."
   /// @nexus.proto "temporal.api.enums.v1.StreamErrorReason"
-  /// @nexus.error details="stream-error-details" field="reason" base="stream-error"
-  ///   python-base="temporalio.exceptions.ApplicationError"
-  ///   typescript-base="ApplicationFailure" typescript-base-import="@temporalio/common"
-  ///   dotnet-base="Temporalio.Exceptions.ApplicationFailureException"
+  /// @nexus.error details="stream-error-details" field="reason" name="stream-error"
+  ///   python-extends="temporalio.exceptions.ApplicationError"
+  ///   typescript-extends="ApplicationFailure" typescript-extends-import="@temporalio/common"
+  ///   dotnet-extends="Temporalio.Exceptions.ApplicationFailureException"
   enum stream-error-reason {
     stream-error-reason-unspecified,
     /// @nexus.error
