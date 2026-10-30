@@ -457,10 +457,6 @@ impl Store for Flaky {
         self.inner.capabilities()
     }
 
-    fn default_retention(&self) -> Duration {
-        self.inner.default_retention()
-    }
-
     async fn create(
         &self,
         namespace: &str,

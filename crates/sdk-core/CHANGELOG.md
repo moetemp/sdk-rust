@@ -34,16 +34,12 @@ relevant information.
 ## Unreleased
 
 ### Added
-* A local activity's `ActivityTask.Start` has `workflow_task` (field 20), with the started event
+* A local activity's `ActivityTask.Start` has `workflow_task` (field 21), with the started event
   id, attempt and start time of the workflow task in which Core dispatched it. `workflow_task`
   also has `previous_started_event_id`, `previous_attempt` and `previous_started_time`, which
   name the run's last completed workflow task, and `failed_tasks`, the started event ids of the
   run's last 100 failed or timed out workflow tasks. Retries that Core runs locally keep the
   value. Core leaves it unset for other activities.
-  also has `previous_started_event_id`, the started event id of the run's last completed workflow
-  task, and `failed_tasks`, the started event ids of the run's last 100 failed or timed out
-  workflow tasks. Retries that Core runs locally keep the value. Core leaves it unset for other
-  activities.
 * A new experimental crate, `temporalio-streams`, has the Stream runtime that the SDKs link
   into their bridges. Core itself has no Stream code.
 

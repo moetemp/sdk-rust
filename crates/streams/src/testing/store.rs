@@ -3,14 +3,13 @@
 //! A case says its guarantee and what it needs from a backend in its comment.
 
 use super::{
-    case,
+    case, fields,
     support::{Needs, Run, Target, digest, record, records_of, stores_for, supersession},
 };
 use crate::{
     Reason,
     ids::{
-        activity_producer_id, client_producer_id, fields, named_client_producer_id,
-        workflow_producer_id,
+        activity_producer_id, client_producer_id, named_client_producer_id, workflow_producer_id,
     },
     offset::offset_of_entry_id,
     proto::{Producer, ProducerEpoch, StreamProducerKind, StreamRef},
@@ -715,7 +714,6 @@ async fn an_append_whose_ids_would_not_fit_an_offset_is_refused_before_it_writes
 
 /// Every Store keeps the meta fields that the shared vectors name.
 async fn every_store_keeps_the_meta_fields_of_the_shared_vectors() {
-    use crate::ids::fields;
     let vectors: serde_json::Value =
         serde_json::from_str(include_str!("../../testdata/fields.json")).unwrap();
     for target in stores_for(Needs::RAW_KEYS).await {

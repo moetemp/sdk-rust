@@ -5,17 +5,6 @@
       "namespace": "default",
       "workflow_id": "agent-1",
       "first_run_id": "run-1",
-      "name": null,
-      "stream_id": "agent-1:run-1",
-      "meta": "temporal-streams:{default:agent-1%3Arun-1}:meta",
-      "log": "temporal-streams:{default:agent-1%3Arun-1}:log",
-      "producers": "temporal-streams:{default:agent-1%3Arun-1}:producers"
-    },
-    {
-      "prefix": "temporal-streams",
-      "namespace": "default",
-      "workflow_id": "agent-1",
-      "first_run_id": "run-1",
       "name": "turn-3",
       "stream_id": "agent-1:run-1:turn-3",
       "meta": "temporal-streams:{default:agent-1%3Arun-1%3Aturn-3}:meta",
