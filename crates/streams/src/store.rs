@@ -108,7 +108,8 @@ pub struct TaskFacts<'a> {
 pub struct Batch<'a> {
     /// The Producer, with its epoch.
     pub producer: &'a Producer,
-    /// The batch number in this epoch.
+    /// The batch number in this epoch. Zero takes the next one of the epoch, which needs
+    /// [Capabilities::NEXT_SEQUENCE]. Such a batch has no dedupe, so its retry writes it again.
     pub sequence: i64,
     /// The encoded Records.
     pub records: &'a [Vec<u8>],
@@ -207,15 +208,19 @@ impl Capabilities {
     pub const CLOSE: Self = Self(1 << 3);
     /// An open Workflow-owned Stream keeps the safety TTL, not the Retention.
     pub const SAFETY_TTL: Self = Self(1 << 4);
+    /// An append with sequence zero takes the next one of the Producer's epoch, in the same atomic
+    /// step as the dedupe check. So two such batches never get the same number.
+    pub const NEXT_SEQUENCE: Self = Self(1 << 5);
     /// Every capability.
-    pub const ALL: Self = Self((1 << 5) - 1);
+    pub const ALL: Self = Self((1 << 6) - 1);
 
-    const NAMES: [(Self, &'static str); 5] = [
+    const NAMES: [(Self, &'static str); 6] = [
         (Self::PRODUCER_FENCE, "producer_fence"),
         (Self::WITHDRAWAL, "withdrawal"),
         (Self::RUN_FENCE, "run_fence"),
         (Self::CLOSE, "close"),
         (Self::SAFETY_TTL, "safety_ttl"),
+        (Self::NEXT_SEQUENCE, "next_sequence"),
     ];
 
     /// Both sets.

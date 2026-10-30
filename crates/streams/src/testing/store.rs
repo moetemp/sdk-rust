@@ -15,6 +15,7 @@ use crate::{
     proto::{Producer, ProducerEpoch, StreamProducerKind, StreamRef},
     store::{Batch, CreateOutcome, Owner, Withdrawal},
 };
+use futures_util::future::join_all;
 use prost_types::Timestamp;
 use std::time::Duration;
 
@@ -506,16 +507,60 @@ async fn a_batch_gets_consecutive_offsets_that_end_at_its_last_offset() {
     }
 }
 
-/// A sequence below one is refused.
-async fn a_sequence_below_one_is_refused() {
+/// A negative sequence is refused.
+async fn a_negative_sequence_is_refused() {
     for target in stores_for(Needs::CALLS).await {
         target.create(Owner::Client).await;
-        for sequence in [0, -1] {
-            let error = append(&target, &client(1), sequence, &["x"])
-                .await
-                .unwrap_err();
-            assert_eq!(error.reason, Reason::Invalid);
+        let error = append(&target, &client(1), -1, &["x"]).await.unwrap_err();
+        assert_eq!(error.reason, Reason::Invalid);
+        assert!(target.texts().await.is_empty());
+    }
+}
+
+/// A batch with no sequence takes the next one of its Producer's epoch, and a newer epoch starts
+/// at one. Such a batch has no dedupe, so its retry writes it again. A batch that sends the taken
+/// number is a resend.
+async fn a_batch_with_no_sequence_takes_the_next_one_of_its_epoch() {
+    for target in stores_for(Needs::CALLS).await {
+        target.create(Owner::Client).await;
+        let p = client(1);
+        append(&target, &p, 0, &["a"]).await.unwrap();
+        let retry = append(&target, &p, 0, &["a"]).await.unwrap();
+        let resend = append(&target, &p, 2, &["a"]).await.unwrap();
+        assert_eq!(resend.offsets, retry.offsets);
+        let lower = append(&target, &p, 1, &["a"]).await.unwrap_err();
+        assert_eq!(lower.reason, Reason::Sequence);
+        append(&target, &p, 7, &["b"]).await.unwrap();
+        let next = append(&target, &p, 0, &["c"]).await.unwrap();
+        let resend = append(&target, &p, 8, &["c"]).await.unwrap();
+        assert_eq!(resend.offsets, next.offsets);
+        let newer = client(2);
+        let first = append(&target, &newer, 0, &["d"]).await.unwrap();
+        let resend = append(&target, &newer, 1, &["d"]).await.unwrap();
+        assert_eq!(resend.offsets, first.offsets);
+        assert_eq!(target.texts().await, ["a", "a", "b", "c", "d"]);
+    }
+}
+
+/// Batches with no sequence that one Producer epoch sends at once each take their own number, so
+/// the Store writes all of them.
+async fn batches_with_no_sequence_at_once_each_take_their_own_number() {
+    for target in stores_for(Needs::CALLS).await {
+        target.create(Owner::Client).await;
+        let p = client(1);
+        let texts = ["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8"];
+        let appends = texts
+            .iter()
+            .map(|text| append(&target, &p, 0, std::slice::from_ref(text)));
+        for appended in join_all(appends).await {
+            appended.unwrap();
         }
+        let mut written = target.texts().await;
+        written.sort();
+        assert_eq!(written, texts);
+        // The batches took 1 to 8, so 8 holds one of them.
+        let taken = append(&target, &p, 8, &["other"]).await.unwrap_err();
+        assert_eq!(taken.reason, Reason::SeqDivergent);
     }
 }
 
@@ -754,7 +799,9 @@ pub const CASES: &[super::Case] = &[
     case!(offsets_go_on_after_the_log_expires),
     case!(a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline),
     case!(a_batch_gets_consecutive_offsets_that_end_at_its_last_offset),
-    case!(a_sequence_below_one_is_refused),
+    case!(a_negative_sequence_is_refused),
+    case!(a_batch_with_no_sequence_takes_the_next_one_of_its_epoch),
+    case!(batches_with_no_sequence_at_once_each_take_their_own_number),
     case!(a_large_sequence_dedupes_and_one_past_2_53_is_refused),
     case!(a_create_with_another_owner_is_refused),
     case!(an_append_forgets_the_producers_that_the_retention_outlived),
