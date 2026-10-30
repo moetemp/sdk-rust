@@ -23,7 +23,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use temporalio_common::protos::temporal::api::{common::v1::Payload, failure::v1::Failure};
+use temporalio_common::protos::temporal::api::{
+    common::v1::Payload,
+    failure::v1::{Failure, failure::FailureInfo},
+};
 use tonic::Code;
 
 struct Case {
@@ -411,6 +414,28 @@ async fn a_producer_must_match_its_kind_and_not_be_a_workflow() {
     }
 }
 
+/// An append with no sequence takes the next one of its Producer's epoch, as a call with no writer
+/// state sends it. Nothing dedupes it, so its retry writes the batch again. A negative sequence
+/// fails.
+async fn an_append_with_no_sequence_takes_the_next_one_of_its_epoch() {
+    for case in cases_for(Needs::CALLS).await {
+        case.create(None).await.unwrap();
+        let first = case.append(client(1), 0, vec![record("a")]).await.unwrap();
+        let retry = case.append(client(1), 0, vec![record("a")]).await.unwrap();
+        assert!(
+            retry.first_offset > first.last_offset,
+            "{first:?} {retry:?}"
+        );
+        let resend = case.append(client(1), 2, vec![record("a")]).await.unwrap();
+        assert_eq!(resend, retry);
+        let error = case
+            .append(client(1), -1, vec![record("b")])
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "stream_invalid");
+    }
+}
+
 /// A read is inclusive from its offset, a read from the end gives only new Records, an offset past
 /// the newest + 1 fails with `stream_offset`, and one below zero is invalid.
 async fn a_read_is_inclusive_from_its_offset_and_get_offset_reads_only_new_records() {
@@ -663,7 +688,7 @@ async fn a_read_of_an_expired_open_stream_fails_instead_of_waiting() {
             assert_eq!(reason(&error), "stream_expired");
             assert!(started.elapsed() < Duration::from_secs(2));
         }
-        let error = case.append(client(1), 0, vec![]).await.unwrap_err();
+        let error = case.append(client(1), -1, vec![]).await.unwrap_err();
         assert_eq!(reason(&error), "stream_invalid");
     }
 }
@@ -1454,56 +1479,55 @@ async fn a_retry_run_s_create_after_the_log_expired_keeps_the_gap() {
     }
 }
 
-/// A close Record gives its status. A caller can't close as terminated or timed out, nor give a
-/// status that its failure contradicts, nor a close Record over the Record limit.
-async fn a_close_record_gives_its_status_and_a_caller_cant_terminate() {
-    for case in cases_for(Needs::CALLS).await {
-        case.create(None).await.unwrap();
-        let close = |status: StreamCloseStatus, failure: Option<Failure>| CloseStreamRequest {
-            namespace: case.namespace.clone(),
-            stream: case.stream(),
-            producer: Some(client(1)),
-            failure,
-            status: status as i32,
+/// A close Record takes its status from the failure. A failure is canceled when it is a cancel, or
+/// an Activity, child Workflow or Nexus Operation failure whose cause is a cancel, and failed
+/// otherwise. A close Record over the Record limit is refused.
+async fn a_close_record_takes_its_status_from_the_failure() {
+    let canceled_activity = Failure {
+        message: "boom".to_string(),
+        failure_info: Some(FailureInfo::ActivityFailureInfo(Default::default())),
+        cause: Some(Box::new(Failure {
+            failure_info: Some(FailureInfo::CanceledFailureInfo(Default::default())),
             ..Default::default()
-        };
-        let failure = Failure {
-            message: "boom".to_string(),
-            ..Default::default()
-        };
-        for request in [
-            close(StreamCloseStatus::Terminated, None),
-            close(StreamCloseStatus::TimedOut, None),
-            close(StreamCloseStatus::Completed, Some(failure.clone())),
-            close(StreamCloseStatus::Failed, None),
-        ] {
-            let error = call::<_, CloseStreamResponse>(&case.ext, "CloseStream", request)
+        })),
+        ..Default::default()
+    };
+    let other = Failure {
+        message: "boom".to_string(),
+        ..Default::default()
+    };
+    for (failure, status) in [
+        (other, StreamCloseStatus::Failed),
+        (canceled_activity, StreamCloseStatus::Canceled),
+    ] {
+        for case in cases_for(Needs::CALLS).await {
+            case.create(None).await.unwrap();
+            let close = CloseStreamRequest {
+                namespace: case.namespace.clone(),
+                stream: case.stream(),
+                producer: Some(client(1)),
+                failure: Some(failure.clone()),
+                ..Default::default()
+            };
+            let huge = CloseStreamRequest {
+                result: Some(Payload {
+                    data: vec![0; crate::store::MAX_RECORD_BYTES],
+                    ..Default::default()
+                }),
+                ..close.clone()
+            };
+            let error = call::<_, CloseStreamResponse>(&case.ext, "CloseStream", huge)
                 .await
                 .unwrap_err();
-            assert_eq!(
-                (error.code(), reason(&error).as_str()),
-                (Code::InvalidArgument, "stream_invalid")
-            );
+            assert_eq!(reason(&error), "stream_too_large");
+            call::<_, CloseStreamResponse>(&case.ext, "CloseStream", close)
+                .await
+                .unwrap();
+            let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+            let record = read.records.last().unwrap();
+            assert_eq!(close_of(record).status, status as i32);
+            assert_eq!(close_of(record).failure.as_ref().unwrap().message, "boom");
         }
-        let huge = CloseStreamRequest {
-            result: Some(Payload {
-                data: vec![0; crate::store::MAX_RECORD_BYTES],
-                ..Default::default()
-            }),
-            ..close(StreamCloseStatus::Unspecified, None)
-        };
-        let error = call::<_, CloseStreamResponse>(&case.ext, "CloseStream", huge)
-            .await
-            .unwrap_err();
-        assert_eq!(reason(&error), "stream_too_large");
-        let failed = close(StreamCloseStatus::Unspecified, Some(failure));
-        call::<_, CloseStreamResponse>(&case.ext, "CloseStream", failed)
-            .await
-            .unwrap();
-        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
-        let record = read.records.last().unwrap();
-        assert_eq!(close_of(record).status, StreamCloseStatus::Failed as i32);
-        assert_eq!(close_of(record).failure.as_ref().unwrap().message, "boom");
     }
 }
 
@@ -1584,6 +1608,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_create_of_an_expired_stream_fails),
     case!(a_create_checks_its_owner_and_its_ref),
     case!(a_producer_must_match_its_kind_and_not_be_a_workflow),
+    case!(an_append_with_no_sequence_takes_the_next_one_of_its_epoch),
     case!(a_read_is_inclusive_from_its_offset_and_get_offset_reads_only_new_records),
     case!(a_higher_attempt_puts_its_superseded_item_before_its_batch),
     case!(a_read_waits_for_the_create_only_as_long_as_create_wait),
@@ -1607,7 +1632,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_withdrawn_run_cant_close_the_stream),
     case!(a_retry_run_s_create_of_a_new_stream_fences_the_previous_run),
     case!(a_retry_run_s_create_after_the_log_expired_keeps_the_gap),
-    case!(a_close_record_gives_its_status_and_a_caller_cant_terminate),
+    case!(a_close_record_takes_its_status_from_the_failure),
     case!(a_last_read_gives_the_newest_records_oldest_first_without_withdrawn_ones),
     case!(a_page_keeps_under_max_bytes_and_a_larger_record_comes_alone),
 ];
