@@ -26,7 +26,7 @@ use tokio::time::Instant;
 /// The longest wait of one read, for new Records and for the create.
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
 /// The maximum number of Records in one read.
-pub const MAX_RECORDS: usize = 1000;
+const MAX_RECORDS: usize = 1000;
 /// The maximum number of log entries that a read of the last Records scans.
 const MAX_SCAN: usize = 10 * MAX_RECORDS;
 /// The most entry bytes that a read of the last Records scans.
