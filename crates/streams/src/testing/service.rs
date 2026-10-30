@@ -22,7 +22,10 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use temporalio_common::protos::temporal::api::{common::v1::Payload, failure::v1::Failure};
+use temporalio_common::protos::temporal::api::{
+    common::v1::Payload,
+    failure::v1::{Failure, failure::FailureInfo},
+};
 use tonic::Code;
 
 struct Case {
@@ -684,7 +687,7 @@ async fn a_read_of_an_expired_open_stream_fails_instead_of_waiting() {
             assert_eq!(reason(&error), "stream_expired");
             assert!(started.elapsed() < Duration::from_secs(2));
         }
-        let error = case.append(client(1), 0, vec![]).await.unwrap_err();
+        let error = case.append(client(1), -1, vec![]).await.unwrap_err();
         assert_eq!(reason(&error), "stream_invalid");
     }
 }
@@ -992,56 +995,55 @@ async fn a_rerun_local_activity_supersedes_its_first_attempt() {
     }
 }
 
-/// A close Record gives its status. A caller can't close as terminated or timed out, nor give a
-/// status that its failure contradicts, nor a close Record over the Record limit.
-async fn a_close_record_gives_its_status_and_a_caller_cant_terminate() {
-    for case in cases_for(Needs::CALLS).await {
-        case.create(None).await.unwrap();
-        let close = |status: StreamCloseStatus, failure: Option<Failure>| CloseStreamRequest {
-            namespace: case.namespace.clone(),
-            stream: case.stream(),
-            producer: Some(client(1)),
-            failure,
-            status: status as i32,
+/// A close Record takes its status from the failure. A failure is canceled when it is a cancel, or
+/// an Activity, child Workflow or Nexus Operation failure whose cause is a cancel, and failed
+/// otherwise. A close Record over the Record limit is refused.
+async fn a_close_record_takes_its_status_from_the_failure() {
+    let canceled_activity = Failure {
+        message: "boom".to_string(),
+        failure_info: Some(FailureInfo::ActivityFailureInfo(Default::default())),
+        cause: Some(Box::new(Failure {
+            failure_info: Some(FailureInfo::CanceledFailureInfo(Default::default())),
             ..Default::default()
-        };
-        let failure = Failure {
-            message: "boom".to_string(),
-            ..Default::default()
-        };
-        for request in [
-            close(StreamCloseStatus::Terminated, None),
-            close(StreamCloseStatus::TimedOut, None),
-            close(StreamCloseStatus::Completed, Some(failure.clone())),
-            close(StreamCloseStatus::Failed, None),
-        ] {
-            let error = call::<_, CloseStreamResponse>(&case.ext, "CloseStream", request)
+        })),
+        ..Default::default()
+    };
+    let other = Failure {
+        message: "boom".to_string(),
+        ..Default::default()
+    };
+    for (failure, status) in [
+        (other, StreamCloseStatus::Failed),
+        (canceled_activity, StreamCloseStatus::Canceled),
+    ] {
+        for case in cases_for(Needs::CALLS).await {
+            case.create(None).await.unwrap();
+            let close = CloseStreamRequest {
+                namespace: case.namespace.clone(),
+                stream: case.stream(),
+                producer: Some(client(1)),
+                failure: Some(failure.clone()),
+                ..Default::default()
+            };
+            let huge = CloseStreamRequest {
+                result: Some(Payload {
+                    data: vec![0; crate::store::MAX_RECORD_BYTES],
+                    ..Default::default()
+                }),
+                ..close.clone()
+            };
+            let error = call::<_, CloseStreamResponse>(&case.ext, "CloseStream", huge)
                 .await
                 .unwrap_err();
-            assert_eq!(
-                (error.code(), reason(&error).as_str()),
-                (Code::InvalidArgument, "stream_invalid")
-            );
+            assert_eq!(reason(&error), "stream_too_large");
+            call::<_, CloseStreamResponse>(&case.ext, "CloseStream", close)
+                .await
+                .unwrap();
+            let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+            let record = read.records.last().unwrap();
+            assert_eq!(close_of(record).status, status as i32);
+            assert_eq!(close_of(record).failure.as_ref().unwrap().message, "boom");
         }
-        let huge = CloseStreamRequest {
-            result: Some(Payload {
-                data: vec![0; crate::store::MAX_RECORD_BYTES],
-                ..Default::default()
-            }),
-            ..close(StreamCloseStatus::Unspecified, None)
-        };
-        let error = call::<_, CloseStreamResponse>(&case.ext, "CloseStream", huge)
-            .await
-            .unwrap_err();
-        assert_eq!(reason(&error), "stream_too_large");
-        let failed = close(StreamCloseStatus::Unspecified, Some(failure));
-        call::<_, CloseStreamResponse>(&case.ext, "CloseStream", failed)
-            .await
-            .unwrap();
-        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
-        let record = read.records.last().unwrap();
-        assert_eq!(close_of(record).status, StreamCloseStatus::Failed as i32);
-        assert_eq!(close_of(record).failure.as_ref().unwrap().message, "boom");
     }
 }
 
@@ -1136,7 +1138,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_ref_with_an_owner_and_one_without_reach_the_same_stream),
     case!(a_create_answer_names_the_backend_and_the_store_never_reads_it),
     case!(a_rerun_local_activity_supersedes_its_first_attempt),
-    case!(a_close_record_gives_its_status_and_a_caller_cant_terminate),
+    case!(a_close_record_takes_its_status_from_the_failure),
     case!(a_last_read_gives_the_newest_records_oldest_first_without_withdrawn_ones),
     case!(a_page_keeps_under_max_bytes_and_a_larger_record_comes_alone),
 ];
