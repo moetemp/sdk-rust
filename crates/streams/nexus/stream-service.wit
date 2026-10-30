@@ -280,9 +280,9 @@ interface stream-service {
   /// @nexus.proto "temporal.api.streamservice.v1.CloseStreamRequest"
   record close-stream-request {
     %stream: stream-ref,
-    /// @nexus.doc "Workflow only. The run's failed or timed out Workflow Tasks."
-    /// @nexus.api-omit
-    failed-tasks: list<s64>,
+    // Native only. The SDK Stores don't read it.
+    /// @nexus.omit
+    failed-tasks: placeholder,
     /// @nexus.source target="workflow" python="workflow_producer()"
     ///   typescript="workflowProducer()" dotnet="StreamWorkflowContext.Producer()"
     /// @nexus.source target="client" python="client_producer()" typescript="clientProducer()"
@@ -295,9 +295,9 @@ interface stream-service {
     ///   "Empty is completed, or failed with a failure. With a canceled failure, it is canceled."
     /// @nexus.api-omit
     status: option<stream-close-status>,
-    /// @nexus.doc "Workflow only. The previous completed Workflow Task of the run."
-    /// @nexus.api-omit
-    previous-completed-task: option<workflow-task-epoch>,
+    // Native only. The SDK Stores don't read it.
+    /// @nexus.omit
+    previous-completed-task: placeholder,
     /// @nexus.omit
     namespace: placeholder,
     // Native only. The SDK Stores don't read them.
