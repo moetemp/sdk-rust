@@ -230,6 +230,32 @@ async fn an_append_without_the_fence_or_the_flag_is_refused_with_nothing_written
 }
 
 #[tokio::test]
+async fn an_append_with_no_sequence_without_the_capability_is_refused_with_nothing_written() {
+    let case = case(Capabilities::NEXT_SEQUENCE);
+    case.create().await;
+    let request = AppendRecordsRequest {
+        namespace: NAMESPACE.to_string(),
+        stream: case.stream_ref(),
+        producer: Some(client()),
+        records: vec![AppendRecord::default()],
+        ..Default::default()
+    };
+    let error = case
+        .call("AppendRecords", request.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(refused_capability(&error), "next_sequence");
+    assert_eq!(case.log_len(), 0);
+    // A batch with its own sequence needs no number from the Store.
+    let numbered = AppendRecordsRequest {
+        sequence: 1,
+        ..request
+    };
+    case.call("AppendRecords", numbered).await.unwrap();
+    assert_eq!(case.log_len(), 1);
+}
+
+#[tokio::test]
 async fn a_close_without_the_capability_is_refused_and_the_stream_stays_open() {
     let case = case(Capabilities::CLOSE);
     case.create().await;

@@ -299,6 +299,28 @@ async fn a_producer_must_match_its_kind_and_not_be_a_workflow() {
     }
 }
 
+/// An append with no sequence takes the next one of its Producer's epoch, as a call with no writer
+/// state sends it. Nothing dedupes it, so its retry writes the batch again. A negative sequence
+/// fails.
+async fn an_append_with_no_sequence_takes_the_next_one_of_its_epoch() {
+    for case in cases_for(Needs::CALLS).await {
+        case.create(None).await.unwrap();
+        let first = case.append(client(1), 0, vec![record("a")]).await.unwrap();
+        let retry = case.append(client(1), 0, vec![record("a")]).await.unwrap();
+        assert!(
+            retry.first_offset > first.last_offset,
+            "{first:?} {retry:?}"
+        );
+        let resend = case.append(client(1), 2, vec![record("a")]).await.unwrap();
+        assert_eq!(resend, retry);
+        let error = case
+            .append(client(1), -1, vec![record("b")])
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "stream_invalid");
+    }
+}
+
 /// An unknown method fails with UNIMPLEMENTED.
 async fn an_unknown_method_is_unimplemented() {
     for case in cases_for(Needs::CALLS).await {
@@ -314,5 +336,6 @@ pub const CASES: &[super::Case] = &[
     case!(a_create_of_an_expired_stream_fails),
     case!(a_create_checks_its_owner_and_its_ref),
     case!(a_producer_must_match_its_kind_and_not_be_a_workflow),
+    case!(an_append_with_no_sequence_takes_the_next_one_of_its_epoch),
     case!(an_unknown_method_is_unimplemented),
 ];
