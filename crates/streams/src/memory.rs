@@ -451,10 +451,18 @@ impl Store for MemoryStore {
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
         let withdrawal = &batch.withdrawal;
         let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
-        let sequence = batch.sequence;
         let suffix = format!("|{}|{}", producer.kind, producer.id);
         let member = format!("{}|{}", producer.kind, producer.id);
         let appended = self.with(namespace, stream_id, |keys, now| {
+            // The lock also covers the dedupe check, so no other batch takes the same number.
+            let sequence = match batch.sequence {
+                0 => keys
+                    .get(&format!("d{suffix}"))
+                    .and_then(|last| last.strip_prefix(&format!("{epoch}|")))
+                    .and_then(|rest| rest.split('|').next())
+                    .map_or(1, |last| last.parse::<i64>().unwrap_or(0) + 1),
+                sequence => sequence,
+            };
             if !(1..=MAX_SEQUENCE).contains(&sequence) {
                 return Err(refuse(
                     Reason::Invalid,
