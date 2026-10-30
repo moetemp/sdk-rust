@@ -11,9 +11,14 @@ repository = "https://github.com/temporalio/sdk-rust"
 keywords = ["temporal", "workflow", "streams"]
 categories = ["development-tools"]
 
+[features]
+# The test helpers, for the crates of other Stores.
+test-support = []
+
 [dependencies]
 prost = { workspace = true }
 prost-types = { workspace = true }
+sha2 = "0.10"
 thiserror = { workspace = true }
 tonic = { workspace = true }
 
@@ -31,6 +36,9 @@ version = "~0.10.0"
 [build-dependencies]
 protox = "0.9.1"
 tonic-prost-build = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

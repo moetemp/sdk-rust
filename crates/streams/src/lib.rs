@@ -6,8 +6,14 @@
 //! client and calls it with an operation name and proto bytes. Core has no hook for it. A Workflow
 //! makes each call from a Local Activity.
 
+pub mod digest;
+pub mod epoch;
 mod error;
+pub mod ids;
+pub mod offset;
 pub mod protos;
+#[cfg(any(test, feature = "test-support"))]
+pub mod testing;
 
 pub use error::{Reason, StreamError, StreamResult};
 
