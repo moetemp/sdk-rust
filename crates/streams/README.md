@@ -20,8 +20,10 @@ Workflow makes each Stream call from a Local Activity. Core has no Stream code.
   every line is at most 100 columns.
 - `testdata/*.json` are the shared vectors. They cover Stream ids, Producer ids, Store keys and
   meta fields, offsets, epoch keys, the withdrawal rule and the batch digest of a dedupe entry.
-  `testdata/gen_vectors.py` writes them from a second implementation. Each SDK, each Store and the
-  server run the same files.
+  `testdata/gen_vectors.py` writes them from a second implementation, and the crate's tests read
+  each file. The Python SDK also reads `ids.json` and `withdrawals.json`, and the server reads
+  `epochs.json` and `withdrawals.json`. Each Store reads `fields.json` through the shared Store
+  suite. `digests.json` is the golden of the crate's batch digest.
 
 ## The runtime
 

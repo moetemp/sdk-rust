@@ -1,5 +1,5 @@
 //! The shared test vectors, which `testdata/gen_vectors.py` writes from a second implementation.
-//! Every SDK that builds ids or reads Records runs the same files.
+//! The crate's README says which other side reads each file.
 
 use prost_types::Timestamp;
 use serde_json::Value;
@@ -9,7 +9,7 @@ use temporalio_common::protos::temporal::api::common::v1::{
 use temporalio_streams::{
     digest::batch_digest,
     epoch::{epoch_key, task_key, withdraws},
-    ids::{self, StreamKeys, fields},
+    ids::{self, StreamKeys},
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{
         AppendRecord, Producer, ProducerEpoch, StreamData, StreamProducerKind, StreamRecord,
@@ -63,11 +63,11 @@ fn kind(name: &str) -> StreamProducerKind {
 fn stream_ids_and_keys_match() {
     let vectors = load("ids.json");
     for case in vectors["streams"].as_array().unwrap() {
-        let (workflow_id, run) = (text(case, "workflow_id"), text(case, "first_run_id"));
-        let id = match case["name"].as_str() {
-            Some(name) => ids::scoped_stream_id(workflow_id, run, name),
-            None => ids::default_stream_id(workflow_id, run),
-        };
+        let id = ids::scoped_stream_id(
+            text(case, "workflow_id"),
+            text(case, "first_run_id"),
+            text(case, "name"),
+        );
         assert_eq!(id, text(case, "stream_id"));
         let keys = StreamKeys::new(text(case, "prefix"), text(case, "namespace"), &id);
         assert_eq!(keys.meta(), text(case, "meta"));
@@ -138,21 +138,6 @@ fn epoch_keys_match() {
         };
         assert_eq!(task_key(&task), text(case, "task_key"));
     }
-}
-
-#[test]
-fn meta_fields_match() {
-    let case = load("fields.json");
-    let (kind, producer, run) = (
-        number(&case, "kind") as i32,
-        text(&case, "producer_id"),
-        text(&case, "run_id"),
-    );
-    assert_eq!(fields::fence(kind, producer), text(&case, "fence"));
-    assert_eq!(fields::dedupe(kind, producer), text(&case, "dedupe"));
-    assert_eq!(fields::holds(kind, producer), text(&case, "holds"));
-    assert_eq!(fields::run_wrote(run), text(&case, "run_wrote"));
-    assert_eq!(fields::withdrawn_run(run), text(&case, "withdrawn_run"));
 }
 
 #[test]

@@ -29,6 +29,7 @@ message MemoryStreamConfig {
 // process take their `sequence` from one counter, so a writer that opens again after its close
 // continues above its earlier batches.
 message OpenWriterRequest {
+    reserved 4, 7;
     string namespace = 1;
     temporal.api.stream.v1.StreamRef stream = 2;
     temporal.api.stream.v1.Producer producer = 3;

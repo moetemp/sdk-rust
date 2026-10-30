@@ -360,7 +360,10 @@ impl MemoryStore {
         }
         result
     }
+}
 
+#[cfg(any(test, feature = "test-support"))]
+impl MemoryStore {
     /// Changes one meta field, for tests of what the scripts refuse.
     #[doc(hidden)]
     pub fn test_set_meta(&self, namespace: &str, stream_id: &str, field: &str, value: &str) {
@@ -434,10 +437,6 @@ fn offsets(first: &str, last: &str) -> StreamResult<Option<(i64, i64)>> {
 impl Store for MemoryStore {
     fn capabilities(&self) -> Capabilities {
         Capabilities::ALL
-    }
-
-    fn default_retention(&self) -> Duration {
-        self.retention
     }
 
     async fn create(
