@@ -60,11 +60,6 @@ fn join(parts: &[&str]) -> String {
         .join(":")
 }
 
-/// The id of a Workflow's default Stream, `<workflow id>:<first run id>`.
-pub fn default_stream_id(workflow_id: &str, first_run_id: &str) -> String {
-    join(&[workflow_id, first_run_id])
-}
-
 /// The id of a Stream that a Workflow creates with a name, `<workflow id>:<first run id>:<name>`.
 pub fn scoped_stream_id(workflow_id: &str, first_run_id: &str, name: &str) -> String {
     join(&[workflow_id, first_run_id, name])
@@ -177,47 +172,6 @@ pub fn check_producer(producer: &Producer) -> StreamResult<()> {
     Ok(())
 }
 
-/// The run id in a Workflow Producer id, or `None` for another id.
-pub fn run_of_workflow_producer(id: &str) -> Option<String> {
-    decode_part(id.strip_prefix("wf:")?)
-}
-
-/// The fields of the `:meta` hash. The field names hold encoded ids only, so a `|` in a field
-/// name is always a separator.
-pub mod fields {
-    use super::encode_part;
-
-    /// The format version of the Stream.
-    pub const VERSION: &str = "v";
-
-    /// The newest epoch key of a Producer, the fence.
-    pub fn fence(kind: i32, producer_id: &str) -> String {
-        format!("e|{kind}|{producer_id}")
-    }
-
-    /// The last batch of a Producer's newest epoch, as
-    /// `<epoch key>|<sequence>|<first>|<last>|<digest>`. These are the dedupe key, the first and
-    /// last entry ids of the batch, and the content digest that a resend must match.
-    pub fn dedupe(kind: i32, producer_id: &str) -> String {
-        format!("d|{kind}|{producer_id}")
-    }
-
-    /// The newest epoch key of a Producer that still has Records in the Stream.
-    pub fn holds(kind: i32, producer_id: &str) -> String {
-        format!("h|{kind}|{producer_id}")
-    }
-
-    /// Set when a Producer of the run wrote a Record to the Stream.
-    pub fn run_wrote(run_id: &str) -> String {
-        format!("run|{}", encode_part(run_id))
-    }
-
-    /// Set when a Workflow retry withdrew the run.
-    pub fn withdrawn_run(run_id: &str) -> String {
-        format!("wr|{}", encode_part(run_id))
-    }
-}
-
 /// The keys of one Stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamKeys {
@@ -328,10 +282,6 @@ mod tests {
                 "{producer:?}"
             );
         }
-        assert_eq!(
-            run_of_workflow_producer(&workflow_producer_id(run)).as_deref(),
-            Some(run)
-        );
     }
 
     #[test]
