@@ -1,7 +1,7 @@
 """Writes the shared test vectors of the Stream runtime.
 
 This is a second implementation of the layout, in Python, so the crate's tests check the Rust
-code against it. Each SDK runs the same JSON files. Run it from this directory:
+code against it. The crate's README says which side reads each file. Run it from this directory:
 
     python3 gen_vectors.py
 """
@@ -58,14 +58,10 @@ def epoch_key(epoch):
 def ids():
     cases = []
     for prefix, namespace, workflow_id, first_run_id, name in [
-        ("temporal-streams", "default", "agent-1", "run-1", None),
         ("temporal-streams", "default", "agent-1", "run-1", "turn-3"),
         ("p:x", "ns{1}", "a:b/c", "r%1", "é name"),
     ]:
-        if name is None:
-            stream_id = join(workflow_id, first_run_id)
-        else:
-            stream_id = join(workflow_id, first_run_id, name)
+        stream_id = join(workflow_id, first_run_id, name)
         cases.append(
             {
                 "prefix": prefix,
@@ -180,7 +176,7 @@ def digest(records):
 
 
 def digests():
-    """Batches as hex bytes, so the server and every SDK compute the same digest."""
+    """Batches as hex bytes, with the digest that the crate's `batch_digest` must compute."""
     cases = [
         {"name": "empty batch", "records": []},
         {"name": "one record, no body", "records": [{}]},

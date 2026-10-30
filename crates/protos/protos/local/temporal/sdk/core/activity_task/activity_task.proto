@@ -65,9 +65,11 @@ message Start {
     bool is_local = 17;
     // Run ID of this activity execution. Only set for standalone activities.
     string run_id = 19;
+    // Upstream uses field 20 for propagated_nexus_serialization_context, which this fork doesn't
+    // have yet. Keep it free so the two stay wire compatible.
     // For a local activity, the workflow task in which Core dispatched this execution. Retries that
     // Core runs locally keep the value. Unset for other activities.
-    WorkflowTaskAttempt workflow_task = 20;
+    WorkflowTaskAttempt workflow_task = 21;
 }
 
 // One attempt of a workflow task, from the poll response and the history of that attempt.

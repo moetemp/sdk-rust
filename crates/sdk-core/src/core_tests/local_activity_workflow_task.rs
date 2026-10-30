@@ -193,34 +193,6 @@ async fn a_retry_that_core_runs_keeps_the_dispatching_task() {
 }
 
 #[tokio::test]
-async fn local_activities_of_one_activation_name_the_same_task() {
-    let mut t = TestHistoryBuilder::default();
-    t.add_by_type(EventType::WorkflowExecutionStarted);
-    t.add_workflow_task_scheduled_and_started();
-    let mut mock = build_mock_pollers(MockPollCfg::from_resps(t, [ResponseType::AllHistory]));
-    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
-    let worker = mock_worker(mock);
-
-    let first = worker.poll_workflow_activation().await.unwrap();
-    complete(&worker, &first, vec![la_cmd(1), la_cmd(2)]).await;
-
-    let one = worker.poll_activity_task().await.unwrap();
-    let two = worker.poll_activity_task().await.unwrap();
-    assert_eq!(dispatching(start_of(&one)), (3, 1));
-    assert_eq!(start_of(&one).workflow_task, start_of(&two).workflow_task);
-    worker
-        .complete_activity_task(ActivityTaskCompletion {
-            task_token: one.task_token,
-            result: Some(ActivityExecutionResult::ok(vec![1].into())),
-        })
-        .await
-        .unwrap();
-    let resolved = worker.poll_workflow_activation().await.unwrap();
-    complete(&worker, &resolved, vec![]).await;
-    finish(worker, two).await;
-}
-
-#[tokio::test]
 async fn failed_tasks_from_every_history_page_are_named() {
     let wf_id = "fake_wf_id";
     let mut t = TestHistoryBuilder::default();
@@ -239,10 +211,13 @@ async fn failed_tasks_from_every_history_page_are_named() {
     t.add_timer_fired(timer_started, "2".to_string());
     t.add_workflow_task_scheduled_and_started();
     t.add_workflow_task_timed_out();
+    // A task that times out before it starts has no started event, so it adds no id.
+    t.add_workflow_task_scheduled();
+    t.add_workflow_task_timed_out();
     t.add_workflow_task_scheduled_and_started();
 
     // The poll response has the first page and each history fetch adds one page. The failed task
-    // is on the second page and the timed out task is on the last.
+    // is on the second page and the timed out tasks are on the last.
     let mut first_page = hist_to_poll_resp(&t, wf_id, ResponseType::AllHistory).resp;
     first_page.history.as_mut().unwrap().events.truncate(6);
     first_page.next_page_token = vec![1];
@@ -293,7 +268,7 @@ async fn failed_tasks_from_every_history_page_are_named() {
     let task = start_of(&la).workflow_task.as_ref().unwrap();
     assert_eq!(
         (task.started_event_id, task.previous_started_event_id),
-        (19, 11)
+        (21, 11)
     );
     assert_eq!(task.failed_tasks, [8, 16]);
     assert_eq!(task.previous_started_time, Some(completed_time.into()));

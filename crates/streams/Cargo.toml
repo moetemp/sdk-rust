@@ -11,6 +11,10 @@ repository = "https://github.com/temporalio/sdk-rust"
 keywords = ["temporal", "workflow", "streams"]
 categories = ["development-tools"]
 
+[features]
+# The test helpers, for the crates of other Stores.
+test-support = []
+
 [dependencies]
 async-trait = "0.1"
 prost = { workspace = true }
