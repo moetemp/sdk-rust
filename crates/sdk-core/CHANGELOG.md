@@ -34,7 +34,7 @@ relevant information.
 ## Unreleased
 
 ### Added
-* A local activity's `ActivityTask.Start` has `workflow_task` (field 20), with the started event
+* A local activity's `ActivityTask.Start` has `workflow_task` (field 21), with the started event
   id, attempt and start time of the workflow task in which Core dispatched it. `workflow_task`
   also has `previous_started_event_id`, `previous_attempt` and `previous_started_time`, which
   name the run's last completed workflow task, and `failed_tasks`, the started event ids of the
