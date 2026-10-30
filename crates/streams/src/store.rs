@@ -264,9 +264,6 @@ pub trait Store: Send + Sync + 'static {
     /// another one must say what it forwards.
     fn capabilities(&self) -> Capabilities;
 
-    /// The Retention of a Stream whose create sets none.
-    fn default_retention(&self) -> Duration;
-
     /// Creates a Stream, or finds it when it is open and has the create's owner. The calls that
     /// write take the Stream's whole ref, since the server finds a Workflow's Stream by its owner.
     /// With [Capabilities::RUN_FENCE], a retry run's create withdraws its previous run.
