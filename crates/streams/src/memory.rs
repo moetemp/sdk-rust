@@ -391,10 +391,6 @@ impl Store for MemoryStore {
         Capabilities::ALL.without(Capabilities::RUN_FENCE)
     }
 
-    fn default_retention(&self) -> Duration {
-        self.retention
-    }
-
     async fn create(
         &self,
         namespace: &str,

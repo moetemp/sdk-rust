@@ -45,7 +45,8 @@ pub enum Reason {
 }
 
 impl Reason {
-    /// The token lang reads from the error details.
+    /// The token that starts the error's text. Lang reads the reason from
+    /// `StreamErrorDetails.reason`, not from this text.
     pub fn token(self) -> &'static str {
         match self {
             Reason::NotFound => "stream_not_found",
