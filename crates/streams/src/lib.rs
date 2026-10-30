@@ -22,7 +22,7 @@ pub mod store;
 pub mod testing;
 
 pub use error::{Reason, StreamError, StreamResult};
-pub use runtime::{MEMORY_RUNTIME_NAME, MemoryStreamRuntime, StoreFactory, StreamRuntime};
+pub use runtime::{MemoryStreamRuntime, StoreFactory, StreamRuntime};
 
 /// The protos that lang and the crate exchange.
 pub mod proto {
