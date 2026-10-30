@@ -116,11 +116,6 @@ impl StreamRuntime {
         self.shared.name
     }
 
-    /// The backend name that the refs of the runtime carry.
-    pub fn backend(&self) -> &str {
-        &self.shared.backend
-    }
-
     /// Runs one method on encoded input and returns the encoded output. The bridge raises an error
     /// with [StreamError::code] and [StreamError::details].
     pub async fn call(&self, method: &str, input: &[u8]) -> StreamResult<Vec<u8>> {
@@ -154,8 +149,8 @@ impl StreamRuntime {
     }
 }
 
-/// The name of the memory runtime, for a bridge that selects a runtime by name.
-pub const MEMORY_RUNTIME_NAME: &str = "temporalio-streams-memory";
+/// The name that [StreamRuntime::name] gives for a memory runtime.
+const MEMORY_RUNTIME_NAME: &str = "temporalio-streams-memory";
 
 /// The Stream runtime on the memory Store, for tests. It serves the same calls with the same
 /// rules as every other Store, and it keeps its Streams in this process only.
@@ -163,15 +158,6 @@ pub const MEMORY_RUNTIME_NAME: &str = "temporalio-streams-memory";
 pub struct MemoryStreamRuntime;
 
 impl MemoryStreamRuntime {
-    /// Builds a runtime on an empty memory Store.
-    pub fn create(
-        retention: Duration,
-        safety_ttl: Duration,
-        meter: Option<TemporalMeter>,
-    ) -> Arc<StreamRuntime> {
-        Self::with_store(Arc::new(MemoryStore::new(retention, safety_ttl)), meter)
-    }
-
     /// Builds a runtime from an encoded [MemoryStreamConfig]. Its field numbers are those of the
     /// same fields in the config of another Store, such as Redis, so a backend can pass that config
     /// too.

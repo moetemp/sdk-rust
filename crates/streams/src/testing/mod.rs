@@ -3,6 +3,7 @@
 
 mod support;
 
+pub mod fields;
 pub mod service;
 pub mod store;
 

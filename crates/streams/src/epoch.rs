@@ -9,10 +9,7 @@ use crate::proto::{
     stream_record::Item,
 };
 use prost_types::Timestamp;
-use std::{
-    cmp::Ordering,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::cmp::Ordering;
 
 fn hex64(value: i64) -> String {
     format!("{:016x}", value.max(0))
@@ -68,15 +65,6 @@ pub fn compare_epochs(a: &ProducerEpoch, b: &ProducerEpoch) -> Ordering {
 
 fn compare_tasks(a: &WorkflowTaskEpoch, b: &WorkflowTaskEpoch) -> Ordering {
     task_key(a).cmp(&task_key(b))
-}
-
-/// A proto timestamp of a system time.
-pub fn timestamp(time: SystemTime) -> Timestamp {
-    let since = time.duration_since(UNIX_EPOCH).unwrap_or_default();
-    Timestamp {
-        seconds: since.as_secs() as i64,
-        nanos: since.subsec_nanos() as i32,
-    }
 }
 
 /// Whether a `Superseded` item withdraws an earlier Record.

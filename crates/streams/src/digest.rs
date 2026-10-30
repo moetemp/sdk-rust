@@ -1,6 +1,6 @@
 //! The content digest of a batch. Each dedupe entry stores it, so that a resend with the same
-//! `sequence` and other content fails instead of being dropped without an error. The server
-//! computes the same digest, and `testdata/digests.json` has the expected values.
+//! `sequence` and other content fails instead of being dropped without an error. The Store compares
+//! the digest that this function gives, and `testdata/digests.json` has its expected values.
 
 use crate::proto::AppendRecord;
 use sha2::{Digest, Sha256};
