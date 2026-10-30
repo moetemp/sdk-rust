@@ -200,8 +200,13 @@ interface stream-service {
     stream-id: string,
     /// @nexus.doc "The age after which a Record is dropped. Empty is the Store default."
     retention: option<duration>,
+    // A wrong run would silently withdraw real Records, so it is never a parameter. The helper
+    // gives the previous run in a retry run's Workflow, and nothing elsewhere.
     /// @nexus.doc "Retry run only. The previous run, whose Records this withdraws."
-    /// @nexus.api-omit
+    /// @nexus.source target="workflow" python="withdraw_run()" typescript="withdrawRun()"
+    ///   dotnet="StreamWorkflowContext.WithdrawRun()"
+    /// @nexus.source target="client" python="withdraw_run()" typescript="withdrawRun()"
+    ///   dotnet="StreamWorkflowContext.WithdrawRun()"
     withdraw-run: option<string>,
     /// @nexus.doc "The Workflow run that owns the Stream. The Workflow transport sets it."
     /// @nexus.source target="workflow" python="workflow_owner()" typescript="workflowOwner()"
@@ -249,8 +254,10 @@ interface stream-service {
     /// @nexus.source target="client" python="client_producer()" typescript="clientProducer()"
     ///   dotnet="StreamActivityContext.Producer()"
     producer: option<producer>,
-    /// @nexus.doc "The batch number in this epoch, 1 or more. It is part of the dedupe key."
-    /// @nexus.api-omit
+    // A call with no writer state, such as publish, sends no sequence. The Store then numbers the
+    // batch, so nothing dedupes it.
+    /// @nexus.doc
+    ///   "The batch number in this epoch. Empty takes the next one, and a retry writes it again."
     sequence: option<s64>,
     /// @nexus.doc "Local Activity only. The run's last completed Workflow Task."
     /// @nexus.api-omit target="workflow"
@@ -258,8 +265,13 @@ interface stream-service {
     ///   typescript="localActivityPreviousCompletedTask()"
     ///   dotnet="StreamActivityContext.LocalActivityPreviousCompletedTask()"
     previous-completed-task: option<workflow-task-epoch>,
+    // A wrong run would silently withdraw real Records, so it is never a parameter. The helper
+    // gives the previous run in a retry run's Workflow, and nothing elsewhere.
     /// @nexus.doc "Retry run only. The previous run, whose Records this withdraws."
-    /// @nexus.api-omit
+    /// @nexus.source target="workflow" python="withdraw_run()" typescript="withdrawRun()"
+    ///   dotnet="StreamWorkflowContext.WithdrawRun()"
+    /// @nexus.source target="client" python="withdraw_run()" typescript="withdrawRun()"
+    ///   dotnet="StreamWorkflowContext.WithdrawRun()"
     withdraw-run: option<string>,
     /// @nexus.omit
     namespace: placeholder,
@@ -289,12 +301,10 @@ interface stream-service {
     ///   dotnet="StreamActivityContext.Producer()"
     producer: option<producer>,
     %result: option<payload>,
+    // Each SDK gives a canceled Activity, child Workflow or Nexus Operation as a failure of that
+    // call whose cause is the cancel. So such a failure also cancels.
+    /// @nexus.doc "Empty completes the Stream. A cancel failure cancels it. Any other fails it."
     failure: option<failure>,
-    // The service sets canceled for a failure with canceled_failure_info, so the API omits status.
-    /// @nexus.doc
-    ///   "Empty is completed, or failed with a failure. With a canceled failure, it is canceled."
-    /// @nexus.api-omit
-    status: option<stream-close-status>,
     // Native only. The SDK Stores don't read it.
     /// @nexus.omit
     previous-completed-task: placeholder,
