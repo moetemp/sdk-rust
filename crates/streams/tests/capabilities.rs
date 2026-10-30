@@ -9,7 +9,7 @@ use std::{
 use temporalio_common::protos::temporal::api::{common::v1::Execution, enums::v1::ExecutionType};
 use temporalio_streams::{
     MemoryStreamRuntime, StreamError, StreamResult, StreamRuntime,
-    ids::{client_producer_id, default_stream_id},
+    ids::client_producer_id,
     memory::MemoryStore,
     proto::{
         AppendRecord, AppendRecordsRequest, CloseStreamRequest, CreateStreamRequest,
@@ -34,10 +34,6 @@ struct Masked {
 impl Store for Masked {
     fn capabilities(&self) -> Capabilities {
         self.inner.capabilities().without(self.without)
-    }
-
-    fn default_retention(&self) -> Duration {
-        self.inner.default_retention()
     }
 
     async fn create(
@@ -123,7 +119,7 @@ fn case(without: Capabilities) -> Case {
     Case {
         ext: MemoryStreamRuntime::with_store(store, None),
         memory,
-        stream: default_stream_id("wf", &run_id),
+        stream: format!("wf:{run_id}"),
         run_id,
     }
 }
