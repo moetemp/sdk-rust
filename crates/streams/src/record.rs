@@ -77,37 +77,34 @@ pub(crate) fn close_record(
     .encode_to_vec()
 }
 
-/// The status of a caller's close. Only the owner's end on the server terminates or times out a
-/// Stream, so a reader can trust those two.
-pub(crate) fn caller_status(
-    status: i32,
-    failure: Option<&Failure>,
-) -> StreamResult<StreamCloseStatus> {
-    let failed = failure.is_some();
-    let canceled = failure.is_some_and(|failure| {
+/// The status of a caller's close, from its failure. Only the owner's end on the server terminates
+/// or times out a Stream, so a reader can trust those two.
+pub(crate) fn caller_status(failure: Option<&Failure>) -> StreamCloseStatus {
+    match failure {
+        None => StreamCloseStatus::Completed,
+        Some(failure) if canceled(failure) => StreamCloseStatus::Canceled,
+        Some(_) => StreamCloseStatus::Failed,
+    }
+}
+
+/// Whether a failure is a cancel. An SDK gives a canceled Activity, child Workflow or Nexus
+/// Operation as a failure of that call whose cause is the cancel, so the rule looks at the cause of
+/// those three.
+fn canceled(failure: &Failure) -> bool {
+    let cancel = |failure: &Failure| {
         matches!(
             failure.failure_info,
             Some(FailureInfo::CanceledFailureInfo(_))
         )
-    });
-    match StreamCloseStatus::try_from(status) {
-        // The SDK APIs send no status, so a failure with `CanceledFailureInfo` gives canceled.
-        Ok(StreamCloseStatus::Unspecified) if canceled => Ok(StreamCloseStatus::Canceled),
-        Ok(StreamCloseStatus::Unspecified) if failed => Ok(StreamCloseStatus::Failed),
-        Ok(StreamCloseStatus::Unspecified) => Ok(StreamCloseStatus::Completed),
-        Ok(StreamCloseStatus::Terminated | StreamCloseStatus::TimedOut) => Err(
-            StreamError::invalid("Only the owner's end terminates or times out a Stream"),
-        ),
-        Ok(StreamCloseStatus::Completed) if failed => {
-            Err(StreamError::invalid("A completed close has no failure"))
-        }
-        Ok(StreamCloseStatus::Failed) if !failed => {
-            Err(StreamError::invalid("A failed close needs its failure"))
-        }
-        Ok(status) => Ok(status),
-        Err(_) => Err(StreamError::invalid(format!(
-            "The close status {status} is unknown"
-        ))),
+    };
+    match failure.failure_info {
+        Some(FailureInfo::CanceledFailureInfo(_)) => true,
+        Some(
+            FailureInfo::ActivityFailureInfo(_)
+            | FailureInfo::ChildWorkflowExecutionFailureInfo(_)
+            | FailureInfo::NexusOperationExecutionFailureInfo(_),
+        ) => failure.cause.as_deref().is_some_and(cancel),
+        _ => false,
     }
 }
 
@@ -150,21 +147,49 @@ mod tests {
         assert_eq!(data_records(&producer, vec![record(10)]).unwrap().len(), 1);
     }
 
-    #[test]
-    fn an_empty_status_with_a_canceled_failure_is_canceled() {
-        let canceled = Failure {
+    fn canceled() -> Failure {
+        Failure {
             failure_info: Some(FailureInfo::CanceledFailureInfo(Default::default())),
             ..Default::default()
-        };
-        let other = Failure::default();
-        let empty = StreamCloseStatus::Unspecified as i32;
-        let status = |status: i32, failure| caller_status(status, failure).unwrap();
-        assert_eq!(status(empty, Some(&canceled)), StreamCloseStatus::Canceled);
-        assert_eq!(status(empty, Some(&other)), StreamCloseStatus::Failed);
-        assert_eq!(status(empty, None), StreamCloseStatus::Completed);
+        }
+    }
+
+    #[test]
+    fn a_close_status_comes_from_the_failure() {
+        assert_eq!(caller_status(None), StreamCloseStatus::Completed);
         assert_eq!(
-            status(StreamCloseStatus::Failed as i32, Some(&canceled)),
+            caller_status(Some(&canceled())),
+            StreamCloseStatus::Canceled
+        );
+        assert_eq!(
+            caller_status(Some(&Failure::default())),
             StreamCloseStatus::Failed
         );
+    }
+
+    #[test]
+    fn a_canceled_activity_child_workflow_or_nexus_operation_is_canceled() {
+        let application = Failure {
+            failure_info: Some(FailureInfo::ApplicationFailureInfo(Default::default())),
+            ..Default::default()
+        };
+        let call = |info: FailureInfo, cause: Option<Failure>| Failure {
+            failure_info: Some(info),
+            cause: cause.map(Box::new),
+            ..Default::default()
+        };
+        for info in [
+            FailureInfo::ActivityFailureInfo(Default::default()),
+            FailureInfo::ChildWorkflowExecutionFailureInfo(Default::default()),
+            FailureInfo::NexusOperationExecutionFailureInfo(Default::default()),
+        ] {
+            let status = |cause| caller_status(Some(&call(info.clone(), cause)));
+            assert_eq!(status(Some(canceled())), StreamCloseStatus::Canceled);
+            assert_eq!(status(Some(application.clone())), StreamCloseStatus::Failed);
+            assert_eq!(status(None), StreamCloseStatus::Failed);
+        }
+        // Each SDK looks for a cancel in the cause of only those three calls.
+        let other = call(application.failure_info.clone().unwrap(), Some(canceled()));
+        assert_eq!(caller_status(Some(&other)), StreamCloseStatus::Failed);
     }
 }

@@ -214,15 +214,22 @@ impl StreamService {
         stream_id(request.stream.as_ref())?;
         let stream = request.stream.clone().unwrap_or_default();
         let producer = outside_producer(request.producer.as_ref())?;
-        if !(1..=MAX_SEQUENCE).contains(&request.sequence) {
+        if !(0..=MAX_SEQUENCE).contains(&request.sequence) {
             return Err(StreamError::invalid(
-                "The sequence must be from 1 to 2^53 - 1",
+                "The sequence must be from 1 to 2^53 - 1, or zero for the next one",
             ));
         }
         // Without the fence and the flag, a copy or a stale batch would reach Readers.
         self.store
             .capabilities()
             .require(Capabilities::PRODUCER_FENCE.union(Capabilities::WITHDRAWAL))?;
+        if request.sequence == 0 {
+            // A call with no writer state sends no sequence. Only the Store can number the batch in
+            // the same step as its dedupe check.
+            self.store
+                .capabilities()
+                .require(Capabilities::NEXT_SEQUENCE)?;
+        }
         if !request.withdraw_run.is_empty() {
             // Only a retry run's Local Activity withdraws its previous run, as only the owner's
             // create does. Any other Producer could withdraw and fence an unrelated run.
@@ -276,7 +283,7 @@ impl StreamService {
         let stream = request.stream.clone().unwrap_or_default();
         let producer = close_producer(request.producer.as_ref())?;
         self.store.capabilities().require(Capabilities::CLOSE)?;
-        let status = caller_status(request.status, request.failure.as_ref())?;
+        let status = caller_status(request.failure.as_ref());
         let record = close_record(producer, request.result, request.failure, status);
         // Every read past the close returns the close Record again.
         if record.len() > MAX_RECORD_BYTES {
