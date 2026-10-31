@@ -13,7 +13,7 @@ use temporalio_streams::{
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{
         AppendRecord, Producer, ProducerEpoch, StreamData, StreamProducerKind, StreamRecord,
-        Supersession, WorkflowTaskEpoch, stream_record::Item,
+        StreamSuperseded, WorkflowTaskEpoch, stream_record::Item,
     },
 };
 
@@ -145,8 +145,8 @@ fn the_appendix_e_withdrawals_match() {
     let cases = load("withdrawals.json");
     assert!(cases.as_array().unwrap().len() >= 35);
     for case in cases.as_array().unwrap() {
-        let s = &case["supersession"];
-        let supersession = Supersession {
+        let s = &case["superseded"];
+        let superseded = StreamSuperseded {
             producer_kind: kind(text(s, "producer_kind")) as i32,
             producer_id: text(s, "producer_id").to_string(),
             // A create's item has no epoch, and a Reader must not read it as an empty one.
@@ -177,7 +177,7 @@ fn the_appendix_e_withdrawals_match() {
             ..Default::default()
         };
         assert_eq!(
-            withdraws(&supersession, &record),
+            withdraws(&superseded, &record),
             case["withdraws"].as_bool().unwrap(),
             "{}",
             text(case, "name")

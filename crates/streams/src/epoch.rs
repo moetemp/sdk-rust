@@ -5,7 +5,7 @@
 //! the epochs field by field. `testdata/epochs.json` has the shared vectors of the keys.
 
 use crate::proto::{
-    Producer, ProducerEpoch, StreamProducerKind, StreamRecord, Supersession, WorkflowTaskEpoch,
+    Producer, ProducerEpoch, StreamProducerKind, StreamRecord, StreamSuperseded, WorkflowTaskEpoch,
     stream_record::Item,
 };
 use prost_types::Timestamp;
@@ -75,37 +75,37 @@ fn compare_tasks(a: &WorkflowTaskEpoch, b: &WorkflowTaskEpoch) -> Ordering {
 /// those at c or at t with a lower epoch. The item of a retry run withdraws every Record of the
 /// previous run. A client's newer epoch fences the earlier ones but withdraws nothing, since a
 /// restarted client's earlier Records are real messages, not a failed attempt's.
-pub fn withdraws(supersession: &Supersession, record: &StreamRecord) -> bool {
+pub fn withdraws(superseded: &StreamSuperseded, record: &StreamRecord) -> bool {
     let Some(Item::Data(data)) = &record.item else {
         return false;
     };
     let Some(producer) = data.producer.as_ref() else {
         return false;
     };
-    if !supersession.withdraw_run.is_empty() && producer.run_id == supersession.withdraw_run {
+    if !superseded.withdraw_run.is_empty() && producer.run_id == superseded.withdraw_run {
         return true;
     }
-    let kind = StreamProducerKind::try_from(supersession.producer_kind).unwrap_or_default();
+    let kind = StreamProducerKind::try_from(superseded.producer_kind).unwrap_or_default();
     if kind == StreamProducerKind::Client {
         return false;
     }
-    let (Some(epoch), Some(old)) = (supersession.epoch.as_ref(), producer.epoch.as_ref()) else {
+    let (Some(epoch), Some(old)) = (superseded.epoch.as_ref(), producer.epoch.as_ref()) else {
         return false;
     };
     if kind != StreamProducerKind::Workflow {
-        return producer.kind == supersession.producer_kind
-            && producer.id == supersession.producer_id
+        return producer.kind == superseded.producer_kind
+            && producer.id == superseded.producer_id
             && compare_epochs(old, epoch) == Ordering::Less;
     }
-    if !of_run(producer, supersession) {
+    if !of_run(producer, superseded) {
         return false;
     }
     let (task, old) = (task_of(epoch), task_of(old));
     let started = old.started_event_id;
-    if supersession.failed_tasks.contains(&started) {
+    if superseded.failed_tasks.contains(&started) {
         return true;
     }
-    let completed = supersession.previous_completed_task.as_ref();
+    let completed = superseded.previous_completed_task.as_ref();
     let after = completed.map_or(0, |c| c.started_event_id);
     if after < started && started < task.started_event_id {
         return true;
@@ -118,11 +118,11 @@ pub fn withdraws(supersession: &Supersession, record: &StreamRecord) -> bool {
 
 /// Whether a Producer is the Workflow run of a `Superseded` item, or one of its Local
 /// Activities.
-fn of_run(producer: &Producer, supersession: &Supersession) -> bool {
+fn of_run(producer: &Producer, superseded: &StreamSuperseded) -> bool {
     let kind = StreamProducerKind::try_from(producer.kind).unwrap_or_default();
     match kind {
-        StreamProducerKind::Workflow => producer.id == supersession.producer_id,
-        StreamProducerKind::LocalActivity => producer.run_id == supersession.run_id,
+        StreamProducerKind::Workflow => producer.id == superseded.producer_id,
+        StreamProducerKind::LocalActivity => producer.run_id == superseded.run_id,
         _ => false,
     }
 }
