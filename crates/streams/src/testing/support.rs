@@ -10,8 +10,8 @@ use crate::{
     epoch::withdraws,
     ids::local_activity_producer_id,
     proto::{
-        AppendRecord, Producer, ProducerEpoch, StreamClose, StreamData, StreamProducerKind,
-        StreamRecord, StreamRef, Supersession, stream_record::Item,
+        AppendRecord, Producer, ProducerEpoch, StreamClose, StreamData, StreamHandle,
+        StreamProducerKind, StreamRecord, StreamSuperseded, stream_record::Item,
     },
     store::{Appended, Batch, Closed, Entry, Owner, Store, Withdrawal},
 };
@@ -46,7 +46,7 @@ impl Needs {
     pub const SHORT_TIMES: Self = Self(1 << 3);
     /// The runtime built from the crate's own config, such as a backend name.
     pub const OWN_CONFIG: Self = Self(1 << 4);
-    /// The Store keys on the id only, so the owner of a ref doesn't route a call.
+    /// The Store keys on the id only, so the owner of a handle doesn't route a call.
     pub const ID_KEYS: Self = Self(1 << 5);
     /// Every need. Redis and memory have all of them.
     pub const ALL: Self = Self(u8::MAX);
@@ -139,7 +139,7 @@ impl Run {
     }
 }
 
-/// The owner of a ref that a Workflow's run chain makes, with the chain's first run id.
+/// The owner of a handle that a Workflow's run chain makes, with the chain's first run id.
 pub(crate) fn workflow_execution(workflow_id: &str, first_run_id: &str) -> Option<Execution> {
     Some(Execution {
         r#type: ExecutionType::Workflow as i32,
@@ -180,8 +180,8 @@ pub(crate) fn digest(texts: &[&str]) -> String {
     batch_digest(&records)
 }
 
-pub(crate) fn supersession(producer: &Producer, withdrawal: &Withdrawal<'_>) -> Vec<u8> {
-    Supersession {
+pub(crate) fn superseded(producer: &Producer, withdrawal: &Withdrawal<'_>) -> Vec<u8> {
+    StreamSuperseded {
         producer_kind: producer.kind,
         producer_id: producer.id.clone(),
         epoch: producer.epoch,
@@ -206,8 +206,8 @@ pub(crate) fn records_of(entries: &[Entry]) -> Vec<String> {
 }
 
 impl Target {
-    pub(crate) fn stream_ref(&self) -> StreamRef {
-        StreamRef {
+    pub(crate) fn handle(&self) -> StreamHandle {
+        StreamHandle {
             id: self.stream.clone(),
             ..Default::default()
         }
@@ -217,7 +217,7 @@ impl Target {
         self.store
             .create(
                 &self.namespace,
-                &self.stream_ref(),
+                &self.handle(),
                 None,
                 owner,
                 &Withdrawal::default(),
@@ -274,8 +274,8 @@ impl Target {
     pub(crate) async fn visible(&self) -> Vec<String> {
         let mut kept: Vec<StreamRecord> = vec![];
         for entry in self.entries().await {
-            if let Some(bytes) = &entry.supersession {
-                let s = Supersession::decode(bytes.as_slice()).unwrap();
+            if let Some(bytes) = &entry.superseded {
+                let s = StreamSuperseded::decode(bytes.as_slice()).unwrap();
                 kept.retain(|old| !withdraws(&s, old));
             }
             if let Some(bytes) = &entry.record {
@@ -312,15 +312,15 @@ impl Target {
         let records: Vec<_> = texts.iter().map(|text| record(producer, text)).collect();
         let mut withdrawal = Withdrawal {
             withdraw_run,
-            supersession: &[],
+            superseded: &[],
             tasks: None,
         };
-        let bytes = supersession(producer, &withdrawal);
-        withdrawal.supersession = &bytes;
+        let bytes = superseded(producer, &withdrawal);
+        withdrawal.superseded = &bytes;
         self.store
             .append(
                 &self.namespace,
-                &self.stream_ref(),
+                &self.handle(),
                 &Batch {
                     producer,
                     sequence,
@@ -333,13 +333,13 @@ impl Target {
     }
 
     pub(crate) async fn close(&self, producer: &Producer) -> StreamResult<Closed> {
-        self.close_at(&self.stream_ref(), producer).await
+        self.close_at(&self.handle(), producer).await
     }
 
-    /// Closes the Stream that `stream` names, with the owner fields it has.
+    /// Closes the Stream that `handle` names, with the owner fields it has.
     pub(crate) async fn close_at(
         &self,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         producer: &Producer,
     ) -> StreamResult<Closed> {
         let record = StreamRecord {
@@ -351,7 +351,7 @@ impl Target {
         }
         .encode_to_vec();
         self.store
-            .close(&self.namespace, stream, producer, &record)
+            .close(&self.namespace, handle, producer, &record)
             .await
     }
 }

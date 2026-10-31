@@ -210,29 +210,29 @@ def digests():
     return cases
 
 
-def withdraws(supersession, record):
+def withdraws(superseded, record):
     """The reader rule of a Superseded item, as the API proposal states it."""
     producer = record["producer"]
-    if supersession.get("withdraw_run") and producer.get("run_id") == supersession["withdraw_run"]:
+    if superseded.get("withdraw_run") and producer.get("run_id") == superseded["withdraw_run"]:
         return True
     # A client's newer epoch only fences. Its earlier Records are real messages.
-    if supersession["producer_kind"] == "client":
+    if superseded["producer_kind"] == "client":
         return False
     # An item with no epoch, such as a create's, withdraws only a run.
-    if "epoch" not in supersession or "epoch" not in producer:
+    if "epoch" not in superseded or "epoch" not in producer:
         return False
-    old, new = producer["epoch"], supersession["epoch"]
-    if supersession["producer_kind"] != "workflow":
+    old, new = producer["epoch"], superseded["epoch"]
+    if superseded["producer_kind"] != "workflow":
         return (
-            producer["kind"] == supersession["producer_kind"]
-            and producer["id"] == supersession["producer_id"]
+            producer["kind"] == superseded["producer_kind"]
+            and producer["id"] == superseded["producer_id"]
             and epoch_key(old) < epoch_key(new)
         )
     if producer["kind"] == "workflow":
-        if producer["id"] != supersession["producer_id"]:
+        if producer["id"] != superseded["producer_id"]:
             return False
     elif producer["kind"] == "local_activity":
-        if producer.get("run_id", "") != supersession["run_id"]:
+        if producer.get("run_id", "") != superseded["run_id"]:
             return False
     else:
         return False
@@ -249,9 +249,9 @@ def withdraws(supersession, record):
 
     started, old_key = task(old)
     t_started, t_key = task(new)
-    c = supersession.get("previous_completed_task")
+    c = superseded.get("previous_completed_task")
     c_started = c["started_event_id"] if c else 0
-    if started in supersession.get("failed_tasks", []):
+    if started in superseded.get("failed_tasks", []):
         return True
     if c_started < started < t_started:
         return True
@@ -275,10 +275,10 @@ def withdrawal_examples():
     r1 = "r1"
     cases = []
 
-    def case(name, supersession, producer, expected):
+    def case(name, superseded, producer, expected):
         record = {"producer": producer}
-        assert withdraws(supersession, record) == expected, name
-        cases.append({"name": name, "supersession": supersession, "record": record,
+        assert withdraws(superseded, record) == expected, name
+        cases.append({"name": name, "superseded": superseded, "record": record,
                       "withdraws": expected})
 
     def sup(task, c=None, failed=(), withdraw_run=None, run=r1):
