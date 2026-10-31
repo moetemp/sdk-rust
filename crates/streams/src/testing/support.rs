@@ -383,7 +383,7 @@ pub(crate) fn stream_runtimes() -> Vec<Arc<StreamRuntime>> {
     named_runtimes("")
 }
 
-/// A runtime on each backend under test, whose refs name `backend`.
+/// A runtime on each backend under test, whose handles name `backend`.
 pub(crate) fn named_runtimes(backend: &str) -> Vec<Arc<StreamRuntime>> {
     backends()
         .into_iter()
