@@ -121,7 +121,7 @@ impl StreamRuntime {
         self.shared.name
     }
 
-    /// Releases one handle of a writer with no wait, as the `FreeWriter` method does. A bridge
+    /// Releases one reference to a writer with no wait, as the `FreeWriter` method does. A bridge
     /// calls it from a finalizer, which has no async runtime to await on.
     pub fn free_writer(&self, writer_id: u64) -> StreamResult<()> {
         self.shared.writers.free(writer_id)

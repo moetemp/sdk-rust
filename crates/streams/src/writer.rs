@@ -3,7 +3,7 @@
 //! order, so that the Store writes a retried batch only once. Lang can buffer Records on its own
 //! and write each batch with one call.
 //!
-//! The handles of one Producer epoch on one Stream share one writer. Each open adds a handle and
+//! The opens of one Producer epoch on one Stream share one writer. Each open adds a reference, and
 //! each close or free releases one. The last release drops the writer.
 
 use crate::{
@@ -178,11 +178,11 @@ fn check_sizes(producer: &Producer, records: &[AppendRecord]) -> StreamResult<()
 /// The namespace, Stream id, Producer id and epoch key of a writer.
 type WriterKey = (String, String, String, String);
 
-/// One open writer and the handles that share it.
+/// One open writer and the references to it.
 struct Open {
     writer: Arc<Writer>,
     key: WriterKey,
-    handles: usize,
+    refs: usize,
 }
 
 #[derive(Default)]
@@ -193,15 +193,15 @@ struct Table {
 }
 
 impl Table {
-    /// Releases one handle of a writer, or every handle with `all`. Returns the writer when it has
-    /// no handle left, so that the caller ends it.
+    /// Releases one reference to a writer, or every reference with `all`. Returns the writer when
+    /// it has no reference left, so that the caller ends it.
     fn release(&mut self, id: u64, all: bool) -> StreamResult<Option<Arc<Writer>>> {
         let open = self
             .open
             .get_mut(&id)
             .ok_or_else(|| StreamError::new(Reason::UnknownWriter, format!("No writer {id}")))?;
-        open.handles -= 1;
-        if open.handles > 0 && !all {
+        open.refs -= 1;
+        if open.refs > 0 && !all {
             return Ok(None);
         }
         let open = self.open.remove(&id).expect("found above");
@@ -218,7 +218,7 @@ pub(crate) struct Writers {
 }
 
 impl Writers {
-    /// Opens a writer, or adds a handle to the one that this Producer epoch has on the Stream. A
+    /// Opens a writer, or adds a reference to the one that this Producer epoch has on the Stream. A
     /// writer of a Local Activity, or of an Activity attempt above 1, first sends an empty batch.
     /// So the new epoch withdraws the earlier one's Records even when it publishes nothing. On a
     /// closed or expired Stream the open still succeeds, and the first write fails with the reason.
@@ -287,7 +287,7 @@ impl Writers {
         }
         let mut table = self.table.lock();
         if let Some(id) = table.by_producer.get(&key).copied() {
-            table.open.get_mut(&id).expect("indexed").handles += 1;
+            table.open.get_mut(&id).expect("indexed").refs += 1;
             return Ok(id);
         }
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
@@ -297,17 +297,17 @@ impl Writers {
             Open {
                 writer,
                 key,
-                handles: 1,
+                refs: 1,
             },
         );
         Ok(id)
     }
 
-    /// Adds a handle to the open writer of `key`, if there is one.
+    /// Adds a reference to the open writer of `key`, if there is one.
     fn share(&self, key: &WriterKey) -> Option<u64> {
         let mut table = self.table.lock();
         let id = table.by_producer.get(key).copied()?;
-        table.open.get_mut(&id).expect("indexed").handles += 1;
+        table.open.get_mut(&id).expect("indexed").refs += 1;
         Some(id)
     }
 
@@ -344,7 +344,7 @@ impl Writers {
         writer.write(records).await
     }
 
-    /// Closes every open writer, whatever its handles. Returns how many had failed.
+    /// Closes every open writer, whatever its references. Returns how many had failed.
     pub(crate) async fn close_all(&self) -> usize {
         let ids: Vec<u64> = self.table.lock().open.keys().copied().collect();
         let mut failed = 0;
@@ -360,7 +360,7 @@ impl Writers {
         failed
     }
 
-    /// Releases one handle. The last one waits for a write in flight, then drops the writer.
+    /// Releases one reference. The last one waits for a write in flight, then drops the writer.
     /// Returns its last offset, or the error it failed with.
     pub(crate) async fn close(&self, id: u64) -> StreamResult<i64> {
         let writer = self.get(id)?;
@@ -374,8 +374,8 @@ impl Writers {
         end(&writer).await
     }
 
-    /// Releases one handle with no wait, for a handle that lang drops. A write in flight still
-    /// completes, and a write that waits behind it is refused once no handle is left.
+    /// Releases one reference with no wait, for a reference that lang drops. A write in flight
+    /// still completes, and a write that waits behind it is refused once no reference is left.
     pub(crate) fn free(&self, id: u64) -> StreamResult<()> {
         if let Some(writer) = self.table.lock().release(id, false)? {
             writer.state.lock().closed = true;
@@ -384,8 +384,8 @@ impl Writers {
     }
 }
 
-/// Ends a writer that no handle uses. It waits for a write in flight, then returns its last offset
-/// or the error it failed with.
+/// Ends a writer that no reference uses. It waits for a write in flight, then returns its last
+/// offset or the error it failed with.
 async fn end(writer: &Writer) -> StreamResult<i64> {
     writer.state.lock().closed = true;
     let _writing = writer.writing.lock().await;

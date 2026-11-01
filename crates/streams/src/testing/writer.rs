@@ -375,7 +375,7 @@ async fn a_reopen_of_a_closed_writer_goes_on_with_its_sequence() {
     }
 }
 
-async fn the_handles_of_one_producer_share_a_writer_until_the_last_one_lets_go() {
+async fn the_opens_of_one_producer_share_a_writer_until_the_last_one_lets_go() {
     for case in cases().await {
         let a = case.open(client(), |_| {}).await;
         let b = case.open(client(), |_| {}).await;
@@ -385,7 +385,7 @@ async fn the_handles_of_one_producer_share_a_writer_until_the_last_one_lets_go()
             .call("CloseWriter", CloseWriterRequest { writer_id: a })
             .await
             .unwrap();
-        // The other handle still writes, on the same sequence.
+        // The other reference still writes, on the same sequence.
         case.write(b, &["2"]).await.unwrap();
         case.ext.free_writer(b).unwrap();
         let error = case.write(b, &["3"]).await.unwrap_err();
@@ -669,7 +669,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_closed_writer_is_gone),
     case!(a_write_splits_big_records_by_bytes_and_refuses_an_oversize_one),
     case!(a_reopen_of_a_closed_writer_goes_on_with_its_sequence),
-    case!(the_handles_of_one_producer_share_a_writer_until_the_last_one_lets_go),
+    case!(the_opens_of_one_producer_share_a_writer_until_the_last_one_lets_go),
     case!(a_named_client_with_a_higher_epoch_fences_its_earlier_self),
     case!(closing_every_writer_drops_them_all),
     case!(a_write_whose_answer_is_lost_goes_in_once),
