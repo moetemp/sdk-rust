@@ -16,8 +16,8 @@ use crate::{
     proto::{
         AppendRecord, CloseStreamRequest, CloseWriterRequest, CloseWriterResponse,
         CreateStreamRequest, CreateStreamResponse, OpenWriterRequest, OpenWriterResponse, Producer,
-        ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse, StreamErrorDetails,
-        StreamProducerKind, StreamRecord, StreamRef, WorkflowTaskEpoch, WriteRecordsRequest,
+        ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse, StreamErrorDetails, StreamHandle,
+        StreamProducerKind, StreamRecord, WorkflowTaskEpoch, WriteRecordsRequest,
         WriteRecordsResponse, stream_record::Item,
     },
     store::{
@@ -141,7 +141,7 @@ impl Case {
     async fn open(&self, producer: Producer, change: impl Fn(&mut OpenWriterRequest)) -> u64 {
         let mut request = OpenWriterRequest {
             namespace: self.namespace.clone(),
-            stream: Some(StreamRef {
+            handle: Some(StreamHandle {
                 id: self.stream.clone(),
                 ..Default::default()
             }),
@@ -172,7 +172,7 @@ impl Case {
             "ReadRecords",
             ReadRecordsRequest {
                 namespace: self.namespace.clone(),
-                stream: Some(StreamRef {
+                handle: Some(StreamHandle {
                     id: self.stream.clone(),
                     ..Default::default()
                 }),
@@ -242,7 +242,7 @@ async fn a_failed_write_fails_every_later_write_and_the_close() {
         let writer = case.open(client(), |_| {}).await;
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
-            stream: Some(StreamRef {
+            handle: Some(StreamHandle {
                 id: case.stream.clone(),
                 ..Default::default()
             }),
@@ -284,7 +284,7 @@ async fn an_activity_retry_opens_on_a_closed_or_expired_stream() {
         case.write(first, &["a1"]).await.unwrap();
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
-            stream: Some(StreamRef {
+            handle: Some(StreamHandle {
                 id: case.stream.clone(),
                 ..Default::default()
             }),
@@ -310,7 +310,7 @@ async fn an_activity_retry_opens_on_a_closed_or_expired_stream() {
             .await
             .unwrap();
         let on_short = |request: &mut OpenWriterRequest| {
-            request.stream = Some(StreamRef {
+            request.handle = Some(StreamHandle {
                 id: short.clone(),
                 ..Default::default()
             });
@@ -460,26 +460,26 @@ impl Store for Flaky {
     async fn create(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         retention: Option<Duration>,
         owner: Owner,
         withdrawal: &Withdrawal<'_>,
     ) -> StreamResult<Created> {
         self.inner
-            .create(namespace, stream, retention, owner, withdrawal)
+            .create(namespace, handle, retention, owner, withdrawal)
             .await
     }
 
     async fn append(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         batch: &Batch<'_>,
     ) -> StreamResult<Appended> {
         if self.down.load(Ordering::SeqCst) {
             return Err(StreamError::storage("the Store is down"));
         }
-        let appended = self.inner.append(namespace, stream, batch).await?;
+        let appended = self.inner.append(namespace, handle, batch).await?;
         if self.lose_next.swap(false, Ordering::SeqCst) {
             return Err(StreamError::storage("the answer was lost"));
         }
@@ -511,11 +511,11 @@ impl Store for Flaky {
     async fn close(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         producer: &Producer,
         record: &[u8],
     ) -> StreamResult<Closed> {
-        self.inner.close(namespace, stream, producer, record).await
+        self.inner.close(namespace, handle, producer, record).await
     }
 
     async fn read_back(
