@@ -5,7 +5,7 @@
 use crate::{
     Reason, StreamError, StreamResult,
     ids::encode_part,
-    proto::{Producer, StreamRef, WorkflowTaskEpoch},
+    proto::{Producer, StreamHandle, WorkflowTaskEpoch},
 };
 use std::time::Duration;
 use temporalio_common::protos::temporal::api::enums::v1::ExecutionType;
@@ -33,10 +33,11 @@ pub const TOMBSTONE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// of a write stay exact in a Lua number.
 pub const MAX_TTL: Duration = Duration::from_secs(315_576_000_000);
 
-/// The owner run chain of a ref as `<workflow id>:<first run id>`, each part encoded, or empty for
-/// another owner. A Store keeps it on a Workflow-owned Stream and checks creates and closes on it.
-pub fn owner_chain(stream: &StreamRef) -> String {
-    stream
+/// The owner run chain of a handle as `<workflow id>:<first run id>`, each part encoded, or empty
+/// for another owner. A Store keeps it on a Workflow-owned Stream and checks creates and closes on
+/// it.
+pub fn owner_chain(handle: &StreamHandle) -> String {
+    handle
         .owner
         .as_ref()
         .filter(|owner| owner.r#type == ExecutionType::Workflow as i32)
@@ -83,8 +84,8 @@ pub struct Created {
 pub struct Withdrawal<'a> {
     /// A retry run's previous run.
     pub withdraw_run: &'a str,
-    /// The encoded Supersession, which the log keeps when the batch withdraws something.
-    pub supersession: &'a [u8],
+    /// The encoded `Superseded` facts, which the log keeps when the batch withdraws something.
+    pub superseded: &'a [u8],
     /// The run's task facts of a Local Activity batch, which withdraw the run's orphaned Local
     /// Activity Records.
     pub tasks: Option<TaskFacts<'a>>,
@@ -99,8 +100,8 @@ pub struct TaskFacts<'a> {
     pub completed: Option<&'a WorkflowTaskEpoch>,
     /// The started event ids of the run's failed Workflow Tasks.
     pub failed_tasks: &'a [i64],
-    /// The encoded Workflow-kind Supersession that withdraws the orphans.
-    pub supersession: &'a [u8],
+    /// The encoded Workflow-kind `Superseded` facts that withdraw the orphans.
+    pub superseded: &'a [u8],
 }
 
 /// One batch of one Producer.
@@ -186,8 +187,8 @@ pub struct Entry {
     pub offset: i64,
     /// The encoded Record, absent on an entry that only withdraws.
     pub record: Option<Vec<u8>>,
-    /// The encoded Supersession of a flagged batch.
-    pub supersession: Option<Vec<u8>>,
+    /// The encoded `Superseded` facts of a flagged batch.
+    pub superseded: Option<Vec<u8>>,
 }
 
 /// The rules that a Store applies atomically beyond the log. The service checks a capability before
@@ -277,12 +278,12 @@ pub trait Store: Send + Sync + 'static {
     fn capabilities(&self) -> Capabilities;
 
     /// Creates a Stream, or finds it when it is open and has the create's owner. The calls that
-    /// write take the Stream's whole ref, since the server finds a Workflow's Stream by its owner.
-    /// With [Capabilities::RUN_FENCE], a retry run's create withdraws its previous run.
+    /// write take the Stream's whole handle, since the server finds a Workflow's Stream by its
+    /// owner. With [Capabilities::RUN_FENCE], a retry run's create withdraws its previous run.
     async fn create(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         retention: Option<Duration>,
         owner: Owner,
         withdrawal: &Withdrawal<'_>,
@@ -293,7 +294,7 @@ pub trait Store: Send + Sync + 'static {
     async fn append(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         batch: &Batch<'_>,
     ) -> StreamResult<Appended>;
 
@@ -321,7 +322,7 @@ pub trait Store: Send + Sync + 'static {
     async fn close(
         &self,
         _namespace: &str,
-        _stream: &StreamRef,
+        _handle: &StreamHandle,
         _producer: &Producer,
         _record: &[u8],
     ) -> StreamResult<Closed> {

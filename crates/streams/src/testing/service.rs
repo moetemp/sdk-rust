@@ -12,8 +12,8 @@ use crate::{
         AppendRecord, AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest,
         CloseStreamResponse, CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest,
         DescribeStreamResponse, Producer, ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse,
-        StreamClose, StreamCloseStatus, StreamErrorDetails, StreamProducerKind, StreamReadStart,
-        StreamRecord, StreamRef, StreamStatus, Supersession, stream_record::Item,
+        StreamClose, StreamCloseStatus, StreamErrorDetails, StreamHandle, StreamProducerKind,
+        StreamReadStart, StreamRecord, StreamStatus, Supersession, stream_record::Item,
     },
 };
 use prost::Message;
@@ -140,8 +140,8 @@ fn millis(ms: u64) -> Option<prost_types::Duration> {
 }
 
 impl Case {
-    fn stream(&self) -> Option<StreamRef> {
-        Some(StreamRef {
+    fn handle(&self) -> Option<StreamHandle> {
+        Some(StreamHandle {
             id: self.stream.clone(),
             ..Default::default()
         })
@@ -175,7 +175,7 @@ impl Case {
             "AppendRecords",
             AppendRecordsRequest {
                 namespace: self.namespace.clone(),
-                stream: self.stream(),
+                handle: self.handle(),
                 producer: Some(producer),
                 sequence,
                 records,
@@ -277,7 +277,7 @@ async fn a_create_of_a_closed_stream_fails() {
         case.create(None).await.unwrap();
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
-            stream: case.stream(),
+            handle: case.handle(),
             producer: Some(client(1)),
             ..Default::default()
         };
@@ -303,9 +303,9 @@ async fn a_create_of_an_expired_stream_fails() {
     }
 }
 
-/// A create with an owner needs a Workflow Producer and a ref of its run chain, and the answer's
-/// ref names that chain. A create that names another owner fails, and no run withdraws itself.
-async fn a_create_checks_its_owner_and_its_ref() {
+/// A create with an owner needs a Workflow Producer and a handle of its run chain, and the answer's
+/// handle names that chain. A create that names another owner fails, and no run withdraws itself.
+async fn a_create_checks_its_owner_and_its_handle() {
     for case in cases_for(Needs::UNCHECKED).await {
         let run = format!("{}-run", case.stream);
         let workflow = Producer {
@@ -319,26 +319,27 @@ async fn a_create_checks_its_owner_and_its_ref() {
             id: crate::ids::local_activity_producer_id(&run, "call-1"),
             ..workflow.clone()
         };
-        let chain = |workflow_id: &str| StreamRef {
+        let chain = |workflow_id: &str| StreamHandle {
             id: case.stream.clone(),
             owner: super::support::workflow_execution(workflow_id, "first-run"),
             ..Default::default()
         };
-        let create =
-            |owner: Option<&Producer>, stream: StreamRef, withdraw_run: &str| CreateStreamRequest {
+        let create = |owner: Option<&Producer>, handle: StreamHandle, withdraw_run: &str| {
+            CreateStreamRequest {
                 namespace: case.namespace.clone(),
                 stream_id: case.stream.clone(),
                 owner: owner.cloned(),
-                r#ref: Some(stream),
+                stream_handle: Some(handle),
                 withdraw_run: withdraw_run.to_string(),
                 ..Default::default()
-            };
+            }
+        };
         for request in [
             create(Some(&local_activity), chain("agent"), ""),
-            create(Some(&workflow), case.stream().unwrap(), ""),
+            create(Some(&workflow), case.handle().unwrap(), ""),
             create(
                 Some(&workflow),
-                StreamRef {
+                StreamHandle {
                     id: format!("{}-other", case.stream),
                     ..chain("agent")
                 },
@@ -358,10 +359,10 @@ async fn a_create_checks_its_owner_and_its_ref() {
         )
         .await
         .unwrap();
-        assert_eq!(created.stream.unwrap().owner, chain("agent").owner);
+        assert_eq!(created.handle.unwrap().owner, chain("agent").owner);
         for request in [
             create(Some(&workflow), chain("another-agent"), ""),
-            create(None, case.stream().unwrap(), ""),
+            create(None, case.handle().unwrap(), ""),
         ] {
             let error = call::<_, CreateStreamResponse>(&case.ext, "CreateStream", request)
                 .await
@@ -1122,7 +1123,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_create_returns_the_stream_that_exists_whatever_its_retention),
     case!(a_create_of_a_closed_stream_fails),
     case!(a_create_of_an_expired_stream_fails),
-    case!(a_create_checks_its_owner_and_its_ref),
+    case!(a_create_checks_its_owner_and_its_handle),
     case!(a_producer_must_match_its_kind_and_not_be_a_workflow),
     case!(an_append_with_no_sequence_takes_the_next_one_of_its_epoch),
     case!(a_read_is_inclusive_from_its_offset_and_get_offset_reads_only_new_records),
