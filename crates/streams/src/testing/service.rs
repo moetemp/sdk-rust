@@ -12,8 +12,8 @@ use crate::{
         AppendRecord, AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest,
         CloseStreamResponse, CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest,
         DescribeStreamResponse, Producer, ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse,
-        StreamClose, StreamCloseStatus, StreamErrorDetails, StreamProducerKind, StreamReadStart,
-        StreamRecord, StreamRef, StreamStatus, Supersession, WorkflowTaskEpoch,
+        StreamClose, StreamCloseStatus, StreamErrorDetails, StreamHandle, StreamProducerKind,
+        StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded, WorkflowTaskEpoch,
         stream_record::Item,
     },
 };
@@ -141,8 +141,8 @@ fn millis(ms: u64) -> Option<prost_types::Duration> {
 }
 
 impl Case {
-    fn stream(&self) -> Option<StreamRef> {
-        Some(StreamRef {
+    fn handle(&self) -> Option<StreamHandle> {
+        Some(StreamHandle {
             id: self.stream.clone(),
             ..Default::default()
         })
@@ -176,7 +176,7 @@ impl Case {
             "AppendRecords",
             AppendRecordsRequest {
                 namespace: self.namespace.clone(),
-                stream: self.stream(),
+                handle: self.handle(),
                 producer: Some(producer),
                 sequence,
                 records,
@@ -192,7 +192,7 @@ impl Case {
             "ReadRecords",
             ReadRecordsRequest {
                 namespace: self.namespace.clone(),
-                stream: self.stream(),
+                handle: self.handle(),
                 ..request
             },
         )
@@ -205,7 +205,7 @@ impl Case {
             "DescribeStream",
             DescribeStreamRequest {
                 namespace: self.namespace.clone(),
-                stream: self.stream(),
+                handle: self.handle(),
             },
         )
         .await
@@ -217,7 +217,7 @@ impl Case {
             "CloseStream",
             CloseStreamRequest {
                 namespace: self.namespace.clone(),
-                stream: self.stream(),
+                handle: self.handle(),
                 producer: Some(producer),
                 result: Some(Payload {
                     data: b"done".to_vec(),
@@ -243,9 +243,9 @@ fn texts(response: &ReadRecordsResponse) -> Vec<String> {
         .collect()
 }
 
-fn superseded_of(record: &StreamRecord) -> &Supersession {
+fn superseded_of(record: &StreamRecord) -> &StreamSuperseded {
     match &record.item {
-        Some(Item::Superseded(supersession)) => supersession,
+        Some(Item::Superseded(superseded)) => superseded,
         other => panic!("not a Superseded item: {other:?}"),
     }
 }
@@ -278,7 +278,7 @@ async fn a_create_of_a_closed_stream_fails() {
         case.create(None).await.unwrap();
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
-            stream: case.stream(),
+            handle: case.handle(),
             producer: Some(client(1)),
             ..Default::default()
         };
@@ -304,9 +304,9 @@ async fn a_create_of_an_expired_stream_fails() {
     }
 }
 
-/// A create with an owner needs a Workflow Producer and a ref of its run chain, and the answer's
-/// ref names that chain. A create that names another owner fails, and no run withdraws itself.
-async fn a_create_checks_its_owner_and_its_ref() {
+/// A create with an owner needs a Workflow Producer and a handle of its run chain, and the answer's
+/// handle names that chain. A create that names another owner fails, and no run withdraws itself.
+async fn a_create_checks_its_owner_and_its_handle() {
     for case in cases_for(Needs::UNCHECKED).await {
         let run = format!("{}-run", case.stream);
         let workflow = Producer {
@@ -320,26 +320,27 @@ async fn a_create_checks_its_owner_and_its_ref() {
             id: crate::ids::local_activity_producer_id(&run, "call-1"),
             ..workflow.clone()
         };
-        let chain = |workflow_id: &str| StreamRef {
+        let chain = |workflow_id: &str| StreamHandle {
             id: case.stream.clone(),
             owner: super::support::workflow_execution(workflow_id, "first-run"),
             ..Default::default()
         };
-        let create =
-            |owner: Option<&Producer>, stream: StreamRef, withdraw_run: &str| CreateStreamRequest {
+        let create = |owner: Option<&Producer>, handle: StreamHandle, withdraw_run: &str| {
+            CreateStreamRequest {
                 namespace: case.namespace.clone(),
                 stream_id: case.stream.clone(),
                 owner: owner.cloned(),
-                r#ref: Some(stream),
+                stream_handle: Some(handle),
                 withdraw_run: withdraw_run.to_string(),
                 ..Default::default()
-            };
+            }
+        };
         for request in [
             create(Some(&local_activity), chain("agent"), ""),
-            create(Some(&workflow), case.stream().unwrap(), ""),
+            create(Some(&workflow), case.handle().unwrap(), ""),
             create(
                 Some(&workflow),
-                StreamRef {
+                StreamHandle {
                     id: format!("{}-other", case.stream),
                     ..chain("agent")
                 },
@@ -359,10 +360,10 @@ async fn a_create_checks_its_owner_and_its_ref() {
         )
         .await
         .unwrap();
-        assert_eq!(created.stream.unwrap().owner, chain("agent").owner);
+        assert_eq!(created.handle.unwrap().owner, chain("agent").owner);
         for request in [
             create(Some(&workflow), chain("another-agent"), ""),
-            create(None, case.stream().unwrap(), ""),
+            create(None, case.handle().unwrap(), ""),
         ] {
             let error = call::<_, CreateStreamResponse>(&case.ext, "CreateStream", request)
                 .await
@@ -515,8 +516,7 @@ async fn a_higher_attempt_puts_its_superseded_item_before_its_batch() {
         let superseded = &all.records[1];
         assert!(all.records[0].offset < superseded.offset);
         assert!(superseded.offset <= all.records[2].offset);
-        let supersession = superseded_of(superseded);
-        assert_eq!(supersession.producer_id, activity(2, 20).id);
+        assert_eq!(superseded_of(superseded).producer_id, activity(2, 20).id);
         let mut from_offset = 0;
         for expected in [&["old"][..], &["<superseded>", "new1"], &["new2"]] {
             let page = case
@@ -600,7 +600,7 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
             tokio::time::sleep(Duration::from_millis(150)).await;
             let request = AppendRecordsRequest {
                 namespace,
-                stream: Some(StreamRef {
+                handle: Some(StreamHandle {
                     id: stream,
                     ..Default::default()
                 }),
@@ -747,7 +747,7 @@ async fn create_owned_short(case: &Case, run: &str) {
             stream_id: case.stream.clone(),
             retention: millis(300),
             owner: Some(workflow_owner(run)),
-            r#ref: owned_ref(case),
+            stream_handle: owned_handle(case),
             ..Default::default()
         },
     )
@@ -795,7 +795,7 @@ async fn a_close_after_the_log_expired_keeps_the_gap() {
         tokio::time::sleep(Duration::from_millis(400)).await;
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
-            stream: owned_ref(&case),
+            handle: owned_handle(&case),
             producer: Some(workflow_owner(&run)),
             ..Default::default()
         };
@@ -809,25 +809,25 @@ async fn a_close_after_the_log_expired_keeps_the_gap() {
     }
 }
 
-/// A ref with an owner and one without reach the same Stream.
-async fn a_ref_with_an_owner_and_one_without_reach_the_same_stream() {
+/// A handle with an owner and one without reach the same Stream.
+async fn a_handle_with_an_owner_and_one_without_reach_the_same_stream() {
     for case in cases_for(Needs::ID_KEYS).await {
         case.create(None).await.unwrap();
-        let owned = Some(StreamRef {
+        let owned = Some(StreamHandle {
             id: case.stream.clone(),
             owner: super::support::workflow_execution("agent-1", "run-1"),
             ..Default::default()
         });
         // An owner that doesn't match the id changes nothing either.
-        let other = Some(StreamRef {
+        let other = Some(StreamHandle {
             id: case.stream.clone(),
             owner: super::support::workflow_execution("someone-else", ""),
             ..Default::default()
         });
-        for (sequence, stream) in [(1, owned.clone()), (2, case.stream()), (3, other)] {
+        for (sequence, stream) in [(1, owned.clone()), (2, case.handle()), (3, other)] {
             let request = AppendRecordsRequest {
                 namespace: case.namespace.clone(),
-                stream,
+                handle: stream,
                 producer: Some(client(1)),
                 sequence,
                 records: vec![record(&sequence.to_string())],
@@ -835,12 +835,12 @@ async fn a_ref_with_an_owner_and_one_without_reach_the_same_stream() {
             };
             let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", request).await.unwrap();
         }
-        let read = |stream: Option<StreamRef>| ReadRecordsRequest {
+        let read = |handle: Option<StreamHandle>| ReadRecordsRequest {
             namespace: case.namespace.clone(),
-            stream,
+            handle,
             ..Default::default()
         };
-        let plain: ReadRecordsResponse = call(&case.ext, "ReadRecords", read(case.stream()))
+        let plain: ReadRecordsResponse = call(&case.ext, "ReadRecords", read(case.handle()))
             .await
             .unwrap();
         let with_owner: ReadRecordsResponse =
@@ -861,12 +861,12 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
             gives: Needs::ALL,
         };
         let created = case.create(None).await.unwrap();
-        let stream = created.stream.unwrap();
+        let stream = created.handle.unwrap();
         assert_eq!(stream.id, case.stream);
         assert_eq!(stream.backend, "redis-a");
-        // A ref with any backend, or none, reaches the same Stream.
+        // A handle with any backend, or none, reaches the same Stream.
         let named = |backend: &str| {
-            Some(StreamRef {
+            Some(StreamHandle {
                 id: case.stream.clone(),
                 backend: backend.to_string(),
                 ..Default::default()
@@ -875,7 +875,7 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
         for (sequence, stream) in [(1, named("redis-a")), (2, named("")), (3, named("other"))] {
             let request = AppendRecordsRequest {
                 namespace: case.namespace.clone(),
-                stream,
+                handle: stream,
                 producer: Some(client(1)),
                 sequence,
                 records: vec![record(&sequence.to_string())],
@@ -885,16 +885,16 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
         }
         let read = ReadRecordsRequest {
             namespace: case.namespace.clone(),
-            stream: named("other"),
+            handle: named("other"),
             ..Default::default()
         };
         let read: ReadRecordsResponse = call(&case.ext, "ReadRecords", read).await.unwrap();
         assert_eq!(texts(&read), ["1", "2", "3"]);
     }
-    // With no backend in the config, the ref has none, and lang reads it as the default.
+    // With no backend in the config, the handle has none, and lang reads it as the default.
     for case in cases_for(Needs::OWN_CONFIG).await {
         let created = case.create(None).await.unwrap();
-        assert_eq!(created.stream.unwrap().backend, "");
+        assert_eq!(created.handle.unwrap().backend, "");
     }
 }
 
@@ -926,9 +926,9 @@ fn workflow_owner(run: &str) -> Producer {
     }
 }
 
-/// The case's ref with the owner of a made-up run chain, which a create with an owner needs.
-fn owned_ref(case: &Case) -> Option<StreamRef> {
-    Some(StreamRef {
+/// The case's handle with the owner of a made-up run chain, which a create with an owner needs.
+fn owned_handle(case: &Case) -> Option<StreamHandle> {
+    Some(StreamHandle {
         id: case.stream.clone(),
         owner: super::support::workflow_execution(&format!("{}-wf", case.stream), "first-run"),
         ..Default::default()
@@ -944,12 +944,12 @@ async fn a_retry_run_s_local_activity_calls_withdraw_the_previous_run() {
             stream_id: case.stream.clone(),
             withdraw_run: withdraw_run.to_string(),
             owner: Some(workflow_owner(run)),
-            r#ref: owned_ref(&case),
+            stream_handle: owned_handle(&case),
             ..Default::default()
         };
         let append = |run: &str, withdraw_run: &str, text: &str| AppendRecordsRequest {
             namespace: case.namespace.clone(),
-            stream: case.stream(),
+            handle: case.handle(),
             producer: Some(local_activity(run)),
             sequence: 1,
             records: vec![record(text)],
@@ -1026,7 +1026,7 @@ async fn only_a_later_run_s_local_activity_withdraws_a_run_on_append() {
                 "AppendRecords",
                 AppendRecordsRequest {
                     namespace: case.namespace.clone(),
-                    stream: case.stream(),
+                    handle: case.handle(),
                     producer: Some(producer),
                     sequence: 1,
                     records: vec![record("other")],
@@ -1073,7 +1073,7 @@ async fn a_rerun_local_activity_supersedes_its_first_attempt() {
                 namespace: case.namespace.clone(),
                 stream_id: case.stream.clone(),
                 owner: Some(workflow_owner(&run)),
-                r#ref: owned_ref(&case),
+                stream_handle: owned_handle(&case),
                 ..Default::default()
             },
         )
@@ -1081,7 +1081,7 @@ async fn a_rerun_local_activity_supersedes_its_first_attempt() {
         .unwrap();
         let write = |producer: Producer, text: &str| AppendRecordsRequest {
             namespace: case.namespace.clone(),
-            stream: case.stream(),
+            handle: case.handle(),
             producer: Some(producer),
             sequence: 1,
             records: vec![record(text)],
@@ -1139,7 +1139,7 @@ fn local_activity_write(
     producer.id = crate::ids::local_activity_producer_id(run, call);
     AppendRecordsRequest {
         namespace: case.namespace.clone(),
-        stream: case.stream(),
+        handle: case.handle(),
         producer: Some(producer),
         sequence: 1,
         records: vec![record(text)],
@@ -1156,7 +1156,7 @@ fn local_activity_write(
 async fn the_close_activity_closes_a_workflow_stream_as_its_workflow_producer() {
     for case in cases_for(Needs::UNCHECKED).await {
         let run = format!("{}-run", case.stream);
-        let chain = StreamRef {
+        let chain = StreamHandle {
             id: case.stream.clone(),
             owner: super::support::workflow_execution(&format!("{}-wf", case.stream), "first-run"),
             ..Default::default()
@@ -1168,7 +1168,7 @@ async fn the_close_activity_closes_a_workflow_stream_as_its_workflow_producer() 
                 namespace: case.namespace.clone(),
                 stream_id: case.stream.clone(),
                 owner: Some(workflow_owner(&run)),
-                r#ref: Some(chain.clone()),
+                stream_handle: Some(chain.clone()),
                 ..Default::default()
             },
         )
@@ -1176,7 +1176,7 @@ async fn the_close_activity_closes_a_workflow_stream_as_its_workflow_producer() 
         .unwrap();
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
-            stream: Some(chain),
+            handle: Some(chain),
             producer: Some(workflow_owner(&run)),
             ..Default::default()
         };
@@ -1304,7 +1304,7 @@ fn task_write(
     }
     AppendRecordsRequest {
         namespace: case.namespace.clone(),
-        stream: case.stream(),
+        handle: case.handle(),
         producer: Some(producer),
         sequence: 1,
         records: vec![record(text)],
@@ -1373,12 +1373,12 @@ async fn a_withdrawn_run_cant_close_the_stream() {
             stream_id: case.stream.clone(),
             withdraw_run: withdraw_run.to_string(),
             owner: Some(workflow_owner(run)),
-            r#ref: owned_ref(&case),
+            stream_handle: owned_handle(&case),
             ..Default::default()
         };
         let close = |run: &str| CloseStreamRequest {
             namespace: case.namespace.clone(),
-            stream: owned_ref(&case),
+            handle: owned_handle(&case),
             producer: Some(workflow_owner(run)),
             ..Default::default()
         };
@@ -1408,7 +1408,7 @@ async fn a_retry_run_s_create_of_a_new_stream_fences_the_previous_run() {
                 stream_id: case.stream.clone(),
                 withdraw_run: previous.clone(),
                 owner: Some(workflow_owner(&retry)),
-                r#ref: owned_ref(&case),
+                stream_handle: owned_handle(&case),
                 ..Default::default()
             },
         )
@@ -1417,7 +1417,7 @@ async fn a_retry_run_s_create_of_a_new_stream_fences_the_previous_run() {
         assert!(created.created);
         let append = |run: &str| AppendRecordsRequest {
             namespace: case.namespace.clone(),
-            stream: case.stream(),
+            handle: case.handle(),
             producer: Some(local_activity(run)),
             sequence: 1,
             records: vec![record(run)],
@@ -1446,7 +1446,7 @@ async fn a_retry_run_s_create_after_the_log_expired_keeps_the_gap() {
             retention: millis(300),
             withdraw_run: withdraw_run.to_string(),
             owner: Some(workflow_owner(run)),
-            r#ref: owned_ref(&case),
+            stream_handle: owned_handle(&case),
             ..Default::default()
         };
         let _: CreateStreamResponse = call(&case.ext, "CreateStream", create(&previous, ""))
@@ -1457,7 +1457,7 @@ async fn a_retry_run_s_create_after_the_log_expired_keeps_the_gap() {
             "AppendRecords",
             AppendRecordsRequest {
                 namespace: case.namespace.clone(),
-                stream: case.stream(),
+                handle: case.handle(),
                 producer: Some(local_activity(&previous)),
                 sequence: 1,
                 records: vec![record("a"), record("b")],
@@ -1504,7 +1504,7 @@ async fn a_close_record_takes_its_status_from_the_failure() {
             case.create(None).await.unwrap();
             let close = CloseStreamRequest {
                 namespace: case.namespace.clone(),
-                stream: case.stream(),
+                handle: case.handle(),
                 producer: Some(client(1)),
                 failure: Some(failure.clone()),
                 ..Default::default()
@@ -1606,7 +1606,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_create_returns_the_stream_that_exists_whatever_its_retention),
     case!(a_create_of_a_closed_stream_fails),
     case!(a_create_of_an_expired_stream_fails),
-    case!(a_create_checks_its_owner_and_its_ref),
+    case!(a_create_checks_its_owner_and_its_handle),
     case!(a_producer_must_match_its_kind_and_not_be_a_workflow),
     case!(an_append_with_no_sequence_takes_the_next_one_of_its_epoch),
     case!(a_read_is_inclusive_from_its_offset_and_get_offset_reads_only_new_records),
@@ -1619,7 +1619,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_read_of_an_expired_closed_stream_fails_instead_of_waiting),
     case!(a_read_behind_an_expired_log_fails_before_and_after_the_next_write),
     case!(a_close_after_the_log_expired_keeps_the_gap),
-    case!(a_ref_with_an_owner_and_one_without_reach_the_same_stream),
+    case!(a_handle_with_an_owner_and_one_without_reach_the_same_stream),
     case!(a_create_answer_names_the_backend_and_the_store_never_reads_it),
     case!(a_retry_run_s_local_activity_calls_withdraw_the_previous_run),
     case!(only_a_later_run_s_local_activity_withdraws_a_run_on_append),

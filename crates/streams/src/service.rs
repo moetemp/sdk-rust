@@ -10,11 +10,11 @@ use crate::{
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        Producer, ReadRecordsRequest, ReadRecordsResponse, StreamProducerKind, StreamReadStart,
-        StreamRecord, StreamRef, StreamStatus, Supersession, WorkflowTaskEpoch,
+        Producer, ReadRecordsRequest, ReadRecordsResponse, StreamHandle, StreamProducerKind,
+        StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded, WorkflowTaskEpoch,
         stream_record::Item,
     },
-    record::{caller_status, close_record, data_records, supersession},
+    record::{caller_status, close_record, data_records, superseded},
     store::{
         Batch, Capabilities, CreateOutcome, FORMAT_VERSION, MAX_RECORD_BYTES, MAX_SEQUENCE,
         MAX_TTL, Owner, Store, StreamState, TaskFacts, Withdrawal, owner_chain,
@@ -39,7 +39,7 @@ const CREATE_POLL: Duration = Duration::from_millis(100);
 pub(crate) struct StreamService {
     pub(crate) store: Arc<dyn Store>,
     pub(crate) metrics: Metrics,
-    /// The backend name for the refs the service builds.
+    /// The backend name for the handles the service builds.
     pub(crate) backend: String,
 }
 
@@ -78,31 +78,31 @@ fn proto_duration(value: Duration) -> prost_types::Duration {
     }
 }
 
-fn stream_id(stream: Option<&StreamRef>) -> StreamResult<&str> {
-    let id = stream.map(|stream| stream.id.as_str()).unwrap_or_default();
+fn stream_id(handle: Option<&StreamHandle>) -> StreamResult<&str> {
+    let id = handle.map(|handle| handle.id.as_str()).unwrap_or_default();
     check_stream_id(id)?;
     Ok(id)
 }
 
 /// The `Superseded` facts of a create that withdraws a retry run's previous run. It has no epoch,
 /// so a Reader withdraws only that run's Records.
-fn run_supersession(owner: Option<&Producer>, withdraw_run: &str) -> Vec<u8> {
+fn run_superseded(owner: Option<&Producer>, withdraw_run: &str) -> Vec<u8> {
     let producer = Producer {
         epoch: None,
         ..owner.cloned().unwrap_or_default()
     };
-    supersession(&producer, withdraw_run)
+    superseded(&producer, withdraw_run)
 }
 
 /// The `Superseded` facts that withdraw a run's orphaned Local Activity Records. They name the
 /// run's Workflow Producer in the batch's task, so that a Reader applies the Workflow rule.
-fn orphan_supersession(
+fn orphan_superseded(
     producer: &Producer,
     completed: Option<&WorkflowTaskEpoch>,
     failed_tasks: &[i64],
 ) -> Vec<u8> {
     let epoch = producer.epoch.unwrap_or_default();
-    Supersession {
+    StreamSuperseded {
         producer_kind: StreamProducerKind::Workflow as i32,
         producer_id: crate::ids::workflow_producer_id(&producer.run_id),
         epoch: Some(crate::proto::ProducerEpoch {
@@ -140,18 +140,18 @@ fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
     Ok(producer)
 }
 
-/// Checks the owner of a create, which must be a Workflow run with a ref of its run chain. A
+/// Checks the owner of a create, which must be a Workflow run with a handle of its run chain. A
 /// Store stores that chain and checks every later create and close against it.
-fn create_owner<'a>(owner: &'a Producer, stream: &StreamRef) -> StreamResult<&'a Producer> {
+fn create_owner<'a>(owner: &'a Producer, handle: &StreamHandle) -> StreamResult<&'a Producer> {
     check_producer(owner)?;
     if owner.kind != StreamProducerKind::Workflow as i32 {
         return Err(StreamError::invalid(
             "The owner of a create is a Workflow Producer",
         ));
     }
-    if owner_chain(stream).is_empty() {
+    if owner_chain(handle).is_empty() {
         return Err(StreamError::invalid(
-            "A create with an owner needs a ref whose owner is the Workflow's run chain",
+            "A create with an owner needs a handle whose owner is the Workflow's run chain",
         ));
     }
     Ok(owner)
@@ -173,18 +173,21 @@ impl StreamService {
         check_stream_id(&request.stream_id)?;
         let retention = retention(request.retention)?;
         if request
-            .r#ref
+            .stream_handle
             .as_ref()
-            .is_some_and(|stream| stream.id != request.stream_id)
+            .is_some_and(|handle| handle.id != request.stream_id)
         {
             return Err(StreamError::invalid(
-                "The create's ref names another Stream than its stream_id",
+                "The create's handle names another Stream than its stream_id",
             ));
         }
-        let stream = request.r#ref.clone().unwrap_or_else(|| StreamRef {
-            id: request.stream_id.clone(),
-            ..Default::default()
-        });
+        let stream = request
+            .stream_handle
+            .clone()
+            .unwrap_or_else(|| StreamHandle {
+                id: request.stream_id.clone(),
+                ..Default::default()
+            });
         // A Workflow's call from outside Workflow code, such as from a Local Activity, sets the
         // owner run. Then the Stream has the safety TTL of a Workflow-owned Stream.
         let owner = match &request.owner {
@@ -210,10 +213,10 @@ impl StreamService {
             }
             self.store.capabilities().require(Capabilities::RUN_FENCE)?;
         }
-        let bytes = run_supersession(request.owner.as_ref(), &request.withdraw_run);
+        let bytes = run_superseded(request.owner.as_ref(), &request.withdraw_run);
         let withdrawal = Withdrawal {
             withdraw_run: &request.withdraw_run,
-            supersession: &bytes,
+            superseded: &bytes,
             tasks: None,
         };
         let created = self
@@ -224,7 +227,7 @@ impl StreamService {
             self.metrics.superseded();
         }
         Ok(CreateStreamResponse {
-            stream: Some(StreamRef {
+            handle: Some(StreamHandle {
                 id: request.stream_id,
                 owner: stream.owner.filter(|_| owner == Owner::Workflow),
                 backend: self.backend.clone(),
@@ -237,8 +240,8 @@ impl StreamService {
         &self,
         request: AppendRecordsRequest,
     ) -> StreamResult<AppendRecordsResponse> {
-        stream_id(request.stream.as_ref())?;
-        let stream = request.stream.clone().unwrap_or_default();
+        stream_id(request.handle.as_ref())?;
+        let stream = request.handle.clone().unwrap_or_default();
         let producer = outside_producer(request.producer.as_ref())?;
         if !(0..=MAX_SEQUENCE).contains(&request.sequence) {
             return Err(StreamError::invalid(
@@ -270,7 +273,7 @@ impl StreamService {
         }
         let digest = batch_digest(&request.records);
         let records = data_records(producer, request.records)?;
-        let bytes = supersession(producer, &request.withdraw_run);
+        let bytes = superseded(producer, &request.withdraw_run);
         // A Local Activity sends its run's task facts, so that the batch withdraws the run's
         // orphaned Local Activity Records. These are the Records of the tasks that never completed.
         let completed = request
@@ -278,7 +281,7 @@ impl StreamService {
             .filter(|c| c.started_event_id > 0);
         let orphans = (producer.kind == StreamProducerKind::LocalActivity as i32
             && request.previous_completed_task.is_some())
-        .then(|| orphan_supersession(producer, completed.as_ref(), &request.failed_tasks));
+        .then(|| orphan_superseded(producer, completed.as_ref(), &request.failed_tasks));
         let batch = Batch {
             producer,
             sequence: request.sequence,
@@ -286,11 +289,11 @@ impl StreamService {
             digest: &digest,
             withdrawal: Withdrawal {
                 withdraw_run: &request.withdraw_run,
-                supersession: &bytes,
+                superseded: &bytes,
                 tasks: orphans.as_ref().map(|orphans| TaskFacts {
                     completed: completed.as_ref(),
                     failed_tasks: &request.failed_tasks,
-                    supersession: orphans,
+                    superseded: orphans,
                 }),
             },
         };
@@ -317,8 +320,8 @@ impl StreamService {
         &self,
         request: CloseStreamRequest,
     ) -> StreamResult<CloseStreamResponse> {
-        stream_id(request.stream.as_ref())?;
-        let stream = request.stream.clone().unwrap_or_default();
+        stream_id(request.handle.as_ref())?;
+        let stream = request.handle.clone().unwrap_or_default();
         let producer = close_producer(request.producer.as_ref())?;
         self.store.capabilities().require(Capabilities::CLOSE)?;
         let status = caller_status(request.failure.as_ref());
@@ -343,7 +346,7 @@ impl StreamService {
         &self,
         request: DescribeStreamRequest,
     ) -> StreamResult<DescribeStreamResponse> {
-        let id = stream_id(request.stream.as_ref())?;
+        let id = stream_id(request.handle.as_ref())?;
         let (state, _) = self.store.read(&request.namespace, id, 0, 0).await?;
         if !state.exists {
             return Err(StreamError::new(
@@ -371,7 +374,7 @@ impl StreamService {
         &self,
         request: ReadRecordsRequest,
     ) -> StreamResult<ReadRecordsResponse> {
-        let id = stream_id(request.stream.as_ref())?.to_string();
+        let id = stream_id(request.handle.as_ref())?.to_string();
         let namespace = request.namespace.as_str();
         if request.from_offset < 0 {
             return Err(StreamError::invalid("The offset is below zero"));
@@ -458,7 +461,7 @@ impl StreamService {
         request: ReadRecordsRequest,
         max_bytes: usize,
     ) -> StreamResult<ReadRecordsResponse> {
-        let id = stream_id(request.stream.as_ref())?.to_string();
+        let id = stream_id(request.handle.as_ref())?.to_string();
         let namespace = request.namespace.as_str();
         let count = (request.last as usize).min(MAX_RECORDS);
         let create_wait = duration(request.create_wait)
@@ -476,7 +479,7 @@ impl StreamService {
         check_expiry(&state, 0)?;
         let retained = state.retained_from();
         let (mut picked, mut close) = (vec![], None);
-        let mut withdrawals: Vec<Supersession> = vec![];
+        let mut withdrawals: Vec<StreamSuperseded> = vec![];
         let (mut bytes, mut scanned, mut scanned_bytes) = (0, 0, 0);
         let mut before = state.newest;
         'scan: while before >= retained
@@ -500,7 +503,7 @@ impl StreamService {
                 before = entry.offset - 1;
                 scanned += 1;
                 scanned_bytes += entry.record.as_ref().map_or(0, Vec::len)
-                    + entry.supersession.as_ref().map_or(0, Vec::len);
+                    + entry.superseded.as_ref().map_or(0, Vec::len);
                 // An entry's `Superseded` item withdraws earlier Records, not the entry's own.
                 if let Some(record) = entry.record {
                     let record = decode(&record, entry.offset)?;
@@ -521,9 +524,9 @@ impl StreamService {
                         }
                     }
                 }
-                if let Some(supersession) = entry.supersession {
+                if let Some(superseded) = entry.superseded {
                     withdrawals.push(
-                        Supersession::decode(supersession.as_slice())
+                        StreamSuperseded::decode(superseded.as_slice())
                             .map_err(|error| StreamError::storage(error.to_string()))?,
                     );
                 }
@@ -622,12 +625,12 @@ impl StreamService {
                     continue;
                 }
                 let mut items = vec![];
-                if let Some(bytes) = entry.supersession {
-                    let supersession = Supersession::decode(bytes.as_slice())
+                if let Some(bytes) = entry.superseded {
+                    let superseded = StreamSuperseded::decode(bytes.as_slice())
                         .map_err(|error| StreamError::storage(error.to_string()))?;
                     items.push(StreamRecord {
                         offset: entry.offset,
-                        item: Some(Item::Superseded(supersession)),
+                        item: Some(Item::Superseded(superseded)),
                     });
                 }
                 if let Some(bytes) = entry.record {

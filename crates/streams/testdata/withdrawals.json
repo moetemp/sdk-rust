@@ -1,7 +1,7 @@
 [
   {
     "name": "e1 B at the failed task 5 goes",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -44,7 +44,7 @@
   },
   {
     "name": "e1 a Record at the completed task 8 stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -87,7 +87,7 @@
   },
   {
     "name": "e1 a Record before c stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -130,7 +130,7 @@
   },
   {
     "name": "e2 B goes",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -173,7 +173,7 @@
   },
   {
     "name": "e2 an older completed Record stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -216,7 +216,7 @@
   },
   {
     "name": "e3 D at a lower attempt of t goes",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -257,7 +257,7 @@
   },
   {
     "name": "e3 a Record of t itself stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -298,7 +298,7 @@
   },
   {
     "name": "e4 U at an earlier started time goes",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -339,7 +339,7 @@
   },
   {
     "name": "e5 D between c and t goes",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -380,7 +380,7 @@
   },
   {
     "name": "e5 a Record at c stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -421,7 +421,7 @@
   },
   {
     "name": "c attempt 3, attempt 2 at c goes",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -462,7 +462,7 @@
   },
   {
     "name": "c attempt 3, c itself stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -503,7 +503,7 @@
   },
   {
     "name": "c with no attempt keeps every Record at c",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -539,7 +539,7 @@
   },
   {
     "name": "e1 a Local Activity of the failed task goes",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -583,7 +583,7 @@
   },
   {
     "name": "another run's Record stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -626,7 +626,7 @@
   },
   {
     "name": "e6 r1's Record goes",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r2",
       "run_id": "r2",
@@ -660,7 +660,7 @@
   },
   {
     "name": "e6 r1's Activity Record goes",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r2",
       "run_id": "r2",
@@ -693,7 +693,7 @@
   },
   {
     "name": "e6 r2's own earlier Record of t stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r2",
       "run_id": "r2",
@@ -727,7 +727,7 @@
   },
   {
     "name": "an Activity retry withdraws attempt 1",
-    "supersession": {
+    "superseded": {
       "producer_kind": "activity",
       "producer_id": "act:r1:a:s",
       "run_id": "r1",
@@ -757,7 +757,7 @@
   },
   {
     "name": "an Activity retry keeps another Activity",
-    "supersession": {
+    "superseded": {
       "producer_kind": "activity",
       "producer_id": "act:r1:a:s",
       "run_id": "r1",
@@ -787,7 +787,7 @@
   },
   {
     "name": "a client's newer epoch keeps its earlier Records",
-    "supersession": {
+    "superseded": {
       "producer_kind": "client",
       "producer_id": "client:ingest",
       "epoch": {
@@ -807,7 +807,7 @@
   },
   {
     "name": "no epoch, r1's Record goes",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r2",
       "run_id": "r2",
@@ -835,7 +835,7 @@
   },
   {
     "name": "no epoch, r1's Local Activity Record goes",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r2",
       "run_id": "r2",
@@ -864,7 +864,7 @@
   },
   {
     "name": "no epoch, r2's Local Activity Record at a failed task stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r2",
       "run_id": "r2",
@@ -893,7 +893,7 @@
   },
   {
     "name": "no epoch, r2's Record stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r2",
       "run_id": "r2",
@@ -921,7 +921,7 @@
   },
   {
     "name": "a Local Activity's newer epoch withdraws a lower attempt",
-    "supersession": {
+    "superseded": {
       "producer_kind": "local_activity",
       "producer_id": "la:r1:k",
       "run_id": "r1",
@@ -955,7 +955,7 @@
   },
   {
     "name": "a Local Activity's newer epoch withdraws an earlier task",
-    "supersession": {
+    "superseded": {
       "producer_kind": "local_activity",
       "producer_id": "la:r1:k",
       "run_id": "r1",
@@ -989,7 +989,7 @@
   },
   {
     "name": "a Local Activity's newer epoch keeps its own epoch",
-    "supersession": {
+    "superseded": {
       "producer_kind": "local_activity",
       "producer_id": "la:r1:k",
       "run_id": "r1",
@@ -1023,7 +1023,7 @@
   },
   {
     "name": "a Local Activity's newer epoch keeps another call",
-    "supersession": {
+    "superseded": {
       "producer_kind": "local_activity",
       "producer_id": "la:r1:k",
       "run_id": "r1",
@@ -1057,7 +1057,7 @@
   },
   {
     "name": "a Local Activity's item keeps the run's Workflow Record",
-    "supersession": {
+    "superseded": {
       "producer_kind": "local_activity",
       "producer_id": "la:r1:k",
       "run_id": "r1",
@@ -1090,7 +1090,7 @@
   },
   {
     "name": "a Local Activity before c stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -1134,7 +1134,7 @@
   },
   {
     "name": "a Local Activity at c stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -1178,7 +1178,7 @@
   },
   {
     "name": "a Local Activity between c and t goes",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -1222,7 +1222,7 @@
   },
   {
     "name": "a Local Activity of a lower attempt of t goes",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -1266,7 +1266,7 @@
   },
   {
     "name": "a Local Activity of t itself stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -1310,7 +1310,7 @@
   },
   {
     "name": "a Local Activity of another run stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",
@@ -1354,7 +1354,7 @@
   },
   {
     "name": "a Local Activity Record with no epoch stays",
-    "supersession": {
+    "superseded": {
       "producer_kind": "workflow",
       "producer_id": "wf:r1",
       "run_id": "r1",

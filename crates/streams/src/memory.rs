@@ -7,7 +7,7 @@ use crate::{
     epoch::{epoch_key, task_key, task_of},
     ids::{StreamKeys, encode_part},
     offset::{entry_id_of_offset, offset_of_entry_id},
-    proto::{Producer, StreamProducerKind, StreamRef},
+    proto::{Producer, StreamHandle, StreamProducerKind},
     store::{
         Appended, Batch, Capabilities, Closed, CreateOutcome, Created, Entry, FORMAT_VERSION,
         MAX_SEQUENCE, Owner, Store, StreamState, TOMBSTONE, Withdrawal, owner_chain,
@@ -28,7 +28,7 @@ const PRUNE_LIMIT: usize = 64;
 #[derive(Clone, Default)]
 struct Fields {
     record: Option<Vec<u8>>,
-    supersession: Option<Vec<u8>>,
+    superseded: Option<Vec<u8>>,
 }
 
 /// One Stream's meta hash and log, each with an expiry time, as Redis keys have.
@@ -158,7 +158,7 @@ impl Keys {
             if self.get("oc").is_some_and(|owner| chain != owner) {
                 return Err(refuse(
                     Reason::NotOwner,
-                    "the ref names another run chain than the owner",
+                    "the handle names another run chain than the owner",
                 ));
             }
         } else if kind != StreamProducerKind::Client as i32 {
@@ -442,12 +442,12 @@ impl Store for MemoryStore {
     async fn create(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         retention: Option<Duration>,
         owner: Owner,
         withdrawal: &Withdrawal<'_>,
     ) -> StreamResult<Created> {
-        let stream_id = stream.id.as_str();
+        let stream_id = handle.id.as_str();
         let retention = millis(retention.filter(|r| !r.is_zero()).unwrap_or(self.retention));
         let owner = match owner {
             Owner::Workflow => "wf",
@@ -456,7 +456,7 @@ impl Store for MemoryStore {
         let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
         let withdrawn_run = encode_run(withdrawal.withdraw_run);
         let chain = if owner == "wf" {
-            owner_chain(stream)
+            owner_chain(handle)
         } else {
             String::new()
         };
@@ -487,7 +487,7 @@ impl Store for MemoryStore {
                     now,
                     Fields {
                         record: None,
-                        supersession: Some(withdrawal.supersession.to_vec()),
+                        superseded: Some(withdrawal.superseded.to_vec()),
                     },
                 );
                 keys.set("newest", id);
@@ -510,10 +510,10 @@ impl Store for MemoryStore {
     async fn append(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         batch: &Batch<'_>,
     ) -> StreamResult<Appended> {
-        let stream_id = stream.id.as_str();
+        let stream_id = handle.id.as_str();
         let producer = batch.producer;
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
         let run = encode_run(&producer.run_id);
@@ -633,7 +633,7 @@ impl Store for MemoryStore {
                     now,
                     Fields {
                         record: None,
-                        supersession: Some(facts.supersession.to_vec()),
+                        superseded: Some(facts.superseded.to_vec()),
                     },
                 );
                 last = orphan.clone();
@@ -643,18 +643,18 @@ impl Store for MemoryStore {
                     now,
                     Fields {
                         record: None,
-                        supersession: Some(withdrawal.supersession.to_vec()),
+                        superseded: Some(withdrawal.superseded.to_vec()),
                     },
                 );
                 first = last.clone();
             }
             for (i, record) in batch.records.iter().enumerate() {
-                let supersession = (i == 0 && flagged).then(|| withdrawal.supersession.to_vec());
+                let superseded = (i == 0 && flagged).then(|| withdrawal.superseded.to_vec());
                 last = keys.add(
                     now,
                     Fields {
                         record: Some(record.clone()),
-                        supersession,
+                        superseded,
                     },
                 );
                 if first.is_empty() {
@@ -714,16 +714,16 @@ impl Store for MemoryStore {
     async fn close(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         producer: &Producer,
         record: &[u8],
     ) -> StreamResult<Closed> {
-        let stream_id = stream.id.as_str();
+        let stream_id = handle.id.as_str();
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
         let run = encode_run(&producer.run_id);
         let suffix = format!("|{}|{}", producer.kind, producer.id);
         let tombstone = millis(TOMBSTONE);
-        let chain = owner_chain(stream);
+        let chain = owner_chain(handle);
         let closed = self.with(namespace, stream_id, |keys, now| {
             keys.check_live(now)?;
             keys.check_owner(producer.kind, &chain)?;
@@ -752,7 +752,7 @@ impl Store for MemoryStore {
                 now,
                 Fields {
                     record: Some(record.to_vec()),
-                    supersession: None,
+                    superseded: None,
                 },
             );
             keys.set("closed", "1");
@@ -809,7 +809,7 @@ impl Store for MemoryStore {
                     entries.push(Entry {
                         offset: offset_of_entry_id(&id_text(*id))?,
                         record: fields.record.clone(),
-                        supersession: fields.supersession.clone(),
+                        superseded: fields.superseded.clone(),
                     });
                 }
             }
@@ -836,7 +836,7 @@ impl Store for MemoryStore {
                     Ok(Entry {
                         offset: offset_of_entry_id(&id_text(*id))?,
                         record: fields.record.clone(),
-                        supersession: fields.supersession.clone(),
+                        superseded: fields.superseded.clone(),
                     })
                 })
                 .collect()
