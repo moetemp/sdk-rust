@@ -227,6 +227,7 @@ impl ActivityContext {
             is_local,
             priority,
             run_id,
+            propagated_nexus_serialization_context: _,
             workflow_task: _,
         } = task;
         let deadline = calculate_deadline(

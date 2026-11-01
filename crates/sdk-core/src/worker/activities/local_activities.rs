@@ -644,6 +644,7 @@ impl LocalActivityManager {
                     priority: Some(Default::default()),
                     is_local: true,
                     run_id: String::new(),
+                    propagated_nexus_serialization_context: None,
                     workflow_task: new_la.workflow_task,
                 })),
             }));
