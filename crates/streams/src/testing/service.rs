@@ -944,12 +944,12 @@ async fn a_retry_run_s_local_activity_calls_withdraw_the_previous_run() {
             stream_id: case.stream.clone(),
             withdraw_run: withdraw_run.to_string(),
             owner: Some(workflow_owner(run)),
-            r#ref: owned_ref(&case),
+            stream_handle: owned_handle(&case),
             ..Default::default()
         };
         let append = |run: &str, withdraw_run: &str, text: &str| AppendRecordsRequest {
             namespace: case.namespace.clone(),
-            stream: case.stream(),
+            handle: case.handle(),
             producer: Some(local_activity(run)),
             sequence: 1,
             records: vec![record(text)],
@@ -1026,7 +1026,7 @@ async fn only_a_later_run_s_local_activity_withdraws_a_run_on_append() {
                 "AppendRecords",
                 AppendRecordsRequest {
                     namespace: case.namespace.clone(),
-                    stream: case.stream(),
+                    handle: case.handle(),
                     producer: Some(producer),
                     sequence: 1,
                     records: vec![record("other")],
@@ -1139,7 +1139,7 @@ fn local_activity_write(
     producer.id = crate::ids::local_activity_producer_id(run, call);
     AppendRecordsRequest {
         namespace: case.namespace.clone(),
-        stream: case.stream(),
+        handle: case.handle(),
         producer: Some(producer),
         sequence: 1,
         records: vec![record(text)],
@@ -1156,7 +1156,7 @@ fn local_activity_write(
 async fn the_close_activity_closes_a_workflow_stream_as_its_workflow_producer() {
     for case in cases_for(Needs::UNCHECKED).await {
         let run = format!("{}-run", case.stream);
-        let chain = StreamRef {
+        let chain = StreamHandle {
             id: case.stream.clone(),
             owner: super::support::workflow_execution(&format!("{}-wf", case.stream), "first-run"),
             ..Default::default()
@@ -1168,7 +1168,7 @@ async fn the_close_activity_closes_a_workflow_stream_as_its_workflow_producer() 
                 namespace: case.namespace.clone(),
                 stream_id: case.stream.clone(),
                 owner: Some(workflow_owner(&run)),
-                r#ref: Some(chain.clone()),
+                stream_handle: Some(chain.clone()),
                 ..Default::default()
             },
         )
@@ -1176,7 +1176,7 @@ async fn the_close_activity_closes_a_workflow_stream_as_its_workflow_producer() 
         .unwrap();
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
-            stream: Some(chain),
+            handle: Some(chain),
             producer: Some(workflow_owner(&run)),
             ..Default::default()
         };
@@ -1304,7 +1304,7 @@ fn task_write(
     }
     AppendRecordsRequest {
         namespace: case.namespace.clone(),
-        stream: case.stream(),
+        handle: case.handle(),
         producer: Some(producer),
         sequence: 1,
         records: vec![record(text)],
@@ -1373,12 +1373,12 @@ async fn a_withdrawn_run_cant_close_the_stream() {
             stream_id: case.stream.clone(),
             withdraw_run: withdraw_run.to_string(),
             owner: Some(workflow_owner(run)),
-            r#ref: owned_ref(&case),
+            stream_handle: owned_handle(&case),
             ..Default::default()
         };
         let close = |run: &str| CloseStreamRequest {
             namespace: case.namespace.clone(),
-            stream: owned_ref(&case),
+            handle: owned_handle(&case),
             producer: Some(workflow_owner(run)),
             ..Default::default()
         };
@@ -1408,7 +1408,7 @@ async fn a_retry_run_s_create_of_a_new_stream_fences_the_previous_run() {
                 stream_id: case.stream.clone(),
                 withdraw_run: previous.clone(),
                 owner: Some(workflow_owner(&retry)),
-                r#ref: owned_ref(&case),
+                stream_handle: owned_handle(&case),
                 ..Default::default()
             },
         )
@@ -1417,7 +1417,7 @@ async fn a_retry_run_s_create_of_a_new_stream_fences_the_previous_run() {
         assert!(created.created);
         let append = |run: &str| AppendRecordsRequest {
             namespace: case.namespace.clone(),
-            stream: case.stream(),
+            handle: case.handle(),
             producer: Some(local_activity(run)),
             sequence: 1,
             records: vec![record(run)],
@@ -1446,7 +1446,7 @@ async fn a_retry_run_s_create_after_the_log_expired_keeps_the_gap() {
             retention: millis(300),
             withdraw_run: withdraw_run.to_string(),
             owner: Some(workflow_owner(run)),
-            r#ref: owned_ref(&case),
+            stream_handle: owned_handle(&case),
             ..Default::default()
         };
         let _: CreateStreamResponse = call(&case.ext, "CreateStream", create(&previous, ""))
@@ -1457,7 +1457,7 @@ async fn a_retry_run_s_create_after_the_log_expired_keeps_the_gap() {
             "AppendRecords",
             AppendRecordsRequest {
                 namespace: case.namespace.clone(),
-                stream: case.stream(),
+                handle: case.handle(),
                 producer: Some(local_activity(&previous)),
                 sequence: 1,
                 records: vec![record("a"), record("b")],

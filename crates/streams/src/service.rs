@@ -96,13 +96,13 @@ fn run_superseded(owner: Option<&Producer>, withdraw_run: &str) -> Vec<u8> {
 
 /// The `Superseded` facts that withdraw a run's orphaned Local Activity Records. They name the
 /// run's Workflow Producer in the batch's task, so that a Reader applies the Workflow rule.
-fn orphan_supersession(
+fn orphan_superseded(
     producer: &Producer,
     completed: Option<&WorkflowTaskEpoch>,
     failed_tasks: &[i64],
 ) -> Vec<u8> {
     let epoch = producer.epoch.unwrap_or_default();
-    Supersession {
+    StreamSuperseded {
         producer_kind: StreamProducerKind::Workflow as i32,
         producer_id: crate::ids::workflow_producer_id(&producer.run_id),
         epoch: Some(crate::proto::ProducerEpoch {
@@ -281,7 +281,7 @@ impl StreamService {
             .filter(|c| c.started_event_id > 0);
         let orphans = (producer.kind == StreamProducerKind::LocalActivity as i32
             && request.previous_completed_task.is_some())
-        .then(|| orphan_supersession(producer, completed.as_ref(), &request.failed_tasks));
+        .then(|| orphan_superseded(producer, completed.as_ref(), &request.failed_tasks));
         let batch = Batch {
             producer,
             sequence: request.sequence,
@@ -293,7 +293,7 @@ impl StreamService {
                 tasks: orphans.as_ref().map(|orphans| TaskFacts {
                     completed: completed.as_ref(),
                     failed_tasks: &request.failed_tasks,
-                    supersession: orphans,
+                    superseded: orphans,
                 }),
             },
         };

@@ -487,7 +487,7 @@ impl Store for MemoryStore {
                     now,
                     Fields {
                         record: None,
-                        supersession: Some(withdrawal.supersession.to_vec()),
+                        superseded: Some(withdrawal.superseded.to_vec()),
                     },
                 );
                 keys.set("newest", id);
@@ -633,7 +633,7 @@ impl Store for MemoryStore {
                     now,
                     Fields {
                         record: None,
-                        supersession: Some(facts.supersession.to_vec()),
+                        superseded: Some(facts.superseded.to_vec()),
                     },
                 );
                 last = orphan.clone();
