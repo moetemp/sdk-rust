@@ -14,7 +14,7 @@ use temporalio_streams::{
     proto::{
         AppendRecord, AppendRecordsRequest, CloseStreamRequest, CreateStreamRequest,
         DescribeStreamRequest, DescribeStreamResponse, Producer, ProducerEpoch, StreamErrorDetails,
-        StreamErrorReason, StreamProducerKind, StreamRef, StreamStatus,
+        StreamErrorReason, StreamHandle, StreamProducerKind, StreamStatus,
     },
     store::{
         Appended, Batch, Capabilities, Closed, Created, Entry, Owner, Store, StreamState,
@@ -39,23 +39,23 @@ impl Store for Masked {
     async fn create(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         retention: Option<Duration>,
         owner: Owner,
         withdrawal: &Withdrawal<'_>,
     ) -> StreamResult<Created> {
         self.inner
-            .create(namespace, stream, retention, owner, withdrawal)
+            .create(namespace, handle, retention, owner, withdrawal)
             .await
     }
 
     async fn append(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         batch: &Batch<'_>,
     ) -> StreamResult<Appended> {
-        self.inner.append(namespace, stream, batch).await
+        self.inner.append(namespace, handle, batch).await
     }
 
     async fn read(
@@ -85,11 +85,11 @@ impl Store for Masked {
     async fn close(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         producer: &Producer,
         record: &[u8],
     ) -> StreamResult<Closed> {
-        self.inner.close(namespace, stream, producer, record).await
+        self.inner.close(namespace, handle, producer, record).await
     }
 }
 
@@ -150,8 +150,8 @@ fn refused_capability(error: &StreamError) -> String {
 }
 
 impl Case {
-    fn stream_ref(&self) -> Option<StreamRef> {
-        Some(StreamRef {
+    fn handle(&self) -> Option<StreamHandle> {
+        Some(StreamHandle {
             id: self.stream.clone(),
             ..Default::default()
         })
@@ -192,7 +192,7 @@ impl Case {
                 run_id: self.run_id.clone(),
                 ..Default::default()
             }),
-            r#ref: Some(StreamRef {
+            stream_handle: Some(StreamHandle {
                 id: self.stream.clone(),
                 owner: Some(Execution {
                     r#type: ExecutionType::Workflow as i32,
@@ -217,7 +217,7 @@ async fn an_append_without_the_fence_or_the_flag_is_refused_with_nothing_written
         case.create().await;
         let request = AppendRecordsRequest {
             namespace: NAMESPACE.to_string(),
-            stream: case.stream_ref(),
+            handle: case.handle(),
             producer: Some(client()),
             sequence: 1,
             records: vec![AppendRecord::default()],
@@ -235,7 +235,7 @@ async fn an_append_with_no_sequence_without_the_capability_is_refused_with_nothi
     case.create().await;
     let request = AppendRecordsRequest {
         namespace: NAMESPACE.to_string(),
-        stream: case.stream_ref(),
+        handle: case.handle(),
         producer: Some(client()),
         records: vec![AppendRecord::default()],
         ..Default::default()
@@ -261,7 +261,7 @@ async fn a_close_without_the_capability_is_refused_and_the_stream_stays_open() {
     case.create().await;
     let request = CloseStreamRequest {
         namespace: NAMESPACE.to_string(),
-        stream: case.stream_ref(),
+        handle: case.handle(),
         producer: Some(client()),
         ..Default::default()
     };
@@ -270,7 +270,7 @@ async fn a_close_without_the_capability_is_refused_and_the_stream_stays_open() {
     assert_eq!(case.log_len(), 0);
     let describe = DescribeStreamRequest {
         namespace: NAMESPACE.to_string(),
-        stream: case.stream_ref(),
+        handle: case.handle(),
     };
     let bytes = case.call("DescribeStream", describe).await.unwrap();
     let described = DescribeStreamResponse::decode(bytes.as_slice()).unwrap();

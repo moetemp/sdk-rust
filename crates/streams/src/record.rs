@@ -4,7 +4,7 @@ use crate::{
     Reason, StreamError, StreamResult,
     proto::{
         AppendRecord, Producer, StreamClose, StreamCloseStatus, StreamData, StreamRecord,
-        Supersession, stream_record::Item,
+        StreamSuperseded, stream_record::Item,
     },
     store::{MAX_BATCH_BYTES, MAX_RECORD_BYTES},
 };
@@ -109,8 +109,8 @@ fn canceled(failure: &Failure) -> bool {
 }
 
 /// The facts a `Superseded` item of this batch gives the Reader.
-pub(crate) fn supersession(producer: &Producer, withdraw_run: &str) -> Vec<u8> {
-    Supersession {
+pub(crate) fn superseded(producer: &Producer, withdraw_run: &str) -> Vec<u8> {
+    StreamSuperseded {
         producer_kind: producer.kind,
         producer_id: producer.id.clone(),
         epoch: producer.epoch,

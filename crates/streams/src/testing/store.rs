@@ -4,7 +4,7 @@
 
 use super::{
     case, fields,
-    support::{Needs, Run, Target, digest, record, records_of, stores_for, supersession},
+    support::{Needs, Run, Target, digest, record, records_of, stores_for, superseded},
 };
 use crate::{
     Reason,
@@ -12,7 +12,7 @@ use crate::{
         activity_producer_id, client_producer_id, named_client_producer_id, workflow_producer_id,
     },
     offset::offset_of_entry_id,
-    proto::{Producer, ProducerEpoch, StreamProducerKind, StreamRef},
+    proto::{Producer, ProducerEpoch, StreamHandle, StreamProducerKind},
     store::{Batch, CreateOutcome, Owner, Withdrawal},
 };
 use futures_util::future::join_all;
@@ -63,13 +63,13 @@ async fn append(
 ) -> Result<crate::store::Appended, crate::StreamError> {
     let records: Vec<_> = texts.iter().map(|text| record(producer, text)).collect();
     let mut withdrawal = Withdrawal::default();
-    let bytes = supersession(producer, &withdrawal);
-    withdrawal.supersession = &bytes;
+    let bytes = superseded(producer, &withdrawal);
+    withdrawal.superseded = &bytes;
     target
         .store
         .append(
             &target.namespace,
-            &target.stream_ref(),
+            &target.handle(),
             &Batch {
                 producer,
                 sequence,
@@ -98,7 +98,7 @@ async fn a_create_writes_the_key_once_and_keeps_its_retention() {
             .store
             .create(
                 &target.namespace,
-                &target.stream_ref(),
+                &target.handle(),
                 day,
                 Owner::Client,
                 &none,
@@ -110,7 +110,7 @@ async fn a_create_writes_the_key_once_and_keeps_its_retention() {
             .store
             .create(
                 &target.namespace,
-                &target.stream_ref(),
+                &target.handle(),
                 day,
                 Owner::Client,
                 &none,
@@ -122,7 +122,7 @@ async fn a_create_writes_the_key_once_and_keeps_its_retention() {
             .store
             .create(
                 &target.namespace,
-                &target.stream_ref(),
+                &target.handle(),
                 None,
                 Owner::Client,
                 &none,
@@ -218,7 +218,7 @@ async fn a_close_stops_appends_but_not_a_resend() {
             .store
             .create(
                 &target.namespace,
-                &target.stream_ref(),
+                &target.handle(),
                 None,
                 Owner::Client,
                 &Withdrawal::default(),
@@ -243,7 +243,7 @@ async fn a_newer_format_refuses_every_write() {
             .store
             .create(
                 &target.namespace,
-                &target.stream_ref(),
+                &target.handle(),
                 None,
                 Owner::Client,
                 &Withdrawal::default(),
@@ -264,7 +264,7 @@ async fn an_expired_stream_refuses_writes_and_its_create() {
             .store
             .create(
                 &target.namespace,
-                &target.stream_ref(),
+                &target.handle(),
                 None,
                 Owner::Client,
                 &Withdrawal::default(),
@@ -385,7 +385,7 @@ async fn an_append_trims_by_retention_and_keeps_the_watermark() {
             .store
             .create(
                 &target.namespace,
-                &target.stream_ref(),
+                &target.handle(),
                 Some(Duration::from_millis(600)),
                 Owner::Workflow,
                 &none,
@@ -424,7 +424,7 @@ async fn offsets_go_on_after_the_log_expires() {
             .store
             .create(
                 &target.namespace,
-                &target.stream_ref(),
+                &target.handle(),
                 Some(Duration::from_millis(200)),
                 Owner::Workflow,
                 &Withdrawal::default(),
@@ -591,21 +591,21 @@ async fn a_large_sequence_dedupes_and_one_past_2_53_is_refused() {
 async fn a_create_with_another_owner_is_refused() {
     for target in stores_for(Needs::RAW_KEYS.and(Needs::STORE_ANSWERS)).await {
         let target = &target;
-        let create = |stream: StreamRef, owner: Owner| async move {
+        let create = |handle: StreamHandle, owner: Owner| async move {
             target
                 .store
                 .create(
                     &target.namespace,
-                    &stream,
+                    &handle,
                     None,
                     owner,
                     &Withdrawal::default(),
                 )
                 .await
         };
-        let owned = |workflow_id: &str, first_run_id: &str| StreamRef {
+        let owned = |workflow_id: &str, first_run_id: &str| StreamHandle {
             owner: super::support::workflow_execution(workflow_id, first_run_id),
-            ..target.stream_ref()
+            ..target.handle()
         };
         target.create(Owner::Client).await;
         let refused = create(owned("agent", "first-run"), Owner::Workflow).await;
@@ -618,7 +618,7 @@ async fn a_create_with_another_owner_is_refused() {
             "{ttl}"
         );
 
-        let owned = |workflow_id: &str, first_run_id: &str| StreamRef {
+        let owned = |workflow_id: &str, first_run_id: &str| StreamHandle {
             id: format!("{}-owned", target.stream),
             ..owned(workflow_id, first_run_id)
         };
@@ -645,7 +645,7 @@ async fn an_append_forgets_the_producers_that_the_retention_outlived() {
             .store
             .create(
                 &target.namespace,
-                &target.stream_ref(),
+                &target.handle(),
                 Some(Duration::from_millis(300)),
                 Owner::Workflow,
                 &Withdrawal::default(),
@@ -691,7 +691,7 @@ fn workflow(run: &str) -> Producer {
 
 /// Only the owner closes a Stream. That's the close Activity of its run chain for a Workflow-owned
 /// Stream, and a client for a client's Stream. A Local Activity of the chain can't close it, and a
-/// ref with no chain can't either.
+/// handle with no chain can't either.
 async fn only_the_owner_closes_a_stream() {
     for target in stores_for(Needs::UNCHECKED.and(Needs::STORE_ANSWERS)).await {
         let run = Run::new("r1");
@@ -703,7 +703,7 @@ async fn only_the_owner_closes_a_stream() {
         }
         target.close(&client(1)).await.unwrap();
 
-        let owned = |workflow_id: &str| StreamRef {
+        let owned = |workflow_id: &str| StreamHandle {
             id: format!("{}-owned", target.stream),
             owner: super::support::workflow_execution(workflow_id, "first-run")
                 .filter(|_| !workflow_id.is_empty()),
