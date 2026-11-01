@@ -16,7 +16,7 @@ use temporalio_streams::{
     proto::{
         AppendRecord, AppendRecordsRequest, AppendRecordsResponse, CreateStreamRequest,
         CreateStreamResponse, Producer, ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse,
-        StreamErrorDetails, StreamErrorReason, StreamProducerKind, StreamRef,
+        StreamErrorDetails, StreamErrorReason, StreamHandle, StreamProducerKind,
     },
     store::{Appended, Batch, Capabilities, Created, Entry, Owner, Store, StreamState, Withdrawal},
 };
@@ -42,23 +42,23 @@ impl Store for Trimming {
     async fn create(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         retention: Option<Duration>,
         owner: Owner,
         withdrawal: &Withdrawal<'_>,
     ) -> StreamResult<Created> {
         self.inner
-            .create(namespace, stream, retention, owner, withdrawal)
+            .create(namespace, handle, retention, owner, withdrawal)
             .await
     }
 
     async fn append(
         &self,
         namespace: &str,
-        stream: &StreamRef,
+        handle: &StreamHandle,
         batch: &Batch<'_>,
     ) -> StreamResult<Appended> {
-        self.inner.append(namespace, stream, batch).await
+        self.inner.append(namespace, handle, batch).await
     }
 
     async fn read(
@@ -141,8 +141,8 @@ fn client() -> Producer {
     }
 }
 
-fn stream() -> Option<StreamRef> {
-    Some(StreamRef {
+fn handle() -> Option<StreamHandle> {
+    Some(StreamHandle {
         id: STREAM.to_string(),
         ..Default::default()
     })
@@ -172,7 +172,7 @@ async fn append_sized(
         "AppendRecords",
         AppendRecordsRequest {
             namespace: NAMESPACE.to_string(),
-            stream: stream(),
+            handle: handle(),
             producer: Some(client()),
             sequence,
             records,
@@ -191,7 +191,7 @@ async fn a_trim_under_a_read_from_an_offset_fails_it_as_expired() {
     let first = append(&ext, 1, 3).await;
     let read = |from_offset| ReadRecordsRequest {
         namespace: NAMESPACE.to_string(),
-        stream: stream(),
+        handle: handle(),
         from_offset,
         ..Default::default()
     };
@@ -219,7 +219,7 @@ async fn a_capped_read_pulls_about_its_page_from_the_store() {
         "ReadRecords",
         ReadRecordsRequest {
             namespace: NAMESPACE.to_string(),
-            stream: stream(),
+            handle: handle(),
             max_bytes: 2500,
             ..Default::default()
         },

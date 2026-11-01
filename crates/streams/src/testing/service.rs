@@ -13,7 +13,7 @@ use crate::{
         CloseStreamResponse, CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest,
         DescribeStreamResponse, Producer, ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse,
         StreamClose, StreamCloseStatus, StreamErrorDetails, StreamHandle, StreamProducerKind,
-        StreamReadStart, StreamRecord, StreamStatus, Supersession, stream_record::Item,
+        StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded, stream_record::Item,
     },
 };
 use prost::Message;
@@ -191,7 +191,7 @@ impl Case {
             "ReadRecords",
             ReadRecordsRequest {
                 namespace: self.namespace.clone(),
-                stream: self.stream(),
+                handle: self.handle(),
                 ..request
             },
         )
@@ -204,7 +204,7 @@ impl Case {
             "DescribeStream",
             DescribeStreamRequest {
                 namespace: self.namespace.clone(),
-                stream: self.stream(),
+                handle: self.handle(),
             },
         )
         .await
@@ -216,7 +216,7 @@ impl Case {
             "CloseStream",
             CloseStreamRequest {
                 namespace: self.namespace.clone(),
-                stream: self.stream(),
+                handle: self.handle(),
                 producer: Some(producer),
                 result: Some(Payload {
                     data: b"done".to_vec(),
@@ -242,9 +242,9 @@ fn texts(response: &ReadRecordsResponse) -> Vec<String> {
         .collect()
 }
 
-fn superseded_of(record: &StreamRecord) -> &Supersession {
+fn superseded_of(record: &StreamRecord) -> &StreamSuperseded {
     match &record.item {
-        Some(Item::Superseded(supersession)) => supersession,
+        Some(Item::Superseded(superseded)) => superseded,
         other => panic!("not a Superseded item: {other:?}"),
     }
 }
@@ -515,8 +515,7 @@ async fn a_higher_attempt_puts_its_superseded_item_before_its_batch() {
         let superseded = &all.records[1];
         assert!(all.records[0].offset < superseded.offset);
         assert!(superseded.offset <= all.records[2].offset);
-        let supersession = superseded_of(superseded);
-        assert_eq!(supersession.producer_id, activity(2, 20).id);
+        assert_eq!(superseded_of(superseded).producer_id, activity(2, 20).id);
         let mut from_offset = 0;
         for expected in [&["old"][..], &["<superseded>", "new1"], &["new2"]] {
             let page = case
@@ -600,7 +599,7 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
             tokio::time::sleep(Duration::from_millis(150)).await;
             let request = AppendRecordsRequest {
                 namespace,
-                stream: Some(StreamRef {
+                handle: Some(StreamHandle {
                     id: stream,
                     ..Default::default()
                 }),
@@ -747,7 +746,7 @@ async fn create_owned_short(case: &Case, run: &str) {
             stream_id: case.stream.clone(),
             retention: millis(300),
             owner: Some(workflow_owner(run)),
-            r#ref: owned_ref(case),
+            stream_handle: owned_handle(case),
             ..Default::default()
         },
     )
@@ -795,7 +794,7 @@ async fn a_close_after_the_log_expired_keeps_the_gap() {
         tokio::time::sleep(Duration::from_millis(400)).await;
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
-            stream: owned_ref(&case),
+            handle: owned_handle(&case),
             producer: Some(workflow_owner(&run)),
             ..Default::default()
         };
@@ -809,25 +808,25 @@ async fn a_close_after_the_log_expired_keeps_the_gap() {
     }
 }
 
-/// A ref with an owner and one without reach the same Stream.
-async fn a_ref_with_an_owner_and_one_without_reach_the_same_stream() {
+/// A handle with an owner and one without reach the same Stream.
+async fn a_handle_with_an_owner_and_one_without_reach_the_same_stream() {
     for case in cases_for(Needs::ID_KEYS).await {
         case.create(None).await.unwrap();
-        let owned = Some(StreamRef {
+        let owned = Some(StreamHandle {
             id: case.stream.clone(),
             owner: super::support::workflow_execution("agent-1", "run-1"),
             ..Default::default()
         });
         // An owner that doesn't match the id changes nothing either.
-        let other = Some(StreamRef {
+        let other = Some(StreamHandle {
             id: case.stream.clone(),
             owner: super::support::workflow_execution("someone-else", ""),
             ..Default::default()
         });
-        for (sequence, stream) in [(1, owned.clone()), (2, case.stream()), (3, other)] {
+        for (sequence, stream) in [(1, owned.clone()), (2, case.handle()), (3, other)] {
             let request = AppendRecordsRequest {
                 namespace: case.namespace.clone(),
-                stream,
+                handle: stream,
                 producer: Some(client(1)),
                 sequence,
                 records: vec![record(&sequence.to_string())],
@@ -835,12 +834,12 @@ async fn a_ref_with_an_owner_and_one_without_reach_the_same_stream() {
             };
             let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", request).await.unwrap();
         }
-        let read = |stream: Option<StreamRef>| ReadRecordsRequest {
+        let read = |handle: Option<StreamHandle>| ReadRecordsRequest {
             namespace: case.namespace.clone(),
-            stream,
+            handle,
             ..Default::default()
         };
-        let plain: ReadRecordsResponse = call(&case.ext, "ReadRecords", read(case.stream()))
+        let plain: ReadRecordsResponse = call(&case.ext, "ReadRecords", read(case.handle()))
             .await
             .unwrap();
         let with_owner: ReadRecordsResponse =
@@ -861,12 +860,12 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
             gives: Needs::ALL,
         };
         let created = case.create(None).await.unwrap();
-        let stream = created.stream.unwrap();
+        let stream = created.handle.unwrap();
         assert_eq!(stream.id, case.stream);
         assert_eq!(stream.backend, "redis-a");
-        // A ref with any backend, or none, reaches the same Stream.
+        // A handle with any backend, or none, reaches the same Stream.
         let named = |backend: &str| {
-            Some(StreamRef {
+            Some(StreamHandle {
                 id: case.stream.clone(),
                 backend: backend.to_string(),
                 ..Default::default()
@@ -875,7 +874,7 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
         for (sequence, stream) in [(1, named("redis-a")), (2, named("")), (3, named("other"))] {
             let request = AppendRecordsRequest {
                 namespace: case.namespace.clone(),
-                stream,
+                handle: stream,
                 producer: Some(client(1)),
                 sequence,
                 records: vec![record(&sequence.to_string())],
@@ -885,16 +884,16 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
         }
         let read = ReadRecordsRequest {
             namespace: case.namespace.clone(),
-            stream: named("other"),
+            handle: named("other"),
             ..Default::default()
         };
         let read: ReadRecordsResponse = call(&case.ext, "ReadRecords", read).await.unwrap();
         assert_eq!(texts(&read), ["1", "2", "3"]);
     }
-    // With no backend in the config, the ref has none, and lang reads it as the default.
+    // With no backend in the config, the handle has none, and lang reads it as the default.
     for case in cases_for(Needs::OWN_CONFIG).await {
         let created = case.create(None).await.unwrap();
-        assert_eq!(created.stream.unwrap().backend, "");
+        assert_eq!(created.handle.unwrap().backend, "");
     }
 }
 
@@ -907,9 +906,9 @@ fn workflow_owner(run: &str) -> Producer {
     }
 }
 
-/// The case's ref with the owner of a made-up run chain, which a create with an owner needs.
-fn owned_ref(case: &Case) -> Option<StreamRef> {
-    Some(StreamRef {
+/// The case's handle with the owner of a made-up run chain, which a create with an owner needs.
+fn owned_handle(case: &Case) -> Option<StreamHandle> {
+    Some(StreamHandle {
         id: case.stream.clone(),
         owner: super::support::workflow_execution(&format!("{}-wf", case.stream), "first-run"),
         ..Default::default()
@@ -944,7 +943,7 @@ async fn a_rerun_local_activity_supersedes_its_first_attempt() {
                 namespace: case.namespace.clone(),
                 stream_id: case.stream.clone(),
                 owner: Some(workflow_owner(&run)),
-                r#ref: owned_ref(&case),
+                stream_handle: owned_handle(&case),
                 ..Default::default()
             },
         )
@@ -952,7 +951,7 @@ async fn a_rerun_local_activity_supersedes_its_first_attempt() {
         .unwrap();
         let write = |producer: Producer, text: &str| AppendRecordsRequest {
             namespace: case.namespace.clone(),
-            stream: case.stream(),
+            handle: case.handle(),
             producer: Some(producer),
             sequence: 1,
             records: vec![record(text)],
@@ -1021,7 +1020,7 @@ async fn a_close_record_takes_its_status_from_the_failure() {
             case.create(None).await.unwrap();
             let close = CloseStreamRequest {
                 namespace: case.namespace.clone(),
-                stream: case.stream(),
+                handle: case.handle(),
                 producer: Some(client(1)),
                 failure: Some(failure.clone()),
                 ..Default::default()
@@ -1136,7 +1135,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_read_of_an_expired_closed_stream_fails_instead_of_waiting),
     case!(a_read_behind_an_expired_log_fails_before_and_after_the_next_write),
     case!(a_close_after_the_log_expired_keeps_the_gap),
-    case!(a_ref_with_an_owner_and_one_without_reach_the_same_stream),
+    case!(a_handle_with_an_owner_and_one_without_reach_the_same_stream),
     case!(a_create_answer_names_the_backend_and_the_store_never_reads_it),
     case!(a_rerun_local_activity_supersedes_its_first_attempt),
     case!(a_close_record_takes_its_status_from_the_failure),

@@ -11,7 +11,7 @@ use crate::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
         Producer, ReadRecordsRequest, ReadRecordsResponse, StreamHandle, StreamProducerKind,
-        StreamReadStart, StreamRecord, StreamStatus, Supersession, stream_record::Item,
+        StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded, stream_record::Item,
     },
     record::{caller_status, close_record, data_records, superseded},
     store::{
@@ -336,7 +336,7 @@ impl StreamService {
         &self,
         request: ReadRecordsRequest,
     ) -> StreamResult<ReadRecordsResponse> {
-        let id = stream_id(request.stream.as_ref())?.to_string();
+        let id = stream_id(request.handle.as_ref())?.to_string();
         let namespace = request.namespace.as_str();
         if request.from_offset < 0 {
             return Err(StreamError::invalid("The offset is below zero"));
@@ -423,7 +423,7 @@ impl StreamService {
         request: ReadRecordsRequest,
         max_bytes: usize,
     ) -> StreamResult<ReadRecordsResponse> {
-        let id = stream_id(request.stream.as_ref())?.to_string();
+        let id = stream_id(request.handle.as_ref())?.to_string();
         let namespace = request.namespace.as_str();
         let count = (request.last as usize).min(MAX_RECORDS);
         let create_wait = duration(request.create_wait)
@@ -441,7 +441,7 @@ impl StreamService {
         check_expiry(&state, 0)?;
         let retained = state.retained_from();
         let (mut picked, mut close) = (vec![], None);
-        let mut withdrawals: Vec<Supersession> = vec![];
+        let mut withdrawals: Vec<StreamSuperseded> = vec![];
         let (mut bytes, mut scanned, mut scanned_bytes) = (0, 0, 0);
         let mut before = state.newest;
         'scan: while before >= retained
@@ -465,7 +465,7 @@ impl StreamService {
                 before = entry.offset - 1;
                 scanned += 1;
                 scanned_bytes += entry.record.as_ref().map_or(0, Vec::len)
-                    + entry.supersession.as_ref().map_or(0, Vec::len);
+                    + entry.superseded.as_ref().map_or(0, Vec::len);
                 // An entry's `Superseded` item withdraws earlier Records, not the entry's own.
                 if let Some(record) = entry.record {
                     let record = decode(&record, entry.offset)?;
@@ -486,9 +486,9 @@ impl StreamService {
                         }
                     }
                 }
-                if let Some(supersession) = entry.supersession {
+                if let Some(superseded) = entry.superseded {
                     withdrawals.push(
-                        Supersession::decode(supersession.as_slice())
+                        StreamSuperseded::decode(superseded.as_slice())
                             .map_err(|error| StreamError::storage(error.to_string()))?,
                     );
                 }
@@ -587,12 +587,12 @@ impl StreamService {
                     continue;
                 }
                 let mut items = vec![];
-                if let Some(bytes) = entry.supersession {
-                    let supersession = Supersession::decode(bytes.as_slice())
+                if let Some(bytes) = entry.superseded {
+                    let superseded = StreamSuperseded::decode(bytes.as_slice())
                         .map_err(|error| StreamError::storage(error.to_string()))?;
                     items.push(StreamRecord {
                         offset: entry.offset,
-                        item: Some(Item::Superseded(supersession)),
+                        item: Some(Item::Superseded(superseded)),
                     });
                 }
                 if let Some(bytes) = entry.record {
