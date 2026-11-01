@@ -103,7 +103,6 @@ macro_rules! payload_visitor {
         }
     };
 }
-#[cfg(feature = "experimental")]
 pub(crate) use payload_visitor;
 
 /// Visitor that encodes payloads using a codec.
