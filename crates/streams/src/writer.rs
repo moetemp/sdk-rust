@@ -13,7 +13,7 @@ use crate::{
         StreamProducerKind, WorkflowTaskEpoch,
     },
     service::StreamService,
-    store::{MAX_BATCH_BYTES, MAX_RECORD_BYTES},
+    store::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES},
 };
 use parking_lot::Mutex;
 use prost::Message;
@@ -27,7 +27,6 @@ use std::{
 };
 use tokio::time::Instant;
 
-const DEFAULT_BATCH: usize = 1000;
 const DEFAULT_RETRY: Duration = Duration::from_secs(10);
 const FIRST_BACKOFF: Duration = Duration::from_millis(50);
 
@@ -254,9 +253,10 @@ impl Writers {
             producer,
             previous_completed_task: request.previous_completed_task,
             failed_tasks: request.failed_tasks,
+            // The Store refuses a batch over its count limit, so a larger size can't go in one batch.
             max_batch: match request.max_batch_size {
-                n if n > 0 => n as usize,
-                _ => DEFAULT_BATCH,
+                n if n > 0 => (n as usize).min(MAX_BATCH_RECORDS),
+                _ => MAX_BATCH_RECORDS,
             },
             max_retry: duration(request.max_retry_duration).unwrap_or(DEFAULT_RETRY),
             service: service.clone(),

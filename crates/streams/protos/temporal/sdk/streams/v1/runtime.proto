@@ -33,7 +33,7 @@ message OpenWriterRequest {
     string namespace = 1;
     temporal.api.stream.v1.StreamHandle handle = 2;
     temporal.api.stream.v1.Producer producer = 3;
-    // A write sends at most this many Records in one batch. Zero is 1000.
+    // A write sends at most this many Records in one batch. Zero, or a value above 1000, is 1000.
     int32 max_batch_size = 5;
     // How long a write retries a Store failure. Empty is 10 s.
     google.protobuf.Duration max_retry_duration = 6;

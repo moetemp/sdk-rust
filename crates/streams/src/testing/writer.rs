@@ -21,8 +21,8 @@ use crate::{
         WriteRecordsResponse, stream_record::Item,
     },
     store::{
-        Appended, Batch, Capabilities, Closed, Created, Entry, Owner, Store, StreamState,
-        Withdrawal,
+        Appended, Batch, Capabilities, Closed, Created, Entry, MAX_BATCH_RECORDS, Owner, Store,
+        StreamState, Withdrawal,
     },
 };
 use prost::Message;
@@ -234,6 +234,17 @@ async fn writes_split_at_the_batch_size_and_keep_one_sequence() {
         assert_eq!(read.records[2].offset, last);
         // Opening the same Producer epoch again returns the same writer, so it keeps the sequence.
         assert_eq!(case.open(client(), |_| {}).await, writer);
+    }
+}
+
+async fn a_batch_size_over_the_store_limit_writes_in_more_batches() {
+    for case in cases().await {
+        let writer = case.open(client(), |r| r.max_batch_size = 5000).await;
+        let texts: Vec<String> = (0..=MAX_BATCH_RECORDS).map(|i| i.to_string()).collect();
+        let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
+        // The Store refuses one batch of this many, so the write goes in two.
+        let (first, last) = case.write(writer, &texts).await.unwrap();
+        assert!(first < last);
     }
 }
 
@@ -663,6 +674,7 @@ async fn a_local_activity_writer_withdraws_the_records_of_a_failed_task() {
 pub const CASES: &[super::Case] = &[
     case!(a_write_is_in_the_store_when_it_answers_its_offsets),
     case!(writes_split_at_the_batch_size_and_keep_one_sequence),
+    case!(a_batch_size_over_the_store_limit_writes_in_more_batches),
     case!(a_failed_write_fails_every_later_write_and_the_close),
     case!(an_activity_retry_withdraws_the_earlier_attempt_even_with_nothing_to_write),
     case!(an_activity_retry_opens_on_a_closed_or_expired_stream),
