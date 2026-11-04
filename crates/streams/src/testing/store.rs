@@ -12,8 +12,8 @@ use crate::{
         activity_producer_id, client_producer_id, named_client_producer_id, workflow_producer_id,
     },
     offset::offset_of_entry_id,
-    proto::{Producer, ProducerEpoch, StreamHandle, StreamProducerKind},
-    store::{Batch, CreateOutcome, Owner, Withdrawal},
+    proto::{Producer, ProducerEpoch, StreamHandle, StreamProducerKind, WorkflowTaskEpoch},
+    store::{Batch, CreateOutcome, Owner, TaskFacts, Withdrawal},
 };
 use futures_util::future::join_all;
 use prost_types::Timestamp;
@@ -801,7 +801,64 @@ async fn every_store_keeps_the_meta_fields_of_the_shared_vectors() {
         ] {
             assert!(target.meta(&field).await.is_some(), "{field}");
         }
+        // Task [3] fails, and a write of task [5] with the completed task [4] withdraws it.
+        let run = Run::new("run:1");
+        task_batch(&target, &run.local_activity("k", 3, 1, 1), 2, &[], &["b"])
+            .await
+            .unwrap();
+        task_batch(&target, &run.local_activity("j", 5, 1, 1), 4, &[3], &["c"])
+            .await
+            .unwrap();
+        let text = |field: &str| vectors[field].as_str().unwrap();
+        for field in ["open_tasks", "withdrawn_task"] {
+            assert!(target.meta(text(field)).await.is_some(), "{field}");
+        }
+        assert_eq!(
+            target.meta(text("task_facts")).await.as_deref(),
+            Some(text("task_facts_value"))
+        );
     }
+}
+
+/// A batch of a Local Activity with its run's task facts, the run's completed task
+/// `[completed]` and its failed tasks.
+async fn task_batch(
+    target: &Target,
+    producer: &Producer,
+    completed: i64,
+    failed_tasks: &[i64],
+    texts: &[&str],
+) -> Result<crate::store::Appended, crate::StreamError> {
+    let records: Vec<_> = texts.iter().map(|text| record(producer, text)).collect();
+    let completed = WorkflowTaskEpoch {
+        started_event_id: completed,
+        ..Default::default()
+    };
+    // The Store keeps the `Superseded` facts as sent, so these do for both items.
+    let bytes = superseded(producer, &Withdrawal::default());
+    let withdrawal = Withdrawal {
+        withdraw_run: "",
+        superseded: &bytes,
+        tasks: Some(TaskFacts {
+            completed: Some(&completed),
+            failed_tasks,
+            superseded: &bytes,
+        }),
+    };
+    target
+        .store
+        .append(
+            &target.namespace,
+            &target.handle(),
+            &Batch {
+                producer,
+                sequence: 1,
+                records: &records,
+                digest: &digest(texts),
+                withdrawal,
+            },
+        )
+        .await
 }
 
 /// The cases of the suite, in file order.

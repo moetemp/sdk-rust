@@ -1335,6 +1335,79 @@ async fn a_write_with_no_task_facts_is_withdrawn_by_a_later_write() {
     }
 }
 
+/// A rerun of a call in a later task withdraws the failed task's Records with two items. The
+/// orphan item has an entry of its own, and the newer epoch's item comes with the first Record.
+async fn a_batch_writes_an_orphan_item_and_an_epoch_item() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let _: AppendRecordsResponse = call(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-1", 3, 2, "orphan"),
+        )
+        .await
+        .unwrap();
+        let mut rerun = local_activity_write(&case, &run, "call-1", 5, 4, "rerun");
+        rerun.failed_tasks = vec![3];
+        let answer: AppendRecordsResponse = call(&case.ext, "AppendRecords", rerun).await.unwrap();
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(
+            texts(&read),
+            ["orphan", "<superseded>", "<superseded>", "rerun"]
+        );
+        let (orphans, epoch) = (
+            superseded_of(&read.records[1]),
+            superseded_of(&read.records[2]),
+        );
+        assert_eq!(orphans.producer_kind, StreamProducerKind::Workflow as i32);
+        assert_eq!(
+            epoch.producer_kind,
+            StreamProducerKind::LocalActivity as i32
+        );
+        assert!(read.records[1].offset < answer.first_offset);
+        assert_eq!(read.records[2].offset, answer.first_offset);
+        assert_eq!(read.records[3].offset, answer.last_offset);
+        for item in [orphans, epoch] {
+            assert!(withdraws(item, &read.records[0]));
+            assert!(!withdraws(item, &read.records[3]));
+        }
+    }
+}
+
+/// A resend of an empty batch that withdrew orphans gets the offsets of its orphan item again, and
+/// adds no second item.
+async fn a_resend_of_an_orphan_batch_withdraws_nothing_again() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let _: AppendRecordsResponse = call(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-1", 3, 2, "orphan"),
+        )
+        .await
+        .unwrap();
+        // The writer of call-2 in task [4] opens with an empty batch.
+        let open = AppendRecordsRequest {
+            records: vec![],
+            ..local_activity_write(&case, &run, "call-2", 4, 2, "")
+        };
+        let first: AppendRecordsResponse = call(&case.ext, "AppendRecords", open.clone())
+            .await
+            .unwrap();
+        let again: AppendRecordsResponse = call(&case.ext, "AppendRecords", open).await.unwrap();
+        assert!(first.first_offset > 0);
+        assert_eq!(
+            (again.first_offset, again.last_offset),
+            (first.first_offset, first.last_offset)
+        );
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["orphan", "<superseded>"]);
+        assert_eq!(read.records[1].offset, first.last_offset);
+    }
+}
+
 /// The Workflow Task `[started_event_id]` in its attempt `attempt`, started at `seconds`.
 fn task(started_event_id: i64, attempt: i32, seconds: i64) -> WorkflowTaskEpoch {
     WorkflowTaskEpoch {
@@ -1687,6 +1760,8 @@ pub const CASES: &[super::Case] = &[
     case!(a_failed_task_before_the_last_completed_one_is_withdrawn_by_its_id),
     case!(a_first_write_of_a_task_that_never_completed_is_fenced),
     case!(a_write_with_no_task_facts_is_withdrawn_by_a_later_write),
+    case!(a_batch_writes_an_orphan_item_and_an_epoch_item),
+    case!(a_resend_of_an_orphan_batch_withdraws_nothing_again),
     case!(a_local_activity_of_a_lower_attempt_of_the_completed_task_is_withdrawn),
     case!(a_write_withdraws_a_lower_attempt_of_its_own_task),
     case!(a_withdrawn_run_cant_close_the_stream),

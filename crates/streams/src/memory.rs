@@ -552,7 +552,7 @@ impl Store for MemoryStore {
             .map(task_key)
             .unwrap_or_default();
         let open_field = format!("oa|{run}");
-        let gone_field = format!("ow|{run}");
+        let gone_field = format!("ow|{run}|{task}");
         // The task facts of the run's highest task, as `<task key>|<completed task key>|<failed
         // ids>`. The completed key is empty before the first one, and spaces separate the ids.
         let facts_field = format!("tf|{run}");
@@ -615,7 +615,7 @@ impl Store for MemoryStore {
                     "the epoch is lower than the newest one of the Producer",
                 ));
             }
-            if tracked && words(keys.get(&gone_field)).contains(&task) {
+            if tracked && keys.get(&gone_field).is_some() {
                 return Err(refuse(
                     Reason::Fenced,
                     "a Superseded item withdrew the Workflow Task of the call",
@@ -725,10 +725,9 @@ impl Store for MemoryStore {
                         keys.set(&open_field, open.join(" "));
                     }
                 }
-                if !withdrawn.is_empty() {
-                    let mut all = words(keys.get(&gone_field));
-                    all.extend(withdrawn.iter().cloned());
-                    keys.set(&gone_field, all.join(" "));
+                // One field per task, so the fence reads one field, as in `append.lua`.
+                for key in &withdrawn {
+                    keys.set(&format!("ow|{run}|{key}"), "1");
                 }
             }
             if let Some(facts) = facts {
