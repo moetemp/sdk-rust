@@ -165,7 +165,7 @@ pub(crate) fn record(producer: &Producer, text: &str) -> Vec<u8> {
 }
 
 /// The digest of the batch that [record] makes of each text.
-pub(crate) fn digest(texts: &[&str]) -> String {
+pub(crate) fn digest(texts: &[&str]) -> [u8; crate::digest::DIGEST_LEN] {
     let records: Vec<_> = texts
         .iter()
         .map(|text| AppendRecord {
@@ -332,7 +332,7 @@ impl Target {
                     producer,
                     sequence,
                     records: &records,
-                    digest: &digest(texts),
+                    digest: digest(texts),
                     withdrawal,
                 },
             )

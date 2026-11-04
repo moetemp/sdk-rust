@@ -74,7 +74,7 @@ async fn append(
                 producer,
                 sequence,
                 records: &records,
-                digest: &digest(texts),
+                digest: digest(texts),
                 withdrawal,
             },
         )

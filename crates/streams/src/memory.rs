@@ -4,7 +4,8 @@
 
 use crate::{
     Reason, StreamError, StreamResult,
-    epoch::epoch_key,
+    digest::DIGEST_LEN,
+    epoch::{EPOCH_KEY_LEN, epoch_key},
     ids::StreamKeys,
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{Producer, StreamHandle, StreamProducerKind},
@@ -86,6 +87,41 @@ fn id_text((ms, seq): (u64, u64)) -> String {
 fn parse_id(text: &str) -> Option<(u64, u64)> {
     let (ms, seq) = text.split_once('-')?;
     Some((ms.parse().ok()?, seq.parse().ok()?))
+}
+
+/// The dedupe field `d|` of a batch, as its epoch key, `|<sequence>|<first>|<last>|` and its
+/// digest. The binary parts can hold a `|`, so they go by position.
+fn dedupe_value(epoch: &[u8], sequence: i64, first: &str, last: &str, digest: &[u8]) -> Vec<u8> {
+    [
+        epoch,
+        format!("|{sequence}|{first}|{last}|").as_bytes(),
+        digest,
+    ]
+    .concat()
+}
+
+/// The parts of a dedupe field.
+struct Dedupe<'a> {
+    epoch: &'a [u8],
+    sequence: i64,
+    first: &'a str,
+    last: &'a str,
+    digest: &'a [u8],
+}
+
+fn parse_dedupe(value: &[u8]) -> Option<Dedupe<'_>> {
+    let (epoch, rest) = value.split_at_checked(EPOCH_KEY_LEN)?;
+    let (middle, digest) = rest.split_at_checked(rest.len().checked_sub(DIGEST_LEN)?)?;
+    let middle = std::str::from_utf8(middle).ok()?;
+    let mut parts = middle.strip_prefix('|')?.strip_suffix('|')?.split('|');
+    let (sequence, first, last) = (parts.next()?, parts.next()?, parts.next()?);
+    Some(Dedupe {
+        epoch,
+        sequence: sequence.parse().ok()?,
+        first,
+        last,
+        digest,
+    })
 }
 
 impl Keys {
@@ -477,10 +513,10 @@ impl Store for MemoryStore {
             // The lock also covers the dedupe check, so no other batch takes the same number.
             let sequence = match batch.sequence {
                 0 => keys
-                    .text(format!("d{suffix}"))
-                    .and_then(|last| last.strip_prefix(&format!("{epoch}|")))
-                    .and_then(|rest| rest.split('|').next())
-                    .map_or(1, |last| last.parse::<i64>().unwrap_or(0) + 1),
+                    .get(format!("d{suffix}"))
+                    .and_then(parse_dedupe)
+                    .filter(|last| last.epoch == epoch.as_slice())
+                    .map_or(1, |last| last.sequence + 1),
                 sequence => sequence,
             };
             if !(1..=MAX_SEQUENCE).contains(&sequence) {
@@ -490,36 +526,38 @@ impl Store for MemoryStore {
                 ));
             }
             keys.check_live(now)?;
-            if let Some(last) = keys.text(format!("d{suffix}")) {
-                let parts: Vec<&str> = last.split('|').collect();
-                if parts.len() == 5 && parts[0] == epoch {
-                    let last_sequence: i64 = parts[1].parse().unwrap_or(0);
-                    if sequence == last_sequence {
-                        if parts[4] != batch.digest {
-                            return Err(refuse(
-                                Reason::SeqDivergent,
-                                &format!(
-                                    "sequence {sequence} has other content than the batch the \
-                                     Store has"
-                                ),
-                            ));
-                        }
-                        return Ok((true, parts[2].to_string(), parts[3].to_string(), false));
-                    }
-                    if sequence < last_sequence {
+            let last = keys.get(format!("d{suffix}")).and_then(parse_dedupe);
+            if let Some(last) = last
+                && last.epoch == epoch.as_slice()
+            {
+                if sequence == last.sequence {
+                    if last.digest != batch.digest.as_slice() {
                         return Err(refuse(
-                            Reason::Sequence,
-                            &format!("sequence {sequence} is below the last one, {last_sequence}"),
+                            Reason::SeqDivergent,
+                            &format!(
+                                "sequence {sequence} has other content than the batch the Store \
+                                 has"
+                            ),
                         ));
                     }
+                    return Ok((true, last.first.to_string(), last.last.to_string(), false));
+                }
+                if sequence < last.sequence {
+                    return Err(refuse(
+                        Reason::Sequence,
+                        &format!(
+                            "sequence {sequence} is below the last one, {}",
+                            last.sequence
+                        ),
+                    ));
                 }
             }
             if keys.get("closed").is_some() {
                 return Err(refuse(Reason::Closed, "the Stream is closed"));
             }
             if keys
-                .text(format!("e{suffix}"))
-                .is_some_and(|newest| epoch.as_str() < newest)
+                .get(format!("e{suffix}"))
+                .is_some_and(|newest| epoch.as_slice() < newest)
             {
                 return Err(refuse(
                     Reason::Fenced,
@@ -532,8 +570,8 @@ impl Store for MemoryStore {
             // A client's newer epoch only fences, as in `append.lua`.
             let flagged = producer.kind != StreamProducerKind::Client as i32
                 && keys
-                    .text(format!("h{suffix}"))
-                    .is_some_and(|holds| holds < epoch.as_str());
+                    .get(format!("h{suffix}"))
+                    .is_some_and(|holds| holds < epoch.as_slice());
 
             keys.trim(now);
             keys.prune(now);
@@ -563,13 +601,13 @@ impl Store for MemoryStore {
                 }
             }
 
-            keys.set(format!("e{suffix}"), epoch.clone());
+            keys.set(format!("e{suffix}"), epoch);
             keys.set(
                 format!("d{suffix}"),
-                format!("{epoch}|{sequence}|{first}|{last}|{}", batch.digest),
+                dedupe_value(&epoch, sequence, &first, &last, &batch.digest),
             );
             if records > 0 {
-                keys.set(format!("h{suffix}"), epoch.clone());
+                keys.set(format!("h{suffix}"), epoch);
             } else if flagged {
                 keys.remove(format!("h{suffix}"));
             }
@@ -611,8 +649,8 @@ impl Store for MemoryStore {
                 return Ok((id, true));
             }
             if keys
-                .text(format!("e{suffix}"))
-                .is_some_and(|newest| epoch.as_str() < newest)
+                .get(format!("e{suffix}"))
+                .is_some_and(|newest| epoch.as_slice() < newest)
             {
                 return Err(refuse(
                     Reason::Fenced,
