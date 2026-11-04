@@ -87,11 +87,6 @@ fn parse_id(text: &str) -> Option<(u64, u64)> {
     Some((ms.parse().ok()?, seq.parse().ok()?))
 }
 
-fn words(text: Option<&String>) -> Vec<String> {
-    text.map(|text| text.split_whitespace().map(str::to_string).collect())
-        .unwrap_or_default()
-}
-
 fn started(task_key: &str) -> i64 {
     i64::from_str_radix(&task_key[..16], 16).unwrap_or(0)
 }
@@ -128,14 +123,19 @@ fn started_key(started_event_id: i64) -> String {
     })
 }
 
+/// The task keys of a field that keeps them back to back, such as `oa|<run>` or `tf|<run>`.
+fn task_keys(value: &str) -> Vec<&str> {
+    let width = started_key(0).len();
+    (0..value.len())
+        .step_by(width)
+        .filter_map(|at| value.get(at..at + width))
+        .collect()
+}
+
 /// Whether the facts that `tf|<run>` keeps show that task `key` never completed. The zero key in
 /// the completed place works as no completed task, since no task key is below it.
 fn fenced_by_facts(facts: &str, key: &str) -> bool {
-    let width = started_key(0).len();
-    let keys: Vec<&str> = (0..facts.len())
-        .step_by(width)
-        .filter_map(|at| facts.get(at..at + width))
-        .collect();
+    let keys = task_keys(facts);
     let [t, c, failed @ ..] = keys.as_slice() else {
         return false;
     };
@@ -655,10 +655,9 @@ impl Store for MemoryStore {
             if keys.withdraw_run(&withdrawn_run) {
                 flagged = true;
             }
-            let open = if tracked {
-                words(keys.get(&open_field))
-            } else {
-                vec![]
+            let open: Vec<String> = match keys.get(&open_field) {
+                Some(open) if tracked => task_keys(open).into_iter().map(str::to_string).collect(),
+                _ => vec![],
             };
             let (withdrawn, mut open) = match facts {
                 Some(facts) => orphan_tasks(&open, &task, &completed, facts.failed_tasks),
@@ -733,7 +732,7 @@ impl Store for MemoryStore {
                     if open.is_empty() {
                         keys.meta.remove(&open_field);
                     } else {
-                        keys.set(&open_field, open.join(" "));
+                        keys.set(&open_field, open.concat());
                     }
                 }
                 // One field per task, so the fence reads one field, as in `append.lua`.

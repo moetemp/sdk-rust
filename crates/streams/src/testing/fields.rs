@@ -33,8 +33,8 @@ pub fn withdrawn_run(run_id: &str) -> String {
     format!("wr|{}", encode_part(run_id))
 }
 
-/// The task keys of the run's Local Activity writes that no task facts showed completed yet,
-/// separated by spaces.
+/// The task keys of the run's Local Activity writes that no task facts showed completed yet, back
+/// to back.
 pub fn open_tasks(run_id: &str) -> String {
     format!("oa|{}", encode_part(run_id))
 }
