@@ -258,11 +258,11 @@ fn close_of(record: &StreamRecord) -> &StreamClose {
 }
 
 /// A create of a Stream that exists returns it with `created` false, whatever its Retention. A
-/// Retention outside a proto Duration's range fails.
+/// Retention outside a proto Duration's range, or under 1 ms, fails.
 async fn a_create_returns_the_stream_that_exists_whatever_its_retention() {
     for case in cases_for(Needs::CALLS).await {
-        for seconds in [i64::MAX, -1] {
-            let retention = Some(prost_types::Duration { seconds, nanos: 0 });
+        for (seconds, nanos) in [(i64::MAX, 0), (-1, 0), (0, 999_999)] {
+            let retention = Some(prost_types::Duration { seconds, nanos });
             let error = case.create(retention).await.unwrap_err();
             assert_eq!(reason(&error), "stream_invalid");
         }
