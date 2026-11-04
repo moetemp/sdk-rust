@@ -33,6 +33,24 @@ pub fn withdrawn_run(run_id: &str) -> String {
     format!("wr|{}", encode_part(run_id))
 }
 
+/// The task keys of the run's Local Activity writes that no task facts showed completed yet,
+/// separated by spaces.
+pub fn open_tasks(run_id: &str) -> String {
+    format!("oa|{}", encode_part(run_id))
+}
+
+/// Set when a `Superseded` item withdrew the run's Workflow Task with the key `task_key`.
+pub fn withdrawn_task(run_id: &str, task_key: &str) -> String {
+    format!("ow|{}|{task_key}", encode_part(run_id))
+}
+
+/// The task facts of the run's highest task, as task keys back to back. These are its own key, the
+/// completed task's key or the zero key before the first, and the key of each failed task's
+/// started event id.
+pub fn task_facts(run_id: &str) -> String {
+    format!("tf|{}", encode_part(run_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -49,5 +67,11 @@ mod tests {
         assert_eq!(holds(kind, producer), text("holds"));
         assert_eq!(run_wrote(run), text("run_wrote"));
         assert_eq!(withdrawn_run(run), text("withdrawn_run"));
+        assert_eq!(open_tasks(run), text("open_tasks"));
+        assert_eq!(
+            withdrawn_task(run, text("task_key")),
+            text("withdrawn_task")
+        );
+        assert_eq!(task_facts(run), text("task_facts"));
     }
 }

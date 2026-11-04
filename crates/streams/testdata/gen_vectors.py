@@ -135,6 +135,9 @@ def epochs():
 def fields():
     run = "run:1"
     producer = "act:" + join(run, "a", "s")
+    # Task [3] fails, and a write of task [5] with the completed task [4] withdraws it.
+    withdrawn = task_key(3, 1, (100, 0))
+    task, completed = task_key(5, 1, (100, 0)), task_key(4)
     return {
         "kind": 3,
         "producer_id": producer,
@@ -144,6 +147,11 @@ def fields():
         "holds": f"h|3|{producer}",
         "run_wrote": f"run|{part(run)}",
         "withdrawn_run": f"wr|{part(run)}",
+        "task_key": withdrawn,
+        "open_tasks": f"oa|{part(run)}",
+        "withdrawn_task": f"ow|{part(run)}|{withdrawn}",
+        "task_facts": f"tf|{part(run)}",
+        "task_facts_value": task + completed + task_key(3),
     }
 
 

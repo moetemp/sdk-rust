@@ -7,7 +7,7 @@ use crate::{
     epoch::{epoch_key, task_key, task_of},
     ids::{StreamKeys, encode_part},
     offset::{entry_id_of_offset, offset_of_entry_id},
-    proto::{Producer, StreamHandle, StreamProducerKind},
+    proto::{Producer, StreamHandle, StreamProducerKind, WorkflowTaskEpoch},
     store::{
         Appended, Batch, Capabilities, Closed, CreateOutcome, Created, Entry, FORMAT_VERSION,
         MAX_SEQUENCE, Owner, Store, StreamState, TOMBSTONE, Withdrawal, owner_chain,
@@ -96,24 +96,51 @@ fn started(task_key: &str) -> i64 {
     i64::from_str_radix(&task_key[..16], 16).unwrap_or(0)
 }
 
+/// Whether the facts of task `t` show that task `key` never completed. An orphan item withdraws the
+/// Records of such a task.
+fn never_completed(key: &str, t: &str, c: &str, failed: &[i64]) -> bool {
+    let (s, ts) = (started(key), started(t));
+    let cs = if c.is_empty() { 0 } else { started(c) };
+    failed.contains(&s)
+        || (cs < s && s < ts)
+        || (s == ts && key < t)
+        || (!c.is_empty() && s == cs && key < c)
+}
+
 /// The orphan rule over a run's open Local Activity tasks, as `orphan_tasks` in `lib.lua`.
 fn orphan_tasks(open: &[String], t: &str, c: &str, failed: &[i64]) -> (Vec<String>, Vec<String>) {
-    let ts = started(t);
-    let cs = if c.is_empty() { 0 } else { started(c) };
     let (mut withdrawn, mut kept) = (vec![], vec![]);
     for key in open {
-        let s = started(key);
-        if failed.contains(&s)
-            || (cs < s && s < ts)
-            || (s == ts && key.as_str() < t)
-            || (!c.is_empty() && s == cs && key.as_str() < c)
-        {
+        if never_completed(key, t, c, failed) {
             withdrawn.push(key.clone());
         } else if c.is_empty() || key.as_str() > c {
             kept.push(key.clone());
         }
     }
     (withdrawn, kept)
+}
+
+/// The task key of the Workflow Task `[started_event_id]`, with no attempt and no time.
+fn started_key(started_event_id: i64) -> String {
+    task_key(&WorkflowTaskEpoch {
+        started_event_id,
+        ..Default::default()
+    })
+}
+
+/// Whether the facts that `tf|<run>` keeps show that task `key` never completed. The zero key in
+/// the completed place works as no completed task, since no task key is below it.
+fn fenced_by_facts(facts: &str, key: &str) -> bool {
+    let width = started_key(0).len();
+    let keys: Vec<&str> = (0..facts.len())
+        .step_by(width)
+        .filter_map(|at| facts.get(at..at + width))
+        .collect();
+    let [t, c, failed @ ..] = keys.as_slice() else {
+        return false;
+    };
+    let failed: Vec<i64> = failed.iter().map(|failed| started(failed)).collect();
+    never_completed(key, t, c, &failed)
 }
 
 impl Keys {
@@ -528,14 +555,18 @@ impl Store for MemoryStore {
         } else {
             String::new()
         };
-        let facts = withdrawal
-            .tasks
-            .filter(|_| local_activity && !run.is_empty());
+        let tracked = local_activity && !run.is_empty();
+        let facts = withdrawal.tasks.filter(|_| tracked);
         let completed = facts
             .and_then(|facts| facts.completed)
             .map(task_key)
             .unwrap_or_default();
-        let (open_field, gone_field) = (format!("oa|{run}"), format!("ow|{run}"));
+        let open_field = format!("oa|{run}");
+        let gone_field = format!("ow|{run}|{task}");
+        // The task facts of the run's highest task, as task keys back to back. These are its own
+        // key, the completed task's key or the zero key before the first, and the key of each
+        // failed task's started event id.
+        let facts_field = format!("tf|{run}");
         let appended = self.with(namespace, stream_id, |keys, now| {
             // The lock also covers the dedupe check, so no other batch takes the same number.
             let sequence = match batch.sequence {
@@ -595,31 +626,43 @@ impl Store for MemoryStore {
                     "the epoch is lower than the newest one of the Producer",
                 ));
             }
-            if local_activity && !run.is_empty() && words(keys.get(&gone_field)).contains(&task) {
+            if tracked && keys.get(&gone_field).is_some() {
                 return Err(refuse(
                     Reason::Fenced,
                     "a Superseded item withdrew the Workflow Task of the call",
+                ));
+            }
+            // A task can fail before its call writes, so no orphan item withdrew it.
+            if tracked
+                && keys
+                    .get(&facts_field)
+                    .is_some_and(|newest| fenced_by_facts(newest, &task))
+            {
+                return Err(refuse(
+                    Reason::Fenced,
+                    "the run's task facts show that the Workflow Task of the call never completed",
                 ));
             }
             let records = batch.records.len() as u64;
             keys.check_ids_fit(now, records + 2)?;
 
             // A client's newer epoch only fences, as in `append.lua`.
-            let mut flagged = producer.kind != StreamProducerKind::Client as i32
+            let newer = producer.kind != StreamProducerKind::Client as i32
                 && keys
                     .get(&format!("h{suffix}"))
                     .is_some_and(|holds| holds.as_str() < epoch.as_str());
+            let mut flagged = newer;
             if keys.withdraw_run(&withdrawn_run) {
                 flagged = true;
             }
+            let open = if tracked {
+                words(keys.get(&open_field))
+            } else {
+                vec![]
+            };
             let (withdrawn, mut open) = match facts {
-                Some(facts) => orphan_tasks(
-                    &words(keys.get(&open_field)),
-                    &task,
-                    &completed,
-                    facts.failed_tasks,
-                ),
-                None => (vec![], vec![]),
+                Some(facts) => orphan_tasks(&open, &task, &completed, facts.failed_tasks),
+                None => (vec![], open),
             };
 
             keys.trim(now);
@@ -672,25 +715,44 @@ impl Store for MemoryStore {
             );
             if records > 0 {
                 keys.set(&format!("h{suffix}"), epoch.clone());
-            } else if flagged {
+            } else if newer {
+                // Only a newer epoch's item withdraws the held epoch's Records.
                 keys.meta.remove(&format!("h{suffix}"));
             }
             if !run.is_empty() && records > 0 {
                 keys.set(&format!("run|{run}"), "1");
             }
-            if facts.is_some() {
-                if records > 0 && !open.contains(&task) {
+            if tracked {
+                // A write with no task facts, as from an older Core, goes in `oa` too, so that a
+                // later write's facts can withdraw it.
+                let added = records > 0 && !open.contains(&task);
+                if added {
                     open.push(task.clone());
                 }
-                if open.is_empty() {
-                    keys.meta.remove(&open_field);
-                } else {
-                    keys.set(&open_field, open.join(" "));
+                if facts.is_some() || added {
+                    if open.is_empty() {
+                        keys.meta.remove(&open_field);
+                    } else {
+                        keys.set(&open_field, open.join(" "));
+                    }
                 }
-                if !withdrawn.is_empty() {
-                    let mut all = words(keys.get(&gone_field));
-                    all.extend(withdrawn.iter().cloned());
-                    keys.set(&gone_field, all.join(" "));
+                // One field per task, so the fence reads one field, as in `append.lua`.
+                for key in &withdrawn {
+                    keys.set(&format!("ow|{run}|{key}"), "1");
+                }
+            }
+            if let Some(facts) = facts {
+                // A long Local Activity of an earlier task writes with older facts.
+                let newest = keys
+                    .get(&facts_field)
+                    .and_then(|newest| newest.get(..task.len()));
+                if newest.is_none_or(|newest| newest < task.as_str()) {
+                    let mut value = task.clone();
+                    value.push_str(&task_key(&facts.completed.copied().unwrap_or_default()));
+                    for &failed in facts.failed_tasks {
+                        value.push_str(&started_key(failed));
+                    }
+                    keys.set(&facts_field, value);
                 }
             }
             if !last.is_empty() {

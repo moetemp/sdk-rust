@@ -312,7 +312,8 @@ impl Target {
         self.write(producer, 1, previous, texts).await
     }
 
-    async fn write(
+    /// A batch that withdraws `withdraw_run`, or no run when it is empty.
+    pub(crate) async fn write(
         &self,
         producer: &Producer,
         sequence: i64,
