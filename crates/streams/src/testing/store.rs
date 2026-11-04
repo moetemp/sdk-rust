@@ -577,7 +577,7 @@ async fn a_create_with_another_owner_is_refused() {
         target.create(Owner::Client).await;
         let refused = create(owned("agent", "first-run"), Owner::Workflow).await;
         assert_eq!(refused.unwrap_err().reason, Reason::NotOwner);
-        assert_eq!(target.meta("own").await.as_deref(), Some("client"));
+        assert_eq!(target.meta("own").await.as_deref(), Some(&b"client"[..]));
         // The meta keeps the TTL of a client's Stream, below the safety TTL of 90 days.
         let (_, ttl) = target.ttls().await;
         assert!(

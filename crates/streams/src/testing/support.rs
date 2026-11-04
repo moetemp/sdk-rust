@@ -227,15 +227,22 @@ impl Target {
     }
 
     /// Sets one meta field under the Store's calls.
-    pub(crate) async fn set_meta(&self, field: &str, value: &str) {
+    pub(crate) async fn set_meta(&self, field: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
         self.raw
-            .set_meta(&self.namespace, &self.stream, field, value)
+            .set_meta(
+                &self.namespace,
+                &self.stream,
+                field.as_ref(),
+                value.as_ref(),
+            )
             .await
     }
 
     /// One meta field.
-    pub(crate) async fn meta(&self, field: &str) -> Option<String> {
-        self.raw.meta(&self.namespace, &self.stream, field).await
+    pub(crate) async fn meta(&self, field: impl AsRef<[u8]>) -> Option<Vec<u8>> {
+        self.raw
+            .meta(&self.namespace, &self.stream, field.as_ref())
+            .await
     }
 
     /// The ms left on the log and on the meta, as `PTTL` gives them.

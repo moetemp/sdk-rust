@@ -34,7 +34,8 @@ struct Fields {
 /// One Stream's meta hash and log, each with an expiry time, as Redis keys have.
 #[derive(Default)]
 struct Keys {
-    meta: HashMap<String, String>,
+    /// The meta hash, whose field names and values are bytes as in Redis.
+    meta: HashMap<Vec<u8>, Vec<u8>>,
     meta_expires: i64,
     /// `None` when the log key doesn't exist.
     log: Option<BTreeMap<(u64, u64), Fields>>,
@@ -88,27 +89,45 @@ fn parse_id(text: &str) -> Option<(u64, u64)> {
 }
 
 impl Keys {
-    fn get(&self, field: &str) -> Option<&String> {
-        self.meta.get(field)
+    fn get(&self, field: impl AsRef<[u8]>) -> Option<&[u8]> {
+        self.meta.get(field.as_ref()).map(Vec::as_slice)
     }
 
-    fn set(&mut self, field: &str, value: impl Into<String>) {
-        self.meta.insert(field.to_string(), value.into());
+    /// A field that holds text, such as `own` or `newest`. `None` when it's absent or not text.
+    fn text(&self, field: impl AsRef<[u8]>) -> Option<&str> {
+        self.get(field)
+            .and_then(|value| std::str::from_utf8(value).ok())
+    }
+
+    /// A field that holds a number, zero when it's absent.
+    fn number(&self, field: &str) -> i64 {
+        self.text(field)
+            .and_then(|number| number.parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn set(&mut self, field: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
+        self.meta.insert(field.into(), value.into());
+    }
+
+    fn remove(&mut self, field: impl AsRef<[u8]>) {
+        self.meta.remove(field.as_ref());
     }
 
     /// The `check_live` step, which checks the create key, the format version and the expiry.
     fn check_live(&self, now: i64) -> StreamResult<()> {
-        let Some(v) = self.get("v") else {
+        if self.get("v").is_none() {
             return Err(refuse(Reason::NotFound, "nobody created the Stream"));
-        };
-        if v.parse::<u32>().unwrap_or(0) > FORMAT_VERSION {
+        }
+        let v = self.number("v");
+        if v > i64::from(FORMAT_VERSION) {
             return Err(refuse(
                 Reason::FormatTooNew,
                 &format!("format {v} is newer than {FORMAT_VERSION}"),
             ));
         }
         if self
-            .get("exp")
+            .text("exp")
             .and_then(|exp| exp.parse::<i64>().ok())
             .is_some_and(|exp| exp <= now)
         {
@@ -119,14 +138,14 @@ impl Keys {
 
     /// The `check_owner` step of a close, as in `lib.lua`.
     fn check_owner(&self, kind: i32, chain: &str) -> StreamResult<()> {
-        if self.get("own").map(String::as_str) == Some("wf") {
+        if self.text("own") == Some("wf") {
             if kind != StreamProducerKind::Workflow as i32 {
                 return Err(refuse(
                     Reason::NotOwner,
                     "only the close Activity of the owner run chain closes a Workflow-owned Stream",
                 ));
             }
-            if self.get("oc").is_some_and(|owner| chain != owner) {
+            if self.text("oc").is_some_and(|owner| chain != owner) {
                 return Err(refuse(
                     Reason::NotOwner,
                     "the handle names another run chain than the owner",
@@ -142,9 +161,9 @@ impl Keys {
     }
 
     fn refresh(&mut self, now: i64, safety: i64, tombstone: i64) {
-        let retention: i64 = self.get("ret").and_then(|r| r.parse().ok()).unwrap_or(0);
+        let retention = self.number("ret");
         let mut ttl = retention;
-        if self.get("own").map(String::as_str) == Some("wf") && self.get("closed").is_none() {
+        if self.text("own") == Some("wf") && self.get("closed").is_none() {
             ttl = safety;
         }
         let exp = now.saturating_add(ttl);
@@ -162,7 +181,7 @@ impl Keys {
     /// Removes the fence and dedupe fields of the Producers whose last append is older than the
     /// Retention, as `prune` in `lib.lua`. Their Records are older too, so they hold none.
     fn prune(&mut self, now: i64) {
-        let retention: i64 = self.get("ret").and_then(|r| r.parse().ok()).unwrap_or(0);
+        let retention = self.number("ret");
         let min = now - retention;
         let mut old: Vec<_> = self
             .producers
@@ -173,7 +192,7 @@ impl Keys {
         old.sort();
         for (_, producer) in old.into_iter().take(PRUNE_LIMIT) {
             for field in ["e", "d", "h"] {
-                self.meta.remove(&format!("{field}|{producer}"));
+                self.remove(format!("{field}|{producer}"));
             }
             self.producers.remove(&producer);
         }
@@ -182,7 +201,7 @@ impl Keys {
     /// The newest id the Stream gave. Redis drops it with an expired log, so the meta's `newest`
     /// keeps the next ids above the old ones.
     fn newest_id(&self) -> (u64, u64) {
-        let newest = self.get("newest").and_then(|id| parse_id(id));
+        let newest = self.text("newest").and_then(parse_id);
         self.last_id.max(newest.unwrap_or_default())
     }
 
@@ -194,8 +213,8 @@ impl Keys {
     /// Refuses a create that names another owner than the Stream has, as `check_identity` in
     /// `lib.lua`.
     fn check_identity(&self, owner: &str, chain: &str) -> StreamResult<()> {
-        let stored = self.get("oc").map_or("", String::as_str);
-        if self.get("own").map(String::as_str) != Some(owner) || stored != chain {
+        let stored = self.text("oc").unwrap_or_default();
+        if self.text("own") != Some(owner) || stored != chain {
             return Err(refuse(
                 Reason::NotOwner,
                 "the Stream has another owner than the create names",
@@ -207,12 +226,12 @@ impl Keys {
     fn trim(&mut self, now: i64) {
         if self.log.is_none() {
             // The expired log took every Record, so a read from an older offset must fail.
-            if let Some(newest) = self.get("newest").and_then(|id| parse_id(id)) {
+            if let Some(newest) = self.text("newest").and_then(parse_id) {
                 self.raise_trimmed(newest);
             }
             return;
         }
-        let retention: i64 = self.get("ret").and_then(|r| r.parse().ok()).unwrap_or(0);
+        let retention = self.number("ret");
         let min = now - retention;
         if min <= 0 {
             return;
@@ -235,9 +254,8 @@ impl Keys {
     /// Sets the trimmed offset to `id`, unless it is already at or past it.
     fn raise_trimmed(&mut self, id: (u64, u64)) {
         let moves = self
-            .meta
-            .get("trimmed")
-            .and_then(|t| parse_id(t))
+            .text("trimmed")
+            .and_then(parse_id)
             .is_none_or(|trimmed| trimmed < id);
         if moves {
             self.set("trimmed", id_text(id));
@@ -329,14 +347,16 @@ impl MemoryStore {
 impl MemoryStore {
     /// Changes one meta field, for tests of what the scripts refuse.
     #[doc(hidden)]
-    pub fn test_set_meta(&self, namespace: &str, stream_id: &str, field: &str, value: &str) {
+    pub fn test_set_meta(&self, namespace: &str, stream_id: &str, field: &[u8], value: &[u8]) {
         self.with(namespace, stream_id, |keys, _| keys.set(field, value));
     }
 
     /// One meta field, for tests.
     #[doc(hidden)]
-    pub fn test_meta(&self, namespace: &str, stream_id: &str, field: &str) -> Option<String> {
-        self.with(namespace, stream_id, |keys, _| keys.get(field).cloned())
+    pub fn test_meta(&self, namespace: &str, stream_id: &str, field: &[u8]) -> Option<Vec<u8>> {
+        self.with(namespace, stream_id, |keys, _| {
+            keys.get(field).map(<[u8]>::to_vec)
+        })
     }
 
     /// The ms left on the log and on the meta, -2 for a key that doesn't exist, as `PTTL`.
@@ -415,7 +435,7 @@ impl Store for MemoryStore {
             String::new()
         };
         let created = self.with(namespace, stream_id, |keys, now| {
-            let Some(stored) = keys.get("ret").cloned() else {
+            if keys.get("ret").is_none() {
                 keys.set("v", FORMAT_VERSION.to_string());
                 keys.set("ret", retention.to_string());
                 keys.set("own", owner);
@@ -424,13 +444,13 @@ impl Store for MemoryStore {
                 }
                 keys.refresh(now, safety, tombstone);
                 return Ok((CreateOutcome::Created, retention));
-            };
+            }
             keys.check_live(now)?;
             keys.check_identity(owner, &chain)?;
             if keys.get("closed").is_some() {
                 return Err(refuse(Reason::Closed, "the Stream is closed"));
             }
-            Ok((CreateOutcome::Exists, stored.parse().unwrap_or(0)))
+            Ok((CreateOutcome::Exists, keys.number("ret")))
         });
         let (outcome, stored) = created?;
         Ok(Created {
@@ -457,7 +477,7 @@ impl Store for MemoryStore {
             // The lock also covers the dedupe check, so no other batch takes the same number.
             let sequence = match batch.sequence {
                 0 => keys
-                    .get(&format!("d{suffix}"))
+                    .text(format!("d{suffix}"))
                     .and_then(|last| last.strip_prefix(&format!("{epoch}|")))
                     .and_then(|rest| rest.split('|').next())
                     .map_or(1, |last| last.parse::<i64>().unwrap_or(0) + 1),
@@ -470,7 +490,7 @@ impl Store for MemoryStore {
                 ));
             }
             keys.check_live(now)?;
-            if let Some(last) = keys.get(&format!("d{suffix}")) {
+            if let Some(last) = keys.text(format!("d{suffix}")) {
                 let parts: Vec<&str> = last.split('|').collect();
                 if parts.len() == 5 && parts[0] == epoch {
                     let last_sequence: i64 = parts[1].parse().unwrap_or(0);
@@ -498,8 +518,8 @@ impl Store for MemoryStore {
                 return Err(refuse(Reason::Closed, "the Stream is closed"));
             }
             if keys
-                .get(&format!("e{suffix}"))
-                .is_some_and(|newest| epoch.as_str() < newest.as_str())
+                .text(format!("e{suffix}"))
+                .is_some_and(|newest| epoch.as_str() < newest)
             {
                 return Err(refuse(
                     Reason::Fenced,
@@ -512,8 +532,8 @@ impl Store for MemoryStore {
             // A client's newer epoch only fences, as in `append.lua`.
             let flagged = producer.kind != StreamProducerKind::Client as i32
                 && keys
-                    .get(&format!("h{suffix}"))
-                    .is_some_and(|holds| holds.as_str() < epoch.as_str());
+                    .text(format!("h{suffix}"))
+                    .is_some_and(|holds| holds < epoch.as_str());
 
             keys.trim(now);
             keys.prune(now);
@@ -543,15 +563,15 @@ impl Store for MemoryStore {
                 }
             }
 
-            keys.set(&format!("e{suffix}"), epoch.clone());
+            keys.set(format!("e{suffix}"), epoch.clone());
             keys.set(
-                &format!("d{suffix}"),
+                format!("d{suffix}"),
                 format!("{epoch}|{sequence}|{first}|{last}|{}", batch.digest),
             );
             if records > 0 {
-                keys.set(&format!("h{suffix}"), epoch.clone());
+                keys.set(format!("h{suffix}"), epoch.clone());
             } else if flagged {
-                keys.meta.remove(&format!("h{suffix}"));
+                keys.remove(format!("h{suffix}"));
             }
             if !last.is_empty() {
                 keys.set("newest", last.clone());
@@ -587,12 +607,12 @@ impl Store for MemoryStore {
             keys.check_live(now)?;
             keys.check_owner(producer.kind, &chain)?;
             if keys.get("closed").is_some() {
-                let id = keys.get("close_id").cloned().unwrap_or_default();
+                let id = keys.text("close_id").unwrap_or_default().to_string();
                 return Ok((id, true));
             }
             if keys
-                .get(&format!("e{suffix}"))
-                .is_some_and(|newest| epoch.as_str() < newest.as_str())
+                .text(format!("e{suffix}"))
+                .is_some_and(|newest| epoch.as_str() < newest)
             {
                 return Err(refuse(
                     Reason::Fenced,
@@ -638,10 +658,9 @@ impl Store for MemoryStore {
         };
         self.with(namespace, stream_id, |keys, now| {
             let offset = |field: &str| -> StreamResult<i64> {
-                keys.get(field).map_or(Ok(0), |id| offset_of_entry_id(id))
+                keys.text(field).map_or(Ok(0), offset_of_entry_id)
             };
-            let number =
-                |field: &str| -> i64 { keys.get(field).and_then(|n| n.parse().ok()).unwrap_or(0) };
+            let number = |field: &str| keys.number(field);
             let state = StreamState {
                 exists: keys.get("v").is_some(),
                 version: number("v") as u32,
