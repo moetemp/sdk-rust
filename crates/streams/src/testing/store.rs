@@ -8,10 +8,12 @@ use super::{
 };
 use crate::{
     Reason,
+    epoch::epoch_key,
     ids::{
         activity_producer_id, client_producer_id, named_client_producer_id, workflow_producer_id,
     },
-    offset::offset_of_entry_id,
+    memory::{EntryId, ProducerField},
+    offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{Producer, ProducerEpoch, StreamHandle, StreamProducerKind},
     store::{Batch, CreateOutcome, Owner, Withdrawal},
 };
@@ -604,8 +606,8 @@ async fn a_create_with_another_owner_is_refused() {
     }
 }
 
-/// An append removes the fence and dedupe fields of a Producer whose last append is older than
-/// the Retention, since its Records are gone too. A lower epoch of that Producer then writes.
+/// An append removes the `p|` field of a Producer whose last append is older than the Retention,
+/// since its Records are gone too. A lower epoch of that Producer then writes.
 async fn an_append_forgets_the_producers_that_the_retention_outlived() {
     for target in stores_for(Needs::RAW_KEYS.and(Needs::SHORT_TIMES)).await {
         target
@@ -624,10 +626,8 @@ async fn an_append_forgets_the_producers_that_the_retention_outlived() {
         tokio::time::sleep(Duration::from_millis(400)).await;
         append(&target, &new, 1, &["new"]).await.unwrap();
         let kind = StreamProducerKind::Client as i32;
-        for field in [fields::fence(kind, &old.id), fields::dedupe(kind, &old.id)] {
-            assert_eq!(target.meta(&field).await, None, "{field}");
-        }
-        assert!(target.meta(&fields::fence(kind, &new.id)).await.is_some());
+        assert_eq!(target.meta(fields::producer(kind, &old.id)).await, None);
+        assert!(target.meta(fields::producer(kind, &new.id)).await.is_some());
         append(&target, &client(1), 1, &["late"]).await.unwrap();
         assert_eq!(target.texts().await, ["new", "late"]);
     }
@@ -735,16 +735,78 @@ async fn every_store_keeps_the_meta_fields_of_the_shared_vectors() {
         let kind = StreamProducerKind::Activity as i32;
         // The vector's Producer is this one, so its field names are the ones the Store keeps.
         assert_eq!(producer.id, vectors["producer_id"].as_str().unwrap());
-        let fence = fields::fence(kind, &producer.id);
-        assert_eq!(fence, vectors["fence"].as_str().unwrap());
-        for field in [
-            fence,
-            fields::dedupe(kind, &producer.id),
-            fields::holds(kind, &producer.id),
-            fields::VERSION.to_string(),
-        ] {
+        let field = fields::producer(kind, &producer.id);
+        assert_eq!(field, vectors["producer"].as_str().unwrap());
+        for field in [field, fields::VERSION.to_string()] {
             assert!(target.meta(&field).await.is_some(), "{field}");
         }
+    }
+}
+
+/// The entry ids of an append's offsets.
+fn entry_ids(offsets: Option<(i64, i64)>) -> Option<(EntryId, EntryId)> {
+    let id = |offset: i64| {
+        let text = entry_id_of_offset(offset);
+        let (ms, seq) = text.split_once('-').unwrap();
+        (ms.parse().unwrap(), seq.parse().unwrap())
+    };
+    offsets.map(|(first, last)| (id(first), id(last)))
+}
+
+/// A Producer's `p|` field has the same 129 bytes on every Store. These are the flags, the fence,
+/// the held epoch, and the last batch's sequence, entry ids and digest.
+async fn a_producer_field_has_the_shared_layout() {
+    for target in stores_for(Needs::RAW_KEYS).await {
+        target.create(Owner::Workflow).await;
+        let kind = StreamProducerKind::Activity as i32;
+        let field = |producer: &Producer, held: Option<&Producer>, offsets, texts: &[&str]| {
+            let epoch = |producer: &Producer| epoch_key(&producer.epoch.unwrap_or_default());
+            ProducerField {
+                fence: epoch(producer),
+                held: held.map(epoch),
+                sequence: 1,
+                entries: entry_ids(offsets),
+                digest: digest(texts),
+            }
+            .encode()
+        };
+        let a1 = activity("r1", 1, 10);
+        let stored = || async { target.meta(fields::producer(kind, &a1.id)).await.unwrap() };
+        let written = append(&target, &a1, 1, &["x", "y"]).await.unwrap();
+        assert_eq!(
+            stored().await,
+            field(&a1, Some(&a1), written.offsets, &["x", "y"])
+        );
+        // A newer attempt's empty batch withdraws the held epoch's Records, so none is held.
+        let a2 = activity("r1", 2, 20);
+        let flagged = append(&target, &a2, 1, &[]).await.unwrap();
+        assert_eq!(stored().await, field(&a2, None, flagged.offsets, &[]));
+        // Nothing is left to withdraw, so the next empty batch writes no entry.
+        let a3 = activity("r1", 3, 30);
+        let empty = append(&target, &a3, 1, &[]).await.unwrap();
+        assert_eq!(empty.offsets, None);
+        assert_eq!(stored().await, field(&a3, None, None, &[]));
+    }
+}
+
+/// A Store refuses a write of a Producer whose `p|` field has another length or another flag bit,
+/// which a later format may write.
+async fn a_producer_field_of_another_format_is_refused() {
+    for target in stores_for(Needs::RAW_KEYS).await {
+        target.create(Owner::Client).await;
+        let p = client(1);
+        append(&target, &p, 1, &["a"]).await.unwrap();
+        let field = fields::producer(StreamProducerKind::Client as i32, &p.id);
+        let value = target.meta(&field).await.unwrap();
+        let mut flagged = value.clone();
+        flagged[0] |= 2;
+        for other in [flagged, value[..value.len() - 1].to_vec()] {
+            target.set_meta(&field, &other).await;
+            let error = append(&target, &p, 2, &["b"]).await.unwrap_err();
+            assert_eq!(error.reason, Reason::Storage);
+            assert_eq!(target.close(&p).await.unwrap_err().reason, Reason::Storage);
+        }
+        assert_eq!(target.texts().await, ["a"]);
     }
 }
 
@@ -774,4 +836,6 @@ pub const CASES: &[super::Case] = &[
     case!(only_the_owner_closes_a_stream),
     case!(an_append_whose_ids_would_not_fit_an_offset_is_refused_before_it_writes),
     case!(every_store_keeps_the_meta_fields_of_the_shared_vectors),
+    case!(a_producer_field_has_the_shared_layout),
+    case!(a_producer_field_of_another_format_is_refused),
 ];

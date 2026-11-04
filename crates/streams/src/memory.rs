@@ -89,39 +89,99 @@ fn parse_id(text: &str) -> Option<(u64, u64)> {
     Some((ms.parse().ok()?, seq.parse().ok()?))
 }
 
-/// The dedupe field `d|` of a batch, as its epoch key, `|<sequence>|<first>|<last>|` and its
-/// digest. The binary parts can hold a `|`, so they go by position.
-fn dedupe_value(epoch: &[u8], sequence: i64, first: &str, last: &str, digest: &[u8]) -> Vec<u8> {
-    [
-        epoch,
-        format!("|{sequence}|{first}|{last}|").as_bytes(),
-        digest,
-    ]
-    .concat()
+/// The length of a [ProducerField] value.
+const PRODUCER_FIELD_LEN: usize = 1 + 2 * EPOCH_KEY_LEN + 8 + 2 * 12 + DIGEST_LEN;
+/// The flag of a [ProducerField] that has a held epoch. The other flag bits are zero.
+const HELD: u8 = 1;
+
+/// An entry id as a [ProducerField] keeps it, the ms and the seq.
+pub(crate) type EntryId = (u64, u32);
+
+/// The `p|<kind>|<producer id>` field, one per Producer. Its value is 129 bytes: a flag byte, the
+/// fence, the held epoch key or zeros, and the last batch's sequence (8), first and last entry ids
+/// (12 each, the ms in 8 and the seq in 4, zeros for none) and digest. Numbers are big-endian.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProducerField {
+    /// The newest epoch key of the Producer, which is also the epoch of its last batch.
+    pub(crate) fence: [u8; EPOCH_KEY_LEN],
+    /// The newest epoch key that still has Records.
+    pub(crate) held: Option<[u8; EPOCH_KEY_LEN]>,
+    /// The last batch's sequence.
+    pub(crate) sequence: i64,
+    /// The last batch's first and last entry ids, `None` when it wrote no entry.
+    pub(crate) entries: Option<(EntryId, EntryId)>,
+    /// The last batch's digest.
+    pub(crate) digest: [u8; DIGEST_LEN],
 }
 
-/// The parts of a dedupe field.
-struct Dedupe<'a> {
-    epoch: &'a [u8],
-    sequence: i64,
-    first: &'a str,
-    last: &'a str,
-    digest: &'a [u8],
+impl ProducerField {
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut value = Vec::with_capacity(PRODUCER_FIELD_LEN);
+        value.push(if self.held.is_some() { HELD } else { 0 });
+        value.extend_from_slice(&self.fence);
+        value.extend_from_slice(&self.held.unwrap_or([0; EPOCH_KEY_LEN]));
+        value.extend_from_slice(&self.sequence.to_be_bytes());
+        let (first, last) = self.entries.unwrap_or_default();
+        for (ms, seq) in [first, last] {
+            value.extend_from_slice(&ms.to_be_bytes());
+            value.extend_from_slice(&seq.to_be_bytes());
+        }
+        value.extend_from_slice(&self.digest);
+        value
+    }
 }
 
-fn parse_dedupe(value: &[u8]) -> Option<Dedupe<'_>> {
-    let (epoch, rest) = value.split_at_checked(EPOCH_KEY_LEN)?;
-    let (middle, digest) = rest.split_at_checked(rest.len().checked_sub(DIGEST_LEN)?)?;
-    let middle = std::str::from_utf8(middle).ok()?;
-    let mut parts = middle.strip_prefix('|')?.strip_suffix('|')?.split('|');
-    let (sequence, first, last) = (parts.next()?, parts.next()?, parts.next()?);
-    Some(Dedupe {
-        epoch,
-        sequence: sequence.parse().ok()?,
-        first,
-        last,
-        digest,
-    })
+/// Refuses a value of another length or with another flag bit, which a later format may write.
+impl TryFrom<&[u8]> for ProducerField {
+    type Error = StreamError;
+
+    fn try_from(value: &[u8]) -> StreamResult<Self> {
+        let unknown = || refuse(Reason::Storage, "the Producer field has an unknown format");
+        let Some((&flags, rest)) = value.split_first() else {
+            return Err(unknown());
+        };
+        if value.len() != PRODUCER_FIELD_LEN || flags & !HELD != 0 {
+            return Err(unknown());
+        }
+        let (fence, rest) = rest.split_at(EPOCH_KEY_LEN);
+        let (held, rest) = rest.split_at(EPOCH_KEY_LEN);
+        let (sequence, rest) = rest.split_at(8);
+        let (first, rest) = rest.split_at(12);
+        let (last, digest) = rest.split_at(12);
+        let entry_id = |bytes: &[u8]| -> StreamResult<EntryId> {
+            let (ms, seq) = bytes.split_at(8);
+            let ms = ms.try_into().map_err(|_| unknown())?;
+            let seq = seq.try_into().map_err(|_| unknown())?;
+            Ok((u64::from_be_bytes(ms), u32::from_be_bytes(seq)))
+        };
+        // A batch has both entry ids or neither.
+        let entries = match (entry_id(first)?, entry_id(last)?) {
+            ((0, 0), (0, 0)) => None,
+            ((0, 0), _) | (_, (0, 0)) => return Err(unknown()),
+            ids => Some(ids),
+        };
+        Ok(Self {
+            fence: fence.try_into().map_err(|_| unknown())?,
+            held: if flags & HELD != 0 {
+                Some(held.try_into().map_err(|_| unknown())?)
+            } else {
+                None
+            },
+            sequence: i64::from_be_bytes(sequence.try_into().map_err(|_| unknown())?),
+            entries,
+            digest: digest.try_into().map_err(|_| unknown())?,
+        })
+    }
+}
+
+/// The [EntryId] of an entry id's text, `<ms>-<seq>`.
+fn entry_id(text: &str) -> StreamResult<EntryId> {
+    let bad = || refuse(Reason::Storage, "an entry id isn't <ms>-<seq>");
+    let (ms, seq) = text.split_once('-').ok_or_else(bad)?;
+    Ok((
+        ms.parse().map_err(|_| bad())?,
+        seq.parse().map_err(|_| bad())?,
+    ))
 }
 
 impl Keys {
@@ -214,8 +274,8 @@ impl Keys {
         }
     }
 
-    /// Removes the fence and dedupe fields of the Producers whose last append is older than the
-    /// Retention, as `prune` in `lib.lua`. Their Records are older too, so they hold none.
+    /// Removes the `p|` field of the Producers whose last append is older than the Retention, as
+    /// `prune` in `lib.lua`. Their Records are older too, so they hold none.
     fn prune(&mut self, now: i64) {
         let retention = self.number("ret");
         let min = now - retention;
@@ -227,9 +287,7 @@ impl Keys {
             .collect();
         old.sort();
         for (_, producer) in old.into_iter().take(PRUNE_LIMIT) {
-            for field in ["e", "d", "h"] {
-                self.remove(format!("{field}|{producer}"));
-            }
+            self.remove(format!("p|{producer}"));
             self.producers.remove(&producer);
         }
     }
@@ -507,16 +565,15 @@ impl Store for MemoryStore {
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
         let withdrawal = &batch.withdrawal;
         let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
-        let suffix = format!("|{}|{}", producer.kind, producer.id);
+        let field = format!("p|{}|{}", producer.kind, producer.id);
         let member = format!("{}|{}", producer.kind, producer.id);
         let appended = self.with(namespace, stream_id, |keys, now| {
+            let stored = keys.get(&field).map(ProducerField::try_from).transpose()?;
+            // Every append sets the fence to its epoch, so the fence is the last batch's epoch.
+            let previous = stored.filter(|stored| stored.fence == epoch);
             // The lock also covers the dedupe check, so no other batch takes the same number.
             let sequence = match batch.sequence {
-                0 => keys
-                    .get(format!("d{suffix}"))
-                    .and_then(parse_dedupe)
-                    .filter(|last| last.epoch == epoch.as_slice())
-                    .map_or(1, |last| last.sequence + 1),
+                0 => previous.map_or(1, |previous| previous.sequence + 1),
                 sequence => sequence,
             };
             if !(1..=MAX_SEQUENCE).contains(&sequence) {
@@ -526,12 +583,9 @@ impl Store for MemoryStore {
                 ));
             }
             keys.check_live(now)?;
-            let last = keys.get(format!("d{suffix}")).and_then(parse_dedupe);
-            if let Some(last) = last
-                && last.epoch == epoch.as_slice()
-            {
-                if sequence == last.sequence {
-                    if last.digest != batch.digest.as_slice() {
+            if let Some(previous) = previous {
+                if sequence == previous.sequence {
+                    if previous.digest != batch.digest {
                         return Err(refuse(
                             Reason::SeqDivergent,
                             &format!(
@@ -540,14 +594,20 @@ impl Store for MemoryStore {
                             ),
                         ));
                     }
-                    return Ok((true, last.first.to_string(), last.last.to_string(), false));
+                    let (first, last) = previous
+                        .entries
+                        .map(|((ms, seq), (last_ms, last_seq))| {
+                            (format!("{ms}-{seq}"), format!("{last_ms}-{last_seq}"))
+                        })
+                        .unwrap_or_default();
+                    return Ok((true, first, last, false));
                 }
-                if sequence < last.sequence {
+                if sequence < previous.sequence {
                     return Err(refuse(
                         Reason::Sequence,
                         &format!(
                             "sequence {sequence} is below the last one, {}",
-                            last.sequence
+                            previous.sequence
                         ),
                     ));
                 }
@@ -555,10 +615,7 @@ impl Store for MemoryStore {
             if keys.get("closed").is_some() {
                 return Err(refuse(Reason::Closed, "the Stream is closed"));
             }
-            if keys
-                .get(format!("e{suffix}"))
-                .is_some_and(|newest| epoch.as_slice() < newest)
-            {
+            if stored.is_some_and(|stored| epoch < stored.fence) {
                 return Err(refuse(
                     Reason::Fenced,
                     "the epoch is lower than the newest one of the Producer",
@@ -569,9 +626,9 @@ impl Store for MemoryStore {
 
             // A client's newer epoch only fences, as in `append.lua`.
             let flagged = producer.kind != StreamProducerKind::Client as i32
-                && keys
-                    .get(format!("h{suffix}"))
-                    .is_some_and(|holds| holds < epoch.as_slice());
+                && stored
+                    .and_then(|stored| stored.held)
+                    .is_some_and(|held| held < epoch);
 
             keys.trim(now);
             keys.prune(now);
@@ -601,16 +658,26 @@ impl Store for MemoryStore {
                 }
             }
 
-            keys.set(format!("e{suffix}"), epoch);
-            keys.set(
-                format!("d{suffix}"),
-                dedupe_value(&epoch, sequence, &first, &last, &batch.digest),
-            );
-            if records > 0 {
-                keys.set(format!("h{suffix}"), epoch);
+            let held = if records > 0 {
+                Some(epoch)
             } else if flagged {
-                keys.remove(format!("h{suffix}"));
-            }
+                None
+            } else {
+                stored.and_then(|stored| stored.held)
+            };
+            let entries = if last.is_empty() {
+                None
+            } else {
+                Some((entry_id(&first)?, entry_id(&last)?))
+            };
+            let value = ProducerField {
+                fence: epoch,
+                held,
+                sequence,
+                entries,
+                digest: batch.digest,
+            };
+            keys.set(field.as_str(), value.encode());
             if !last.is_empty() {
                 keys.set("newest", last.clone());
             }
@@ -638,7 +705,7 @@ impl Store for MemoryStore {
     ) -> StreamResult<Closed> {
         let stream_id = handle.id.as_str();
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
-        let suffix = format!("|{}|{}", producer.kind, producer.id);
+        let field = format!("p|{}|{}", producer.kind, producer.id);
         let tombstone = millis(TOMBSTONE);
         let chain = owner_chain(handle);
         let closed = self.with(namespace, stream_id, |keys, now| {
@@ -648,10 +715,8 @@ impl Store for MemoryStore {
                 let id = keys.text("close_id").unwrap_or_default().to_string();
                 return Ok((id, true));
             }
-            if keys
-                .get(format!("e{suffix}"))
-                .is_some_and(|newest| epoch.as_slice() < newest)
-            {
+            let stored = keys.get(&field).map(ProducerField::try_from).transpose()?;
+            if stored.is_some_and(|stored| epoch < stored.fence) {
                 return Err(refuse(
                     Reason::Fenced,
                     "the epoch is lower than the newest one of the Producer",
@@ -796,5 +861,37 @@ mod tests {
         // The ids keep increasing when the clock steps back.
         assert_eq!(keys.add(3, Fields::default()), "5-2");
         assert_eq!(keys.add(9, Fields::default()), "9-0");
+    }
+
+    #[test]
+    fn a_producer_field_matches_the_shared_vectors() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/fields.json")).unwrap();
+        let hex = |text: &str| -> Vec<u8> {
+            (0..text.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        for case in vectors["producer_values"].as_array().unwrap() {
+            let text = |name: &str| case[name].as_str().unwrap();
+            let key = |name: &str| case[name].as_str().map(|key| hex(key).try_into().unwrap());
+            let entries = (!text("first").is_empty()).then(|| {
+                (
+                    entry_id(text("first")).unwrap(),
+                    entry_id(text("last")).unwrap(),
+                )
+            });
+            let field = ProducerField {
+                fence: key("fence").unwrap(),
+                held: key("held"),
+                sequence: case["sequence"].as_i64().unwrap(),
+                entries,
+                digest: hex(text("digest")).try_into().unwrap(),
+            };
+            let value = hex(text("value"));
+            assert_eq!(field.encode(), value, "{}", text("name"));
+            assert_eq!(ProducerField::try_from(value.as_slice()).unwrap(), field);
+        }
     }
 }
