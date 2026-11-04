@@ -22,10 +22,10 @@ use std::{future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc};
 /// The state under a Store's calls, which some cases read or change.
 #[async_trait::async_trait]
 pub trait RawKeys: Send + Sync {
-    /// Sets one meta field of a Stream.
-    async fn set_meta(&self, namespace: &str, stream: &str, field: &str, value: &str);
+    /// Sets one meta field of a Stream. Field names and values are bytes, as Redis keeps them.
+    async fn set_meta(&self, namespace: &str, stream: &str, field: &[u8], value: &[u8]);
     /// One meta field of a Stream.
-    async fn meta(&self, namespace: &str, stream: &str, field: &str) -> Option<String>;
+    async fn meta(&self, namespace: &str, stream: &str, field: &[u8]) -> Option<Vec<u8>>;
     /// The ms left on the log and on the meta, as `PTTL` gives them.
     async fn ttls(&self, namespace: &str, stream: &str) -> (i64, i64);
     /// Adds a log entry with an explicit id, as `XADD <id>`.
@@ -72,11 +72,11 @@ impl TestBackend for MemoryBackend {
 
 #[async_trait::async_trait]
 impl RawKeys for MemoryStore {
-    async fn set_meta(&self, namespace: &str, stream: &str, field: &str, value: &str) {
+    async fn set_meta(&self, namespace: &str, stream: &str, field: &[u8], value: &[u8]) {
         self.test_set_meta(namespace, stream, field, value)
     }
 
-    async fn meta(&self, namespace: &str, stream: &str, field: &str) -> Option<String> {
+    async fn meta(&self, namespace: &str, stream: &str, field: &[u8]) -> Option<Vec<u8>> {
         self.test_meta(namespace, stream, field)
     }
 

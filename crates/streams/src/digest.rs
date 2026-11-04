@@ -5,10 +5,13 @@
 use crate::proto::AppendRecord;
 use sha2::{Digest, Sha256};
 
-/// SHA-256 over the Records in order, as 64 lowercase hex characters. Each part has its length
-/// before it, so that two different batches never hash the same bytes. The metadata is hashed in
-/// key order, since a map has no order on the wire.
-pub fn batch_digest(records: &[AppendRecord]) -> String {
+/// The length of a [batch_digest].
+pub const DIGEST_LEN: usize = 16;
+
+/// The first 16 bytes of a SHA-256 over the Records in order. Each part has its length before it,
+/// so that two different batches never hash the same bytes. The metadata is hashed in key order,
+/// since a map has no order on the wire.
+pub fn batch_digest(records: &[AppendRecord]) -> [u8; DIGEST_LEN] {
     let mut hasher = Sha256::new();
     for record in records {
         // A Record with no body and one with an empty body are two different stored Records.
@@ -30,11 +33,9 @@ pub fn batch_digest(records: &[AppendRecord]) -> String {
             hasher.update(external.size_bytes.to_be_bytes());
         }
     }
-    hasher
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let mut digest = [0; DIGEST_LEN];
+    digest.copy_from_slice(&hasher.finalize()[..DIGEST_LEN]);
+    digest
 }
 
 fn part(hasher: &mut Sha256, bytes: &[u8]) {

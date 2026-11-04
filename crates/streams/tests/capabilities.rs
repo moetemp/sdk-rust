@@ -176,7 +176,7 @@ impl Case {
 
     fn created(&self) -> bool {
         self.memory
-            .test_meta(NAMESPACE, &self.stream, "v")
+            .test_meta(NAMESPACE, &self.stream, b"v")
             .is_some()
     }
 

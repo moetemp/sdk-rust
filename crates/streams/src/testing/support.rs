@@ -164,8 +164,16 @@ pub(crate) fn record(producer: &Producer, text: &str) -> Vec<u8> {
     .encode_to_vec()
 }
 
+/// The bytes of a hex text, as the vectors give binary values.
+pub(crate) fn hex(text: &str) -> Vec<u8> {
+    (0..text.len())
+        .step_by(2)
+        .map(|at| u8::from_str_radix(&text[at..at + 2], 16).unwrap())
+        .collect()
+}
+
 /// The digest of the batch that [record] makes of each text.
-pub(crate) fn digest(texts: &[&str]) -> String {
+pub(crate) fn digest(texts: &[&str]) -> [u8; crate::digest::DIGEST_LEN] {
     let records: Vec<_> = texts
         .iter()
         .map(|text| AppendRecord {
@@ -227,15 +235,22 @@ impl Target {
     }
 
     /// Sets one meta field under the Store's calls.
-    pub(crate) async fn set_meta(&self, field: &str, value: &str) {
+    pub(crate) async fn set_meta(&self, field: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
         self.raw
-            .set_meta(&self.namespace, &self.stream, field, value)
+            .set_meta(
+                &self.namespace,
+                &self.stream,
+                field.as_ref(),
+                value.as_ref(),
+            )
             .await
     }
 
     /// One meta field.
-    pub(crate) async fn meta(&self, field: &str) -> Option<String> {
-        self.raw.meta(&self.namespace, &self.stream, field).await
+    pub(crate) async fn meta(&self, field: impl AsRef<[u8]>) -> Option<Vec<u8>> {
+        self.raw
+            .meta(&self.namespace, &self.stream, field.as_ref())
+            .await
     }
 
     /// The ms left on the log and on the meta, as `PTTL` gives them.
@@ -336,7 +351,7 @@ impl Target {
                     producer,
                     sequence,
                     records: &records,
-                    digest: &digest(texts),
+                    digest: digest(texts),
                     withdrawal,
                 },
             )
