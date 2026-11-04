@@ -16,7 +16,7 @@ use crate::{
     record::{caller_status, close_record, data_records, superseded},
     store::{
         Batch, Capabilities, CreateOutcome, FORMAT_VERSION, MAX_RECORD_BYTES, MAX_SEQUENCE,
-        MAX_TTL, Owner, Store, StreamState, Withdrawal, owner_chain,
+        MAX_TTL, MIN_RETENTION, Owner, Store, StreamState, Withdrawal, owner_chain,
     },
 };
 use prost::Message;
@@ -56,7 +56,8 @@ fn retention(value: Option<prost_types::Duration>) -> StreamResult<Option<Durati
     };
     let out_of_range = || {
         StreamError::invalid(format!(
-            "The Retention must be from 0 to {} s",
+            "The Retention must be 0 for the Store default, or from {} ms to {} s",
+            MIN_RETENTION.as_millis(),
             MAX_TTL.as_secs()
         ))
     };
@@ -67,7 +68,11 @@ fn retention(value: Option<prost_types::Duration>) -> StreamResult<Option<Durati
     if nanos >= 1_000_000_000 || Duration::new(seconds, nanos) > MAX_TTL {
         return Err(out_of_range());
     }
-    Ok(duration(Some(value)))
+    let retention = duration(Some(value));
+    if retention.is_some_and(|retention| retention < MIN_RETENTION) {
+        return Err(out_of_range());
+    }
+    Ok(retention)
 }
 
 fn proto_duration(value: Duration) -> prost_types::Duration {

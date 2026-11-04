@@ -24,6 +24,9 @@ pub const FORMAT_VERSION: u32 = 1;
 pub const MAX_RECORD_BYTES: usize = 1536 * 1024;
 /// The maximum size of a stored append, in bytes.
 pub const MAX_BATCH_BYTES: usize = 4 * 1024 * 1024;
+/// The maximum number of Records in an append. Many small Records fit under [MAX_BATCH_BYTES], but
+/// they keep a Store busy for long.
+pub const MAX_BATCH_RECORDS: usize = 1000;
 /// The highest batch `sequence`. A Lua number is exact for integers only up to this value.
 pub const MAX_SEQUENCE: i64 = (1 << 53) - 1;
 /// How long the meta key stays after the log key expires, so that a read can tell an expired Stream
@@ -32,6 +35,9 @@ pub const TOMBSTONE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// The longest Retention or safety TTL, which is the largest proto Duration. Its ms plus the time
 /// of a write stay exact in a Lua number.
 pub const MAX_TTL: Duration = Duration::from_secs(315_576_000_000);
+/// The shortest Retention. A Store keeps whole ms, so a shorter one would expire the Stream at its
+/// next write.
+pub const MIN_RETENTION: Duration = Duration::from_millis(1);
 
 /// The owner run chain of a handle as `<workflow id>:<first run id>`, each part encoded, or empty
 /// for another owner. A Store keeps it on a Workflow-owned Stream and checks creates and closes on
