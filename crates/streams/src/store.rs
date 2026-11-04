@@ -121,7 +121,7 @@ pub struct Batch<'a> {
     /// The encoded Records.
     pub records: &'a [Vec<u8>],
     /// The [crate::digest::batch_digest] of the batch, which the dedupe entry keeps.
-    pub digest: &'a str,
+    pub digest: [u8; crate::digest::DIGEST_LEN],
     /// What the batch withdraws.
     pub withdrawal: Withdrawal<'a>,
 }

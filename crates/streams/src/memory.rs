@@ -4,7 +4,8 @@
 
 use crate::{
     Reason, StreamError, StreamResult,
-    epoch::epoch_key,
+    digest::DIGEST_LEN,
+    epoch::{EPOCH_KEY_LEN, epoch_key},
     ids::StreamKeys,
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{Producer, StreamHandle, StreamProducerKind},
@@ -34,7 +35,8 @@ struct Fields {
 /// One Stream's meta hash and log, each with an expiry time, as Redis keys have.
 #[derive(Default)]
 struct Keys {
-    meta: HashMap<String, String>,
+    /// The meta hash, whose field names and values are bytes as in Redis.
+    meta: HashMap<Vec<u8>, Vec<u8>>,
     meta_expires: i64,
     /// `None` when the log key doesn't exist.
     log: Option<BTreeMap<(u64, u64), Fields>>,
@@ -87,28 +89,141 @@ fn parse_id(text: &str) -> Option<(u64, u64)> {
     Some((ms.parse().ok()?, seq.parse().ok()?))
 }
 
+/// The length of a [ProducerField] value.
+const PRODUCER_FIELD_LEN: usize = 1 + 2 * EPOCH_KEY_LEN + 8 + 2 * 12 + DIGEST_LEN;
+/// The flag of a [ProducerField] that has a held epoch. The other flag bits are zero.
+const HELD: u8 = 1;
+
+/// An entry id as a [ProducerField] keeps it, the ms and the seq.
+pub(crate) type EntryId = (u64, u32);
+
+/// The `p|<kind>|<producer id>` field, one per Producer. Its value is 129 bytes: a flag byte, the
+/// fence, the held epoch key or zeros, and the last batch's sequence (8), first and last entry ids
+/// (12 each, the ms in 8 and the seq in 4, zeros for none) and digest. Numbers are big-endian.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ProducerField {
+    /// The newest epoch key of the Producer, which is also the epoch of its last batch.
+    pub(crate) fence: [u8; EPOCH_KEY_LEN],
+    /// The newest epoch key that still has Records.
+    pub(crate) held: Option<[u8; EPOCH_KEY_LEN]>,
+    /// The last batch's sequence.
+    pub(crate) sequence: i64,
+    /// The last batch's first and last entry ids, `None` when it wrote no entry.
+    pub(crate) entries: Option<(EntryId, EntryId)>,
+    /// The last batch's digest.
+    pub(crate) digest: [u8; DIGEST_LEN],
+}
+
+impl ProducerField {
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        let mut value = Vec::with_capacity(PRODUCER_FIELD_LEN);
+        value.push(if self.held.is_some() { HELD } else { 0 });
+        value.extend_from_slice(&self.fence);
+        value.extend_from_slice(&self.held.unwrap_or([0; EPOCH_KEY_LEN]));
+        value.extend_from_slice(&self.sequence.to_be_bytes());
+        let (first, last) = self.entries.unwrap_or_default();
+        for (ms, seq) in [first, last] {
+            value.extend_from_slice(&ms.to_be_bytes());
+            value.extend_from_slice(&seq.to_be_bytes());
+        }
+        value.extend_from_slice(&self.digest);
+        value
+    }
+}
+
+/// Refuses a value of another length or with another flag bit, which a later format may write.
+impl TryFrom<&[u8]> for ProducerField {
+    type Error = StreamError;
+
+    fn try_from(value: &[u8]) -> StreamResult<Self> {
+        let unknown = || refuse(Reason::Storage, "the Producer field has an unknown format");
+        let Some((&flags, rest)) = value.split_first() else {
+            return Err(unknown());
+        };
+        if value.len() != PRODUCER_FIELD_LEN || flags & !HELD != 0 {
+            return Err(unknown());
+        }
+        let (fence, rest) = rest.split_at(EPOCH_KEY_LEN);
+        let (held, rest) = rest.split_at(EPOCH_KEY_LEN);
+        let (sequence, rest) = rest.split_at(8);
+        let (first, rest) = rest.split_at(12);
+        let (last, digest) = rest.split_at(12);
+        let entry_id = |bytes: &[u8]| -> StreamResult<EntryId> {
+            let (ms, seq) = bytes.split_at(8);
+            let ms = ms.try_into().map_err(|_| unknown())?;
+            let seq = seq.try_into().map_err(|_| unknown())?;
+            Ok((u64::from_be_bytes(ms), u32::from_be_bytes(seq)))
+        };
+        // A batch has both entry ids or neither.
+        let entries = match (entry_id(first)?, entry_id(last)?) {
+            ((0, 0), (0, 0)) => None,
+            ((0, 0), _) | (_, (0, 0)) => return Err(unknown()),
+            ids => Some(ids),
+        };
+        Ok(Self {
+            fence: fence.try_into().map_err(|_| unknown())?,
+            held: if flags & HELD != 0 {
+                Some(held.try_into().map_err(|_| unknown())?)
+            } else {
+                None
+            },
+            sequence: i64::from_be_bytes(sequence.try_into().map_err(|_| unknown())?),
+            entries,
+            digest: digest.try_into().map_err(|_| unknown())?,
+        })
+    }
+}
+
+/// The [EntryId] of an entry id's text, `<ms>-<seq>`.
+fn entry_id(text: &str) -> StreamResult<EntryId> {
+    let bad = || refuse(Reason::Storage, "an entry id isn't <ms>-<seq>");
+    let (ms, seq) = text.split_once('-').ok_or_else(bad)?;
+    Ok((
+        ms.parse().map_err(|_| bad())?,
+        seq.parse().map_err(|_| bad())?,
+    ))
+}
+
 impl Keys {
-    fn get(&self, field: &str) -> Option<&String> {
-        self.meta.get(field)
+    fn get(&self, field: impl AsRef<[u8]>) -> Option<&[u8]> {
+        self.meta.get(field.as_ref()).map(Vec::as_slice)
     }
 
-    fn set(&mut self, field: &str, value: impl Into<String>) {
-        self.meta.insert(field.to_string(), value.into());
+    /// A field that holds text, such as `own` or `newest`. `None` when it's absent or not text.
+    fn text(&self, field: impl AsRef<[u8]>) -> Option<&str> {
+        self.get(field)
+            .and_then(|value| std::str::from_utf8(value).ok())
+    }
+
+    /// A field that holds a number, zero when it's absent.
+    fn number(&self, field: &str) -> i64 {
+        self.text(field)
+            .and_then(|number| number.parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn set(&mut self, field: impl Into<Vec<u8>>, value: impl Into<Vec<u8>>) {
+        self.meta.insert(field.into(), value.into());
+    }
+
+    fn remove(&mut self, field: impl AsRef<[u8]>) {
+        self.meta.remove(field.as_ref());
     }
 
     /// The `check_live` step, which checks the create key, the format version and the expiry.
     fn check_live(&self, now: i64) -> StreamResult<()> {
-        let Some(v) = self.get("v") else {
+        if self.get("v").is_none() {
             return Err(refuse(Reason::NotFound, "nobody created the Stream"));
-        };
-        if v.parse::<u32>().unwrap_or(0) > FORMAT_VERSION {
+        }
+        let v = self.number("v");
+        if v > i64::from(FORMAT_VERSION) {
             return Err(refuse(
                 Reason::FormatTooNew,
                 &format!("format {v} is newer than {FORMAT_VERSION}"),
             ));
         }
         if self
-            .get("exp")
+            .text("exp")
             .and_then(|exp| exp.parse::<i64>().ok())
             .is_some_and(|exp| exp <= now)
         {
@@ -119,14 +234,14 @@ impl Keys {
 
     /// The `check_owner` step of a close, as in `lib.lua`.
     fn check_owner(&self, kind: i32, chain: &str) -> StreamResult<()> {
-        if self.get("own").map(String::as_str) == Some("wf") {
+        if self.text("own") == Some("wf") {
             if kind != StreamProducerKind::Workflow as i32 {
                 return Err(refuse(
                     Reason::NotOwner,
                     "only the close Activity of the owner run chain closes a Workflow-owned Stream",
                 ));
             }
-            if self.get("oc").is_some_and(|owner| chain != owner) {
+            if self.text("oc").is_some_and(|owner| chain != owner) {
                 return Err(refuse(
                     Reason::NotOwner,
                     "the handle names another run chain than the owner",
@@ -142,9 +257,9 @@ impl Keys {
     }
 
     fn refresh(&mut self, now: i64, safety: i64, tombstone: i64) {
-        let retention: i64 = self.get("ret").and_then(|r| r.parse().ok()).unwrap_or(0);
+        let retention = self.number("ret");
         let mut ttl = retention;
-        if self.get("own").map(String::as_str) == Some("wf") && self.get("closed").is_none() {
+        if self.text("own") == Some("wf") && self.get("closed").is_none() {
             ttl = safety;
         }
         let exp = now.saturating_add(ttl);
@@ -159,10 +274,10 @@ impl Keys {
         }
     }
 
-    /// Removes the fence and dedupe fields of the Producers whose last append is older than the
-    /// Retention, as `prune` in `lib.lua`. Their Records are older too, so they hold none.
+    /// Removes the `p|` field of the Producers whose last append is older than the Retention, as
+    /// `prune` in `lib.lua`. Their Records are older too, so they hold none.
     fn prune(&mut self, now: i64) {
-        let retention: i64 = self.get("ret").and_then(|r| r.parse().ok()).unwrap_or(0);
+        let retention = self.number("ret");
         let min = now - retention;
         let mut old: Vec<_> = self
             .producers
@@ -172,9 +287,7 @@ impl Keys {
             .collect();
         old.sort();
         for (_, producer) in old.into_iter().take(PRUNE_LIMIT) {
-            for field in ["e", "d", "h"] {
-                self.meta.remove(&format!("{field}|{producer}"));
-            }
+            self.remove(format!("p|{producer}"));
             self.producers.remove(&producer);
         }
     }
@@ -182,7 +295,7 @@ impl Keys {
     /// The newest id the Stream gave. Redis drops it with an expired log, so the meta's `newest`
     /// keeps the next ids above the old ones.
     fn newest_id(&self) -> (u64, u64) {
-        let newest = self.get("newest").and_then(|id| parse_id(id));
+        let newest = self.text("newest").and_then(parse_id);
         self.last_id.max(newest.unwrap_or_default())
     }
 
@@ -194,8 +307,8 @@ impl Keys {
     /// Refuses a create that names another owner than the Stream has, as `check_identity` in
     /// `lib.lua`.
     fn check_identity(&self, owner: &str, chain: &str) -> StreamResult<()> {
-        let stored = self.get("oc").map_or("", String::as_str);
-        if self.get("own").map(String::as_str) != Some(owner) || stored != chain {
+        let stored = self.text("oc").unwrap_or_default();
+        if self.text("own") != Some(owner) || stored != chain {
             return Err(refuse(
                 Reason::NotOwner,
                 "the Stream has another owner than the create names",
@@ -207,12 +320,12 @@ impl Keys {
     fn trim(&mut self, now: i64) {
         if self.log.is_none() {
             // The expired log took every Record, so a read from an older offset must fail.
-            if let Some(newest) = self.get("newest").and_then(|id| parse_id(id)) {
+            if let Some(newest) = self.text("newest").and_then(parse_id) {
                 self.raise_trimmed(newest);
             }
             return;
         }
-        let retention: i64 = self.get("ret").and_then(|r| r.parse().ok()).unwrap_or(0);
+        let retention = self.number("ret");
         let min = now - retention;
         if min <= 0 {
             return;
@@ -235,9 +348,8 @@ impl Keys {
     /// Sets the trimmed offset to `id`, unless it is already at or past it.
     fn raise_trimmed(&mut self, id: (u64, u64)) {
         let moves = self
-            .meta
-            .get("trimmed")
-            .and_then(|t| parse_id(t))
+            .text("trimmed")
+            .and_then(parse_id)
             .is_none_or(|trimmed| trimmed < id);
         if moves {
             self.set("trimmed", id_text(id));
@@ -329,14 +441,16 @@ impl MemoryStore {
 impl MemoryStore {
     /// Changes one meta field, for tests of what the scripts refuse.
     #[doc(hidden)]
-    pub fn test_set_meta(&self, namespace: &str, stream_id: &str, field: &str, value: &str) {
+    pub fn test_set_meta(&self, namespace: &str, stream_id: &str, field: &[u8], value: &[u8]) {
         self.with(namespace, stream_id, |keys, _| keys.set(field, value));
     }
 
     /// One meta field, for tests.
     #[doc(hidden)]
-    pub fn test_meta(&self, namespace: &str, stream_id: &str, field: &str) -> Option<String> {
-        self.with(namespace, stream_id, |keys, _| keys.get(field).cloned())
+    pub fn test_meta(&self, namespace: &str, stream_id: &str, field: &[u8]) -> Option<Vec<u8>> {
+        self.with(namespace, stream_id, |keys, _| {
+            keys.get(field).map(<[u8]>::to_vec)
+        })
     }
 
     /// The ms left on the log and on the meta, -2 for a key that doesn't exist, as `PTTL`.
@@ -415,7 +529,7 @@ impl Store for MemoryStore {
             String::new()
         };
         let created = self.with(namespace, stream_id, |keys, now| {
-            let Some(stored) = keys.get("ret").cloned() else {
+            if keys.get("ret").is_none() {
                 keys.set("v", FORMAT_VERSION.to_string());
                 keys.set("ret", retention.to_string());
                 keys.set("own", owner);
@@ -424,13 +538,13 @@ impl Store for MemoryStore {
                 }
                 keys.refresh(now, safety, tombstone);
                 return Ok((CreateOutcome::Created, retention));
-            };
+            }
             keys.check_live(now)?;
             keys.check_identity(owner, &chain)?;
             if keys.get("closed").is_some() {
                 return Err(refuse(Reason::Closed, "the Stream is closed"));
             }
-            Ok((CreateOutcome::Exists, stored.parse().unwrap_or(0)))
+            Ok((CreateOutcome::Exists, keys.number("ret")))
         });
         let (outcome, stored) = created?;
         Ok(Created {
@@ -451,16 +565,15 @@ impl Store for MemoryStore {
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
         let withdrawal = &batch.withdrawal;
         let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
-        let suffix = format!("|{}|{}", producer.kind, producer.id);
+        let field = format!("p|{}|{}", producer.kind, producer.id);
         let member = format!("{}|{}", producer.kind, producer.id);
         let appended = self.with(namespace, stream_id, |keys, now| {
+            let stored = keys.get(&field).map(ProducerField::try_from).transpose()?;
+            // Every append sets the fence to its epoch, so the fence is the last batch's epoch.
+            let previous = stored.filter(|stored| stored.fence == epoch);
             // The lock also covers the dedupe check, so no other batch takes the same number.
             let sequence = match batch.sequence {
-                0 => keys
-                    .get(&format!("d{suffix}"))
-                    .and_then(|last| last.strip_prefix(&format!("{epoch}|")))
-                    .and_then(|rest| rest.split('|').next())
-                    .map_or(1, |last| last.parse::<i64>().unwrap_or(0) + 1),
+                0 => previous.map_or(1, |previous| previous.sequence + 1),
                 sequence => sequence,
             };
             if !(1..=MAX_SEQUENCE).contains(&sequence) {
@@ -470,37 +583,39 @@ impl Store for MemoryStore {
                 ));
             }
             keys.check_live(now)?;
-            if let Some(last) = keys.get(&format!("d{suffix}")) {
-                let parts: Vec<&str> = last.split('|').collect();
-                if parts.len() == 5 && parts[0] == epoch {
-                    let last_sequence: i64 = parts[1].parse().unwrap_or(0);
-                    if sequence == last_sequence {
-                        if parts[4] != batch.digest {
-                            return Err(refuse(
-                                Reason::SeqDivergent,
-                                &format!(
-                                    "sequence {sequence} has other content than the batch the \
-                                     Store has"
-                                ),
-                            ));
-                        }
-                        return Ok((true, parts[2].to_string(), parts[3].to_string(), false));
-                    }
-                    if sequence < last_sequence {
+            if let Some(previous) = previous {
+                if sequence == previous.sequence {
+                    if previous.digest != batch.digest {
                         return Err(refuse(
-                            Reason::Sequence,
-                            &format!("sequence {sequence} is below the last one, {last_sequence}"),
+                            Reason::SeqDivergent,
+                            &format!(
+                                "sequence {sequence} has other content than the batch the Store \
+                                 has"
+                            ),
                         ));
                     }
+                    let (first, last) = previous
+                        .entries
+                        .map(|((ms, seq), (last_ms, last_seq))| {
+                            (format!("{ms}-{seq}"), format!("{last_ms}-{last_seq}"))
+                        })
+                        .unwrap_or_default();
+                    return Ok((true, first, last, false));
+                }
+                if sequence < previous.sequence {
+                    return Err(refuse(
+                        Reason::Sequence,
+                        &format!(
+                            "sequence {sequence} is below the last one, {}",
+                            previous.sequence
+                        ),
+                    ));
                 }
             }
             if keys.get("closed").is_some() {
                 return Err(refuse(Reason::Closed, "the Stream is closed"));
             }
-            if keys
-                .get(&format!("e{suffix}"))
-                .is_some_and(|newest| epoch.as_str() < newest.as_str())
-            {
+            if stored.is_some_and(|stored| epoch < stored.fence) {
                 return Err(refuse(
                     Reason::Fenced,
                     "the epoch is lower than the newest one of the Producer",
@@ -511,9 +626,9 @@ impl Store for MemoryStore {
 
             // A client's newer epoch only fences, as in `append.lua`.
             let flagged = producer.kind != StreamProducerKind::Client as i32
-                && keys
-                    .get(&format!("h{suffix}"))
-                    .is_some_and(|holds| holds.as_str() < epoch.as_str());
+                && stored
+                    .and_then(|stored| stored.held)
+                    .is_some_and(|held| held < epoch);
 
             keys.trim(now);
             keys.prune(now);
@@ -543,16 +658,26 @@ impl Store for MemoryStore {
                 }
             }
 
-            keys.set(&format!("e{suffix}"), epoch.clone());
-            keys.set(
-                &format!("d{suffix}"),
-                format!("{epoch}|{sequence}|{first}|{last}|{}", batch.digest),
-            );
-            if records > 0 {
-                keys.set(&format!("h{suffix}"), epoch.clone());
+            let held = if records > 0 {
+                Some(epoch)
             } else if flagged {
-                keys.meta.remove(&format!("h{suffix}"));
-            }
+                None
+            } else {
+                stored.and_then(|stored| stored.held)
+            };
+            let entries = if last.is_empty() {
+                None
+            } else {
+                Some((entry_id(&first)?, entry_id(&last)?))
+            };
+            let value = ProducerField {
+                fence: epoch,
+                held,
+                sequence,
+                entries,
+                digest: batch.digest,
+            };
+            keys.set(field.as_str(), value.encode());
             if !last.is_empty() {
                 keys.set("newest", last.clone());
             }
@@ -580,20 +705,18 @@ impl Store for MemoryStore {
     ) -> StreamResult<Closed> {
         let stream_id = handle.id.as_str();
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
-        let suffix = format!("|{}|{}", producer.kind, producer.id);
+        let field = format!("p|{}|{}", producer.kind, producer.id);
         let tombstone = millis(TOMBSTONE);
         let chain = owner_chain(handle);
         let closed = self.with(namespace, stream_id, |keys, now| {
             keys.check_live(now)?;
             keys.check_owner(producer.kind, &chain)?;
             if keys.get("closed").is_some() {
-                let id = keys.get("close_id").cloned().unwrap_or_default();
+                let id = keys.text("close_id").unwrap_or_default().to_string();
                 return Ok((id, true));
             }
-            if keys
-                .get(&format!("e{suffix}"))
-                .is_some_and(|newest| epoch.as_str() < newest.as_str())
-            {
+            let stored = keys.get(&field).map(ProducerField::try_from).transpose()?;
+            if stored.is_some_and(|stored| epoch < stored.fence) {
                 return Err(refuse(
                     Reason::Fenced,
                     "the epoch is lower than the newest one of the Producer",
@@ -638,10 +761,9 @@ impl Store for MemoryStore {
         };
         self.with(namespace, stream_id, |keys, now| {
             let offset = |field: &str| -> StreamResult<i64> {
-                keys.get(field).map_or(Ok(0), |id| offset_of_entry_id(id))
+                keys.text(field).map_or(Ok(0), offset_of_entry_id)
             };
-            let number =
-                |field: &str| -> i64 { keys.get(field).and_then(|n| n.parse().ok()).unwrap_or(0) };
+            let number = |field: &str| keys.number(field);
             let state = StreamState {
                 exists: keys.get("v").is_some(),
                 version: number("v") as u32,
@@ -739,5 +861,37 @@ mod tests {
         // The ids keep increasing when the clock steps back.
         assert_eq!(keys.add(3, Fields::default()), "5-2");
         assert_eq!(keys.add(9, Fields::default()), "9-0");
+    }
+
+    #[test]
+    fn a_producer_field_matches_the_shared_vectors() {
+        let vectors: serde_json::Value =
+            serde_json::from_str(include_str!("../testdata/fields.json")).unwrap();
+        let hex = |text: &str| -> Vec<u8> {
+            (0..text.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap())
+                .collect()
+        };
+        for case in vectors["producer_values"].as_array().unwrap() {
+            let text = |name: &str| case[name].as_str().unwrap();
+            let key = |name: &str| case[name].as_str().map(|key| hex(key).try_into().unwrap());
+            let entries = (!text("first").is_empty()).then(|| {
+                (
+                    entry_id(text("first")).unwrap(),
+                    entry_id(text("last")).unwrap(),
+                )
+            });
+            let field = ProducerField {
+                fence: key("fence").unwrap(),
+                held: key("held"),
+                sequence: case["sequence"].as_i64().unwrap(),
+                entries,
+                digest: hex(text("digest")).try_into().unwrap(),
+            };
+            let value = hex(text("value"));
+            assert_eq!(field.encode(), value, "{}", text("name"));
+            assert_eq!(ProducerField::try_from(value.as_slice()).unwrap(), field);
+        }
     }
 }

@@ -2,14 +2,14 @@
   {
     "name": "empty batch",
     "records": [],
-    "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    "digest": "e3b0c44298fc1c149afbf4c8996fb924"
   },
   {
     "name": "one record, no body",
     "records": [
       {}
     ],
-    "digest": "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d"
+    "digest": "6e340b9cffb37a989ca544e6bb780a2c"
   },
   {
     "name": "one record, an empty body",
@@ -18,7 +18,7 @@
         "data": ""
       }
     ],
-    "digest": "6bb0f5246ac6ee3fa6a6879c512f393f05348f9cbb2144fe34dc8a8a4354f208"
+    "digest": "6bb0f5246ac6ee3fa6a6879c512f393f"
   },
   {
     "name": "one record",
@@ -27,7 +27,7 @@
         "data": "68656c6c6f"
       }
     ],
-    "digest": "00cedb65fe85721791cf031124cc4ba2722ab1ba174277c3d79d9b2ceba637a1"
+    "digest": "00cedb65fe85721791cf031124cc4ba2"
   },
   {
     "name": "metadata in key order",
@@ -40,7 +40,7 @@
         "data": "7b2278223a317d"
       }
     ],
-    "digest": "eea3c073d22bc6bd16ffd5c5a18a290037e9b4df892664c75ed41192a5ce1542"
+    "digest": "eea3c073d22bc6bd16ffd5c5a18a2900"
   },
   {
     "name": "two records",
@@ -52,7 +52,7 @@
         "data": "0203"
       }
     ],
-    "digest": "b75e10295b9753dbbc5774e454c9a7fbbfac2aa5775d9525e2b8cddff8ed9106"
+    "digest": "b75e10295b9753dbbc5774e454c9a7fb"
   },
   {
     "name": "external payloads",
@@ -65,7 +65,7 @@
         ]
       }
     ],
-    "digest": "381530dbc9c2fb0d5ddefbc99e72c6e1f79e6f4127536a74b10f20e568440f64"
+    "digest": "381530dbc9c2fb0d5ddefbc99e72c6e1"
   },
   {
     "name": "metadata key and value split one way",
@@ -76,7 +76,7 @@
         }
       }
     ],
-    "digest": "be5bd276e8b11daeb753e3d3b6d6f93d6ece8a9e53fe665356d7f946739c86aa"
+    "digest": "be5bd276e8b11daeb753e3d3b6d6f93d"
   },
   {
     "name": "metadata key and value split another way",
@@ -87,6 +87,6 @@
         }
       }
     ],
-    "digest": "ddc7d1a81ecebb12548d3adae06622b809df0494090db434f2f98c0a46aa3d32"
+    "digest": "ddc7d1a81ecebb12548d3adae06622b8"
   }
 ]

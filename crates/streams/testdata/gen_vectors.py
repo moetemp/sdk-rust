@@ -26,33 +26,28 @@ def keys(prefix, namespace, stream_id):
     return {"meta": f"{base}:meta", "log": f"{base}:log", "producers": f"{base}:producers"}
 
 
-def hex64(value):
-    return f"{max(value, 0):016x}"
+def be64(value):
+    return max(value, 0).to_bytes(8, "big")
 
 
-def hex32(value):
-    return f"{max(value, 0):08x}"
+def be32(value):
+    return max(value, 0).to_bytes(4, "big")
 
 
 def task_key(started_event_id=0, attempt=0, started_time=(0, 0)):
-    return ".".join(
-        [hex64(started_event_id), hex32(attempt), hex64(started_time[0]), hex32(started_time[1])]
-    )
+    """24 bytes, which compare as bytes in the order of the fields."""
+    return be64(started_event_id) + be32(attempt) + be64(started_time[0]) + be32(started_time[1])
 
 
 def epoch_key(epoch):
-    return ".".join(
-        [
-            task_key(
-                epoch.get("task_started_event_id", 0),
-                epoch.get("task_attempt", 0),
-                tuple(epoch.get("task_started_time", (0, 0))),
-            ),
-            hex64(epoch.get("attempt_scheduled_time", (0, 0))[0]),
-            hex32(epoch.get("attempt_scheduled_time", (0, 0))[1]),
-            hex32(epoch.get("attempt", 0)),
-        ]
+    """40 bytes, the task key and then the scheduled time and the attempt."""
+    scheduled = epoch.get("attempt_scheduled_time", (0, 0))
+    task = task_key(
+        epoch.get("task_started_event_id", 0),
+        epoch.get("task_attempt", 0),
+        tuple(epoch.get("task_started_time", (0, 0))),
     )
+    return task + be64(scheduled[0]) + be32(scheduled[1]) + be32(epoch.get("attempt", 0))
 
 
 def ids():
@@ -122,13 +117,52 @@ def epochs():
         {"kind": "empty", "epoch": {}},
     ]
     for case in cases:
-        case["key"] = epoch_key(case["epoch"])
+        case["key"] = epoch_key(case["epoch"]).hex()
         epoch = case["epoch"]
         case["task_key"] = task_key(
             epoch.get("task_started_event_id", 0),
             epoch.get("task_attempt", 0),
             tuple(epoch.get("task_started_time", (0, 0))),
-        )
+        ).hex()
+    return cases
+
+
+def entry_id(text):
+    """An entry id in a Producer field, the ms in 8 bytes and the seq in 4, zero for none."""
+    if not text:
+        return bytes(12)
+    ms, seq = (int(x) for x in text.split("-"))
+    return ms.to_bytes(8, "big") + seq.to_bytes(4, "big")
+
+
+def producer_value(fence, held, sequence, first, last, digest):
+    """The 129 bytes of a `p|` field."""
+    flags = bytes([1 if held else 0])
+    return (flags + fence + (held or bytes(40)) + sequence.to_bytes(8, "big") + entry_id(first)
+            + entry_id(last) + digest)
+
+
+def producer_values():
+    held = epoch_key({"attempt_scheduled_time": [1760000001, 999999999], "attempt": 2})
+    newer = epoch_key({"attempt_scheduled_time": [1760000002, 0], "attempt": 3})
+    cases = []
+    for name, fence, held_key, sequence, first, last, records in [
+        ("a batch with Records", held, held, 3, "1760000000123-4", "1760000000123-6",
+         [{"data": "01"}]),
+        ("an empty batch that wrote no entry", newer, None, 1, "", "", []),
+    ]:
+        batch_digest = bytes.fromhex(digest(records))
+        value = producer_value(fence, held_key, sequence, first, last, batch_digest)
+        cases.append({
+            "name": name,
+            "fence": fence.hex(),
+            "held": held_key.hex() if held_key else None,
+            "sequence": sequence,
+            "first": first,
+            "last": last,
+            "digest": batch_digest.hex(),
+            "value": value.hex(),
+        })
     return cases
 
 
@@ -139,16 +173,16 @@ def fields():
         "kind": 3,
         "producer_id": producer,
         "run_id": run,
-        "fence": f"e|3|{producer}",
-        "dedupe": f"d|3|{producer}",
-        "holds": f"h|3|{producer}",
+        "producer": f"p|3|{producer}",
         "run_wrote": f"run|{part(run)}",
         "withdrawn_run": f"wr|{part(run)}",
+        "producer_values": producer_values(),
     }
 
 
 def digest(records):
-    """The content digest of a batch, which a dedupe entry keeps."""
+    """The content digest of a batch, which a dedupe entry keeps, as the first 16 bytes of the
+    SHA-256."""
     out = hashlib.sha256()
 
     def part(data):
@@ -172,11 +206,11 @@ def digest(records):
         out.update(len(external).to_bytes(8, "big"))
         for size in external:
             out.update(size.to_bytes(8, "big", signed=True))
-    return out.hexdigest()
+    return out.digest()[:16].hex()
 
 
 def digests():
-    """Batches as hex bytes, with the digest that the crate's `batch_digest` must compute."""
+    """Batches as hex bytes, with the hex digest that the crate's `batch_digest` must compute."""
     cases = [
         {"name": "empty batch", "records": []},
         {"name": "one record, no body", "records": [{}]},
