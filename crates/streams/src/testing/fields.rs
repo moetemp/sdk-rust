@@ -44,8 +44,9 @@ pub fn withdrawn_task(run_id: &str, task_key: &str) -> String {
     format!("ow|{}|{task_key}", encode_part(run_id))
 }
 
-/// The task facts of the run's highest task, as `<task key>|<completed task key>|<failed ids>`.
-/// The completed key is empty before the first one, and spaces separate the ids.
+/// The task facts of the run's highest task, as task keys back to back. These are its own key, the
+/// completed task's key or the zero key before the first, and the key of each failed task's
+/// started event id.
 pub fn task_facts(run_id: &str) -> String {
     format!("tf|{}", encode_part(run_id))
 }

@@ -151,7 +151,7 @@ def fields():
         "open_tasks": f"oa|{part(run)}",
         "withdrawn_task": f"ow|{part(run)}|{withdrawn}",
         "task_facts": f"tf|{part(run)}",
-        "task_facts_value": f"{task}|{completed}|3",
+        "task_facts_value": task + completed + task_key(3),
     }
 
 

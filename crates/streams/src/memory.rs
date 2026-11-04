@@ -7,7 +7,7 @@ use crate::{
     epoch::{epoch_key, task_key, task_of},
     ids::{StreamKeys, encode_part},
     offset::{entry_id_of_offset, offset_of_entry_id},
-    proto::{Producer, StreamHandle, StreamProducerKind},
+    proto::{Producer, StreamHandle, StreamProducerKind, WorkflowTaskEpoch},
     store::{
         Appended, Batch, Capabilities, Closed, CreateOutcome, Created, Entry, FORMAT_VERSION,
         MAX_SEQUENCE, Owner, Store, StreamState, TOMBSTONE, Withdrawal, owner_chain,
@@ -120,16 +120,26 @@ fn orphan_tasks(open: &[String], t: &str, c: &str, failed: &[i64]) -> (Vec<Strin
     (withdrawn, kept)
 }
 
-/// Whether the facts that `tf|<run>` keeps show that task `key` never completed.
+/// The task key of the Workflow Task `[started_event_id]`, with no attempt and no time.
+fn started_key(started_event_id: i64) -> String {
+    task_key(&WorkflowTaskEpoch {
+        started_event_id,
+        ..Default::default()
+    })
+}
+
+/// Whether the facts that `tf|<run>` keeps show that task `key` never completed. The zero key in
+/// the completed place works as no completed task, since no task key is below it.
 fn fenced_by_facts(facts: &str, key: &str) -> bool {
-    let mut parts = facts.splitn(3, '|');
-    let (Some(t), Some(c), Some(failed)) = (parts.next(), parts.next(), parts.next()) else {
+    let width = started_key(0).len();
+    let keys: Vec<&str> = (0..facts.len())
+        .step_by(width)
+        .filter_map(|at| facts.get(at..at + width))
+        .collect();
+    let [t, c, failed @ ..] = keys.as_slice() else {
         return false;
     };
-    let failed: Vec<i64> = failed
-        .split_whitespace()
-        .filter_map(|id| id.parse().ok())
-        .collect();
+    let failed: Vec<i64> = failed.iter().map(|failed| started(failed)).collect();
     never_completed(key, t, c, &failed)
 }
 
@@ -553,8 +563,9 @@ impl Store for MemoryStore {
             .unwrap_or_default();
         let open_field = format!("oa|{run}");
         let gone_field = format!("ow|{run}|{task}");
-        // The task facts of the run's highest task, as `<task key>|<completed task key>|<failed
-        // ids>`. The completed key is empty before the first one, and spaces separate the ids.
+        // The task facts of the run's highest task, as task keys back to back. These are its own
+        // key, the completed task's key or the zero key before the first, and the key of each
+        // failed task's started event id.
         let facts_field = format!("tf|{run}");
         let appended = self.with(namespace, stream_id, |keys, now| {
             // The lock also covers the dedupe check, so no other batch takes the same number.
@@ -734,14 +745,14 @@ impl Store for MemoryStore {
                 // A long Local Activity of an earlier task writes with older facts.
                 let newest = keys
                     .get(&facts_field)
-                    .and_then(|newest| newest.split('|').next());
+                    .and_then(|newest| newest.get(..task.len()));
                 if newest.is_none_or(|newest| newest < task.as_str()) {
-                    let failed: Vec<String> =
-                        facts.failed_tasks.iter().map(i64::to_string).collect();
-                    keys.set(
-                        &facts_field,
-                        format!("{task}|{completed}|{}", failed.join(" ")),
-                    );
+                    let mut value = task.clone();
+                    value.push_str(&task_key(&facts.completed.copied().unwrap_or_default()));
+                    for &failed in facts.failed_tasks {
+                        value.push_str(&started_key(failed));
+                    }
+                    keys.set(&facts_field, value);
                 }
             }
             if !last.is_empty() {
