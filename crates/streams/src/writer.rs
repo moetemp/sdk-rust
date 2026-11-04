@@ -175,7 +175,7 @@ fn check_sizes(producer: &Producer, records: &[AppendRecord]) -> StreamResult<()
 }
 
 /// The namespace, Stream id, Producer id and epoch key of a writer.
-type WriterKey = (String, String, String, String);
+type WriterKey = (String, String, String, [u8; crate::epoch::EPOCH_KEY_LEN]);
 
 /// One open writer and the references to it.
 struct Open {
