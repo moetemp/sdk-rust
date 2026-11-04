@@ -6,7 +6,7 @@ use crate::{
         AppendRecord, Producer, StreamClose, StreamCloseStatus, StreamData, StreamRecord,
         StreamSuperseded, stream_record::Item,
     },
-    store::{MAX_BATCH_BYTES, MAX_RECORD_BYTES},
+    store::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES},
 };
 use prost::Message;
 use temporalio_common::protos::temporal::api::{
@@ -32,6 +32,15 @@ pub(crate) fn data_records(
     producer: &Producer,
     records: Vec<AppendRecord>,
 ) -> StreamResult<Vec<Vec<u8>>> {
+    if records.len() > MAX_BATCH_RECORDS {
+        return Err(StreamError::new(
+            Reason::TooLarge,
+            format!(
+                "The batch has {} Records, more than {MAX_BATCH_RECORDS}",
+                records.len()
+            ),
+        ));
+    }
     let records: Vec<_> = records
         .into_iter()
         .map(|record| data_record(producer, record))
@@ -145,6 +154,16 @@ mod tests {
             Reason::TooLarge
         );
         assert_eq!(data_records(&producer, vec![record(10)]).unwrap().len(), 1);
+        let small = vec![record(1); MAX_BATCH_RECORDS + 1];
+        assert_eq!(
+            data_records(&producer, small).unwrap_err().reason,
+            Reason::TooLarge
+        );
+        let small = vec![record(1); MAX_BATCH_RECORDS];
+        assert_eq!(
+            data_records(&producer, small).unwrap().len(),
+            MAX_BATCH_RECORDS
+        );
     }
 
     fn canceled() -> Failure {
