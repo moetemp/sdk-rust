@@ -1313,6 +1313,43 @@ async fn a_first_write_of_a_task_that_never_completed_is_fenced() {
     }
 }
 
+/// Task facts that a Store would drop or misread fail before any write. Only a Local Activity sends
+/// them, failed tasks need the last completed task, and a started event id is positive.
+async fn a_write_with_bad_task_facts_fails() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let facts = |failed: Vec<i64>| AppendRecordsRequest {
+            failed_tasks: failed,
+            ..local_activity_write(&case, &run, "call-1", 4, 2, "bad")
+        };
+        let mut no_completed = facts(vec![3]);
+        no_completed.previous_completed_task = None;
+        let by_client = AppendRecordsRequest {
+            producer: Some(client(1)),
+            ..facts(vec![])
+        };
+        let by_activity = AppendRecordsRequest {
+            producer: Some(activity(1, 100)),
+            ..facts(vec![3])
+        };
+        for bad in [
+            facts(vec![0]),
+            facts(vec![-5]),
+            no_completed,
+            by_client,
+            by_activity,
+        ] {
+            let error = call::<_, AppendRecordsResponse>(&case.ext, "AppendRecords", bad)
+                .await
+                .unwrap_err();
+            assert_eq!(reason(&error), "stream_invalid");
+        }
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert!(texts(&read).is_empty());
+    }
+}
+
 /// A Local Activity write with no task facts, as from an older Core, is withdrawn by a later write
 /// whose facts show that its task never completed.
 async fn a_write_with_no_task_facts_is_withdrawn_by_a_later_write() {
@@ -1759,6 +1796,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_local_activity_of_a_task_that_never_completed_is_withdrawn_by_the_next_write),
     case!(a_failed_task_before_the_last_completed_one_is_withdrawn_by_its_id),
     case!(a_first_write_of_a_task_that_never_completed_is_fenced),
+    case!(a_write_with_bad_task_facts_fails),
     case!(a_write_with_no_task_facts_is_withdrawn_by_a_later_write),
     case!(a_batch_writes_an_orphan_item_and_an_epoch_item),
     case!(a_resend_of_an_orphan_batch_withdraws_nothing_again),

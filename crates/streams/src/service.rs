@@ -145,6 +145,33 @@ fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
     Ok(producer)
 }
 
+/// Refuses task facts that a Store would drop or misread. Only a Local Activity has its run's task
+/// facts, and a failed task is a started event id, which is never zero or negative.
+fn check_task_facts(producer: &Producer, request: &AppendRecordsRequest) -> StreamResult<()> {
+    let completed = request.previous_completed_task.as_ref();
+    if completed.is_none() && request.failed_tasks.is_empty() {
+        return Ok(());
+    }
+    if producer.kind != StreamProducerKind::LocalActivity as i32 {
+        return Err(StreamError::invalid(
+            "Only a Local Activity sends its run's task facts",
+        ));
+    }
+    if completed.is_none() {
+        return Err(StreamError::invalid(
+            "Failed tasks need the run's last completed task",
+        ));
+    }
+    if completed.is_some_and(|c| c.started_event_id < 0)
+        || request.failed_tasks.iter().any(|&id| id <= 0)
+    {
+        return Err(StreamError::invalid(
+            "A task's started event id must be positive",
+        ));
+    }
+    Ok(())
+}
+
 /// Checks the owner of a create, which must be a Workflow run with a handle of its run chain. A
 /// Store stores that chain and checks every later create and close against it.
 fn create_owner<'a>(owner: &'a Producer, handle: &StreamHandle) -> StreamResult<&'a Producer> {
@@ -276,6 +303,7 @@ impl StreamService {
             }
             self.store.capabilities().require(Capabilities::RUN_FENCE)?;
         }
+        check_task_facts(producer, &request)?;
         let digest = batch_digest(&request.records);
         let records = data_records(producer, request.records)?;
         let bytes = superseded(producer, &request.withdraw_run);
