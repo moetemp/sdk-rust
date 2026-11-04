@@ -1,8 +1,8 @@
 //! Producer epochs, their order, and the withdrawal rule of a `Superseded` item.
 //!
-//! The Lua scripts compare epochs as strings. So an epoch is stored in Redis as a key of
-//! fixed-width hex fields, in the order of comparison. A string comparison of two keys then orders
-//! the epochs field by field. `testdata/epochs.json` has the shared vectors of the keys.
+//! A Store keeps an epoch as a key of fixed-width big-endian fields, in the order of comparison.
+//! A byte comparison of two keys then orders the epochs field by field. `testdata/epochs.json` has
+//! the shared vectors of the keys, in hex.
 
 use crate::proto::{
     Producer, ProducerEpoch, StreamProducerKind, StreamRecord, StreamSuperseded, WorkflowTaskEpoch,
@@ -11,42 +11,47 @@ use crate::proto::{
 use prost_types::Timestamp;
 use std::cmp::Ordering;
 
-fn hex64(value: i64) -> String {
-    format!("{:016x}", value.max(0))
+/// The length of a [task_key].
+pub const TASK_KEY_LEN: usize = 24;
+/// The length of an [epoch_key].
+pub const EPOCH_KEY_LEN: usize = 40;
+
+// A negative field is clamped at zero, since its bytes would outrank every real epoch.
+fn be64(value: i64) -> [u8; 8] {
+    value.max(0).to_be_bytes()
 }
 
-fn hex32(value: i32) -> String {
-    format!("{:08x}", value.max(0))
+fn be32(value: i32) -> [u8; 4] {
+    value.max(0).to_be_bytes()
 }
 
-fn time_fields(time: Option<&Timestamp>) -> [String; 2] {
-    let (seconds, nanos) = time.map_or((0, 0), |time| (time.seconds, time.nanos));
-    [hex64(seconds), hex32(nanos)]
+fn time_fields(time: Option<&Timestamp>) -> (i64, i32) {
+    time.map_or((0, 0), |time| (time.seconds, time.nanos))
 }
 
-/// The key of a Workflow Task attempt, from its started event id, attempt and started time. The
-/// epoch keys of the run and of the task's Local Activities start with it.
-pub fn task_key(task: &WorkflowTaskEpoch) -> String {
-    let [seconds, nanos] = time_fields(task.started_time.as_ref());
-    [
-        hex64(task.started_event_id),
-        hex32(task.attempt),
-        seconds,
-        nanos,
-    ]
-    .join(".")
+/// The key of a Workflow Task attempt. It is the started event id, the attempt, and the started
+/// seconds and nanos, in 8, 4, 8 and 4 bytes. The epoch keys of the run and of the task's Local
+/// Activities start with it.
+pub fn task_key(task: &WorkflowTaskEpoch) -> [u8; TASK_KEY_LEN] {
+    let (seconds, nanos) = time_fields(task.started_time.as_ref());
+    let mut key = [0; TASK_KEY_LEN];
+    key[..8].copy_from_slice(&be64(task.started_event_id));
+    key[8..12].copy_from_slice(&be32(task.attempt));
+    key[12..20].copy_from_slice(&be64(seconds));
+    key[20..].copy_from_slice(&be32(nanos));
+    key
 }
 
-/// The key of an epoch. Fields that a kind doesn't use compare as zero.
-pub fn epoch_key(epoch: &ProducerEpoch) -> String {
-    let [scheduled_seconds, scheduled_nanos] = time_fields(epoch.attempt_scheduled_time.as_ref());
-    [
-        task_key(&task_of(epoch)),
-        scheduled_seconds,
-        scheduled_nanos,
-        hex32(epoch.attempt),
-    ]
-    .join(".")
+/// The key of an epoch. It is the task key, then the attempt's scheduled seconds and nanos and the
+/// attempt, in 8, 4 and 4 bytes. Fields that a kind doesn't use compare as zero.
+pub fn epoch_key(epoch: &ProducerEpoch) -> [u8; EPOCH_KEY_LEN] {
+    let (seconds, nanos) = time_fields(epoch.attempt_scheduled_time.as_ref());
+    let mut key = [0; EPOCH_KEY_LEN];
+    key[..TASK_KEY_LEN].copy_from_slice(&task_key(&task_of(epoch)));
+    key[24..32].copy_from_slice(&be64(seconds));
+    key[32..36].copy_from_slice(&be32(nanos));
+    key[36..].copy_from_slice(&be32(epoch.attempt));
+    key
 }
 
 /// The Workflow Task fields of an epoch.
@@ -131,7 +136,7 @@ fn of_run(producer: &Producer, superseded: &StreamSuperseded) -> bool {
 mod tests {
     use super::*;
 
-    // Without the clamp, the hex of a negative field would outrank every real epoch.
+    // Without the clamp, the bytes of a negative field would outrank every real epoch.
     #[test]
     fn a_negative_field_compares_as_zero() {
         let negative = ProducerEpoch {
