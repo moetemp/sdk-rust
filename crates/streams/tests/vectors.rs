@@ -130,13 +130,13 @@ fn offsets_match() {
 fn epoch_keys_match() {
     for case in load("epochs.json").as_array().unwrap() {
         let epoch = epoch(&case["epoch"]);
-        assert_eq!(epoch_key(&epoch), text(case, "key"));
+        assert_eq!(epoch_key(&epoch).to_vec(), hex(text(case, "key")));
         let task = WorkflowTaskEpoch {
             started_event_id: epoch.task_started_event_id,
             attempt: epoch.task_attempt,
             started_time: epoch.task_started_time,
         };
-        assert_eq!(task_key(&task), text(case, "task_key"));
+        assert_eq!(task_key(&task).to_vec(), hex(text(case, "task_key")));
     }
 }
 
@@ -224,8 +224,8 @@ fn batch_digests_match() {
             })
             .collect();
         assert_eq!(
-            batch_digest(&records),
-            text(case, "digest"),
+            batch_digest(&records).to_vec(),
+            hex(text(case, "digest")),
             "{}",
             text(case, "name")
         );
