@@ -257,7 +257,7 @@ impl StreamService {
             producer,
             sequence: request.sequence,
             records: &records,
-            digest: &digest,
+            digest,
             withdrawal: Withdrawal {
                 withdraw_run: &request.withdraw_run,
                 superseded: &bytes,
