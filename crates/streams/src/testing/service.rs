@@ -1277,6 +1277,42 @@ async fn a_failed_task_before_the_last_completed_one_is_withdrawn_by_its_id() {
     }
 }
 
+/// A call of a task that failed before the call wrote is fenced on its first write, by the task
+/// facts of the run's highest task. A write of a lower task keeps those facts.
+async fn a_first_write_of_a_task_that_never_completed_is_fenced() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let _: AppendRecordsResponse = call(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-1", 2, 0, "done"),
+        )
+        .await
+        .unwrap();
+        // Task [3] runs call-2 and fails before call-2 writes. Task [4] knows that [3] failed.
+        let mut retry = local_activity_write(&case, &run, "call-3", 4, 2, "retry");
+        retry.failed_tasks = vec![3];
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", retry).await.unwrap();
+        // Call-1 of the completed task [2] still runs and writes with its older facts.
+        let more = AppendRecordsRequest {
+            sequence: 2,
+            ..local_activity_write(&case, &run, "call-1", 2, 0, "more")
+        };
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", more).await.unwrap();
+        let late = call::<_, AppendRecordsResponse>(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-2", 3, 2, "late"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reason(&late), "stream_fenced");
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["done", "retry", "more"]);
+    }
+}
+
 /// The Workflow Task `[started_event_id]` in its attempt `attempt`, started at `seconds`.
 fn task(started_event_id: i64, attempt: i32, seconds: i64) -> WorkflowTaskEpoch {
     WorkflowTaskEpoch {
@@ -1627,6 +1663,7 @@ pub const CASES: &[super::Case] = &[
     case!(the_close_activity_closes_a_workflow_stream_as_its_workflow_producer),
     case!(a_local_activity_of_a_task_that_never_completed_is_withdrawn_by_the_next_write),
     case!(a_failed_task_before_the_last_completed_one_is_withdrawn_by_its_id),
+    case!(a_first_write_of_a_task_that_never_completed_is_fenced),
     case!(a_local_activity_of_a_lower_attempt_of_the_completed_task_is_withdrawn),
     case!(a_write_withdraws_a_lower_attempt_of_its_own_task),
     case!(a_withdrawn_run_cant_close_the_stream),

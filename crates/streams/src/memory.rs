@@ -96,24 +96,41 @@ fn started(task_key: &str) -> i64 {
     i64::from_str_radix(&task_key[..16], 16).unwrap_or(0)
 }
 
+/// Whether the facts of task `t` show that task `key` never completed. An orphan item withdraws the
+/// Records of such a task.
+fn never_completed(key: &str, t: &str, c: &str, failed: &[i64]) -> bool {
+    let (s, ts) = (started(key), started(t));
+    let cs = if c.is_empty() { 0 } else { started(c) };
+    failed.contains(&s)
+        || (cs < s && s < ts)
+        || (s == ts && key < t)
+        || (!c.is_empty() && s == cs && key < c)
+}
+
 /// The orphan rule over a run's open Local Activity tasks, as `orphan_tasks` in `lib.lua`.
 fn orphan_tasks(open: &[String], t: &str, c: &str, failed: &[i64]) -> (Vec<String>, Vec<String>) {
-    let ts = started(t);
-    let cs = if c.is_empty() { 0 } else { started(c) };
     let (mut withdrawn, mut kept) = (vec![], vec![]);
     for key in open {
-        let s = started(key);
-        if failed.contains(&s)
-            || (cs < s && s < ts)
-            || (s == ts && key.as_str() < t)
-            || (!c.is_empty() && s == cs && key.as_str() < c)
-        {
+        if never_completed(key, t, c, failed) {
             withdrawn.push(key.clone());
         } else if c.is_empty() || key.as_str() > c {
             kept.push(key.clone());
         }
     }
     (withdrawn, kept)
+}
+
+/// Whether the facts that `tf|<run>` keeps show that task `key` never completed.
+fn fenced_by_facts(facts: &str, key: &str) -> bool {
+    let mut parts = facts.splitn(3, '|');
+    let (Some(t), Some(c), Some(failed)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    let failed: Vec<i64> = failed
+        .split_whitespace()
+        .filter_map(|id| id.parse().ok())
+        .collect();
+    never_completed(key, t, c, &failed)
 }
 
 impl Keys {
@@ -528,14 +545,17 @@ impl Store for MemoryStore {
         } else {
             String::new()
         };
-        let facts = withdrawal
-            .tasks
-            .filter(|_| local_activity && !run.is_empty());
+        let tracked = local_activity && !run.is_empty();
+        let facts = withdrawal.tasks.filter(|_| tracked);
         let completed = facts
             .and_then(|facts| facts.completed)
             .map(task_key)
             .unwrap_or_default();
-        let (open_field, gone_field) = (format!("oa|{run}"), format!("ow|{run}"));
+        let open_field = format!("oa|{run}");
+        let gone_field = format!("ow|{run}");
+        // The task facts of the run's highest task, as `<task key>|<completed task key>|<failed
+        // ids>`. The completed key is empty before the first one, and spaces separate the ids.
+        let facts_field = format!("tf|{run}");
         let appended = self.with(namespace, stream_id, |keys, now| {
             // The lock also covers the dedupe check, so no other batch takes the same number.
             let sequence = match batch.sequence {
@@ -595,10 +615,21 @@ impl Store for MemoryStore {
                     "the epoch is lower than the newest one of the Producer",
                 ));
             }
-            if local_activity && !run.is_empty() && words(keys.get(&gone_field)).contains(&task) {
+            if tracked && words(keys.get(&gone_field)).contains(&task) {
                 return Err(refuse(
                     Reason::Fenced,
                     "a Superseded item withdrew the Workflow Task of the call",
+                ));
+            }
+            // A task can fail before its call writes, so no orphan item withdrew it.
+            if tracked
+                && keys
+                    .get(&facts_field)
+                    .is_some_and(|newest| fenced_by_facts(newest, &task))
+            {
+                return Err(refuse(
+                    Reason::Fenced,
+                    "the run's task facts show that the Workflow Task of the call never completed",
                 ));
             }
             let records = batch.records.len() as u64;
@@ -691,6 +722,20 @@ impl Store for MemoryStore {
                     let mut all = words(keys.get(&gone_field));
                     all.extend(withdrawn.iter().cloned());
                     keys.set(&gone_field, all.join(" "));
+                }
+            }
+            if let Some(facts) = facts {
+                // A long Local Activity of an earlier task writes with older facts.
+                let newest = keys
+                    .get(&facts_field)
+                    .and_then(|newest| newest.split('|').next());
+                if newest.is_none_or(|newest| newest < task.as_str()) {
+                    let failed: Vec<String> =
+                        facts.failed_tasks.iter().map(i64::to_string).collect();
+                    keys.set(
+                        &facts_field,
+                        format!("{task}|{completed}|{}", failed.join(" ")),
+                    );
                 }
             }
             if !last.is_empty() {
