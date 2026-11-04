@@ -101,8 +101,10 @@ pub struct Withdrawal<'a> {
 /// `completed` and before the batch's own task, or one in `failed_tasks`, never completed, so
 /// its Local Activity Records are orphans.
 ///
-/// A Store keeps the facts of the run's highest task and fences a write whose task they show never
-/// completed, since a task can fail before its call writes.
+/// A Store keeps the task of each Local Activity batch with Records, also of one with no facts, so
+/// that a later batch's facts withdraw it. It also keeps the facts of the run's highest task and
+/// fences a write whose task they show never completed, since a task can fail before its call
+/// writes.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TaskFacts<'a> {
     /// The run's last completed Workflow Task, `None` before the first one.

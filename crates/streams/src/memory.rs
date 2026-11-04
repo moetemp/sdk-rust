@@ -643,14 +643,14 @@ impl Store for MemoryStore {
             if keys.withdraw_run(&withdrawn_run) {
                 flagged = true;
             }
+            let open = if tracked {
+                words(keys.get(&open_field))
+            } else {
+                vec![]
+            };
             let (withdrawn, mut open) = match facts {
-                Some(facts) => orphan_tasks(
-                    &words(keys.get(&open_field)),
-                    &task,
-                    &completed,
-                    facts.failed_tasks,
-                ),
-                None => (vec![], vec![]),
+                Some(facts) => orphan_tasks(&open, &task, &completed, facts.failed_tasks),
+                None => (vec![], open),
             };
 
             keys.trim(now);
@@ -709,14 +709,19 @@ impl Store for MemoryStore {
             if !run.is_empty() && records > 0 {
                 keys.set(&format!("run|{run}"), "1");
             }
-            if facts.is_some() {
-                if records > 0 && !open.contains(&task) {
+            if tracked {
+                // A write with no task facts, as from an older Core, goes in `oa` too, so that a
+                // later write's facts can withdraw it.
+                let added = records > 0 && !open.contains(&task);
+                if added {
                     open.push(task.clone());
                 }
-                if open.is_empty() {
-                    keys.meta.remove(&open_field);
-                } else {
-                    keys.set(&open_field, open.join(" "));
+                if facts.is_some() || added {
+                    if open.is_empty() {
+                        keys.meta.remove(&open_field);
+                    } else {
+                        keys.set(&open_field, open.join(" "));
+                    }
                 }
                 if !withdrawn.is_empty() {
                     let mut all = words(keys.get(&gone_field));

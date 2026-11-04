@@ -1313,6 +1313,28 @@ async fn a_first_write_of_a_task_that_never_completed_is_fenced() {
     }
 }
 
+/// A Local Activity write with no task facts, as from an older Core, is withdrawn by a later write
+/// whose facts show that its task never completed.
+async fn a_write_with_no_task_facts_is_withdrawn_by_a_later_write() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let orphan = AppendRecordsRequest {
+            previous_completed_task: None,
+            ..local_activity_write(&case, &run, "call-1", 3, 2, "orphan")
+        };
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", orphan).await.unwrap();
+        let mut next = local_activity_write(&case, &run, "call-2", 5, 4, "next");
+        next.failed_tasks = vec![3];
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", next).await.unwrap();
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["orphan", "<superseded>", "next"]);
+        let superseded = superseded_of(&read.records[1]);
+        assert!(withdraws(superseded, &read.records[0]));
+        assert!(!withdraws(superseded, &read.records[2]));
+    }
+}
+
 /// The Workflow Task `[started_event_id]` in its attempt `attempt`, started at `seconds`.
 fn task(started_event_id: i64, attempt: i32, seconds: i64) -> WorkflowTaskEpoch {
     WorkflowTaskEpoch {
@@ -1664,6 +1686,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_local_activity_of_a_task_that_never_completed_is_withdrawn_by_the_next_write),
     case!(a_failed_task_before_the_last_completed_one_is_withdrawn_by_its_id),
     case!(a_first_write_of_a_task_that_never_completed_is_fenced),
+    case!(a_write_with_no_task_facts_is_withdrawn_by_a_later_write),
     case!(a_local_activity_of_a_lower_attempt_of_the_completed_task_is_withdrawn),
     case!(a_write_withdraws_a_lower_attempt_of_its_own_task),
     case!(a_withdrawn_run_cant_close_the_stream),
