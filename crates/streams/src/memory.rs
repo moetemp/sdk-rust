@@ -636,10 +636,11 @@ impl Store for MemoryStore {
             keys.check_ids_fit(now, records + 2)?;
 
             // A client's newer epoch only fences, as in `append.lua`.
-            let mut flagged = producer.kind != StreamProducerKind::Client as i32
+            let newer = producer.kind != StreamProducerKind::Client as i32
                 && keys
                     .get(&format!("h{suffix}"))
                     .is_some_and(|holds| holds.as_str() < epoch.as_str());
+            let mut flagged = newer;
             if keys.withdraw_run(&withdrawn_run) {
                 flagged = true;
             }
@@ -703,7 +704,8 @@ impl Store for MemoryStore {
             );
             if records > 0 {
                 keys.set(&format!("h{suffix}"), epoch.clone());
-            } else if flagged {
+            } else if newer {
+                // Only a newer epoch's item withdraws the held epoch's Records.
                 keys.meta.remove(&format!("h{suffix}"));
             }
             if !run.is_empty() && records > 0 {

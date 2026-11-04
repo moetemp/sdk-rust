@@ -349,6 +349,28 @@ async fn a_retry_run_withdraws_and_fences_the_previous_run() {
     }
 }
 
+/// An empty batch that withdraws a run keeps its Producer's held epoch, whose Records it doesn't
+/// withdraw. So the Producer's next epoch still withdraws them.
+async fn an_empty_batch_that_withdraws_a_run_keeps_the_held_epoch() {
+    for target in stores_for(Needs::UNCHECKED).await {
+        target.create(Owner::Workflow).await;
+        let (r1, r2) = (Run::new("r1"), Run::new("r2"));
+        target
+            .batch(&r1.local_activity("k", 3, 1, 1), 1, &["A"])
+            .await
+            .unwrap();
+        let first = r2.local_activity("k", 3, 1, 1);
+        target.batch(&first, 1, &["B1"]).await.unwrap();
+        target.write(&first, 2, "r1", &[]).await.unwrap();
+        assert_eq!(target.visible().await, ["B1"]);
+        target
+            .batch(&r2.local_activity("k", 3, 1, 2), 1, &["B2"])
+            .await
+            .unwrap();
+        assert_eq!(target.visible().await, ["B2"]);
+    }
+}
+
 /// An open Workflow Stream's meta keeps the safety TTL, and its log keeps the Retention, after
 /// which a read hides every Record. Its close gives the meta the Retention too.
 async fn the_ttl_follows_the_owner_and_the_close() {
@@ -794,6 +816,7 @@ pub const CASES: &[super::Case] = &[
     case!(an_activity_retry_flags_its_first_batch_only),
     case!(an_empty_batch_of_a_retry_withdraws_the_earlier_attempt),
     case!(a_retry_run_withdraws_and_fences_the_previous_run),
+    case!(an_empty_batch_that_withdraws_a_run_keeps_the_held_epoch),
     case!(the_ttl_follows_the_owner_and_the_close),
     case!(an_append_trims_by_retention_and_keeps_the_watermark),
     case!(offsets_go_on_after_the_log_expires),
