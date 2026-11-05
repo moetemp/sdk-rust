@@ -242,7 +242,7 @@ impl Case {
             CloseStreamRequest {
                 namespace: self.namespace.clone(),
                 r#ref: self.stream_ref(),
-                producer: Some(producer),
+                writer: writer_for(producer),
                 ..Default::default()
             },
         )
@@ -632,7 +632,8 @@ async fn a_higher_attempt_puts_its_superseded_item_before_its_batch() {
         let superseded = &all.records[1];
         assert!(all.records[0].offset < superseded.offset);
         assert!(superseded.offset <= all.records[2].offset);
-        assert_eq!(superseded_of(superseded).producer_id, activity(2, 20).id);
+        let writer = superseded_of(superseded).writer.as_ref().unwrap();
+        assert_eq!(writer.producer.as_ref().unwrap().id, activity(2, 20).id);
         let mut from_offset = 0;
         for expected in [&["old"][..], &["<superseded>", "new1"], &["new2"]] {
             let page = case
@@ -723,7 +724,7 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
                     id: stream,
                     ..Default::default()
                 }),
-                producer: Some(client(1)),
+                writer: writer_for(client(1)),
                 sequence: 2,
                 records: vec![record("2")],
                 ..Default::default()
@@ -911,7 +912,7 @@ async fn a_close_after_the_log_expired_keeps_the_gap() {
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
             r#ref: owned_ref(&case),
-            producer: Some(workflow(&run)),
+            writer: writer_for(workflow(&run)),
             ..Default::default()
         };
         let _: CloseStreamResponse = call(&case.ext, "CloseStream", close).await.unwrap();
@@ -943,7 +944,7 @@ async fn a_ref_with_an_owner_and_one_without_reach_the_same_stream() {
             let request = AppendRecordsRequest {
                 namespace: case.namespace.clone(),
                 r#ref: stream,
-                producer: Some(client(1)),
+                writer: writer_for(client(1)),
                 sequence,
                 records: vec![record(&sequence.to_string())],
                 ..Default::default()
@@ -991,7 +992,7 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
             let request = AppendRecordsRequest {
                 namespace: case.namespace.clone(),
                 r#ref: stream,
-                producer: Some(client(1)),
+                writer: writer_for(client(1)),
                 sequence,
                 records: vec![record(&sequence.to_string())],
                 ..Default::default()
@@ -1061,7 +1062,7 @@ async fn a_rerun_local_activity_supersedes_its_first_attempt() {
         let write = |producer: Producer, text: &str| AppendRecordsRequest {
             namespace: case.namespace.clone(),
             r#ref: case.stream_ref(),
-            producer: Some(producer),
+            writer: writer_for(producer),
             sequence: 1,
             records: vec![record(text)],
             ..Default::default()
@@ -1164,7 +1165,7 @@ async fn a_waiting_read_wakes_with_done_on_a_close() {
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
             r#ref: case.stream_ref(),
-            producer: Some(client(1)),
+            writer: writer_for(client(1)),
             ..Default::default()
         };
         let closer = tokio::spawn(async move {
