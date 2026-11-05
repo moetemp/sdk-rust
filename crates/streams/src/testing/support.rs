@@ -10,9 +10,8 @@ use crate::{
     epoch::withdraws,
     ids::local_activity_producer_id,
     proto::{
-        AppendRecord, LocalActivityEpoch, Producer, ProducerEpoch, StreamData, StreamHandle,
-        StreamRecord, StreamSuperseded, WorkflowTaskEpoch, producer_epoch::Kind,
-        stream_record::Item,
+        AppendRecord, LocalActivityEpoch, Producer, ProducerEpoch, StreamData, StreamRecord,
+        StreamRef, StreamSuperseded, WorkflowTaskEpoch, producer_epoch::Kind, stream_record::Item,
     },
     store::{Appended, Batch, Closed, Create, Created, Entry, Owner, Store, Withdrawal},
 };
@@ -47,7 +46,7 @@ impl Needs {
     pub const SHORT_TIMES: Self = Self(1 << 3);
     /// The runtime built from the crate's own config, such as a backend name.
     pub const OWN_CONFIG: Self = Self(1 << 4);
-    /// The Store keys on the id only, so the owner of a handle doesn't route a call.
+    /// The Store keys on the id only, so the owner of a ref doesn't route a call.
     pub const ID_KEYS: Self = Self(1 << 5);
     /// Every need. Redis and memory have all of them.
     pub const ALL: Self = Self(u8::MAX);
@@ -143,7 +142,7 @@ impl Run {
     }
 }
 
-/// The owner of a handle that a Workflow's run chain makes, with the chain's first run id.
+/// The owner of a ref that a Workflow's run chain makes, with the chain's first run id.
 pub(crate) fn workflow_execution(workflow_id: &str, first_run_id: &str) -> Option<Execution> {
     Some(Execution {
         r#type: ExecutionType::Workflow as i32,
@@ -209,8 +208,8 @@ pub(crate) fn records_of(entries: &[Entry]) -> Vec<String> {
 }
 
 impl Target {
-    pub(crate) fn handle(&self) -> StreamHandle {
-        StreamHandle {
+    pub(crate) fn stream_ref(&self) -> StreamRef {
+        StreamRef {
             id: self.stream.clone(),
             ..Default::default()
         }
@@ -228,7 +227,7 @@ impl Target {
     /// Creates the Stream, and gives the Store's answer.
     pub(crate) async fn create_with(&self, create: &Create<'_>) -> StreamResult<Created> {
         self.store
-            .create(&self.namespace, &self.handle(), create)
+            .create(&self.namespace, &self.stream_ref(), create)
             .await
     }
 
@@ -333,7 +332,7 @@ impl Target {
         self.store
             .append(
                 &self.namespace,
-                &self.handle(),
+                &self.stream_ref(),
                 &Batch {
                     producer,
                     sequence,
@@ -346,16 +345,18 @@ impl Target {
     }
 
     pub(crate) async fn close(&self, producer: &Producer) -> StreamResult<Closed> {
-        self.close_at(&self.handle(), producer).await
+        self.close_at(&self.stream_ref(), producer).await
     }
 
-    /// Closes the Stream that `handle` names, with the owner fields it has.
+    /// Closes the Stream of `stream_ref`, with the owner fields it has.
     pub(crate) async fn close_at(
         &self,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         producer: &Producer,
     ) -> StreamResult<Closed> {
-        self.store.close(&self.namespace, handle, producer).await
+        self.store
+            .close(&self.namespace, stream_ref, producer)
+            .await
     }
 }
 

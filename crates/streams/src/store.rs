@@ -5,7 +5,7 @@
 use crate::{
     Reason, StreamError, StreamResult,
     ids::encode_part,
-    proto::{Producer, StreamHandle, WorkflowTaskEpoch},
+    proto::{Producer, StreamRef, WorkflowTaskEpoch},
 };
 use std::time::Duration;
 use temporalio_common::protos::temporal::api::enums::v1::ExecutionType;
@@ -39,11 +39,11 @@ pub const MAX_TTL: Duration = Duration::from_secs(315_576_000_000);
 /// next write.
 pub const MIN_RETENTION: Duration = Duration::from_millis(1);
 
-/// The owner run chain of a handle as `<workflow id>:<first run id>`, each part encoded, or empty
+/// The owner run chain of a ref as `<workflow id>:<first run id>`, each part encoded, or empty
 /// for another owner. A Store keeps it on a Workflow-owned Stream and checks creates and closes on
 /// it.
-pub fn owner_chain(handle: &StreamHandle) -> String {
-    handle
+pub fn owner_chain(stream_ref: &StreamRef) -> String {
+    stream_ref
         .owner
         .as_ref()
         .filter(|owner| owner.r#type == ExecutionType::Workflow as i32)
@@ -311,7 +311,7 @@ pub trait Store: Send + Sync + 'static {
     /// another one must say what it forwards.
     fn capabilities(&self) -> Capabilities;
 
-    /// Creates a Stream. The calls that write take the Stream's whole handle, since the server
+    /// Creates a Stream. The calls that write take the Stream's whole ref, since the server
     /// finds a Workflow's Stream by its owner.
     ///
     /// The create of an existing Stream fails with [Reason::Expired], [Reason::NotOwner] or
@@ -322,7 +322,7 @@ pub trait Store: Send + Sync + 'static {
     async fn create(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         create: &Create<'_>,
     ) -> StreamResult<Created>;
 
@@ -331,7 +331,7 @@ pub trait Store: Send + Sync + 'static {
     async fn append(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         batch: &Batch<'_>,
     ) -> StreamResult<Appended>;
 
@@ -361,7 +361,7 @@ pub trait Store: Send + Sync + 'static {
     async fn close(
         &self,
         _namespace: &str,
-        _handle: &StreamHandle,
+        _stream_ref: &StreamRef,
         _producer: &Producer,
     ) -> StreamResult<Closed> {
         Err(unsupported("close"))
