@@ -254,7 +254,7 @@ impl Writers {
             producer,
             previous_completed_task: request.previous_completed_task,
             failed_tasks: request.failed_tasks,
-            // The Store refuses a batch over its count limit, so a larger size can't go in one batch.
+            // The Store refuses a batch over its Record limit, so no batch can be larger.
             max_batch: match request.max_batch_size {
                 n if n > 0 => (n as usize).min(MAX_BATCH_RECORDS),
                 _ => MAX_BATCH_RECORDS,
