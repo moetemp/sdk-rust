@@ -329,7 +329,8 @@ impl StreamService {
         })
     }
 
-    /// A long poll that returns the Records it found, the close Record, or nothing after `wait`.
+    /// A long poll that returns the Records it found, or nothing after `wait`. On a closed Stream
+    /// with no item left, it returns `done` at once.
     pub(crate) async fn read_records(
         &self,
         request: ReadRecordsRequest,
@@ -413,9 +414,9 @@ impl StreamService {
         }
     }
 
-    /// The newest `last` Records, oldest first, and the close Record of a closed Stream at the end.
-    /// A Record that a newer `Superseded` item withdraws doesn't count. It never waits, and it
-    /// stops after [MAX_SCAN] entries or [MAX_SCAN_BYTES] of them.
+    /// The newest `last` Records, oldest first, and `done` for a closed Stream. A Record that a
+    /// newer `Superseded` item withdraws doesn't count. It never waits, and it stops after
+    /// [MAX_SCAN] entries or [MAX_SCAN_BYTES] of them.
     async fn read_last(
         &self,
         request: ReadRecordsRequest,
@@ -438,7 +439,7 @@ impl StreamService {
         }
         check_expiry(&state, 0)?;
         let retained = state.retained_from();
-        let (mut picked, mut close) = (vec![], None);
+        let mut picked = vec![];
         let mut withdrawals: Vec<StreamSuperseded> = vec![];
         let (mut bytes, mut scanned, mut scanned_bytes) = (0, 0, 0);
         let mut before = state.newest;
@@ -468,10 +469,7 @@ impl StreamService {
                 if let Some(record) = entry.record {
                     let record = decode(&record, entry.offset)?;
                     let size = record.encoded_len();
-                    // The close Record ends the page and doesn't count toward the byte cap.
-                    if matches!(record.item, Some(Item::Close(_))) {
-                        close = Some(record);
-                    } else if !withdrawals.iter().any(|s| withdraws(s, &record)) {
+                    if !withdrawals.iter().any(|s| withdraws(s, &record)) {
                         // A Record over the cap is still returned alone, so that the read always
                         // returns a Record.
                         if !picked.is_empty() && bytes + size > max_bytes {
@@ -487,17 +485,17 @@ impl StreamService {
                 if let Some(superseded) = entry.superseded {
                     withdrawals.push(
                         StreamSuperseded::decode(superseded.as_slice())
-                            .map_err(|error| StreamError::storage(error.to_string()))?,
+                            .map_err(|error| StreamError::storage_corrupt(error.to_string()))?,
                     );
                 }
             }
         }
         picked.reverse();
-        picked.extend(close);
+        // The read ends at the newest offset, which a close makes final.
         Ok(ReadRecordsResponse {
             records: picked,
             next_offset: state.newest + 1,
-            done: state.closed_at.is_some(),
+            done: state.closed,
             ..Default::default()
         })
     }
@@ -525,8 +523,9 @@ impl StreamService {
         }
     }
 
-    /// The Records from `from`, or `None` when there is none yet. A page that ends in the close
-    /// Record is done. `(max, max_bytes)` caps the items and their bytes.
+    /// The Records from `from`, or `None` when there is none yet and the Stream is open. A page
+    /// of a closed Stream that gives its last item is done, also with no item. `(max, max_bytes)`
+    /// caps the items and their bytes.
     async fn page(
         &self,
         namespace: &str,
@@ -535,39 +534,25 @@ impl StreamService {
         from: i64,
         (max, max_bytes): (usize, usize),
     ) -> StreamResult<Option<ReadRecordsResponse>> {
-        // A read past the close returns the close Record again, so that every read ends with it.
-        if let Some(closed_at) = state.closed_at.filter(|at| from > *at) {
-            let (_, entries) = self.store.read(namespace, id, closed_at, 1).await?;
-            let mut records = vec![];
-            for entry in entries {
-                if let Some(bytes) = entry.record {
-                    records.push(decode(&bytes, entry.offset)?);
-                }
-            }
-            let page = ReadRecordsResponse {
-                records,
-                next_offset: from,
-                done: true,
-                ..Default::default()
-            };
-            return Ok(Some(page));
-        }
         // A read from the start skips the Records that the Retention hides. A read from an offset
         // fails on them, since the Reader asked for those Records.
         let retained = state.retained_from();
         let mut start = if from > 0 { from } else { retained };
         let mut records = vec![];
         let mut next = from;
-        let (mut done, mut full) = (false, false);
+        let mut full = false;
         let mut bytes = 0;
         // The bytes and the entries that the page read from the Store.
         let mut pulled = (0, 0);
-        while records.len() < max && !done && !full {
+        // Whether the Stream was closed, and its newest offset, at the newest Store read.
+        let mut end = (state.closed, state.newest);
+        while records.len() < max && !full {
             let room = (max_bytes != usize::MAX).then(|| max_bytes.saturating_sub(bytes));
             let chunk = chunk_len(max - records.len(), room, pulled);
             let (chunk_state, entries) = self.store.read(namespace, id, start, chunk).await?;
             // A trim after the state read leaves a gap before these entries.
             check_expiry(&chunk_state, if from > 0 { start } else { 0 })?;
+            end = (chunk_state.closed, chunk_state.newest);
             if entries.is_empty() {
                 // Only an expired log has no entry at an offset up to `newest`.
                 if from > 0 && start == from && from <= chunk_state.newest {
@@ -587,16 +572,14 @@ impl StreamService {
                 let mut items = vec![];
                 if let Some(bytes) = entry.superseded {
                     let superseded = StreamSuperseded::decode(bytes.as_slice())
-                        .map_err(|error| StreamError::storage(error.to_string()))?;
+                        .map_err(|error| StreamError::storage_corrupt(error.to_string()))?;
                     items.push(StreamRecord {
                         offset: entry.offset,
                         item: Some(Item::Superseded(superseded)),
                     });
                 }
                 if let Some(bytes) = entry.record {
-                    let record = decode(&bytes, entry.offset)?;
-                    done = matches!(record.item, Some(Item::Close(_)));
-                    items.push(record);
+                    items.push(decode(&bytes, entry.offset)?);
                 }
                 // An entry over the caps is still returned alone, so that the read always makes
                 // progress. The next read starts at the entry that didn't fit.
@@ -604,7 +587,7 @@ impl StreamService {
                 pulled = (pulled.0 + size, pulled.1 + 1);
                 let over = bytes + size > max_bytes || records.len() + items.len() > max;
                 if !records.is_empty() && over {
-                    (done, full) = (false, true);
+                    full = true;
                     next = entry.offset;
                     break;
                 }
@@ -612,12 +595,14 @@ impl StreamService {
                 records.extend(items);
                 next = entry.offset + 1;
                 start = next;
-                if done || records.len() >= max {
+                if records.len() >= max {
                     break;
                 }
             }
         }
-        if records.is_empty() {
+        // A closed Stream takes no more appends, so no item is left past its newest offset.
+        let done = end.0 && start > end.1;
+        if records.is_empty() && !done {
             return Ok(None);
         }
         let page = ReadRecordsResponse {
@@ -644,8 +629,9 @@ fn chunk_len(left: usize, room: Option<usize>, (bytes, entries): (usize, usize))
 }
 
 fn decode(bytes: &[u8], offset: i64) -> StreamResult<StreamRecord> {
-    let mut record = StreamRecord::decode(bytes)
-        .map_err(|error| StreamError::storage(format!("A stored Record is bad: {error}")))?;
+    let mut record = StreamRecord::decode(bytes).map_err(|error| {
+        StreamError::storage_corrupt(format!("A stored Record is bad: {error}"))
+    })?;
     record.offset = offset;
     Ok(record)
 }
@@ -654,7 +640,7 @@ fn decode(bytes: &[u8], offset: i64) -> StreamResult<StreamRecord> {
 /// the gap. A read from the start of the Stream has no gap.
 ///
 /// A Tombstone fails every read. An open Stream that expired gets no more Records, so the Reader
-/// would wait forever. A closed one lost its log and its close Record.
+/// would wait forever. A closed one lost its log.
 fn check_expiry(state: &StreamState, from: i64) -> StreamResult<()> {
     if state.expired() || (from > 0 && state.trimmed >= from) {
         return Err(expired());
