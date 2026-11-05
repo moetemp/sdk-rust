@@ -188,3 +188,43 @@ fn duration(value: Option<prost_types::Duration>) -> Option<Duration> {
 pub(crate) fn decode<M: Message + Default>(input: &[u8]) -> StreamResult<M> {
     M::decode(input).map_err(|error| StreamError::invalid(format!("The request is bad: {error}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const METHODS: [&str; 4] = [
+        "CreateStream",
+        "AppendRecords",
+        "CloseStream",
+        "DescribeStream",
+    ];
+
+    fn runtime() -> Arc<StreamRuntime> {
+        let config = MemoryStreamConfig::default().encode_to_vec();
+        MemoryStreamRuntime::from_config_bytes(&config, None).unwrap()
+    }
+
+    // A call connects the Store before it decodes its request, so the runtime is a memory one. A
+    // typo in a method name would make it unknown, which is unsupported, so the loop also checks
+    // the names that a bridge calls.
+    #[tokio::test]
+    async fn a_bad_request_is_invalid_and_an_unknown_method_is_unsupported() {
+        let runtime = runtime();
+        for method in METHODS {
+            let error = runtime.call(method, &[0xff]).await.unwrap_err();
+            assert_eq!(error.reason, Reason::Invalid, "{method}");
+        }
+        let error = runtime.call("Nope", &[]).await.unwrap_err();
+        assert_eq!(
+            (error.reason, error.message.as_str()),
+            (Reason::Unsupported, "Unknown method Nope")
+        );
+    }
+
+    #[test]
+    fn a_bad_memory_config_is_invalid() {
+        let error = MemoryStreamRuntime::from_config_bytes(&[0xff], None).unwrap_err();
+        assert_eq!(error.reason, Reason::Invalid);
+    }
+}
