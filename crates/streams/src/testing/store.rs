@@ -17,7 +17,7 @@ use crate::{
     memory::{EntryId, ProducerField},
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{
-        ActivityEpoch, ClientEpoch, Producer, ProducerEpoch, StreamHandle, WorkflowTaskEpoch,
+        ActivityEpoch, ClientEpoch, Producer, ProducerEpoch, StreamRef, WorkflowTaskEpoch,
         producer_epoch::Kind,
     },
     store::{Batch, ConflictPolicy, Create, CreateOutcome, Created, Owner, Withdrawal},
@@ -74,7 +74,7 @@ async fn append(
         .store
         .append(
             &target.namespace,
-            &target.handle(),
+            &target.stream_ref(),
             &Batch {
                 producer,
                 sequence,
@@ -182,9 +182,9 @@ async fn closed_expired_and_not_owner_come_before_already_exists() {
         };
         target.create_with(&first).await.unwrap();
         let reason = |created: StreamResult<Created>| created.unwrap_err().reason;
-        let owned = StreamHandle {
+        let owned = StreamRef {
             owner: workflow_execution("agent", "first-run"),
-            ..target.handle()
+            ..target.stream_ref()
         };
         let workflow = Create {
             owner: Owner::Workflow,
@@ -628,19 +628,19 @@ async fn a_large_sequence_dedupes_and_one_past_2_53_is_refused() {
 async fn a_create_with_another_owner_is_refused() {
     for target in stores_for(Needs::RAW_KEYS.and(Needs::STORE_ANSWERS)).await {
         let target = &target;
-        let create = |handle: StreamHandle, owner: Owner| async move {
+        let create = |stream_ref: StreamRef, owner: Owner| async move {
             let create = Create {
                 owner,
                 ..use_existing()
             };
             target
                 .store
-                .create(&target.namespace, &handle, &create)
+                .create(&target.namespace, &stream_ref, &create)
                 .await
         };
-        let owned = |workflow_id: &str, first_run_id: &str| StreamHandle {
+        let owned = |workflow_id: &str, first_run_id: &str| StreamRef {
             owner: workflow_execution(workflow_id, first_run_id),
-            ..target.handle()
+            ..target.stream_ref()
         };
         target.create(Owner::Client).await;
         let refused = create(owned("agent", "first-run"), Owner::Workflow).await;
@@ -653,7 +653,7 @@ async fn a_create_with_another_owner_is_refused() {
             "{ttl}"
         );
 
-        let owned = |workflow_id: &str, first_run_id: &str| StreamHandle {
+        let owned = |workflow_id: &str, first_run_id: &str| StreamRef {
             id: format!("{}-owned", target.stream),
             ..owned(workflow_id, first_run_id)
         };
@@ -752,7 +752,7 @@ async fn a_producer_with_no_epoch_case_is_refused() {
 
 /// Only the owner closes a Stream. That's the close Activity of its run chain for a Workflow-owned
 /// Stream, and a Workflow or a client for a Stream with no owner. A Local Activity of the chain
-/// can't close it, and a handle with no chain can't either.
+/// can't close it, and a ref with no chain can't either.
 async fn only_the_owner_closes_a_stream() {
     for target in stores_for(Needs::UNCHECKED.and(Needs::STORE_ANSWERS)).await {
         let run = Run::new("r1");
@@ -764,7 +764,7 @@ async fn only_the_owner_closes_a_stream() {
         }
         target.close(&client(1)).await.unwrap();
 
-        let owned = |workflow_id: &str| StreamHandle {
+        let owned = |workflow_id: &str| StreamRef {
             id: format!("{}-owned", target.stream),
             owner: workflow_execution(workflow_id, "first-run").filter(|_| !workflow_id.is_empty()),
             ..Default::default()
