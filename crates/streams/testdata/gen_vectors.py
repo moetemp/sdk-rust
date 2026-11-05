@@ -174,6 +174,9 @@ def producer_values():
 def fields():
     run = "run:1"
     producer = "act:" + join(run, "a", "s")
+    # Task [3] fails, and a write of task [5] with the completed task [4] withdraws it.
+    withdrawn = task_key(3, 1, (100, 0))
+    task, completed = task_key(5, 1, (100, 0)), task_key(4)
     return {
         "kind": 3,
         "producer_id": producer,
@@ -182,6 +185,12 @@ def fields():
         "run_wrote": f"run|{part(run)}",
         "withdrawn_run": f"wr|{part(run)}",
         "producer_values": producer_values(),
+        # The task keys are binary, so the vectors give them in hex after the field name's prefix.
+        "task_key": withdrawn.hex(),
+        "open_tasks": f"oa|{part(run)}",
+        "withdrawn_task_prefix": f"ow|{part(run)}|",
+        "task_facts": f"tf|{part(run)}",
+        "task_facts_value": (task + completed + task_key(3)).hex(),
     }
 
 

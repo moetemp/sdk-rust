@@ -122,13 +122,18 @@ pub struct Withdrawal<'a> {
     /// The encoded `Superseded` facts, which the log keeps when the batch withdraws something.
     pub superseded: &'a [u8],
     /// The run's task facts of a Local Activity batch, which withdraw the run's orphaned Local
-    /// Activity Records.
+    /// Activity Records and fence their later writes.
     pub tasks: Option<TaskFacts<'a>>,
 }
 
 /// The run's Workflow Task facts that a Local Activity batch gives. A task of the run after
 /// `completed` and before the batch's own task, or one in `failed_tasks`, never completed, so
 /// its Local Activity Records are orphans.
+///
+/// A Store keeps the task of each Local Activity batch with Records, also of one with no facts, so
+/// that a later batch's facts withdraw it. It also keeps the facts of the run's highest task and
+/// fences a write whose task they show never completed, since a task can fail before its call
+/// writes.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TaskFacts<'a> {
     /// The run's last completed Workflow Task, `None` before the first one.

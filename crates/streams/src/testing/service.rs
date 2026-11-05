@@ -1014,6 +1014,11 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
     }
 }
 
+/// The Local Activity Producer of a Workflow call in run `run`.
+fn local_activity(run: &str) -> Producer {
+    user_local_activity(run, 3, 100)
+}
+
 /// The case's ref with the owner of a made-up run chain, which a create with an owner needs.
 fn owned_ref(case: &Case) -> Option<StreamRef> {
     Some(StreamRef {
@@ -1021,6 +1026,121 @@ fn owned_ref(case: &Case) -> Option<StreamRef> {
         owner: super::support::workflow_execution(&format!("{}-wf", case.stream), "first-run"),
         ..Default::default()
     })
+}
+
+/// A retry run's Local Activity calls withdraw the previous run.
+async fn a_retry_run_s_local_activity_calls_withdraw_the_previous_run() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let (previous, retry) = (format!("{}-r1", case.stream), format!("{}-r2", case.stream));
+        let create = |run: &str, withdraw_run: &str| CreateStreamRequest {
+            namespace: case.namespace.clone(),
+            withdraw_run: withdraw_run.to_string(),
+            owner: Some(workflow(run)),
+            stream_ref: owned_ref(&case),
+            ..use_existing()
+        };
+        let append = |run: &str, withdraw_run: &str, text: &str| AppendRecordsRequest {
+            namespace: case.namespace.clone(),
+            r#ref: case.stream_ref(),
+            writer: Some(StreamWriter {
+                producer: Some(local_activity(run)),
+                withdraw_run: withdraw_run.to_string(),
+                ..Default::default()
+            }),
+            sequence: 1,
+            records: vec![record(text)],
+            ..Default::default()
+        };
+        let _: CreateStreamResponse = call(&case.ext, "CreateStream", create(&previous, ""))
+            .await
+            .unwrap();
+        let _: AppendRecordsResponse =
+            call(&case.ext, "AppendRecords", append(&previous, "", "old"))
+                .await
+                .unwrap();
+        // The retry run's first create withdraws the previous run.
+        let _: CreateStreamResponse = call(&case.ext, "CreateStream", create(&retry, &previous))
+            .await
+            .unwrap();
+        let first: AppendRecordsResponse =
+            call(&case.ext, "AppendRecords", append(&retry, &previous, "new"))
+                .await
+                .unwrap();
+        // A retried Local Activity sends the same batch and gets its first answer.
+        let again: AppendRecordsResponse =
+            call(&case.ext, "AppendRecords", append(&retry, &previous, "new"))
+                .await
+                .unwrap();
+        assert_eq!(
+            (again.first_offset, again.last_offset),
+            (first.first_offset, first.last_offset)
+        );
+        assert!(first.last_offset > 0);
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["old", "<superseded>", "new"]);
+        let superseded = superseded_of(&read.records[1]);
+        let writer = superseded.writer.as_ref().unwrap();
+        assert_eq!(writer.withdraw_run, previous);
+        // The item's writer has its Producer, which the WIT requires.
+        let producer = writer.producer.as_ref().unwrap();
+        assert_eq!(producer.id, crate::ids::workflow_producer_id(&retry));
+        assert_eq!(producer.run_id, retry);
+        let error = call::<_, CreateStreamResponse>(
+            &case.ext,
+            "CreateStream",
+            CreateStreamRequest {
+                owner: None,
+                ..create(&retry, &previous)
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reason(&error), "stream_invalid");
+        assert!(withdraws(superseded, &read.records[0]));
+        assert!(!withdraws(superseded, &read.records[2]));
+    }
+}
+
+/// Only a Local Activity of a later run withdraws a run on append. A client, an Activity or the
+/// run's own Local Activity that sends a run to withdraw fails with `stream_invalid` and withdraws
+/// nothing.
+async fn only_a_later_run_s_local_activity_withdraws_a_run_on_append() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let _: AppendRecordsResponse = call(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-1", 3, 2, "workflow output"),
+        )
+        .await
+        .unwrap();
+        for producer in [client(1), activity(1, 10), local_activity(&run)] {
+            let error = call::<_, AppendRecordsResponse>(
+                &case.ext,
+                "AppendRecords",
+                AppendRecordsRequest {
+                    namespace: case.namespace.clone(),
+                    r#ref: case.stream_ref(),
+                    writer: Some(StreamWriter {
+                        producer: Some(producer),
+                        withdraw_run: run.clone(),
+                        ..Default::default()
+                    }),
+                    sequence: 1,
+                    records: vec![record("other")],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(reason(&error), "stream_invalid");
+        }
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["workflow output"]);
+        let next = local_activity_write(&case, &run, "call-2", 4, 3, "next");
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", next).await.unwrap();
+    }
 }
 
 /// The user Local Activity `call-1` of `run`, dispatched by the Workflow Task `[started]`. A rerun
@@ -1102,6 +1222,535 @@ async fn a_rerun_local_activity_supersedes_its_first_attempt() {
         let superseded = superseded_of(&read.records[1]);
         assert!(withdraws(superseded, &read.records[0]));
         assert!(!withdraws(superseded, &read.records[2]));
+    }
+}
+
+/// A write of the Local Activity `call` of `run`, dispatched by task `[started]`, with the run's
+/// last completed task `[completed]`, or 0 before the first.
+fn local_activity_write(
+    case: &Case,
+    run: &str,
+    call: &str,
+    started: i64,
+    completed: i64,
+    text: &str,
+) -> AppendRecordsRequest {
+    let mut producer = user_local_activity(run, started, 100 + started);
+    producer.id = crate::ids::local_activity_producer_id(run, call);
+    AppendRecordsRequest {
+        namespace: case.namespace.clone(),
+        r#ref: case.stream_ref(),
+        writer: Some(StreamWriter {
+            producer: Some(producer),
+            previous_completed_task: Some(WorkflowTaskEpoch {
+                started_event_id: completed,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        sequence: 1,
+        records: vec![record(text)],
+        ..Default::default()
+    }
+}
+
+/// The writer of a write, to change its Producer or its task facts.
+fn writer_mut(request: &mut AppendRecordsRequest) -> &mut StreamWriter {
+    request.writer.get_or_insert_with(Default::default)
+}
+
+/// The close Activity closes a Workflow's Stream as the run's Workflow Producer, which the service
+/// refuses on an append.
+async fn the_close_activity_closes_a_workflow_stream_as_its_workflow_producer() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        let chain = StreamRef {
+            id: case.stream.clone(),
+            owner: super::support::workflow_execution(&format!("{}-wf", case.stream), "first-run"),
+            ..Default::default()
+        };
+        let _: CreateStreamResponse = call(
+            &case.ext,
+            "CreateStream",
+            CreateStreamRequest {
+                namespace: case.namespace.clone(),
+                owner: Some(workflow(&run)),
+                stream_ref: Some(chain.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let close = CloseStreamRequest {
+            namespace: case.namespace.clone(),
+            r#ref: Some(chain),
+            writer: writer_for(workflow(&run)),
+            ..Default::default()
+        };
+        let _: CloseStreamResponse = call(&case.ext, "CloseStream", close).await.unwrap();
+        assert_eq!(
+            case.describe().await.unwrap().status,
+            StreamStatus::Closed as i32
+        );
+    }
+}
+
+/// A Local Activity of a task that never completed is withdrawn by the run's next write.
+async fn a_local_activity_of_a_task_that_never_completed_is_withdrawn_by_the_next_write() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        // Task [2] completed. Task [3] runs a Local Activity that writes, then task [3] fails.
+        let _: AppendRecordsResponse = call(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-1", 2, 0, "done"),
+        )
+        .await
+        .unwrap();
+        let _: AppendRecordsResponse = call(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-2", 3, 2, "orphan"),
+        )
+        .await
+        .unwrap();
+        // Task [4] takes another path and writes once.
+        let _: AppendRecordsResponse = call(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-3", 4, 2, "other"),
+        )
+        .await
+        .unwrap();
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["done", "orphan", "<superseded>", "other"]);
+        let superseded = superseded_of(&read.records[2]);
+        let kept: Vec<_> = [0, 1, 3]
+            .iter()
+            .filter(|&&i| !withdraws(superseded, &read.records[i]))
+            .map(|&i| texts(&read)[i].clone())
+            .collect();
+        assert_eq!(kept, ["done", "other"]);
+        // A late write of the orphaned call is fenced.
+        let late = call::<_, AppendRecordsResponse>(
+            &case.ext,
+            "AppendRecords",
+            AppendRecordsRequest {
+                sequence: 2,
+                ..local_activity_write(&case, &run, "call-2", 3, 2, "late")
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reason(&late), "stream_fenced");
+        // A later write that knows task [4] completed withdraws nothing more.
+        let _: AppendRecordsResponse = call(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-4", 7, 4, "later"),
+        )
+        .await
+        .unwrap();
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(
+            texts(&read),
+            ["done", "orphan", "<superseded>", "other", "later"]
+        );
+    }
+}
+
+/// A failed task before the last completed one is withdrawn by its id.
+async fn a_failed_task_before_the_last_completed_one_is_withdrawn_by_its_id() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let _: AppendRecordsResponse = call(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-1", 3, 2, "orphan"),
+        )
+        .await
+        .unwrap();
+        // Task [3] failed and task [4] completed with no write here. Task [5] knows both.
+        let mut next = local_activity_write(&case, &run, "call-2", 5, 4, "next");
+        writer_mut(&mut next).failed_tasks = vec![3];
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", next).await.unwrap();
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["orphan", "<superseded>", "next"]);
+        let superseded = superseded_of(&read.records[1]);
+        assert!(withdraws(superseded, &read.records[0]));
+        assert!(!withdraws(superseded, &read.records[2]));
+    }
+}
+
+/// A call of a task that failed before the call wrote is fenced on its first write, by the task
+/// facts of the run's highest task. A write of a lower task keeps those facts.
+async fn a_first_write_of_a_task_that_never_completed_is_fenced() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let _: AppendRecordsResponse = call(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-1", 2, 0, "done"),
+        )
+        .await
+        .unwrap();
+        // Task [3] runs call-2 and fails before call-2 writes. Task [4] knows that [3] failed.
+        let mut retry = local_activity_write(&case, &run, "call-3", 4, 2, "retry");
+        writer_mut(&mut retry).failed_tasks = vec![3];
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", retry).await.unwrap();
+        // Call-1 of the completed task [2] still runs and writes with its older facts.
+        let more = AppendRecordsRequest {
+            sequence: 2,
+            ..local_activity_write(&case, &run, "call-1", 2, 0, "more")
+        };
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", more).await.unwrap();
+        let late = call::<_, AppendRecordsResponse>(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-2", 3, 2, "late"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(reason(&late), "stream_fenced");
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["done", "retry", "more"]);
+    }
+}
+
+/// Task facts that a Store would drop or misread fail before any write. Only a Local Activity sends
+/// them, failed tasks need the last completed task, and a started event id is positive.
+async fn a_write_with_bad_task_facts_fails() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let facts = |failed: Vec<i64>| {
+            let mut request = local_activity_write(&case, &run, "call-1", 4, 2, "bad");
+            writer_mut(&mut request).failed_tasks = failed;
+            request
+        };
+        let mut no_completed = facts(vec![3]);
+        writer_mut(&mut no_completed).previous_completed_task = None;
+        let mut by_client = facts(vec![]);
+        writer_mut(&mut by_client).producer = Some(client(1));
+        let mut by_activity = facts(vec![3]);
+        writer_mut(&mut by_activity).producer = Some(activity(1, 100));
+        for bad in [
+            facts(vec![0]),
+            facts(vec![-5]),
+            no_completed,
+            by_client,
+            by_activity,
+        ] {
+            let error = call::<_, AppendRecordsResponse>(&case.ext, "AppendRecords", bad)
+                .await
+                .unwrap_err();
+            assert_eq!(reason(&error), "stream_invalid");
+        }
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert!(texts(&read).is_empty());
+    }
+}
+
+/// A Local Activity write with no task facts, as from an older Core, is withdrawn by a later write
+/// whose facts show that its task never completed.
+async fn a_write_with_no_task_facts_is_withdrawn_by_a_later_write() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let mut orphan = local_activity_write(&case, &run, "call-1", 3, 2, "orphan");
+        writer_mut(&mut orphan).previous_completed_task = None;
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", orphan).await.unwrap();
+        let mut next = local_activity_write(&case, &run, "call-2", 5, 4, "next");
+        writer_mut(&mut next).failed_tasks = vec![3];
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", next).await.unwrap();
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["orphan", "<superseded>", "next"]);
+        let superseded = superseded_of(&read.records[1]);
+        assert!(withdraws(superseded, &read.records[0]));
+        assert!(!withdraws(superseded, &read.records[2]));
+    }
+}
+
+/// A rerun of a call in a later task withdraws the failed task's Records with two items. The
+/// orphan item has an entry of its own, and the newer epoch's item comes with the first Record.
+async fn a_batch_writes_an_orphan_item_and_an_epoch_item() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let _: AppendRecordsResponse = call(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-1", 3, 2, "orphan"),
+        )
+        .await
+        .unwrap();
+        let mut rerun = local_activity_write(&case, &run, "call-1", 5, 4, "rerun");
+        writer_mut(&mut rerun).failed_tasks = vec![3];
+        let answer: AppendRecordsResponse = call(&case.ext, "AppendRecords", rerun).await.unwrap();
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(
+            texts(&read),
+            ["orphan", "<superseded>", "<superseded>", "rerun"]
+        );
+        let (orphans, epoch) = (
+            superseded_of(&read.records[1]),
+            superseded_of(&read.records[2]),
+        );
+        let kind = |item: &StreamSuperseded| {
+            let producer = item.writer.as_ref()?.producer.as_ref()?;
+            producer.epoch?.kind
+        };
+        assert!(matches!(kind(orphans), Some(Kind::Workflow(_))));
+        assert!(matches!(kind(epoch), Some(Kind::LocalActivity(_))));
+        assert!(read.records[1].offset < answer.first_offset);
+        assert_eq!(read.records[2].offset, answer.first_offset);
+        assert_eq!(read.records[3].offset, answer.last_offset);
+        for item in [orphans, epoch] {
+            assert!(withdraws(item, &read.records[0]));
+            assert!(!withdraws(item, &read.records[3]));
+        }
+    }
+}
+
+/// A resend of an empty batch that withdrew orphans gets the offsets of its orphan item again, and
+/// adds no second item.
+async fn a_resend_of_an_orphan_batch_withdraws_nothing_again() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let _: AppendRecordsResponse = call(
+            &case.ext,
+            "AppendRecords",
+            local_activity_write(&case, &run, "call-1", 3, 2, "orphan"),
+        )
+        .await
+        .unwrap();
+        // The writer of call-2 in task [4] opens with an empty batch.
+        let open = AppendRecordsRequest {
+            records: vec![],
+            ..local_activity_write(&case, &run, "call-2", 4, 2, "")
+        };
+        let first: AppendRecordsResponse = call(&case.ext, "AppendRecords", open.clone())
+            .await
+            .unwrap();
+        let again: AppendRecordsResponse = call(&case.ext, "AppendRecords", open).await.unwrap();
+        assert!(first.first_offset > 0);
+        assert_eq!(
+            (again.first_offset, again.last_offset),
+            (first.first_offset, first.last_offset)
+        );
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["orphan", "<superseded>"]);
+        assert_eq!(read.records[1].offset, first.last_offset);
+    }
+}
+
+/// The Workflow Task `[started_event_id]` in its attempt `attempt`, started at `seconds`.
+fn task(started_event_id: i64, attempt: i32, seconds: i64) -> WorkflowTaskEpoch {
+    WorkflowTaskEpoch {
+        started_event_id,
+        attempt,
+        started_time: Some(Timestamp { seconds, nanos: 0 }),
+    }
+}
+
+/// A write of the Local Activity `call` of `run`, dispatched by `task`, with the run's last
+/// completed task, if the write sends it.
+fn task_write(
+    case: &Case,
+    run: &str,
+    call: &str,
+    task: WorkflowTaskEpoch,
+    completed: Option<WorkflowTaskEpoch>,
+    text: &str,
+) -> AppendRecordsRequest {
+    let producer = Producer {
+        id: crate::ids::local_activity_producer_id(run, call),
+        epoch: Some(ProducerEpoch {
+            kind: Some(Kind::LocalActivity(LocalActivityEpoch {
+                task: Some(task),
+                attempt: 1,
+            })),
+        }),
+        run_id: run.to_string(),
+    };
+    AppendRecordsRequest {
+        namespace: case.namespace.clone(),
+        r#ref: case.stream_ref(),
+        writer: Some(StreamWriter {
+            producer: Some(producer),
+            previous_completed_task: completed,
+            ..Default::default()
+        }),
+        sequence: 1,
+        records: vec![record(text)],
+        ..Default::default()
+    }
+}
+
+/// A Local Activity of a transient attempt of a task that later completed is withdrawn by the
+/// next write, which names the completed attempt. A Record of the completed attempt stays.
+async fn a_local_activity_of_a_lower_attempt_of_the_completed_task_is_withdrawn() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let write =
+            |call: &str,
+             task: WorkflowTaskEpoch,
+             completed: Option<WorkflowTaskEpoch>,
+             text: &str| task_write(&case, &run, call, task, completed, text);
+        // Attempt 2 of task [9] writes, then fails with no event in History.
+        let c = Some(task(3, 1, 100));
+        let orphan = write("call-1", task(9, 2, 200), c, "orphan");
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", orphan).await.unwrap();
+        // Attempt 3 completes. Its write sends no task facts, so it withdraws nothing itself.
+        let kept = write("call-2", task(9, 3, 300), None, "kept");
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", kept).await.unwrap();
+        let later = write("call-3", task(12, 1, 400), Some(task(9, 3, 300)), "later");
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", later).await.unwrap();
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["orphan", "kept", "<superseded>", "later"]);
+        let superseded = superseded_of(&read.records[2]);
+        let kept: Vec<_> = [0, 1, 3]
+            .iter()
+            .filter(|&&i| !withdraws(superseded, &read.records[i]))
+            .map(|&i| texts(&read)[i].clone())
+            .collect();
+        assert_eq!(kept, ["kept", "later"]);
+    }
+}
+
+/// A write sends the facts of its own task, attempt 3 of `[9]`. It withdraws the Records of
+/// attempt 2 of `[9]`, which can't have completed, and keeps its own.
+async fn a_write_withdraws_a_lower_attempt_of_its_own_task() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let run = format!("{}-run", case.stream);
+        case.create(None).await.unwrap();
+        let completed = Some(task(3, 1, 100));
+        let orphan = task_write(&case, &run, "call-1", task(9, 2, 200), completed, "orphan");
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", orphan).await.unwrap();
+        let own = task_write(&case, &run, "call-2", task(9, 3, 300), completed, "own");
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", own).await.unwrap();
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["orphan", "<superseded>", "own"]);
+        let superseded = superseded_of(&read.records[1]);
+        assert!(withdraws(superseded, &read.records[0]));
+        assert!(!withdraws(superseded, &read.records[2]));
+    }
+}
+
+/// A run that a retry run withdrew can't close the Stream, and the retry run can.
+async fn a_withdrawn_run_cant_close_the_stream() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let (previous, retry) = (format!("{}-r1", case.stream), format!("{}-r2", case.stream));
+        let create = |run: &str, withdraw_run: &str| CreateStreamRequest {
+            namespace: case.namespace.clone(),
+            withdraw_run: withdraw_run.to_string(),
+            owner: Some(workflow(run)),
+            stream_ref: owned_ref(&case),
+            ..use_existing()
+        };
+        let close = |run: &str| CloseStreamRequest {
+            namespace: case.namespace.clone(),
+            r#ref: owned_ref(&case),
+            writer: writer_for(workflow(run)),
+            ..Default::default()
+        };
+        let _: CreateStreamResponse = call(&case.ext, "CreateStream", create(&previous, ""))
+            .await
+            .unwrap();
+        let _: CreateStreamResponse = call(&case.ext, "CreateStream", create(&retry, &previous))
+            .await
+            .unwrap();
+        let error = call::<_, CloseStreamResponse>(&case.ext, "CloseStream", close(&previous))
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "stream_fenced");
+        let _: CloseStreamResponse = call(&case.ext, "CloseStream", close(&retry)).await.unwrap();
+    }
+}
+
+/// A retry run's create of a new Stream fences the previous run, whose later write fails.
+async fn a_retry_run_s_create_of_a_new_stream_fences_the_previous_run() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        let (previous, retry) = (format!("{}-r1", case.stream), format!("{}-r2", case.stream));
+        let created: CreateStreamResponse = call(
+            &case.ext,
+            "CreateStream",
+            CreateStreamRequest {
+                namespace: case.namespace.clone(),
+                withdraw_run: previous.clone(),
+                owner: Some(workflow(&retry)),
+                stream_ref: owned_ref(&case),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(created.created);
+        let append = |run: &str| AppendRecordsRequest {
+            namespace: case.namespace.clone(),
+            r#ref: case.stream_ref(),
+            writer: writer_for(local_activity(run)),
+            sequence: 1,
+            records: vec![record(run)],
+            ..Default::default()
+        };
+        let error = call::<_, AppendRecordsResponse>(&case.ext, "AppendRecords", append(&previous))
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "stream_fenced");
+        let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", append(&retry))
+            .await
+            .unwrap();
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), [retry]);
+    }
+}
+
+/// A retry run's create after the log expired keeps the gap, so a read from an offset that the
+/// log took fails as expired.
+async fn a_retry_run_s_create_after_the_log_expired_keeps_the_gap() {
+    for case in cases_for(Needs::UNCHECKED.and(Needs::SHORT_TIMES)).await {
+        let (previous, retry) = (format!("{}-r1", case.stream), format!("{}-r2", case.stream));
+        let create = |run: &str, withdraw_run: &str| CreateStreamRequest {
+            namespace: case.namespace.clone(),
+            retention: millis(300),
+            withdraw_run: withdraw_run.to_string(),
+            owner: Some(workflow(run)),
+            stream_ref: owned_ref(&case),
+            ..use_existing()
+        };
+        let _: CreateStreamResponse = call(&case.ext, "CreateStream", create(&previous, ""))
+            .await
+            .unwrap();
+        let first: AppendRecordsResponse = call(
+            &case.ext,
+            "AppendRecords",
+            AppendRecordsRequest {
+                namespace: case.namespace.clone(),
+                r#ref: case.stream_ref(),
+                writer: writer_for(local_activity(&previous)),
+                sequence: 1,
+                records: vec![record("a"), record("b")],
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let _: CreateStreamResponse = call(&case.ext, "CreateStream", create(&retry, &previous))
+            .await
+            .unwrap();
+        let behind = ReadRecordsRequest {
+            from_offset: first.first_offset + 1,
+            ..Default::default()
+        };
+        let error = case.read(behind).await.unwrap_err();
+        assert_eq!(reason(&error), "stream_expired");
     }
 }
 
@@ -1280,7 +1929,22 @@ pub const CASES: &[super::Case] = &[
     case!(a_close_after_the_log_expired_keeps_the_gap),
     case!(a_ref_with_an_owner_and_one_without_reach_the_same_stream),
     case!(a_create_answer_names_the_backend_and_the_store_never_reads_it),
+    case!(a_retry_run_s_local_activity_calls_withdraw_the_previous_run),
+    case!(only_a_later_run_s_local_activity_withdraws_a_run_on_append),
     case!(a_rerun_local_activity_supersedes_its_first_attempt),
+    case!(the_close_activity_closes_a_workflow_stream_as_its_workflow_producer),
+    case!(a_local_activity_of_a_task_that_never_completed_is_withdrawn_by_the_next_write),
+    case!(a_failed_task_before_the_last_completed_one_is_withdrawn_by_its_id),
+    case!(a_first_write_of_a_task_that_never_completed_is_fenced),
+    case!(a_write_with_bad_task_facts_fails),
+    case!(a_write_with_no_task_facts_is_withdrawn_by_a_later_write),
+    case!(a_batch_writes_an_orphan_item_and_an_epoch_item),
+    case!(a_resend_of_an_orphan_batch_withdraws_nothing_again),
+    case!(a_local_activity_of_a_lower_attempt_of_the_completed_task_is_withdrawn),
+    case!(a_write_withdraws_a_lower_attempt_of_its_own_task),
+    case!(a_withdrawn_run_cant_close_the_stream),
+    case!(a_retry_run_s_create_of_a_new_stream_fences_the_previous_run),
+    case!(a_retry_run_s_create_after_the_log_expired_keeps_the_gap),
     case!(a_read_of_a_closed_stream_with_no_item_left_answers_at_once),
     case!(a_waiting_read_wakes_with_done_on_a_close),
     case!(a_last_read_gives_the_newest_records_oldest_first_without_withdrawn_ones),
