@@ -42,7 +42,7 @@ pub trait TestBackend: Send + Sync {
     fn gives(&self) -> Needs;
     /// A Store for one case, and the state under it.
     async fn connect(&self) -> (Arc<dyn Store>, Arc<dyn RawKeys>);
-    /// A runtime on the backend, whose handles name `backend`.
+    /// A runtime on the backend, whose refs carry `backend`.
     fn runtime(&self, backend: &str) -> Arc<StreamRuntime>;
 }
 

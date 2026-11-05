@@ -17,7 +17,7 @@ message MemoryStreamConfig {
     // How long an open Workflow-owned Stream stays after its last write. Empty is 90 days.
     google.protobuf.Duration safety_ttl = 5;
     // The backend name that lang registered this runtime under. The crate sets it on each
-    // StreamHandle that it builds, such as the one in a create response.
+    // StreamRef that it builds, such as the one in a create response.
     string backend = 10;
 }
 
@@ -30,7 +30,7 @@ message MemoryStreamConfig {
 // continues above its earlier batches.
 message OpenWriterRequest {
     string namespace = 1;
-    temporal.api.stream.v1.StreamHandle handle = 2;
+    temporal.api.stream.v1.StreamRef ref = 2;
     temporal.api.stream.v1.Producer producer = 3;
     // A write sends at most this many Records in one batch. Zero, or a value above 1000, is 1000.
     int32 max_batch_size = 4;

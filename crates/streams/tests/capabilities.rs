@@ -14,7 +14,7 @@ use temporalio_streams::{
     proto::{
         AppendRecord, AppendRecordsRequest, ClientEpoch, CloseStreamRequest, CreateStreamRequest,
         DescribeStreamRequest, DescribeStreamResponse, Producer, ProducerEpoch, StreamErrorDetails,
-        StreamErrorReason, StreamHandle, StreamStatus, WorkflowTaskEpoch, producer_epoch::Kind,
+        StreamErrorReason, StreamRef, StreamStatus, WorkflowTaskEpoch, producer_epoch::Kind,
     },
     store::{Appended, Batch, Capabilities, Closed, Create, Created, Entry, Store, StreamState},
 };
@@ -36,19 +36,19 @@ impl Store for Masked {
     async fn create(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         create: &Create<'_>,
     ) -> StreamResult<Created> {
-        self.inner.create(namespace, handle, create).await
+        self.inner.create(namespace, stream_ref, create).await
     }
 
     async fn append(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         batch: &Batch<'_>,
     ) -> StreamResult<Appended> {
-        self.inner.append(namespace, handle, batch).await
+        self.inner.append(namespace, stream_ref, batch).await
     }
 
     async fn read(
@@ -78,10 +78,10 @@ impl Store for Masked {
     async fn close(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         producer: &Producer,
     ) -> StreamResult<Closed> {
-        self.inner.close(namespace, handle, producer).await
+        self.inner.close(namespace, stream_ref, producer).await
     }
 }
 
@@ -140,8 +140,8 @@ fn refused_capability(error: &StreamError) -> String {
 }
 
 impl Case {
-    fn handle(&self) -> Option<StreamHandle> {
-        Some(StreamHandle {
+    fn stream_ref(&self) -> Option<StreamRef> {
+        Some(StreamRef {
             id: self.stream.clone(),
             ..Default::default()
         })
@@ -154,7 +154,7 @@ impl Case {
     async fn create(&self) {
         let request = CreateStreamRequest {
             namespace: NAMESPACE.to_string(),
-            stream_handle: self.handle(),
+            stream_ref: self.stream_ref(),
             ..Default::default()
         };
         self.call("CreateStream", request).await.unwrap();
@@ -182,7 +182,7 @@ impl Case {
                 }),
                 run_id: self.run_id.clone(),
             }),
-            stream_handle: Some(StreamHandle {
+            stream_ref: Some(StreamRef {
                 id: self.stream.clone(),
                 owner: Some(Execution {
                     r#type: ExecutionType::Workflow as i32,
@@ -207,7 +207,7 @@ async fn an_append_without_the_fence_or_the_flag_is_refused_with_nothing_written
         case.create().await;
         let request = AppendRecordsRequest {
             namespace: NAMESPACE.to_string(),
-            handle: case.handle(),
+            r#ref: case.stream_ref(),
             producer: Some(client()),
             sequence: 1,
             records: vec![AppendRecord::default()],
@@ -225,7 +225,7 @@ async fn an_append_with_no_sequence_without_the_capability_is_refused_with_nothi
     case.create().await;
     let request = AppendRecordsRequest {
         namespace: NAMESPACE.to_string(),
-        handle: case.handle(),
+        r#ref: case.stream_ref(),
         producer: Some(client()),
         records: vec![AppendRecord::default()],
         ..Default::default()
@@ -251,7 +251,7 @@ async fn a_close_without_the_capability_is_refused_and_the_stream_stays_open() {
     case.create().await;
     let request = CloseStreamRequest {
         namespace: NAMESPACE.to_string(),
-        handle: case.handle(),
+        r#ref: case.stream_ref(),
         producer: Some(client()),
         ..Default::default()
     };
@@ -260,7 +260,7 @@ async fn a_close_without_the_capability_is_refused_and_the_stream_stays_open() {
     assert_eq!(case.log_len(), 0);
     let describe = DescribeStreamRequest {
         namespace: NAMESPACE.to_string(),
-        handle: case.handle(),
+        r#ref: case.stream_ref(),
     };
     let bytes = case.call("DescribeStream", describe).await.unwrap();
     let described = DescribeStreamResponse::decode(bytes.as_slice()).unwrap();
