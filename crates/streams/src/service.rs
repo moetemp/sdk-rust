@@ -10,9 +10,9 @@ use crate::{
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        Producer, ReadRecordsRequest, ReadRecordsResponse, StreamHandle, StreamIdConflictPolicy,
-        StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded, WorkflowTaskEpoch,
-        stream_record::Item,
+        Producer, ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse, StreamHandle,
+        StreamIdConflictPolicy, StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded,
+        WorkflowTaskEpoch, producer_epoch::Kind, stream_record::Item,
     },
     record::{caller_status, close_record, data_records, superseded},
     store::{
@@ -120,15 +120,11 @@ fn orphan_superseded(
     completed: Option<&WorkflowTaskEpoch>,
     failed_tasks: &[i64],
 ) -> Vec<u8> {
-    let epoch = producer.epoch.unwrap_or_default();
+    let task = producer.epoch.as_ref().map(task_of).unwrap_or_default();
     StreamSuperseded {
-        producer_kind: StreamProducerKind::Workflow as i32,
         producer_id: crate::ids::workflow_producer_id(&producer.run_id),
-        epoch: Some(crate::proto::ProducerEpoch {
-            task_started_event_id: epoch.task_started_event_id,
-            task_attempt: epoch.task_attempt,
-            task_started_time: epoch.task_started_time,
-            ..Default::default()
+        epoch: Some(ProducerEpoch {
+            kind: Some(Kind::Workflow(task)),
         }),
         previous_completed_task: completed.copied(),
         failed_tasks: failed_tasks.to_vec(),
@@ -162,12 +158,12 @@ fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
 
 /// Refuses task facts that a Store would drop or misread. Only a Local Activity has its run's task
 /// facts, and a failed task is a started event id, which is never zero or negative.
-fn check_task_facts(producer: &Producer, request: &AppendRecordsRequest) -> StreamResult<()> {
+fn check_task_facts(kind: ProducerKind, request: &AppendRecordsRequest) -> StreamResult<()> {
     let completed = request.previous_completed_task.as_ref();
     if completed.is_none() && request.failed_tasks.is_empty() {
         return Ok(());
     }
-    if producer.kind != StreamProducerKind::LocalActivity as i32 {
+    if kind != ProducerKind::LocalActivity {
         return Err(StreamError::invalid(
             "Only a Local Activity sends its run's task facts",
         ));
@@ -309,7 +305,7 @@ impl StreamService {
             }
             self.store.capabilities().require(Capabilities::RUN_FENCE)?;
         }
-        check_task_facts(producer, &request)?;
+        check_task_facts(kind, &request)?;
         let digest = batch_digest(&request.records);
         let records = data_records(producer, request.records)?;
         let bytes = superseded(producer, &request.withdraw_run);
@@ -318,7 +314,7 @@ impl StreamService {
         let completed = request
             .previous_completed_task
             .filter(|c| c.started_event_id > 0);
-        let orphans = (producer.kind == StreamProducerKind::LocalActivity as i32
+        let orphans = (kind == ProducerKind::LocalActivity
             && request.previous_completed_task.is_some())
         .then(|| orphan_superseded(producer, completed.as_ref(), &request.failed_tasks));
         let batch = Batch {
