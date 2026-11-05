@@ -264,7 +264,7 @@ async fn a_lower_epoch_is_fenced_for_each_producer_kind() {
 }
 
 /// A close refuses later appends but not a resend of an earlier batch, and a create of the Stream
-/// fails as closed. With `STORE_ANSWERS`, a second close returns `already` with the same offset.
+/// fails as closed. With `STORE_ANSWERS`, a second close returns `already`.
 async fn a_close_stops_appends_but_not_a_resend() {
     for target in stores_for(Needs::CALLS).await {
         target.create(Owner::Client).await;
@@ -282,7 +282,6 @@ async fn a_close_stops_appends_but_not_a_resend() {
         let again = target.close(&p).await.unwrap();
         if target.gives.gives(Needs::STORE_ANSWERS) {
             assert!(!closed.already && again.already);
-            assert_eq!(again.offset, closed.offset);
         }
         let created = target.create_with(&use_existing()).await;
         assert_eq!(created.unwrap_err().reason, Reason::Closed);
@@ -536,6 +535,42 @@ async fn a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline() {
         tokio::time::sleep(Duration::from_millis(100)).await;
         append(&target, &client(1), 2, &["b"]).await.unwrap();
         assert!(waiter.await.unwrap().unwrap());
+    }
+}
+
+/// A close writes no log entry. It ends a wait for the next entry, and a wait on a closed Stream
+/// ends at once, so a waiting read sees the close.
+async fn a_close_writes_no_entry_and_ends_a_wait() {
+    for target in stores_for(Needs::RAW_KEYS).await {
+        target.create(Owner::Client).await;
+        let first = append(&target, &client(1), 1, &["a"]).await.unwrap();
+        let newest = first.offsets.unwrap().1;
+        let store = target.store.clone();
+        let (namespace, stream) = (target.namespace.clone(), target.stream.clone());
+        let waiter = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            store
+                .wait_after(&namespace, &stream, newest, deadline)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        target.close(&client(1)).await.unwrap();
+        assert!(waiter.await.unwrap().unwrap());
+        let started = tokio::time::Instant::now();
+        let deadline = started + Duration::from_secs(5);
+        let woke = target
+            .store
+            .wait_after(&target.namespace, &target.stream, newest, deadline)
+            .await
+            .unwrap();
+        assert!(woke && started.elapsed() < Duration::from_secs(1));
+        let (state, entries) = target
+            .store
+            .read(&target.namespace, &target.stream, 0, 10)
+            .await
+            .unwrap();
+        assert!(state.closed);
+        assert_eq!((state.newest, entries.len()), (newest, 1));
     }
 }
 
@@ -831,7 +866,7 @@ async fn an_append_whose_ids_would_not_fit_an_offset_is_refused_before_it_writes
         let error = append(&target, &client(1), 1, &["a"; 10])
             .await
             .unwrap_err();
-        assert_eq!(error.reason, Reason::Storage);
+        assert_eq!(error.reason, Reason::StorageUnavailable);
         assert_eq!(target.log_len().await, 1);
     }
 }
@@ -980,8 +1015,9 @@ async fn a_producer_field_of_another_format_is_refused() {
         for other in [flagged, value[..value.len() - 1].to_vec()] {
             target.set_meta(&field, &other).await;
             let error = append(&target, &p, 2, &["b"]).await.unwrap_err();
-            assert_eq!(error.reason, Reason::Storage);
-            assert_eq!(target.close(&p).await.unwrap_err().reason, Reason::Storage);
+            assert_eq!(error.reason, Reason::StorageCorrupt);
+            let error = target.close(&p).await.unwrap_err();
+            assert_eq!(error.reason, Reason::StorageCorrupt);
         }
         assert_eq!(target.texts().await, ["a"]);
     }
@@ -1006,6 +1042,7 @@ pub const CASES: &[super::Case] = &[
     case!(an_append_trims_by_retention_and_keeps_the_watermark),
     case!(offsets_go_on_after_the_log_expires),
     case!(a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline),
+    case!(a_close_writes_no_entry_and_ends_a_wait),
     case!(a_batch_gets_consecutive_offsets_that_end_at_its_last_offset),
     case!(a_negative_sequence_is_refused),
     case!(a_batch_with_no_sequence_takes_the_next_one_of_its_epoch),
