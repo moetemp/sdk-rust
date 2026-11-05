@@ -10,8 +10,9 @@ use crate::{
     proto::{
         ActivityEpoch, AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientEpoch,
         CloseStreamRequest, CloseStreamResponse, CreateStreamRequest, CreateStreamResponse,
-        LocalActivityEpoch, Producer, ProducerEpoch, StreamErrorDetails, StreamHandle,
-        StreamIdConflictPolicy, WorkflowTaskEpoch, producer_epoch::Kind,
+        DescribeStreamRequest, DescribeStreamResponse, LocalActivityEpoch, Producer, ProducerEpoch,
+        StreamErrorDetails, StreamHandle, StreamIdConflictPolicy, StreamStatus, WorkflowTaskEpoch,
+        producer_epoch::Kind,
     },
 };
 use prost::Message;
@@ -264,6 +265,30 @@ async fn a_create_of_a_closed_stream_fails() {
     }
 }
 
+/// A close writes no Record, so the describe's last offset stays at the newest Record. A second
+/// close of the closed Stream succeeds, and a later append fails as closed.
+async fn a_close_writes_no_record_and_a_second_close_succeeds() {
+    for case in cases_for(Needs::CALLS).await {
+        case.create(None).await.unwrap();
+        let written = case.append(client(1), 1, vec![record("a")]).await.unwrap();
+        case.close(client(1)).await.unwrap();
+        case.close(client(1)).await.unwrap();
+        let error = case
+            .append(client(1), 2, vec![record("b")])
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "stream_closed");
+        let describe = DescribeStreamRequest {
+            namespace: case.namespace.clone(),
+            handle: case.handle(),
+        };
+        let described: DescribeStreamResponse =
+            call(&case.ext, "DescribeStream", describe).await.unwrap();
+        assert_eq!(described.status, StreamStatus::Closed as i32);
+        assert_eq!(described.last_offset, written.last_offset);
+    }
+}
+
 /// A Stream with no owner takes a close from a Workflow or a client. The close of an Activity
 /// fails as `not_owner`.
 async fn a_workflow_or_a_client_closes_a_stream_with_no_owner() {
@@ -450,6 +475,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_create_returns_the_stream_that_exists_whatever_its_retention),
     case!(a_create_of_an_open_stream_fails_unless_it_uses_it_or_retries),
     case!(a_create_of_a_closed_stream_fails),
+    case!(a_close_writes_no_record_and_a_second_close_succeeds),
     case!(a_workflow_or_a_client_closes_a_stream_with_no_owner),
     case!(a_create_of_an_expired_stream_fails),
     case!(a_create_checks_its_owner_and_its_handle),
