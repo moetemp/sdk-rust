@@ -8,7 +8,7 @@ use crate::{
     epoch::{EPOCH_KEY_LEN, ProducerKind, epoch_key},
     ids::StreamKeys,
     offset::{entry_id_of_offset, offset_of_entry_id},
-    proto::{Producer, StreamHandle},
+    proto::{Producer, StreamRef},
     store::{
         Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, CreateOutcome, Created,
         Entry, FORMAT_VERSION, MAX_SEQUENCE, Owner, Store, StreamState, TOMBSTONE, owner_chain,
@@ -249,7 +249,7 @@ impl Keys {
             if self.text("oc").is_some_and(|owner| chain != owner) {
                 return Err(refuse(
                     Reason::NotOwner,
-                    "the handle names another run chain than the owner",
+                    "the ref has another run chain than the owner",
                 ));
             }
         } else if !matches!(kind, ProducerKind::Workflow | ProducerKind::Client) {
@@ -516,10 +516,10 @@ impl Store for MemoryStore {
     async fn create(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         create: &Create<'_>,
     ) -> StreamResult<Created> {
-        let stream_id = handle.id.as_str();
+        let stream_id = stream_ref.id.as_str();
         let retention = create.retention.filter(|r| !r.is_zero());
         let retention = millis(retention.unwrap_or(self.retention));
         let request_id = create.request_id;
@@ -529,7 +529,7 @@ impl Store for MemoryStore {
         };
         let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
         let chain = if owner == "wf" {
-            owner_chain(handle)
+            owner_chain(stream_ref)
         } else {
             String::new()
         };
@@ -572,10 +572,10 @@ impl Store for MemoryStore {
     async fn append(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         batch: &Batch<'_>,
     ) -> StreamResult<Appended> {
-        let stream_id = handle.id.as_str();
+        let stream_id = stream_ref.id.as_str();
         let producer = batch.producer;
         let kind = ProducerKind::try_from(producer)?;
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
@@ -715,15 +715,15 @@ impl Store for MemoryStore {
     async fn close(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         producer: &Producer,
     ) -> StreamResult<Closed> {
-        let stream_id = handle.id.as_str();
+        let stream_id = stream_ref.id.as_str();
         let kind = ProducerKind::try_from(producer)?;
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
         let field = format!("p|{}|{}", kind as i32, producer.id);
         let tombstone = millis(TOMBSTONE);
-        let chain = owner_chain(handle);
+        let chain = owner_chain(stream_ref);
         let closed = self.with(namespace, stream_id, |keys, now| {
             keys.check_live(now)?;
             keys.check_owner(kind, &chain)?;
