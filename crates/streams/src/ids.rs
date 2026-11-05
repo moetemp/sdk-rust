@@ -11,10 +11,7 @@
 //! script. Each part is percent-encoded, so a `:` or a brace in an id can't make two Streams share
 //! a key.
 
-use crate::{
-    StreamError, StreamResult,
-    proto::{Producer, StreamProducerKind},
-};
+use crate::{StreamError, StreamResult, epoch::ProducerKind, proto::Producer};
 
 /// The longest Stream id, in bytes.
 pub const MAX_STREAM_ID_BYTES: usize = 4096;
@@ -111,25 +108,22 @@ pub fn named_client_producer_id(name: &str) -> String {
 }
 
 /// The id prefix of a Producer kind.
-pub(crate) fn kind_prefix(kind: StreamProducerKind) -> Option<&'static str> {
+pub(crate) fn kind_prefix(kind: ProducerKind) -> &'static str {
     match kind {
-        StreamProducerKind::Workflow => Some("wf:"),
-        StreamProducerKind::LocalActivity => Some("la:"),
-        StreamProducerKind::Activity => Some("act:"),
-        StreamProducerKind::StandaloneActivity => Some("sa:"),
-        StreamProducerKind::Client => Some("client:"),
-        StreamProducerKind::Unspecified => None,
+        ProducerKind::Workflow => "wf:",
+        ProducerKind::LocalActivity => "la:",
+        ProducerKind::Activity => "act:",
+        ProducerKind::StandaloneActivity => "sa:",
+        ProducerKind::Client => "client:",
     }
 }
 
-/// Checks that a Producer's id has the prefix of its kind, and that the run in the id is its
-/// `run_id`. The kind prefix stops a Producer from using the id of another kind.
+/// Checks that a Producer's epoch has a case, that its id has the prefix of that kind, and that the
+/// run in the id is its `run_id`. The kind prefix stops a Producer from using the id of another
+/// kind.
 pub fn check_producer(producer: &Producer) -> StreamResult<()> {
-    let kind =
-        StreamProducerKind::try_from(producer.kind).unwrap_or(StreamProducerKind::Unspecified);
-    let Some(prefix) = kind_prefix(kind) else {
-        return Err(StreamError::invalid("The Producer has no kind"));
-    };
+    let kind = ProducerKind::try_from(producer)?;
+    let prefix = kind_prefix(kind);
     let Some(rest) = producer.id.strip_prefix(prefix) else {
         return Err(StreamError::invalid(format!(
             "The Producer id {:?} doesn't start with {prefix:?}, as its kind requires",
@@ -138,13 +132,12 @@ pub fn check_producer(producer: &Producer) -> StreamResult<()> {
     };
     let parts: Vec<_> = rest.split(':').collect();
     let expected = match kind {
-        StreamProducerKind::Workflow => 1,
-        StreamProducerKind::LocalActivity | StreamProducerKind::StandaloneActivity => 2,
+        ProducerKind::Workflow => 1,
+        ProducerKind::LocalActivity | ProducerKind::StandaloneActivity => 2,
         // A named client id has one part. A process client id has two.
-        StreamProducerKind::Client if parts.len() == 1 => 1,
-        StreamProducerKind::Client => 2,
-        StreamProducerKind::Activity => 3,
-        StreamProducerKind::Unspecified => unreachable!("refused above"),
+        ProducerKind::Client if parts.len() == 1 => 1,
+        ProducerKind::Client => 2,
+        ProducerKind::Activity => 3,
     };
     // The meta field names use `|` as a separator, so a part must be in the form of `encode_part`.
     let encoded = |part: &&str| decode_part(part).is_some_and(|text| encode_part(&text) == *part);
@@ -156,9 +149,7 @@ pub fn check_producer(producer: &Producer) -> StreamResult<()> {
     }
     let runs = matches!(
         kind,
-        StreamProducerKind::Workflow
-            | StreamProducerKind::LocalActivity
-            | StreamProducerKind::Activity
+        ProducerKind::Workflow | ProducerKind::LocalActivity | ProducerKind::Activity
     );
     if runs && decode_part(parts[0]).as_deref() != Some(producer.run_id.as_str()) {
         return Err(StreamError::invalid(format!(
@@ -166,7 +157,7 @@ pub fn check_producer(producer: &Producer) -> StreamResult<()> {
             producer.id, producer.run_id
         )));
     }
-    if kind == StreamProducerKind::Client && !producer.run_id.is_empty() {
+    if kind == ProducerKind::Client && !producer.run_id.is_empty() {
         return Err(StreamError::invalid("A client Producer has no run id"));
     }
     Ok(())
@@ -210,12 +201,19 @@ impl StreamKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{ProducerEpoch, producer_epoch::Kind};
 
-    fn producer(kind: StreamProducerKind, id: &str, run_id: &str) -> Producer {
+    fn producer(kind: ProducerKind, id: &str, run_id: &str) -> Producer {
+        let kind = match kind {
+            ProducerKind::Workflow => Kind::Workflow(Default::default()),
+            ProducerKind::LocalActivity => Kind::LocalActivity(Default::default()),
+            ProducerKind::Activity => Kind::Activity(Default::default()),
+            ProducerKind::StandaloneActivity => Kind::StandaloneActivity(Default::default()),
+            ProducerKind::Client => Kind::Client(Default::default()),
+        };
         Producer {
-            kind: kind as i32,
             id: id.to_string(),
-            epoch: None,
+            epoch: Some(ProducerEpoch { kind: Some(kind) }),
             run_id: run_id.to_string(),
         }
     }
@@ -233,28 +231,24 @@ mod tests {
     fn the_kind_prefix_and_the_run_must_match_the_producer() {
         let run = "run:1";
         let ok = [
+            producer(ProducerKind::Workflow, &workflow_producer_id(run), run),
             producer(
-                StreamProducerKind::Workflow,
-                &workflow_producer_id(run),
-                run,
-            ),
-            producer(
-                StreamProducerKind::LocalActivity,
+                ProducerKind::LocalActivity,
                 &local_activity_producer_id(run, "k"),
                 run,
             ),
             producer(
-                StreamProducerKind::Activity,
+                ProducerKind::Activity,
                 &activity_producer_id(run, "a:1", "s"),
                 run,
             ),
             producer(
-                StreamProducerKind::StandaloneActivity,
+                ProducerKind::StandaloneActivity,
                 &standalone_activity_producer_id("a", "r"),
                 "",
             ),
             producer(
-                StreamProducerKind::Client,
+                ProducerKind::Client,
                 &client_producer_id("me@host", "p"),
                 "",
             ),
@@ -263,17 +257,20 @@ mod tests {
             check_producer(producer).unwrap();
         }
         let bad = [
-            producer(StreamProducerKind::Client, &workflow_producer_id(run), run),
-            producer(
-                StreamProducerKind::Workflow,
-                &workflow_producer_id(run),
-                "other",
-            ),
-            producer(StreamProducerKind::Activity, "act:run%3A1:a", run),
-            producer(StreamProducerKind::Unspecified, "wf:x", "x"),
-            producer(StreamProducerKind::Client, "client:a:b", "run"),
-            producer(StreamProducerKind::Client, "client:a|b", ""),
-            producer(StreamProducerKind::Client, "client:run%3a1", ""),
+            producer(ProducerKind::Client, &workflow_producer_id(run), run),
+            producer(ProducerKind::Workflow, &workflow_producer_id(run), "other"),
+            producer(ProducerKind::Activity, "act:run%3A1:a", run),
+            Producer {
+                epoch: None,
+                ..producer(ProducerKind::Workflow, "wf:x", "x")
+            },
+            Producer {
+                epoch: Some(ProducerEpoch::default()),
+                ..producer(ProducerKind::Workflow, "wf:x", "x")
+            },
+            producer(ProducerKind::Client, "client:a:b", "run"),
+            producer(ProducerKind::Client, "client:a|b", ""),
+            producer(ProducerKind::Client, "client:run%3a1", ""),
         ];
         for producer in &bad {
             assert_eq!(
