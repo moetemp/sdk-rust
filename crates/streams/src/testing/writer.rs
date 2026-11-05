@@ -17,7 +17,7 @@ use crate::{
         ActivityEpoch, AppendRecord, ClientEpoch, CloseStreamRequest, CloseWriterRequest,
         CloseWriterResponse, CreateStreamRequest, CreateStreamResponse, LocalActivityEpoch,
         OpenWriterRequest, OpenWriterResponse, Producer, ProducerEpoch, ReadRecordsRequest,
-        ReadRecordsResponse, StreamErrorDetails, StreamHandle, StreamRecord, WorkflowTaskEpoch,
+        ReadRecordsResponse, StreamErrorDetails, StreamRecord, StreamRef, WorkflowTaskEpoch,
         WriteRecordsRequest, WriteRecordsResponse, producer_epoch::Kind, stream_record::Item,
     },
     store::{
@@ -63,7 +63,7 @@ async fn cases() -> Vec<Case> {
                 "CreateStream",
                 CreateStreamRequest {
                     namespace: case.namespace.clone(),
-                    stream_handle: Some(StreamHandle {
+                    stream_ref: Some(StreamRef {
                         id: case.stream.clone(),
                         ..Default::default()
                     }),
@@ -142,7 +142,7 @@ impl Case {
     async fn open(&self, producer: Producer, change: impl Fn(&mut OpenWriterRequest)) -> u64 {
         let mut request = OpenWriterRequest {
             namespace: self.namespace.clone(),
-            handle: Some(StreamHandle {
+            r#ref: Some(StreamRef {
                 id: self.stream.clone(),
                 ..Default::default()
             }),
@@ -173,7 +173,7 @@ impl Case {
             "ReadRecords",
             ReadRecordsRequest {
                 namespace: self.namespace.clone(),
-                handle: Some(StreamHandle {
+                r#ref: Some(StreamRef {
                     id: self.stream.clone(),
                     ..Default::default()
                 }),
@@ -254,7 +254,7 @@ async fn a_failed_write_fails_every_later_write_and_the_close() {
         let writer = case.open(client(), |_| {}).await;
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
-            handle: Some(StreamHandle {
+            r#ref: Some(StreamRef {
                 id: case.stream.clone(),
                 ..Default::default()
             }),
@@ -296,7 +296,7 @@ async fn an_activity_retry_opens_on_a_closed_or_expired_stream() {
         case.write(first, &["a1"]).await.unwrap();
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
-            handle: Some(StreamHandle {
+            r#ref: Some(StreamRef {
                 id: case.stream.clone(),
                 ..Default::default()
             }),
@@ -314,7 +314,7 @@ async fn an_activity_retry_opens_on_a_closed_or_expired_stream() {
                 "CreateStream",
                 CreateStreamRequest {
                     namespace: case.namespace.clone(),
-                    stream_handle: Some(StreamHandle {
+                    stream_ref: Some(StreamRef {
                         id: short.clone(),
                         ..Default::default()
                     }),
@@ -325,7 +325,7 @@ async fn an_activity_retry_opens_on_a_closed_or_expired_stream() {
             .await
             .unwrap();
         let on_short = |request: &mut OpenWriterRequest| {
-            request.handle = Some(StreamHandle {
+            request.r#ref = Some(StreamRef {
                 id: short.clone(),
                 ..Default::default()
             });
@@ -476,16 +476,16 @@ impl Store for Flaky {
     async fn create(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         create: &Create<'_>,
     ) -> StreamResult<Created> {
-        self.inner.create(namespace, handle, create).await
+        self.inner.create(namespace, stream_ref, create).await
     }
 
     async fn append(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         batch: &Batch<'_>,
     ) -> StreamResult<Appended> {
         if self.down.load(Ordering::SeqCst) {
@@ -494,7 +494,7 @@ impl Store for Flaky {
         if self.corrupt_next.swap(false, Ordering::SeqCst) {
             return Err(StreamError::storage_corrupt("a stored field is bad"));
         }
-        let appended = self.inner.append(namespace, handle, batch).await?;
+        let appended = self.inner.append(namespace, stream_ref, batch).await?;
         if self.lose_next.swap(false, Ordering::SeqCst) {
             return Err(StreamError::storage_unavailable("the answer was lost"));
         }
@@ -526,10 +526,10 @@ impl Store for Flaky {
     async fn close(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         producer: &Producer,
     ) -> StreamResult<Closed> {
-        self.inner.close(namespace, handle, producer).await
+        self.inner.close(namespace, stream_ref, producer).await
     }
 
     async fn read_back(
@@ -564,7 +564,7 @@ async fn flaky_cases(lose_next: bool) -> Vec<(Arc<Flaky>, Case)> {
                 "CreateStream",
                 CreateStreamRequest {
                     namespace: case.namespace.clone(),
-                    stream_handle: Some(StreamHandle {
+                    stream_ref: Some(StreamRef {
                         id: case.stream.clone(),
                         ..Default::default()
                     }),

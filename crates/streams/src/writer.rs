@@ -10,7 +10,7 @@ use crate::{
     Reason, StreamError, StreamResult,
     epoch::ProducerKind,
     proto::{
-        AppendRecord, AppendRecordsRequest, OpenWriterRequest, Producer, StreamHandle,
+        AppendRecord, AppendRecordsRequest, OpenWriterRequest, Producer, StreamRef,
         WorkflowTaskEpoch, producer_epoch::Kind,
     },
     service::StreamService,
@@ -50,7 +50,7 @@ struct State {
 
 struct Writer {
     namespace: String,
-    handle: StreamHandle,
+    stream_ref: StreamRef,
     producer: Producer,
     previous_completed_task: Option<WorkflowTaskEpoch>,
     failed_tasks: Vec<i64>,
@@ -130,7 +130,7 @@ impl Writer {
     async fn send(&self, records: Vec<AppendRecord>, sequence: i64) -> StreamResult<(i64, i64)> {
         let request = AppendRecordsRequest {
             namespace: self.namespace.clone(),
-            handle: Some(self.handle.clone()),
+            r#ref: Some(self.stream_ref.clone()),
             producer: Some(self.producer.clone()),
             sequence,
             records,
@@ -229,7 +229,7 @@ impl Writers {
         request: OpenWriterRequest,
     ) -> StreamResult<u64> {
         let stream = request
-            .handle
+            .r#ref
             .ok_or_else(|| StreamError::invalid("The writer has no Stream"))?;
         crate::ids::check_stream_id(&stream.id)?;
         let producer = request
@@ -251,7 +251,7 @@ impl Writers {
         }
         let writer = Arc::new(Writer {
             namespace: request.namespace,
-            handle: stream,
+            stream_ref: stream,
             producer,
             previous_completed_task: request.previous_completed_task,
             failed_tasks: request.failed_tasks,
