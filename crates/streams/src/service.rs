@@ -4,20 +4,21 @@
 use crate::{
     Reason, StreamError, StreamResult,
     digest::batch_digest,
-    epoch::withdraws,
+    epoch::{ProducerKind, task_of, withdraws},
     ids::{check_producer, check_stream_id},
     metrics::Metrics,
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        Producer, ReadRecordsRequest, ReadRecordsResponse, StreamHandle, StreamProducerKind,
+        Producer, ReadRecordsRequest, ReadRecordsResponse, StreamHandle, StreamIdConflictPolicy,
         StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded, WorkflowTaskEpoch,
         stream_record::Item,
     },
     record::{caller_status, close_record, data_records, superseded},
     store::{
-        Batch, Capabilities, CreateOutcome, FORMAT_VERSION, MAX_RECORD_BYTES, MAX_SEQUENCE,
-        MAX_TTL, MIN_RETENTION, Owner, Store, StreamState, TaskFacts, Withdrawal, owner_chain,
+        Batch, Capabilities, ConflictPolicy, Create, CreateOutcome, FORMAT_VERSION,
+        MAX_RECORD_BYTES, MAX_SEQUENCE, MAX_TTL, MIN_RETENTION, Owner, Store, StreamState,
+        TaskFacts, Withdrawal, owner_chain,
     },
 };
 use prost::Message;
@@ -76,6 +77,19 @@ fn retention(value: Option<prost_types::Duration>) -> StreamResult<Option<Durati
     Ok(retention)
 }
 
+/// The conflict policy of a create. Unspecified is FAIL, as for a Workflow start.
+fn conflict_policy(value: i32) -> StreamResult<ConflictPolicy> {
+    match StreamIdConflictPolicy::try_from(value) {
+        Ok(StreamIdConflictPolicy::Unspecified | StreamIdConflictPolicy::Fail) => {
+            Ok(ConflictPolicy::Fail)
+        }
+        Ok(StreamIdConflictPolicy::UseExisting) => Ok(ConflictPolicy::UseExisting),
+        Err(_) => Err(StreamError::invalid(format!(
+            "The conflict policy {value} is unknown"
+        ))),
+    }
+}
+
 fn proto_duration(value: Duration) -> prost_types::Duration {
     prost_types::Duration {
         seconds: value.as_secs() as i64,
@@ -128,7 +142,8 @@ fn orphan_superseded(
 fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
     let producer = producer.ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
     check_producer(producer)?;
-    if producer.kind == StreamProducerKind::Workflow as i32 {
+    let kind = ProducerKind::try_from(producer)?;
+    if kind == ProducerKind::Workflow {
         return Err(StreamError::invalid(
             "A Workflow writes with the Producer of its Local Activity",
         ));
@@ -136,8 +151,8 @@ fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
     // Without its task, a re-dispatch in a later task has the same epoch as the first dispatch.
     let task = producer
         .epoch
-        .map_or(0, |epoch| epoch.task_started_event_id);
-    if producer.kind == StreamProducerKind::LocalActivity as i32 && task <= 0 {
+        .map_or(0, |epoch| task_of(&epoch).started_event_id);
+    if kind == ProducerKind::LocalActivity && task <= 0 {
         return Err(StreamError::invalid(
             "A Local Activity Producer's epoch must name the Workflow Task that dispatched it",
         ));
@@ -176,7 +191,7 @@ fn check_task_facts(producer: &Producer, request: &AppendRecordsRequest) -> Stre
 /// Store stores that chain and checks every later create and close against it.
 fn create_owner<'a>(owner: &'a Producer, handle: &StreamHandle) -> StreamResult<&'a Producer> {
     check_producer(owner)?;
-    if owner.kind != StreamProducerKind::Workflow as i32 {
+    if ProducerKind::try_from(owner)? != ProducerKind::Workflow {
         return Err(StreamError::invalid(
             "The owner of a create is a Workflow Producer",
         ));
@@ -202,24 +217,10 @@ impl StreamService {
         &self,
         request: CreateStreamRequest,
     ) -> StreamResult<CreateStreamResponse> {
-        check_stream_id(&request.stream_id)?;
+        stream_id(request.stream_handle.as_ref())?;
+        let stream = request.stream_handle.clone().unwrap_or_default();
         let retention = retention(request.retention)?;
-        if request
-            .stream_handle
-            .as_ref()
-            .is_some_and(|handle| handle.id != request.stream_id)
-        {
-            return Err(StreamError::invalid(
-                "The create's handle names another Stream than its stream_id",
-            ));
-        }
-        let stream = request
-            .stream_handle
-            .clone()
-            .unwrap_or_else(|| StreamHandle {
-                id: request.stream_id.clone(),
-                ..Default::default()
-            });
+        let conflict = conflict_policy(request.id_conflict_policy)?;
         // A Workflow's call from outside Workflow code, such as from a Local Activity, sets the
         // owner run. Then the Stream has the safety TTL of a Workflow-owned Stream.
         let owner = match &request.owner {
@@ -246,21 +247,27 @@ impl StreamService {
             self.store.capabilities().require(Capabilities::RUN_FENCE)?;
         }
         let bytes = run_superseded(request.owner.as_ref(), &request.withdraw_run);
-        let withdrawal = Withdrawal {
-            withdraw_run: &request.withdraw_run,
-            superseded: &bytes,
-            tasks: None,
+        let create = Create {
+            retention,
+            owner,
+            conflict,
+            request_id: &request.request_id,
+            withdrawal: Withdrawal {
+                withdraw_run: &request.withdraw_run,
+                superseded: &bytes,
+                tasks: None,
+            },
         };
         let created = self
             .store
-            .create(&request.namespace, &stream, retention, owner, &withdrawal)
+            .create(&request.namespace, &stream, &create)
             .await?;
         if created.flagged {
             self.metrics.superseded();
         }
         Ok(CreateStreamResponse {
             handle: Some(StreamHandle {
-                id: request.stream_id,
+                id: stream.id,
                 owner: stream.owner.filter(|_| owner == Owner::Workflow),
                 backend: self.backend.clone(),
             }),
@@ -275,6 +282,7 @@ impl StreamService {
         stream_id(request.handle.as_ref())?;
         let stream = request.handle.clone().unwrap_or_default();
         let producer = outside_producer(request.producer.as_ref())?;
+        let kind = ProducerKind::try_from(producer)?;
         if !(0..=MAX_SEQUENCE).contains(&request.sequence) {
             return Err(StreamError::invalid(
                 "The sequence must be from 1 to 2^53 - 1, or zero for the next one",
@@ -294,9 +302,7 @@ impl StreamService {
         if !request.withdraw_run.is_empty() {
             // Only a retry run's Local Activity withdraws its previous run, as only the owner's
             // create does. Any other Producer could withdraw and fence an unrelated run.
-            if producer.kind != StreamProducerKind::LocalActivity as i32
-                || request.withdraw_run == producer.run_id
-            {
+            if kind != ProducerKind::LocalActivity || request.withdraw_run == producer.run_id {
                 return Err(StreamError::invalid(
                     "Only a Local Activity of a later run withdraws a run",
                 ));
@@ -455,7 +461,7 @@ impl StreamService {
         if from > state.newest + 1 {
             let next = state.newest + 1;
             return Err(StreamError::new(
-                Reason::Offset,
+                Reason::OffsetTooHigh,
                 format!(
                     "The offset {from} is past the newest offset + 1, {next}. A failover may have \
                      lost the newest Records. Read from {next}, or read again once newer Records \

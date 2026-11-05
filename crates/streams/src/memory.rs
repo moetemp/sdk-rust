@@ -5,13 +5,13 @@
 use crate::{
     Reason, StreamError, StreamResult,
     digest::DIGEST_LEN,
-    epoch::{EPOCH_KEY_LEN, TASK_KEY_LEN, epoch_key, task_key, task_of},
+    epoch::{EPOCH_KEY_LEN, ProducerKind, TASK_KEY_LEN, epoch_key, task_key, task_of},
     ids::{StreamKeys, encode_part},
     offset::{entry_id_of_offset, offset_of_entry_id},
-    proto::{Producer, StreamHandle, StreamProducerKind, WorkflowTaskEpoch},
+    proto::{Producer, StreamHandle, WorkflowTaskEpoch},
     store::{
-        Appended, Batch, Capabilities, Closed, CreateOutcome, Created, Entry, FORMAT_VERSION,
-        MAX_SEQUENCE, Owner, Store, StreamState, TOMBSTONE, Withdrawal, owner_chain,
+        Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, CreateOutcome, Created,
+        Entry, FORMAT_VERSION, MAX_SEQUENCE, Owner, Store, StreamState, TOMBSTONE, owner_chain,
     },
 };
 use parking_lot::Mutex;
@@ -309,9 +309,9 @@ impl Keys {
     }
 
     /// The `check_owner` step of a close, as in `lib.lua`.
-    fn check_owner(&self, kind: i32, chain: &str) -> StreamResult<()> {
+    fn check_owner(&self, kind: ProducerKind, chain: &str) -> StreamResult<()> {
         if self.text("own") == Some("wf") {
-            if kind != StreamProducerKind::Workflow as i32 {
+            if kind != ProducerKind::Workflow {
                 return Err(refuse(
                     Reason::NotOwner,
                     "only the close Activity of the owner run chain closes a Workflow-owned Stream",
@@ -323,10 +323,10 @@ impl Keys {
                     "the handle names another run chain than the owner",
                 ));
             }
-        } else if kind != StreamProducerKind::Client as i32 {
+        } else if !matches!(kind, ProducerKind::Workflow | ProducerKind::Client) {
             return Err(refuse(
                 Reason::NotOwner,
-                "only a client closes a Stream that a client created",
+                "only a Workflow or a client closes a Stream with no owner",
             ));
         }
         Ok(())
@@ -604,17 +604,18 @@ impl Store for MemoryStore {
         &self,
         namespace: &str,
         handle: &StreamHandle,
-        retention: Option<Duration>,
-        owner: Owner,
-        withdrawal: &Withdrawal<'_>,
+        create: &Create<'_>,
     ) -> StreamResult<Created> {
         let stream_id = handle.id.as_str();
-        let retention = millis(retention.filter(|r| !r.is_zero()).unwrap_or(self.retention));
-        let owner = match owner {
+        let retention = create.retention.filter(|r| !r.is_zero());
+        let retention = millis(retention.unwrap_or(self.retention));
+        let request_id = create.request_id;
+        let owner = match create.owner {
             Owner::Workflow => "wf",
             Owner::Client => "client",
         };
         let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
+        let withdrawal = &create.withdrawal;
         let withdrawn_run = encode_run(withdrawal.withdraw_run);
         let chain = if owner == "wf" {
             owner_chain(handle)
@@ -629,6 +630,9 @@ impl Store for MemoryStore {
                 if !chain.is_empty() {
                     keys.set("oc", chain.clone());
                 }
+                if !request_id.is_empty() {
+                    keys.set("rid", request_id);
+                }
                 keys.withdraw_run(&withdrawn_run);
                 keys.refresh(now, safety, tombstone);
                 return Ok((CreateOutcome::Created, retention, false));
@@ -637,6 +641,13 @@ impl Store for MemoryStore {
             keys.check_identity(owner, &chain)?;
             if keys.get("closed").is_some() {
                 return Err(refuse(Reason::Closed, "the Stream is closed"));
+            }
+            // A retry of the create that made the Stream gets its answer again.
+            if !request_id.is_empty() && keys.get("rid") == Some(request_id.as_bytes()) {
+                return Ok((CreateOutcome::Created, keys.number("ret"), false));
+            }
+            if create.conflict == ConflictPolicy::Fail {
+                return Err(refuse(Reason::AlreadyExists, "the Stream exists"));
             }
             if !withdrawn_run.is_empty() {
                 keys.check_ids_fit(now, 1)?;
@@ -676,15 +687,16 @@ impl Store for MemoryStore {
     ) -> StreamResult<Appended> {
         let stream_id = handle.id.as_str();
         let producer = batch.producer;
+        let kind = ProducerKind::try_from(producer)?;
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
         let run = encode_run(&producer.run_id);
         let withdrawal = &batch.withdrawal;
         let withdrawn_run = encode_run(withdrawal.withdraw_run);
         let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
-        let field = format!("p|{}|{}", producer.kind, producer.id);
-        let member = format!("{}|{}", producer.kind, producer.id);
+        let field = format!("p|{}|{}", kind as i32, producer.id);
+        let member = format!("{}|{}", kind as i32, producer.id);
         // The Workflow Task of a Local Activity of a run, which the run's task facts can withdraw.
-        let task = (producer.kind == StreamProducerKind::LocalActivity as i32 && !run.is_empty())
+        let task = (kind == ProducerKind::LocalActivity && !run.is_empty())
             .then(|| task_key(&task_of(&producer.epoch.unwrap_or_default())));
         let facts = withdrawal.tasks.filter(|_| task.is_some());
         let completed = facts.and_then(|facts| facts.completed).map(task_key);
@@ -730,7 +742,7 @@ impl Store for MemoryStore {
                 }
                 if sequence < previous.sequence {
                     return Err(refuse(
-                        Reason::Sequence,
+                        Reason::SequenceTooLow,
                         &format!(
                             "sequence {sequence} is below the last one, {}",
                             previous.sequence
@@ -776,7 +788,7 @@ impl Store for MemoryStore {
             keys.check_ids_fit(now, records + 2)?;
 
             // A client's newer epoch only fences, as in `append.lua`.
-            let newer = producer.kind != StreamProducerKind::Client as i32
+            let newer = kind != ProducerKind::Client
                 && stored
                     .and_then(|stored| stored.held)
                     .is_some_and(|held| held < epoch);
@@ -926,14 +938,15 @@ impl Store for MemoryStore {
         record: &[u8],
     ) -> StreamResult<Closed> {
         let stream_id = handle.id.as_str();
+        let kind = ProducerKind::try_from(producer)?;
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
         let run = encode_run(&producer.run_id);
-        let field = format!("p|{}|{}", producer.kind, producer.id);
+        let field = format!("p|{}|{}", kind as i32, producer.id);
         let tombstone = millis(TOMBSTONE);
         let chain = owner_chain(handle);
         let closed = self.with(namespace, stream_id, |keys, now| {
             keys.check_live(now)?;
-            keys.check_owner(producer.kind, &chain)?;
+            keys.check_owner(kind, &chain)?;
             if keys.get("closed").is_some() {
                 let id = keys.text("close_id").unwrap_or_default().to_string();
                 return Ok((id, true));

@@ -57,20 +57,49 @@ pub fn owner_chain(handle: &StreamHandle) -> String {
 }
 
 /// Who created a Stream, which decides its TTL while it is open.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Owner {
     /// Until it closes, the Stream expires `safety_ttl` after its last write.
     Workflow,
-    /// The Stream expires one Retention after its last write.
+    /// The Stream has no owner. It expires one Retention after its last write.
+    #[default]
     Client,
+}
+
+/// What a create does when its Stream exists and is open, and the create isn't a retry of the
+/// create that made the Stream.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ConflictPolicy {
+    /// The create fails with [Reason::AlreadyExists].
+    #[default]
+    Fail,
+    /// The create gets the open Stream, which keeps its own Retention.
+    UseExisting,
+}
+
+/// A create of a Stream.
+#[derive(Debug, Clone, Default)]
+pub struct Create<'a> {
+    /// The Retention, `None` for the Store default.
+    pub retention: Option<Duration>,
+    /// Who creates the Stream.
+    pub owner: Owner,
+    /// What the create does when the Stream exists.
+    pub conflict: ConflictPolicy,
+    /// Unique for each create call, and the same on its retries. Empty for none. The Store keeps
+    /// the request id of the create that made the Stream, so a retry after a lost answer succeeds.
+    pub request_id: &'a str,
+    /// What a retry run's create withdraws.
+    pub withdrawal: Withdrawal<'a>,
 }
 
 /// What a create found.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateOutcome {
-    /// The create wrote the key.
+    /// The create wrote the key, or it is a retry of the create that wrote it.
     Created,
-    /// The Stream exists and is open. The create doesn't change its Retention.
+    /// The Stream exists and is open, and the create uses it. The create doesn't change its
+    /// Retention.
     Exists,
 }
 
@@ -288,16 +317,19 @@ pub trait Store: Send + Sync + 'static {
     /// another one must say what it forwards.
     fn capabilities(&self) -> Capabilities;
 
-    /// Creates a Stream, or finds it when it is open and has the create's owner. The calls that
-    /// write take the Stream's whole handle, since the server finds a Workflow's Stream by its
-    /// owner. With [Capabilities::RUN_FENCE], a retry run's create withdraws its previous run.
+    /// Creates a Stream. The calls that write take the Stream's whole handle, since the server
+    /// finds a Workflow's Stream by its owner.
+    ///
+    /// The create of an existing Stream fails with [Reason::Expired], [Reason::NotOwner] or
+    /// [Reason::Closed], in this order. Then a retry of the create that made the Stream, with the
+    /// same request id, gets [CreateOutcome::Created] and changes nothing. Any other create
+    /// applies its [ConflictPolicy]. With [Capabilities::RUN_FENCE], a retry run's create
+    /// withdraws its previous run.
     async fn create(
         &self,
         namespace: &str,
         handle: &StreamHandle,
-        retention: Option<Duration>,
-        owner: Owner,
-        withdrawal: &Withdrawal<'_>,
+        create: &Create<'_>,
     ) -> StreamResult<Created>;
 
     /// Appends the whole batch, or nothing of it. The batch's Records get consecutive offsets that

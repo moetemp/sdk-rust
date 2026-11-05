@@ -120,7 +120,6 @@ fn canceled(failure: &Failure) -> bool {
 /// The facts a `Superseded` item of this batch gives the Reader.
 pub(crate) fn superseded(producer: &Producer, withdraw_run: &str) -> Vec<u8> {
     StreamSuperseded {
-        producer_kind: producer.kind,
         producer_id: producer.id.clone(),
         epoch: producer.epoch,
         withdraw_run: withdraw_run.to_string(),

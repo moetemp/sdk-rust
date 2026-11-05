@@ -12,14 +12,11 @@ use temporalio_streams::{
     ids::client_producer_id,
     memory::MemoryStore,
     proto::{
-        AppendRecord, AppendRecordsRequest, CloseStreamRequest, CreateStreamRequest,
+        AppendRecord, AppendRecordsRequest, ClientEpoch, CloseStreamRequest, CreateStreamRequest,
         DescribeStreamRequest, DescribeStreamResponse, Producer, ProducerEpoch, StreamErrorDetails,
-        StreamErrorReason, StreamHandle, StreamProducerKind, StreamStatus,
+        StreamErrorReason, StreamHandle, StreamStatus, WorkflowTaskEpoch, producer_epoch::Kind,
     },
-    store::{
-        Appended, Batch, Capabilities, Closed, Created, Entry, Owner, Store, StreamState,
-        Withdrawal,
-    },
+    store::{Appended, Batch, Capabilities, Closed, Create, Created, Entry, Store, StreamState},
 };
 use tokio::time::Instant;
 use tonic::Code;
@@ -40,13 +37,9 @@ impl Store for Masked {
         &self,
         namespace: &str,
         handle: &StreamHandle,
-        retention: Option<Duration>,
-        owner: Owner,
-        withdrawal: &Withdrawal<'_>,
+        create: &Create<'_>,
     ) -> StreamResult<Created> {
-        self.inner
-            .create(namespace, handle, retention, owner, withdrawal)
-            .await
+        self.inner.create(namespace, handle, create).await
     }
 
     async fn append(
@@ -126,11 +119,9 @@ fn case(without: Capabilities) -> Case {
 
 fn client() -> Producer {
     Producer {
-        kind: StreamProducerKind::Client as i32,
         id: client_producer_id("me", "p"),
         epoch: Some(ProducerEpoch {
-            attempt: 1,
-            ..Default::default()
+            kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
         }),
         run_id: String::new(),
     }
@@ -164,7 +155,7 @@ impl Case {
     async fn create(&self) {
         let request = CreateStreamRequest {
             namespace: NAMESPACE.to_string(),
-            stream_id: self.stream.clone(),
+            stream_handle: self.handle(),
             ..Default::default()
         };
         self.call("CreateStream", request).await.unwrap();
@@ -184,13 +175,13 @@ impl Case {
     async fn create_owned(&self, withdraw_run: &str) -> Result<Vec<u8>, StreamError> {
         let request = CreateStreamRequest {
             namespace: NAMESPACE.to_string(),
-            stream_id: self.stream.clone(),
             withdraw_run: withdraw_run.to_string(),
             owner: Some(Producer {
-                kind: StreamProducerKind::Workflow as i32,
                 id: temporalio_streams::ids::workflow_producer_id(&self.run_id),
+                epoch: Some(ProducerEpoch {
+                    kind: Some(Kind::Workflow(WorkflowTaskEpoch::default())),
+                }),
                 run_id: self.run_id.clone(),
-                ..Default::default()
             }),
             stream_handle: Some(StreamHandle {
                 id: self.stream.clone(),
