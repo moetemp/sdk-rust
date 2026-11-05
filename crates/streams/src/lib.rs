@@ -13,7 +13,6 @@ pub mod ids;
 pub mod memory;
 mod metrics;
 pub mod offset;
-pub mod protos;
 mod record;
 mod runtime;
 mod service;
@@ -24,10 +23,15 @@ pub mod testing;
 pub use error::{Reason, StreamError, StreamResult};
 pub use runtime::{MemoryStreamRuntime, StoreFactory, StreamRuntime};
 
-/// The protos that lang and the crate exchange.
+/// The protos that lang and the crate exchange. `temporalio-protos` generates them, so a value
+/// needs no conversion between the crates.
 pub mod proto {
-    pub use crate::protos::temporal::{
-        api::{enums::v1::*, stream::v1::*, streamservice::v1::*},
-        sdk::streams::v1::*,
+    pub use temporalio_common::protos::{
+        coresdk::streams::*,
+        temporal::api::{
+            enums::v1::{StreamErrorReason, StreamIdConflictPolicy, StreamReadStart, StreamStatus},
+            stream::v1::*,
+            streamservice::v1::*,
+        },
     };
 }
