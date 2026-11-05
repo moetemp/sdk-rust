@@ -943,7 +943,7 @@ async fn task_batch(
         .store
         .append(
             &target.namespace,
-            &target.handle(),
+            &target.stream_ref(),
             &Batch {
                 producer,
                 sequence: 1,

@@ -11,8 +11,8 @@ use crate::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
         Producer, ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy,
-        StreamReadStart, StreamRecord, StreamRef, StreamStatus, StreamSuperseded, WorkflowTaskEpoch,
-        producer_epoch::Kind, stream_record::Item,
+        StreamReadStart, StreamRecord, StreamRef, StreamStatus, StreamSuperseded,
+        WorkflowTaskEpoch, producer_epoch::Kind, stream_record::Item,
     },
     record::{data_records, superseded},
     store::{
