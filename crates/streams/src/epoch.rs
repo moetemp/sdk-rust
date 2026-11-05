@@ -4,12 +4,61 @@
 //! A byte comparison of two keys then orders the epochs field by field. `testdata/epochs.json` has
 //! the shared vectors of the keys, in hex.
 
-use crate::proto::{
-    Producer, ProducerEpoch, StreamProducerKind, StreamRecord, StreamSuperseded, WorkflowTaskEpoch,
-    stream_record::Item,
+use crate::{
+    StreamError, StreamResult,
+    proto::{
+        Producer, ProducerEpoch, StreamRecord, StreamSuperseded, WorkflowTaskEpoch,
+        producer_epoch::Kind, stream_record::Item,
+    },
 };
 use prost_types::Timestamp;
 use std::cmp::Ordering;
+
+/// The kind of a Producer, which is the case of its epoch. The stored field names and keys hold
+/// its number, so each kind keeps its number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProducerKind {
+    /// A Workflow run.
+    Workflow = 1,
+    /// A Local Activity.
+    LocalActivity = 2,
+    /// An Activity of a Workflow.
+    Activity = 3,
+    /// A client.
+    Client = 4,
+    /// A Standalone Activity.
+    StandaloneActivity = 5,
+}
+
+impl From<&Kind> for ProducerKind {
+    fn from(kind: &Kind) -> Self {
+        match kind {
+            Kind::Workflow(_) => Self::Workflow,
+            Kind::LocalActivity(_) => Self::LocalActivity,
+            Kind::Activity(_) => Self::Activity,
+            Kind::StandaloneActivity(_) => Self::StandaloneActivity,
+            Kind::Client(_) => Self::Client,
+        }
+    }
+}
+
+/// Refuses a Producer with no epoch, or with an epoch that has no case.
+impl TryFrom<&Producer> for ProducerKind {
+    type Error = StreamError;
+
+    fn try_from(producer: &Producer) -> StreamResult<Self> {
+        let epoch = producer
+            .epoch
+            .as_ref()
+            .ok_or_else(|| StreamError::invalid("The Producer has no epoch"))?;
+        kind(epoch).ok_or_else(|| StreamError::invalid("The Producer's epoch has no kind"))
+    }
+}
+
+/// The kind of an epoch's case, `None` when the epoch has no case.
+fn kind(epoch: &ProducerEpoch) -> Option<ProducerKind> {
+    epoch.kind.as_ref().map(ProducerKind::from)
+}
 
 /// The length of a [task_key].
 pub const TASK_KEY_LEN: usize = 24;
@@ -42,24 +91,34 @@ pub fn task_key(task: &WorkflowTaskEpoch) -> [u8; TASK_KEY_LEN] {
     key
 }
 
-/// The key of an epoch. It is the task key, then the attempt's scheduled seconds and nanos and the
-/// attempt, in 8, 4 and 4 bytes. Fields that a kind doesn't use compare as zero.
+/// The key of an epoch. It is the [task_of] key, then the attempt's scheduled seconds and nanos
+/// and the attempt, in 8, 4 and 4 bytes. A field that the case doesn't have is zero, and an epoch
+/// with no case is all zeros.
 pub fn epoch_key(epoch: &ProducerEpoch) -> [u8; EPOCH_KEY_LEN] {
-    let (seconds, nanos) = time_fields(epoch.attempt_scheduled_time.as_ref());
+    let (scheduled, attempt) = match &epoch.kind {
+        Some(Kind::LocalActivity(local)) => (None, local.attempt),
+        Some(Kind::Activity(activity) | Kind::StandaloneActivity(activity)) => {
+            (activity.attempt_scheduled_time.as_ref(), activity.attempt)
+        }
+        Some(Kind::Client(client)) => (None, client.attempt),
+        Some(Kind::Workflow(_)) | None => (None, 0),
+    };
+    let (seconds, nanos) = time_fields(scheduled);
     let mut key = [0; EPOCH_KEY_LEN];
     key[..TASK_KEY_LEN].copy_from_slice(&task_key(&task_of(epoch)));
     key[24..32].copy_from_slice(&be64(seconds));
     key[32..36].copy_from_slice(&be32(nanos));
-    key[36..].copy_from_slice(&be32(epoch.attempt));
+    key[36..].copy_from_slice(&be32(attempt));
     key
 }
 
-/// The Workflow Task fields of an epoch.
+/// The Workflow Task of an epoch. It is a Workflow's own task, or the task that dispatched a Local
+/// Activity, and zero for the other kinds.
 pub fn task_of(epoch: &ProducerEpoch) -> WorkflowTaskEpoch {
-    WorkflowTaskEpoch {
-        started_event_id: epoch.task_started_event_id,
-        attempt: epoch.task_attempt,
-        started_time: epoch.task_started_time,
+    match &epoch.kind {
+        Some(Kind::Workflow(task)) => *task,
+        Some(Kind::LocalActivity(local)) => local.task.unwrap_or_default(),
+        _ => WorkflowTaskEpoch::default(),
     }
 }
 
@@ -72,7 +131,8 @@ fn compare_tasks(a: &WorkflowTaskEpoch, b: &WorkflowTaskEpoch) -> Ordering {
     task_key(a).cmp(&task_key(b))
 }
 
-/// Whether a `Superseded` item withdraws an earlier Record.
+/// Whether a `Superseded` item withdraws an earlier Record. The case of the item's epoch picks the
+/// rule.
 ///
 /// For an Activity or a Local Activity, it withdraws that Producer's Records with a lower epoch.
 /// For a Workflow task t with the previous completed task c, it withdraws the Records of the run
@@ -90,17 +150,17 @@ pub fn withdraws(superseded: &StreamSuperseded, record: &StreamRecord) -> bool {
     if !superseded.withdraw_run.is_empty() && producer.run_id == superseded.withdraw_run {
         return true;
     }
-    let kind = StreamProducerKind::try_from(superseded.producer_kind).unwrap_or_default();
-    if kind == StreamProducerKind::Client {
-        return false;
-    }
     let (Some(epoch), Some(old)) = (superseded.epoch.as_ref(), producer.epoch.as_ref()) else {
         return false;
     };
-    if kind != StreamProducerKind::Workflow {
-        return producer.kind == superseded.producer_kind
-            && producer.id == superseded.producer_id
-            && compare_epochs(old, epoch) == Ordering::Less;
+    match kind(epoch) {
+        None | Some(ProducerKind::Client) => return false,
+        Some(ProducerKind::Workflow) => {}
+        same => {
+            return kind(old) == same
+                && producer.id == superseded.producer_id
+                && compare_epochs(old, epoch) == Ordering::Less;
+        }
     }
     if !of_run(producer, superseded) {
         return false;
@@ -124,10 +184,9 @@ pub fn withdraws(superseded: &StreamSuperseded, record: &StreamRecord) -> bool {
 /// Whether a Producer is the Workflow run of a `Superseded` item, or one of its Local
 /// Activities.
 fn of_run(producer: &Producer, superseded: &StreamSuperseded) -> bool {
-    let kind = StreamProducerKind::try_from(producer.kind).unwrap_or_default();
-    match kind {
-        StreamProducerKind::Workflow => producer.id == superseded.producer_id,
-        StreamProducerKind::LocalActivity => producer.run_id == superseded.run_id,
+    match producer.epoch.as_ref().and_then(kind) {
+        Some(ProducerKind::Workflow) => producer.id == superseded.producer_id,
+        Some(ProducerKind::LocalActivity) => producer.run_id == superseded.run_id,
         _ => false,
     }
 }
@@ -135,13 +194,13 @@ fn of_run(producer: &Producer, superseded: &StreamSuperseded) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::ClientEpoch;
 
     // Without the clamp, the bytes of a negative field would outrank every real epoch.
     #[test]
     fn a_negative_field_compares_as_zero() {
         let negative = ProducerEpoch {
-            attempt: -1,
-            ..Default::default()
+            kind: Some(Kind::Client(ClientEpoch { attempt: -1 })),
         };
         assert_eq!(
             compare_epochs(&negative, &ProducerEpoch::default()),
