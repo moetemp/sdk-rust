@@ -11,8 +11,8 @@ use crate::{
         ActivityEpoch, AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientEpoch,
         CloseStreamRequest, CloseStreamResponse, CreateStreamRequest, CreateStreamResponse,
         DescribeStreamRequest, DescribeStreamResponse, LocalActivityEpoch, Producer, ProducerEpoch,
-        StreamErrorDetails, StreamIdConflictPolicy, StreamRef, StreamStatus, WorkflowTaskEpoch,
-        producer_epoch::Kind,
+        StreamErrorDetails, StreamIdConflictPolicy, StreamRef, StreamStatus, StreamWriter,
+        WorkflowTaskEpoch, producer_epoch::Kind,
     },
 };
 use prost::Message;
@@ -66,6 +66,14 @@ fn reason(error: &StreamError) -> String {
     let details = StreamErrorDetails::decode(error.details().as_slice()).unwrap();
     assert_eq!(details.reason(), error.reason.proto());
     error.reason.token().to_string()
+}
+
+/// The writer of a write by `producer`, with no withdrawal facts.
+fn writer_for(producer: Producer) -> Option<StreamWriter> {
+    Some(StreamWriter {
+        producer: Some(producer),
+        ..Default::default()
+    })
 }
 
 fn client(attempt: i32) -> Producer {
@@ -150,7 +158,7 @@ impl Case {
         let close = CloseStreamRequest {
             namespace: self.namespace.clone(),
             r#ref: self.stream_ref(),
-            producer: Some(producer),
+            writer: writer_for(producer),
             ..Default::default()
         };
         call(&self.ext, "CloseStream", close).await
@@ -168,7 +176,7 @@ impl Case {
             AppendRecordsRequest {
                 namespace: self.namespace.clone(),
                 r#ref: self.stream_ref(),
-                producer: Some(producer),
+                writer: writer_for(producer),
                 sequence,
                 records,
                 ..Default::default()
