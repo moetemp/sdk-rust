@@ -23,7 +23,12 @@ def join(*parts):
 
 def keys(prefix, namespace, stream_id):
     base = f"{part(prefix)}:{{{join(namespace, stream_id)}}}"
-    return {"meta": f"{base}:meta", "log": f"{base}:log", "producers": f"{base}:producers"}
+    return {
+        "meta": f"{base}:meta",
+        "log": f"{base}:log",
+        "producers": f"{base}:producers",
+        "closed": f"{base}:closed",
+    }
 
 
 def be64(value):
