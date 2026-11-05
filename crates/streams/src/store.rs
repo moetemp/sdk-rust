@@ -170,8 +170,6 @@ pub struct Appended {
 /// The result of a close.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Closed {
-    /// The offset of the close Record.
-    pub offset: i64,
     /// The Stream was already closed.
     pub already: bool,
 }
@@ -183,8 +181,8 @@ pub struct StreamState {
     pub exists: bool,
     /// The format version.
     pub version: u32,
-    /// The offset of the close Record, if the Stream is closed.
-    pub closed_at: Option<i64>,
+    /// The Stream is closed. Every later append fails, so `newest` is final.
+    pub closed: bool,
     /// The offset of the newest entry written, zero if none.
     pub newest: i64,
     /// The offset of the newest entry that Retention dropped, zero if none.
@@ -240,7 +238,8 @@ impl Capabilities {
     pub const WITHDRAWAL: Self = Self(1 << 1);
     /// A retry run's first write withdraws the previous run and fences its Producers.
     pub const RUN_FENCE: Self = Self(1 << 2);
-    /// A close writes the close Record and every later append is refused.
+    /// A close marks the Stream closed and wakes the waiting reads. Every later append is
+    /// refused.
     pub const CLOSE: Self = Self(1 << 3);
     /// An open Workflow-owned Stream keeps the safety TTL, not the Retention.
     pub const SAFETY_TTL: Self = Self(1 << 4);
@@ -346,8 +345,9 @@ pub trait Store: Send + Sync + 'static {
         count: usize,
     ) -> StreamResult<(StreamState, Vec<Entry>)>;
 
-    /// Waits until the log has an entry after `after`, or `deadline` passes. Returns whether an
-    /// entry came. It may return `false` before the deadline, and then the caller reads again.
+    /// Waits until the log has an entry after `after`, the Stream is closed, or `deadline` passes.
+    /// Returns whether an entry came or the Stream is closed. It may return `false` before the
+    /// deadline, and then the caller reads again.
     async fn wait_after(
         &self,
         namespace: &str,
@@ -356,13 +356,13 @@ pub trait Store: Send + Sync + 'static {
         deadline: Instant,
     ) -> StreamResult<bool>;
 
-    /// Closes a Stream with an encoded close Record. Needs [Capabilities::CLOSE].
+    /// Closes a Stream. A close writes no log entry, and a close of a closed Stream changes
+    /// nothing. Needs [Capabilities::CLOSE].
     async fn close(
         &self,
         _namespace: &str,
         _handle: &StreamHandle,
         _producer: &Producer,
-        _record: &[u8],
     ) -> StreamResult<Closed> {
         Err(unsupported("close"))
     }
