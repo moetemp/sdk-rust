@@ -287,15 +287,20 @@ async fn a_close_stops_appends_but_not_a_resend() {
     }
 }
 
-/// A Stream with a newer format version refuses every write.
+/// A Stream with a newer format version refuses every write. A write checks the version before it
+/// reads the Producer's `p|` field, since a newer format can change that field.
 async fn a_newer_format_refuses_every_write() {
     for target in stores_for(Needs::RAW_KEYS).await {
         target.create(Owner::Client).await;
-        target.set_meta("v", "2").await;
-        let error = append(&target, &client(1), 1, &["a"]).await.unwrap_err();
+        let p = client(1);
+        append(&target, &p, 1, &["a"]).await.unwrap();
+        target.set_meta(fields::VERSION, "2").await;
+        let field = fields::producer(ProducerKind::Client as i32, &p.id);
+        target.set_meta(&field, "a field of a newer format").await;
+        let error = append(&target, &p, 2, &["b"]).await.unwrap_err();
         assert_eq!(error.reason, Reason::FormatTooNew);
         assert_eq!(
-            target.close(&client(1)).await.unwrap_err().reason,
+            target.close(&p).await.unwrap_err().reason,
             Reason::FormatTooNew
         );
         let create = target.create_with(&use_existing()).await;
