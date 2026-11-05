@@ -278,7 +278,8 @@ impl StreamService {
     ) -> StreamResult<AppendRecordsResponse> {
         stream_id(request.r#ref.as_ref())?;
         let stream = request.r#ref.clone().unwrap_or_default();
-        let producer = outside_producer(request.producer.as_ref())?;
+        let writer = request.writer.unwrap_or_default();
+        let producer = outside_producer(writer.producer.as_ref())?;
         let kind = ProducerKind::try_from(producer)?;
         if !(0..=MAX_SEQUENCE).contains(&request.sequence) {
             return Err(StreamError::invalid(
@@ -296,10 +297,10 @@ impl StreamService {
                 .capabilities()
                 .require(Capabilities::NEXT_SEQUENCE)?;
         }
-        if !request.withdraw_run.is_empty() {
+        if !writer.withdraw_run.is_empty() {
             // Only a retry run's Local Activity withdraws its previous run, as only the owner's
             // create does. Any other Producer could withdraw and fence an unrelated run.
-            if kind != ProducerKind::LocalActivity || request.withdraw_run == producer.run_id {
+            if kind != ProducerKind::LocalActivity || writer.withdraw_run == producer.run_id {
                 return Err(StreamError::invalid(
                     "Only a Local Activity of a later run withdraws a run",
                 ));
@@ -309,7 +310,7 @@ impl StreamService {
         check_task_facts(kind, &request)?;
         let digest = batch_digest(&request.records);
         let records = data_records(producer, request.records)?;
-        let bytes = superseded(producer, &request.withdraw_run);
+        let bytes = superseded(producer, &writer.withdraw_run);
         // A Local Activity sends its run's task facts, so that the batch withdraws the run's
         // orphaned Local Activity Records. These are the Records of the tasks that never completed.
         let completed = request
@@ -324,7 +325,7 @@ impl StreamService {
             records: &records,
             digest,
             withdrawal: Withdrawal {
-                withdraw_run: &request.withdraw_run,
+                withdraw_run: &writer.withdraw_run,
                 superseded: &bytes,
                 tasks: orphans.as_ref().map(|orphans| TaskFacts {
                     completed: completed.as_ref(),
@@ -358,7 +359,8 @@ impl StreamService {
     ) -> StreamResult<CloseStreamResponse> {
         stream_id(request.r#ref.as_ref())?;
         let stream = request.r#ref.clone().unwrap_or_default();
-        let producer = close_producer(request.producer.as_ref())?;
+        let writer = request.writer.unwrap_or_default();
+        let producer = close_producer(writer.producer.as_ref())?;
         self.store.capabilities().require(Capabilities::CLOSE)?;
         self.store
             .close(&request.namespace, &stream, producer)

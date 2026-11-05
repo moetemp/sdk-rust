@@ -131,8 +131,8 @@ fn compare_tasks(a: &WorkflowTaskEpoch, b: &WorkflowTaskEpoch) -> Ordering {
     task_key(a).cmp(&task_key(b))
 }
 
-/// Whether a `Superseded` item withdraws an earlier Record. The case of the item's epoch picks the
-/// rule.
+/// Whether a `Superseded` item withdraws an earlier Record. The case of the epoch of the item's
+/// writer picks the rule.
 ///
 /// For an Activity or a Local Activity, it withdraws that Producer's Records with a lower epoch.
 /// For a Workflow task t with the previous completed task c, it withdraws the Records of the run
@@ -141,16 +141,22 @@ fn compare_tasks(a: &WorkflowTaskEpoch, b: &WorkflowTaskEpoch) -> Ordering {
 /// previous run. A client's newer epoch fences the earlier ones but withdraws nothing, since a
 /// restarted client's earlier Records are real messages, not a failed attempt's.
 pub fn withdraws(superseded: &StreamSuperseded, record: &StreamRecord) -> bool {
+    let Some(writer) = superseded.writer.as_ref() else {
+        return false;
+    };
     let Some(Item::Data(data)) = &record.item else {
         return false;
     };
     let Some(producer) = data.producer.as_ref() else {
         return false;
     };
-    if !superseded.withdraw_run.is_empty() && producer.run_id == superseded.withdraw_run {
+    if !writer.withdraw_run.is_empty() && producer.run_id == writer.withdraw_run {
         return true;
     }
-    let (Some(epoch), Some(old)) = (superseded.epoch.as_ref(), producer.epoch.as_ref()) else {
+    let Some(withdrawing) = writer.producer.as_ref() else {
+        return false;
+    };
+    let (Some(epoch), Some(old)) = (withdrawing.epoch.as_ref(), producer.epoch.as_ref()) else {
         return false;
     };
     match kind(epoch) {
@@ -158,19 +164,19 @@ pub fn withdraws(superseded: &StreamSuperseded, record: &StreamRecord) -> bool {
         Some(ProducerKind::Workflow) => {}
         same => {
             return kind(old) == same
-                && producer.id == superseded.producer_id
+                && producer.id == withdrawing.id
                 && compare_epochs(old, epoch) == Ordering::Less;
         }
     }
-    if !of_run(producer, superseded) {
+    if !of_run(producer, withdrawing) {
         return false;
     }
     let (task, old) = (task_of(epoch), task_of(old));
     let started = old.started_event_id;
-    if superseded.failed_tasks.contains(&started) {
+    if writer.failed_tasks.contains(&started) {
         return true;
     }
-    let completed = superseded.previous_completed_task.as_ref();
+    let completed = writer.previous_completed_task.as_ref();
     let after = completed.map_or(0, |c| c.started_event_id);
     if after < started && started < task.started_event_id {
         return true;
@@ -181,12 +187,11 @@ pub fn withdraws(superseded: &StreamSuperseded, record: &StreamRecord) -> bool {
     lower_at(&task) || completed.is_some_and(lower_at)
 }
 
-/// Whether a Producer is the Workflow run of a `Superseded` item, or one of its Local
-/// Activities.
-fn of_run(producer: &Producer, superseded: &StreamSuperseded) -> bool {
+/// Whether a Producer is the Workflow run that withdraws, or one of its Local Activities.
+fn of_run(producer: &Producer, withdrawing: &Producer) -> bool {
     match producer.epoch.as_ref().and_then(kind) {
-        Some(ProducerKind::Workflow) => producer.id == superseded.producer_id,
-        Some(ProducerKind::LocalActivity) => producer.run_id == superseded.run_id,
+        Some(ProducerKind::Workflow) => producer.id == withdrawing.id,
+        Some(ProducerKind::LocalActivity) => producer.run_id == withdrawing.run_id,
         _ => false,
     }
 }

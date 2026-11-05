@@ -11,7 +11,8 @@ use crate::{
     ids::local_activity_producer_id,
     proto::{
         AppendRecord, LocalActivityEpoch, Producer, ProducerEpoch, StreamData, StreamRecord,
-        StreamRef, StreamSuperseded, WorkflowTaskEpoch, producer_epoch::Kind, stream_record::Item,
+        StreamRef, StreamSuperseded, StreamWriter, WorkflowTaskEpoch, producer_epoch::Kind,
+        stream_record::Item,
     },
     store::{Appended, Batch, Closed, Create, Created, Entry, Owner, Store, Withdrawal},
 };
@@ -193,11 +194,11 @@ pub(crate) fn digest(texts: &[&str]) -> [u8; crate::digest::DIGEST_LEN] {
 
 pub(crate) fn superseded(producer: &Producer, withdrawal: &Withdrawal<'_>) -> Vec<u8> {
     StreamSuperseded {
-        producer_id: producer.id.clone(),
-        epoch: producer.epoch,
-        withdraw_run: withdrawal.withdraw_run.to_string(),
-        run_id: producer.run_id.clone(),
-        ..Default::default()
+        writer: Some(StreamWriter {
+            producer: Some(producer.clone()),
+            withdraw_run: withdrawal.withdraw_run.to_string(),
+            ..Default::default()
+        }),
     }
     .encode_to_vec()
 }
