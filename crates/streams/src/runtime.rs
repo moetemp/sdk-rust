@@ -200,10 +200,11 @@ pub(crate) fn decode<M: Message + Default>(input: &[u8]) -> StreamResult<M> {
 mod tests {
     use super::*;
 
-    const METHODS: [&str; 4] = [
+    const METHODS: [&str; 5] = [
         "CreateStream",
         "AppendRecords",
         "CloseStream",
+        "ReadRecords",
         "DescribeStream",
     ];
 
