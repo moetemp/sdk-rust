@@ -14,15 +14,15 @@ use crate::{
         named_client_producer_id,
     },
     proto::{
-        AppendRecord, CloseStreamRequest, CloseWriterRequest, CloseWriterResponse,
-        CreateStreamRequest, CreateStreamResponse, OpenWriterRequest, OpenWriterResponse, Producer,
-        ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse, StreamErrorDetails, StreamHandle,
-        StreamProducerKind, StreamRecord, WorkflowTaskEpoch, WriteRecordsRequest,
-        WriteRecordsResponse, stream_record::Item,
+        ActivityEpoch, AppendRecord, ClientEpoch, CloseStreamRequest, CloseWriterRequest,
+        CloseWriterResponse, CreateStreamRequest, CreateStreamResponse, LocalActivityEpoch,
+        OpenWriterRequest, OpenWriterResponse, Producer, ProducerEpoch, ReadRecordsRequest,
+        ReadRecordsResponse, StreamErrorDetails, StreamHandle, StreamRecord, WorkflowTaskEpoch,
+        WriteRecordsRequest, WriteRecordsResponse, producer_epoch::Kind, stream_record::Item,
     },
     store::{
-        Appended, Batch, Capabilities, Closed, Created, Entry, MAX_BATCH_RECORDS, Owner, Store,
-        StreamState, Withdrawal,
+        Appended, Batch, Capabilities, Closed, Create, Created, Entry, MAX_BATCH_RECORDS, Store,
+        StreamState,
     },
 };
 use prost::Message;
@@ -63,7 +63,10 @@ async fn cases() -> Vec<Case> {
                 "CreateStream",
                 CreateStreamRequest {
                     namespace: case.namespace.clone(),
-                    stream_id: case.stream.clone(),
+                    stream_handle: Some(StreamHandle {
+                        id: case.stream.clone(),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
             )
@@ -77,11 +80,9 @@ async fn cases() -> Vec<Case> {
 
 fn client() -> Producer {
     Producer {
-        kind: StreamProducerKind::Client as i32,
         id: client_producer_id("me", "p"),
         epoch: Some(ProducerEpoch {
-            attempt: 1,
-            ..Default::default()
+            kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
         }),
         run_id: String::new(),
     }
@@ -89,15 +90,15 @@ fn client() -> Producer {
 
 fn activity(attempt: i32) -> Producer {
     Producer {
-        kind: StreamProducerKind::Activity as i32,
         id: activity_producer_id("r1", "a", "s"),
         epoch: Some(ProducerEpoch {
-            attempt_scheduled_time: Some(Timestamp {
-                seconds: 10 * attempt as i64,
-                nanos: 0,
-            }),
-            attempt,
-            ..Default::default()
+            kind: Some(Kind::Activity(ActivityEpoch {
+                attempt_scheduled_time: Some(Timestamp {
+                    seconds: 10 * attempt as i64,
+                    nanos: 0,
+                }),
+                attempt,
+            })),
         }),
         run_id: "r1".to_string(),
     }
@@ -313,7 +314,10 @@ async fn an_activity_retry_opens_on_a_closed_or_expired_stream() {
                 "CreateStream",
                 CreateStreamRequest {
                     namespace: case.namespace.clone(),
-                    stream_id: short.clone(),
+                    stream_handle: Some(StreamHandle {
+                        id: short.clone(),
+                        ..Default::default()
+                    }),
                     retention: millis(300),
                     ..Default::default()
                 },
@@ -408,11 +412,9 @@ async fn the_opens_of_one_producer_share_a_writer_until_the_last_one_lets_go() {
 async fn a_named_client_with_a_higher_epoch_fences_its_earlier_self() {
     for case in cases().await {
         let named = |attempt| Producer {
-            kind: StreamProducerKind::Client as i32,
             id: named_client_producer_id("ingest-1"),
             epoch: Some(ProducerEpoch {
-                attempt,
-                ..Default::default()
+                kind: Some(Kind::Client(ClientEpoch { attempt })),
             }),
             run_id: String::new(),
         };
@@ -472,13 +474,9 @@ impl Store for Flaky {
         &self,
         namespace: &str,
         handle: &StreamHandle,
-        retention: Option<Duration>,
-        owner: Owner,
-        withdrawal: &Withdrawal<'_>,
+        create: &Create<'_>,
     ) -> StreamResult<Created> {
-        self.inner
-            .create(namespace, handle, retention, owner, withdrawal)
-            .await
+        self.inner.create(namespace, handle, create).await
     }
 
     async fn append(
@@ -561,7 +559,10 @@ async fn flaky_cases(lose_next: bool) -> Vec<(Arc<Flaky>, Case)> {
                 "CreateStream",
                 CreateStreamRequest {
                     namespace: case.namespace.clone(),
-                    stream_id: case.stream.clone(),
+                    stream_handle: Some(StreamHandle {
+                        id: case.stream.clone(),
+                        ..Default::default()
+                    }),
                     ..Default::default()
                 },
             )
@@ -634,17 +635,19 @@ async fn a_write_that_waits_behind_a_close_is_refused() {
 async fn a_local_activity_writer_withdraws_the_records_of_a_failed_task() {
     for case in cases().await {
         let local_activity = |call: &str, started: i64| Producer {
-            kind: StreamProducerKind::LocalActivity as i32,
             id: local_activity_producer_id("r1", call),
             epoch: Some(ProducerEpoch {
-                task_started_event_id: started,
-                task_attempt: 1,
-                task_started_time: Some(Timestamp {
-                    seconds: started,
-                    nanos: 0,
-                }),
-                attempt: 1,
-                ..Default::default()
+                kind: Some(Kind::LocalActivity(LocalActivityEpoch {
+                    task: Some(WorkflowTaskEpoch {
+                        started_event_id: started,
+                        attempt: 1,
+                        started_time: Some(Timestamp {
+                            seconds: started,
+                            nanos: 0,
+                        }),
+                    }),
+                    attempt: 1,
+                })),
             }),
             run_id: "r1".to_string(),
         };

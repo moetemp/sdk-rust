@@ -8,9 +8,10 @@
 
 use crate::{
     Reason, StreamError, StreamResult,
+    epoch::ProducerKind,
     proto::{
         AppendRecord, AppendRecordsRequest, OpenWriterRequest, Producer, StreamHandle,
-        StreamProducerKind, WorkflowTaskEpoch,
+        WorkflowTaskEpoch, producer_epoch::Kind,
     },
     service::StreamService,
     store::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES},
@@ -234,7 +235,7 @@ impl Writers {
             .producer
             .ok_or_else(|| StreamError::invalid("The writer has no Producer"))?;
         crate::ids::check_producer(&producer)?;
-        if producer.kind == StreamProducerKind::Workflow as i32 {
+        if ProducerKind::try_from(&producer)? == ProducerKind::Workflow {
             return Err(StreamError::invalid("Workflow code doesn't open a writer"));
         }
         let epoch = producer.epoch.unwrap_or_default();
@@ -265,10 +266,10 @@ impl Writers {
         });
         // A Local Activity that runs again in a later task has attempt 1 again, so its writer
         // always sends the empty batch.
-        let retry = match StreamProducerKind::try_from(writer.producer.kind).unwrap_or_default() {
-            StreamProducerKind::LocalActivity => true,
-            StreamProducerKind::Activity | StreamProducerKind::StandaloneActivity => {
-                epoch.attempt > 1
+        let retry = match epoch.kind {
+            Some(Kind::LocalActivity(_)) => true,
+            Some(Kind::Activity(activity) | Kind::StandaloneActivity(activity)) => {
+                activity.attempt > 1
             }
             _ => false,
         };
