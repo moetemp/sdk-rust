@@ -584,6 +584,8 @@ impl Store for MemoryStore {
         let field = format!("p|{}|{}", kind as i32, producer.id);
         let member = format!("{}|{}", kind as i32, producer.id);
         let appended = self.with(namespace, stream_id, |keys, now| {
+            // The format version comes first, since a newer format can change the Producer field.
+            keys.check_live(now)?;
             let stored = keys.get(&field).map(ProducerField::try_from).transpose()?;
             // Every append sets the fence to its epoch, so the fence is the last batch's epoch.
             let previous = stored.filter(|stored| stored.fence == epoch);
@@ -598,7 +600,6 @@ impl Store for MemoryStore {
                     "the sequence must be from 1 to 2^53 - 1",
                 ));
             }
-            keys.check_live(now)?;
             if let Some(previous) = previous {
                 if sequence == previous.sequence {
                     if previous.digest != batch.digest {
