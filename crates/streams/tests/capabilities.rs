@@ -14,7 +14,8 @@ use temporalio_streams::{
     proto::{
         AppendRecord, AppendRecordsRequest, ClientEpoch, CloseStreamRequest, CreateStreamRequest,
         DescribeStreamRequest, DescribeStreamResponse, Producer, ProducerEpoch, StreamErrorDetails,
-        StreamErrorReason, StreamRef, StreamStatus, WorkflowTaskEpoch, producer_epoch::Kind,
+        StreamErrorReason, StreamRef, StreamStatus, StreamWriter, WorkflowTaskEpoch,
+        producer_epoch::Kind,
     },
     store::{Appended, Batch, Capabilities, Closed, Create, Created, Entry, Store, StreamState},
 };
@@ -126,6 +127,14 @@ fn client() -> Producer {
     }
 }
 
+/// The writer of a client's write, with no withdrawal facts.
+fn client_writer() -> Option<StreamWriter> {
+    Some(StreamWriter {
+        producer: Some(client()),
+        ..Default::default()
+    })
+}
+
 /// The capability an error names, after it checked the code and the reason.
 fn refused_capability(error: &StreamError) -> String {
     assert_eq!(error.code(), Code::Unimplemented, "{error:?}");
@@ -208,7 +217,7 @@ async fn an_append_without_the_fence_or_the_flag_is_refused_with_nothing_written
         let request = AppendRecordsRequest {
             namespace: NAMESPACE.to_string(),
             r#ref: case.stream_ref(),
-            producer: Some(client()),
+            writer: client_writer(),
             sequence: 1,
             records: vec![AppendRecord::default()],
             ..Default::default()
@@ -226,7 +235,7 @@ async fn an_append_with_no_sequence_without_the_capability_is_refused_with_nothi
     let request = AppendRecordsRequest {
         namespace: NAMESPACE.to_string(),
         r#ref: case.stream_ref(),
-        producer: Some(client()),
+        writer: client_writer(),
         records: vec![AppendRecord::default()],
         ..Default::default()
     };
@@ -252,7 +261,7 @@ async fn a_close_without_the_capability_is_refused_and_the_stream_stays_open() {
     let request = CloseStreamRequest {
         namespace: NAMESPACE.to_string(),
         r#ref: case.stream_ref(),
-        producer: Some(client()),
+        writer: client_writer(),
         ..Default::default()
     };
     let error = case.call("CloseStream", request).await.unwrap_err();
