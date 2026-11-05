@@ -644,6 +644,35 @@ async fn a_write_on_corrupt_store_data_fails_with_no_retry() {
     }
 }
 
+/// An open of a writer with a run to withdraw fails with `stream_invalid` and writes nothing, since
+/// only a retry run's first append withdraws a run and a writer sends many batches.
+async fn a_writer_with_a_run_to_withdraw_is_refused() {
+    for case in cases().await {
+        let request = OpenWriterRequest {
+            namespace: case.namespace.clone(),
+            r#ref: Some(StreamRef {
+                id: case.stream.clone(),
+                ..Default::default()
+            }),
+            writer: Some(StreamWriter {
+                producer: Some(client()),
+                withdraw_run: "r1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let error = case
+            .call::<_, OpenWriterResponse>("OpenWriter", request)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.code(), reason(&error).as_str()),
+            (Code::InvalidArgument, "stream_invalid")
+        );
+        assert!(case.visible().await.is_empty());
+    }
+}
+
 async fn a_write_that_waits_behind_a_close_is_refused() {
     for case in cases().await {
         let writer = case.open(client(), |_| {}).await;
@@ -722,6 +751,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_write_whose_answer_is_lost_goes_in_once),
     case!(a_writer_writes_again_after_a_store_outage),
     case!(a_write_on_corrupt_store_data_fails_with_no_retry),
+    case!(a_writer_with_a_run_to_withdraw_is_refused),
     case!(a_write_that_waits_behind_a_close_is_refused),
     case!(a_local_activity_writer_withdraws_the_records_of_a_failed_task),
 ];

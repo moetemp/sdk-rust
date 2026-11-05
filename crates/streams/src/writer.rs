@@ -52,7 +52,7 @@ struct Writer {
     namespace: String,
     stream_ref: StreamRef,
     producer: Producer,
-    /// The open's writer, with its Producer and withdrawal facts, which each batch sends.
+    /// The open's writer, with its Producer and task facts, which each batch sends.
     stream_writer: StreamWriter,
     max_batch: usize,
     max_retry: Duration,
@@ -231,6 +231,10 @@ impl Writers {
             .ok_or_else(|| StreamError::invalid("The writer has no Stream"))?;
         crate::ids::check_stream_id(&stream.id)?;
         let stream_writer = request.writer.unwrap_or_default();
+        // Only a retry run's first append withdraws a run, and a writer sends many batches.
+        if !stream_writer.withdraw_run.is_empty() {
+            return Err(StreamError::invalid("A writer doesn't withdraw a run"));
+        }
         let producer = stream_writer
             .producer
             .clone()
