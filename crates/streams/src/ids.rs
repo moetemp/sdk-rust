@@ -196,6 +196,12 @@ impl StreamKeys {
     pub fn producers(&self) -> String {
         format!("{}:producers", self.base)
     }
+
+    /// The key that a close adds one entry to. A close writes no log entry, so a waiting read also
+    /// waits on this key, and the close wakes it.
+    pub fn closed(&self) -> String {
+        format!("{}:closed", self.base)
+    }
 }
 
 #[cfg(test)]

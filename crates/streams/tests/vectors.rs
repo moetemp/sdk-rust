@@ -80,6 +80,7 @@ fn stream_ids_and_keys_match() {
         assert_eq!(keys.meta(), text(case, "meta"));
         assert_eq!(keys.log(), text(case, "log"));
         assert_eq!(keys.producers(), text(case, "producers"));
+        assert_eq!(keys.closed(), text(case, "closed"));
     }
 }
 
