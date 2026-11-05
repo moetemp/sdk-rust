@@ -248,12 +248,17 @@ pub(crate) fn decode<M: Message + Default>(input: &[u8]) -> StreamResult<M> {
 mod tests {
     use super::*;
 
-    const METHODS: [&str; 5] = [
+    const METHODS: [&str; 10] = [
         "CreateStream",
         "AppendRecords",
         "CloseStream",
         "ReadRecords",
         "DescribeStream",
+        "OpenWriter",
+        "WriteRecords",
+        "CloseWriters",
+        "CloseWriter",
+        "FreeWriter",
     ];
 
     fn runtime() -> Arc<StreamRuntime> {
