@@ -9,11 +9,12 @@ use crate::{
     epoch::withdraws,
     ids::{activity_producer_id, client_producer_id, named_client_producer_id},
     proto::{
-        AppendRecord, AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest,
-        CloseStreamResponse, CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest,
-        DescribeStreamResponse, Producer, ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse,
-        StreamClose, StreamCloseStatus, StreamErrorDetails, StreamHandle, StreamProducerKind,
-        StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded, WorkflowTaskEpoch,
+        ActivityEpoch, AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientEpoch,
+        CloseStreamRequest, CloseStreamResponse, CreateStreamRequest, CreateStreamResponse,
+        DescribeStreamRequest, DescribeStreamResponse, LocalActivityEpoch, Producer, ProducerEpoch,
+        ReadRecordsRequest, ReadRecordsResponse, StreamClose, StreamCloseStatus,
+        StreamErrorDetails, StreamHandle, StreamIdConflictPolicy, StreamReadStart, StreamRecord,
+        StreamStatus, StreamSuperseded, WorkflowTaskEpoch, producer_epoch::Kind,
         stream_record::Item,
     },
 };
@@ -82,11 +83,9 @@ fn reason(error: &StreamError) -> String {
 
 fn client(attempt: i32) -> Producer {
     Producer {
-        kind: StreamProducerKind::Client as i32,
         id: client_producer_id("me", "p"),
         epoch: Some(ProducerEpoch {
-            attempt,
-            ..Default::default()
+            kind: Some(Kind::Client(ClientEpoch { attempt })),
         }),
         run_id: String::new(),
     }
@@ -95,13 +94,8 @@ fn client(attempt: i32) -> Producer {
 /// A client Producer that a test names, at `attempt`. Every backend accepts it as sent.
 fn named(name: &str, attempt: i32) -> Producer {
     Producer {
-        kind: StreamProducerKind::Client as i32,
         id: named_client_producer_id(name),
-        epoch: Some(ProducerEpoch {
-            attempt,
-            ..Default::default()
-        }),
-        run_id: String::new(),
+        ..client(attempt)
     }
 }
 
@@ -109,17 +103,36 @@ fn named(name: &str, attempt: i32) -> Producer {
 /// Records. The server requires the Activity's task token, so only Redis and memory accept it.
 fn activity(attempt: i32, scheduled: i64) -> Producer {
     Producer {
-        kind: StreamProducerKind::Activity as i32,
         id: activity_producer_id("r1", "a", "s"),
         epoch: Some(ProducerEpoch {
-            attempt_scheduled_time: Some(Timestamp {
-                seconds: scheduled,
-                nanos: 0,
-            }),
-            attempt,
-            ..Default::default()
+            kind: Some(Kind::Activity(ActivityEpoch {
+                attempt_scheduled_time: Some(Timestamp {
+                    seconds: scheduled,
+                    nanos: 0,
+                }),
+                attempt,
+            })),
         }),
         run_id: "r1".to_string(),
+    }
+}
+
+/// The Producer of run `run` in its first Workflow Task, as its close Activity sends it.
+fn workflow(run: &str) -> Producer {
+    Producer {
+        id: crate::ids::workflow_producer_id(run),
+        epoch: Some(ProducerEpoch {
+            kind: Some(Kind::Workflow(WorkflowTaskEpoch::default())),
+        }),
+        run_id: run.to_string(),
+    }
+}
+
+/// The fields of a create that uses an existing Stream.
+fn use_existing() -> CreateStreamRequest {
+    CreateStreamRequest {
+        id_conflict_policy: StreamIdConflictPolicy::UseExisting as i32,
+        ..Default::default()
     }
 }
 
@@ -152,17 +165,24 @@ impl Case {
         &self,
         retention: Option<prost_types::Duration>,
     ) -> Result<CreateStreamResponse, StreamError> {
-        call(
-            &self.ext,
-            "CreateStream",
-            CreateStreamRequest {
-                namespace: self.namespace.clone(),
-                stream_id: self.stream.clone(),
-                retention,
-                ..Default::default()
-            },
-        )
+        self.create_with(CreateStreamRequest {
+            retention,
+            ..Default::default()
+        })
         .await
+    }
+
+    /// Creates the Stream with the fields of `request`, in the case's namespace and handle.
+    async fn create_with(
+        &self,
+        request: CreateStreamRequest,
+    ) -> Result<CreateStreamResponse, StreamError> {
+        let request = CreateStreamRequest {
+            namespace: self.namespace.clone(),
+            stream_handle: self.handle(),
+            ..request
+        };
+        call(&self.ext, "CreateStream", request).await
     }
 
     async fn append(
@@ -257,8 +277,8 @@ fn close_of(record: &StreamRecord) -> &StreamClose {
     }
 }
 
-/// A create of a Stream that exists returns it with `created` false, whatever its Retention. A
-/// Retention outside a proto Duration's range, or under 1 ms, fails.
+/// A create that uses a Stream that exists returns it with `created` false, whatever its
+/// Retention. A Retention outside a proto Duration's range, or under 1 ms, fails.
 async fn a_create_returns_the_stream_that_exists_whatever_its_retention() {
     for case in cases_for(Needs::CALLS).await {
         for (seconds, nanos) in [(i64::MAX, 0), (-1, 0), (0, 999_999)] {
@@ -267,31 +287,110 @@ async fn a_create_returns_the_stream_that_exists_whatever_its_retention() {
             assert_eq!(reason(&error), "stream_invalid");
         }
         assert!(case.create(None).await.unwrap().created);
-        assert!(!case.create(None).await.unwrap().created);
-        assert!(!case.create(millis(1000)).await.unwrap().created);
+        for retention in [None, millis(1000)] {
+            let request = CreateStreamRequest {
+                retention,
+                ..use_existing()
+            };
+            assert!(!case.create_with(request).await.unwrap().created);
+        }
     }
 }
 
-/// A create of a closed Stream fails as closed.
-async fn a_create_of_a_closed_stream_fails() {
+/// A create of an open Stream fails as `already_exists`, unless it uses the Stream or it is a
+/// retry of the create that made the Stream. Such a retry has the same request id, and it gets
+/// `created` true with either policy. A create needs a handle with an id.
+async fn a_create_of_an_open_stream_fails_unless_it_uses_it_or_retries() {
     for case in cases_for(Needs::CALLS).await {
-        case.create(None).await.unwrap();
-        let close = CloseStreamRequest {
-            namespace: case.namespace.clone(),
-            handle: case.handle(),
-            producer: Some(client(1)),
+        let first = CreateStreamRequest {
+            request_id: "create-1".to_string(),
             ..Default::default()
         };
-        let _: CloseStreamResponse = call(&case.ext, "CloseStream", close).await.unwrap();
-        let error = case.create(None).await.unwrap_err();
-        assert_eq!(
-            (error.code(), reason(&error).as_str()),
-            (Code::FailedPrecondition, "stream_closed")
-        );
+        assert!(case.create_with(first.clone()).await.unwrap().created);
+        let other = CreateStreamRequest {
+            request_id: "create-2".to_string(),
+            ..Default::default()
+        };
+        for request in [other.clone(), CreateStreamRequest::default()] {
+            let error = case.create_with(request).await.unwrap_err();
+            assert_eq!(
+                (error.code(), reason(&error).as_str()),
+                (Code::AlreadyExists, "stream_already_exists")
+            );
+        }
+        let used = CreateStreamRequest {
+            request_id: other.request_id,
+            ..use_existing()
+        };
+        assert!(!case.create_with(used).await.unwrap().created);
+        let retry = CreateStreamRequest {
+            request_id: first.request_id.clone(),
+            ..use_existing()
+        };
+        for request in [first, retry] {
+            assert!(case.create_with(request).await.unwrap().created);
+        }
+        for stream_handle in [None, Some(StreamHandle::default())] {
+            let request = CreateStreamRequest {
+                namespace: case.namespace.clone(),
+                stream_handle,
+                ..Default::default()
+            };
+            let error = call::<_, CreateStreamResponse>(&case.ext, "CreateStream", request)
+                .await
+                .unwrap_err();
+            assert_eq!(reason(&error), "stream_invalid");
+        }
     }
 }
 
-/// A create of a Stream whose Retention passed fails as expired while its Tombstone is there.
+/// A create of a closed Stream fails as closed, before its conflict policy and before a retry of
+/// the create that made the Stream.
+async fn a_create_of_a_closed_stream_fails() {
+    for case in cases_for(Needs::CALLS).await {
+        let first = CreateStreamRequest {
+            request_id: "create-1".to_string(),
+            ..Default::default()
+        };
+        case.create_with(first.clone()).await.unwrap();
+        case.close(client(1)).await.unwrap();
+        for request in [first, CreateStreamRequest::default()] {
+            let error = case.create_with(request).await.unwrap_err();
+            assert_eq!(
+                (error.code(), reason(&error).as_str()),
+                (Code::FailedPrecondition, "stream_closed")
+            );
+        }
+    }
+}
+
+/// A Stream with no owner takes a close from a Workflow or a client. The close of an Activity
+/// fails as `not_owner`.
+async fn a_workflow_or_a_client_closes_a_stream_with_no_owner() {
+    for case in cases_for(Needs::UNCHECKED).await {
+        case.create(None).await.unwrap();
+        let run = format!("{}-run", case.stream);
+        let activity = Producer {
+            id: activity_producer_id(&run, "a", "s"),
+            epoch: Some(ProducerEpoch {
+                kind: Some(Kind::Activity(ActivityEpoch {
+                    attempt: 1,
+                    ..Default::default()
+                })),
+            }),
+            run_id: run.clone(),
+        };
+        let error = case.close(activity).await.unwrap_err();
+        assert_eq!(
+            (error.code(), reason(&error).as_str()),
+            (Code::FailedPrecondition, "stream_not_owner")
+        );
+        case.close(workflow(&run)).await.unwrap();
+    }
+}
+
+/// A create of a Stream whose Retention passed fails as expired while its Tombstone is there, not
+/// as `already_exists`.
 async fn a_create_of_an_expired_stream_fails() {
     for case in cases_for(Needs::SHORT_TIMES).await {
         case.create(millis(300)).await.unwrap();
@@ -305,19 +404,24 @@ async fn a_create_of_an_expired_stream_fails() {
 }
 
 /// A create with an owner needs a Workflow Producer and a handle of its run chain, and the answer's
-/// handle names that chain. A create that names another owner fails, and no run withdraws itself.
+/// handle names that chain. A create that names another owner fails as `not_owner`, not as
+/// `already_exists`, and no run withdraws itself.
 async fn a_create_checks_its_owner_and_its_handle() {
     for case in cases_for(Needs::UNCHECKED).await {
         let run = format!("{}-run", case.stream);
-        let workflow = Producer {
-            kind: StreamProducerKind::Workflow as i32,
-            id: crate::ids::workflow_producer_id(&run),
-            run_id: run.clone(),
+        let workflow = workflow(&run);
+        let task = WorkflowTaskEpoch {
+            started_event_id: 3,
             ..Default::default()
         };
         let local_activity = Producer {
-            kind: StreamProducerKind::LocalActivity as i32,
             id: crate::ids::local_activity_producer_id(&run, "call-1"),
+            epoch: Some(ProducerEpoch {
+                kind: Some(Kind::LocalActivity(LocalActivityEpoch {
+                    task: Some(task),
+                    attempt: 1,
+                })),
+            }),
             ..workflow.clone()
         };
         let chain = |workflow_id: &str| StreamHandle {
@@ -328,7 +432,6 @@ async fn a_create_checks_its_owner_and_its_handle() {
         let create = |owner: Option<&Producer>, handle: StreamHandle, withdraw_run: &str| {
             CreateStreamRequest {
                 namespace: case.namespace.clone(),
-                stream_id: case.stream.clone(),
                 owner: owner.cloned(),
                 stream_handle: Some(handle),
                 withdraw_run: withdraw_run.to_string(),
@@ -341,7 +444,7 @@ async fn a_create_checks_its_owner_and_its_handle() {
             create(
                 Some(&workflow),
                 StreamHandle {
-                    id: format!("{}-other", case.stream),
+                    id: String::new(),
                     ..chain("agent")
                 },
                 "",
@@ -376,35 +479,32 @@ async fn a_create_checks_its_owner_and_its_handle() {
     }
 }
 
-/// A Producer's id must match its kind, a Workflow appends only through a Local Activity, and a
-/// Local Activity's epoch names the Workflow Task that dispatched it.
+/// A Producer's epoch has a case, its id must match that kind, a Workflow appends only through a
+/// Local Activity, and a Local Activity's epoch names the Workflow Task that dispatched it.
 async fn a_producer_must_match_its_kind_and_not_be_a_workflow() {
     for case in cases_for(Needs::CALLS).await {
         case.create(None).await.unwrap();
-        let wrong = Producer {
-            kind: StreamProducerKind::Activity as i32,
-            ..client(1)
+        let activity = ProducerEpoch {
+            kind: Some(Kind::Activity(ActivityEpoch::default())),
         };
-        let error = case.append(wrong, 1, vec![record("x")]).await.unwrap_err();
-        assert_eq!(
-            (error.code(), reason(&error).as_str()),
-            (Code::InvalidArgument, "stream_invalid")
-        );
-        let workflow = Producer {
-            kind: StreamProducerKind::Workflow as i32,
-            id: crate::ids::workflow_producer_id("r1"),
-            run_id: "r1".to_string(),
-            epoch: None,
-        };
-        let error = case.append(workflow, 1, vec![]).await.unwrap_err();
+        for epoch in [Some(activity), None, Some(ProducerEpoch::default())] {
+            let wrong = Producer { epoch, ..client(1) };
+            let error = case.append(wrong, 1, vec![record("x")]).await.unwrap_err();
+            assert_eq!(
+                (error.code(), reason(&error).as_str()),
+                (Code::InvalidArgument, "stream_invalid")
+            );
+        }
+        let error = case.append(workflow("r1"), 1, vec![]).await.unwrap_err();
         assert_eq!(error.code(), Code::InvalidArgument);
         let no_task = Producer {
-            kind: StreamProducerKind::LocalActivity as i32,
             id: crate::ids::local_activity_producer_id("r1", "call-1"),
             run_id: "r1".to_string(),
             epoch: Some(ProducerEpoch {
-                attempt: 1,
-                ..Default::default()
+                kind: Some(Kind::LocalActivity(LocalActivityEpoch {
+                    task: None,
+                    attempt: 1,
+                })),
             }),
         };
         let error = case
@@ -438,7 +538,7 @@ async fn an_append_with_no_sequence_takes_the_next_one_of_its_epoch() {
 }
 
 /// A read is inclusive from its offset, a read from the end gives only new Records, an offset past
-/// the newest + 1 fails with `stream_offset`, and one below zero is invalid.
+/// the newest + 1 fails with `stream_offset_too_high`, and one below zero is invalid.
 async fn a_read_is_inclusive_from_its_offset_and_get_offset_reads_only_new_records() {
     for case in cases_for(Needs::CALLS).await {
         case.create(None).await.unwrap();
@@ -485,7 +585,7 @@ async fn a_read_is_inclusive_from_its_offset_and_get_offset_reads_only_new_recor
             .unwrap_err();
         assert_eq!(
             (error.code(), reason(&error).as_str()),
-            (Code::OutOfRange, "stream_offset")
+            (Code::OutOfRange, "stream_offset_too_high")
         );
         let error = case
             .read(ReadRecordsRequest {
@@ -557,7 +657,10 @@ async fn a_read_waits_for_the_create_only_as_long_as_create_wait() {
             tokio::time::sleep(Duration::from_millis(150)).await;
             let request = CreateStreamRequest {
                 namespace,
-                stream_id: stream,
+                stream_handle: Some(StreamHandle {
+                    id: stream,
+                    ..Default::default()
+                }),
                 ..Default::default()
             };
             call::<_, CreateStreamResponse>(&ext, "CreateStream", request).await
@@ -744,9 +847,8 @@ async fn create_owned_short(case: &Case, run: &str) {
         "CreateStream",
         CreateStreamRequest {
             namespace: case.namespace.clone(),
-            stream_id: case.stream.clone(),
             retention: millis(300),
-            owner: Some(workflow_owner(run)),
+            owner: Some(workflow(run)),
             stream_handle: owned_handle(case),
             ..Default::default()
         },
@@ -796,7 +898,7 @@ async fn a_close_after_the_log_expired_keeps_the_gap() {
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
             handle: owned_handle(&case),
-            producer: Some(workflow_owner(&run)),
+            producer: Some(workflow(&run)),
             ..Default::default()
         };
         let _: CloseStreamResponse = call(&case.ext, "CloseStream", close).await.unwrap();
@@ -900,30 +1002,7 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
 
 /// The Local Activity Producer of a Workflow call in run `run`.
 fn local_activity(run: &str) -> Producer {
-    Producer {
-        kind: StreamProducerKind::LocalActivity as i32,
-        id: crate::ids::local_activity_producer_id(run, "call-1"),
-        epoch: Some(ProducerEpoch {
-            task_started_event_id: 3,
-            task_attempt: 1,
-            task_started_time: Some(Timestamp {
-                seconds: 100,
-                nanos: 0,
-            }),
-            attempt: 1,
-            ..Default::default()
-        }),
-        run_id: run.to_string(),
-    }
-}
-
-fn workflow_owner(run: &str) -> Producer {
-    Producer {
-        kind: StreamProducerKind::Workflow as i32,
-        id: crate::ids::workflow_producer_id(run),
-        run_id: run.to_string(),
-        ..Default::default()
-    }
+    user_local_activity(run, 3, 100)
 }
 
 /// The case's handle with the owner of a made-up run chain, which a create with an owner needs.
@@ -941,11 +1020,10 @@ async fn a_retry_run_s_local_activity_calls_withdraw_the_previous_run() {
         let (previous, retry) = (format!("{}-r1", case.stream), format!("{}-r2", case.stream));
         let create = |run: &str, withdraw_run: &str| CreateStreamRequest {
             namespace: case.namespace.clone(),
-            stream_id: case.stream.clone(),
             withdraw_run: withdraw_run.to_string(),
-            owner: Some(workflow_owner(run)),
+            owner: Some(workflow(run)),
             stream_handle: owned_handle(&case),
-            ..Default::default()
+            ..use_existing()
         };
         let append = |run: &str, withdraw_run: &str, text: &str| AppendRecordsRequest {
             namespace: case.namespace.clone(),
@@ -1048,15 +1126,18 @@ async fn only_a_later_run_s_local_activity_withdraws_a_run_on_append() {
 /// The user Local Activity `call-1` of `run`, dispatched by the Workflow Task `[started]`. A rerun
 /// in a later task keeps the Producer id and has a newer dispatching task.
 fn user_local_activity(run: &str, started: i64, seconds: i64) -> Producer {
+    let task = WorkflowTaskEpoch {
+        started_event_id: started,
+        attempt: 1,
+        started_time: Some(Timestamp { seconds, nanos: 0 }),
+    };
     Producer {
-        kind: StreamProducerKind::LocalActivity as i32,
         id: crate::ids::local_activity_producer_id(run, "call-1"),
         epoch: Some(ProducerEpoch {
-            task_started_event_id: started,
-            task_attempt: 1,
-            task_started_time: Some(Timestamp { seconds, nanos: 0 }),
-            attempt: 1,
-            ..Default::default()
+            kind: Some(Kind::LocalActivity(LocalActivityEpoch {
+                task: Some(task),
+                attempt: 1,
+            })),
         }),
         run_id: run.to_string(),
     }
@@ -1071,8 +1152,7 @@ async fn a_rerun_local_activity_supersedes_its_first_attempt() {
             "CreateStream",
             CreateStreamRequest {
                 namespace: case.namespace.clone(),
-                stream_id: case.stream.clone(),
-                owner: Some(workflow_owner(&run)),
+                owner: Some(workflow(&run)),
                 stream_handle: owned_handle(&case),
                 ..Default::default()
             },
@@ -1166,8 +1246,7 @@ async fn the_close_activity_closes_a_workflow_stream_as_its_workflow_producer() 
             "CreateStream",
             CreateStreamRequest {
                 namespace: case.namespace.clone(),
-                stream_id: case.stream.clone(),
-                owner: Some(workflow_owner(&run)),
+                owner: Some(workflow(&run)),
                 stream_handle: Some(chain.clone()),
                 ..Default::default()
             },
@@ -1177,7 +1256,7 @@ async fn the_close_activity_closes_a_workflow_stream_as_its_workflow_producer() 
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
             handle: Some(chain),
-            producer: Some(workflow_owner(&run)),
+            producer: Some(workflow(&run)),
             ..Default::default()
         };
         let _: CloseStreamResponse = call(&case.ext, "CloseStream", close).await.unwrap();
@@ -1397,11 +1476,9 @@ async fn a_batch_writes_an_orphan_item_and_an_epoch_item() {
             superseded_of(&read.records[1]),
             superseded_of(&read.records[2]),
         );
-        assert_eq!(orphans.producer_kind, StreamProducerKind::Workflow as i32);
-        assert_eq!(
-            epoch.producer_kind,
-            StreamProducerKind::LocalActivity as i32
-        );
+        let kind = |item: &StreamSuperseded| item.epoch.and_then(|epoch| epoch.kind);
+        assert!(matches!(kind(orphans), Some(Kind::Workflow(_))));
+        assert!(matches!(kind(epoch), Some(Kind::LocalActivity(_))));
         assert!(read.records[1].offset < answer.first_offset);
         assert_eq!(read.records[2].offset, answer.first_offset);
         assert_eq!(read.records[3].offset, answer.last_offset);
@@ -1464,12 +1541,16 @@ fn task_write(
     completed: Option<WorkflowTaskEpoch>,
     text: &str,
 ) -> AppendRecordsRequest {
-    let mut producer = user_local_activity(run, task.started_event_id, 0);
-    producer.id = crate::ids::local_activity_producer_id(run, call);
-    if let Some(epoch) = producer.epoch.as_mut() {
-        epoch.task_attempt = task.attempt;
-        epoch.task_started_time = task.started_time;
-    }
+    let producer = Producer {
+        id: crate::ids::local_activity_producer_id(run, call),
+        epoch: Some(ProducerEpoch {
+            kind: Some(Kind::LocalActivity(LocalActivityEpoch {
+                task: Some(task),
+                attempt: 1,
+            })),
+        }),
+        run_id: run.to_string(),
+    };
     AppendRecordsRequest {
         namespace: case.namespace.clone(),
         handle: case.handle(),
@@ -1538,16 +1619,15 @@ async fn a_withdrawn_run_cant_close_the_stream() {
         let (previous, retry) = (format!("{}-r1", case.stream), format!("{}-r2", case.stream));
         let create = |run: &str, withdraw_run: &str| CreateStreamRequest {
             namespace: case.namespace.clone(),
-            stream_id: case.stream.clone(),
             withdraw_run: withdraw_run.to_string(),
-            owner: Some(workflow_owner(run)),
+            owner: Some(workflow(run)),
             stream_handle: owned_handle(&case),
-            ..Default::default()
+            ..use_existing()
         };
         let close = |run: &str| CloseStreamRequest {
             namespace: case.namespace.clone(),
             handle: owned_handle(&case),
-            producer: Some(workflow_owner(run)),
+            producer: Some(workflow(run)),
             ..Default::default()
         };
         let _: CreateStreamResponse = call(&case.ext, "CreateStream", create(&previous, ""))
@@ -1573,9 +1653,8 @@ async fn a_retry_run_s_create_of_a_new_stream_fences_the_previous_run() {
             "CreateStream",
             CreateStreamRequest {
                 namespace: case.namespace.clone(),
-                stream_id: case.stream.clone(),
                 withdraw_run: previous.clone(),
-                owner: Some(workflow_owner(&retry)),
+                owner: Some(workflow(&retry)),
                 stream_handle: owned_handle(&case),
                 ..Default::default()
             },
@@ -1610,12 +1689,11 @@ async fn a_retry_run_s_create_after_the_log_expired_keeps_the_gap() {
         let (previous, retry) = (format!("{}-r1", case.stream), format!("{}-r2", case.stream));
         let create = |run: &str, withdraw_run: &str| CreateStreamRequest {
             namespace: case.namespace.clone(),
-            stream_id: case.stream.clone(),
             retention: millis(300),
             withdraw_run: withdraw_run.to_string(),
-            owner: Some(workflow_owner(run)),
+            owner: Some(workflow(run)),
             stream_handle: owned_handle(&case),
-            ..Default::default()
+            ..use_existing()
         };
         let _: CreateStreamResponse = call(&case.ext, "CreateStream", create(&previous, ""))
             .await
@@ -1772,7 +1850,9 @@ async fn a_page_keeps_under_max_bytes_and_a_larger_record_comes_alone() {
 /// The cases of the suite, in file order.
 pub const CASES: &[super::Case] = &[
     case!(a_create_returns_the_stream_that_exists_whatever_its_retention),
+    case!(a_create_of_an_open_stream_fails_unless_it_uses_it_or_retries),
     case!(a_create_of_a_closed_stream_fails),
+    case!(a_workflow_or_a_client_closes_a_stream_with_no_owner),
     case!(a_create_of_an_expired_stream_fails),
     case!(a_create_checks_its_owner_and_its_handle),
     case!(a_producer_must_match_its_kind_and_not_be_a_workflow),

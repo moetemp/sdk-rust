@@ -19,10 +19,10 @@ import "temporal/api/failure/v1/message.proto";
 // Identifies one Stream. The id is opaque to callers.
 message StreamHandle {
     string id = 1;
-    // Unset for a client's Stream. For a Workflow, business_id is the Workflow ID and run_id is
-    // the first execution run id of its run chain. For a Standalone Activity, business_id is the
-    // activity ID and run_id is its run id. A create and a close of a Workflow-owned Stream must
-    // name its owner.
+    // Unset for a standalone Stream. For a Stream bound to a Workflow, business_id is the Workflow
+    // ID and run_id is the first execution run id of its run chain. For a Standalone Activity,
+    // business_id is the activity ID and run_id is its run id. A create and a close of a
+    // Workflow-owned Stream must name its owner.
     temporal.api.common.v1.Execution owner = 2;
     // The name of the backend that holds the Stream, as the Worker and client config register
     // it, so every process routes a handle it receives. Empty is the default backend. The Store
@@ -31,65 +31,103 @@ message StreamHandle {
 }
 
 // Experimental. Might change in the future.
-// The ordered attempt of a Producer. Compared in this order: task_started_event_id,
-// task_attempt, task_started_time, attempt_scheduled_time, attempt. A field that a kind does
-// not use is empty and compares as zero. A timestamp compares seconds, then nanos.
+// The ordered attempt of a Producer. A higher epoch supersedes the Records of a lower epoch of the
+// same Producer. The case is the kind of the Producer. It decides how the Store orders the epochs,
+// and which earlier Records a higher epoch withdraws.
 message ProducerEpoch {
-    // The Workflow Task of a Workflow, or the one that dispatched a Local Activity.
-    int64 task_started_event_id = 1;
-    int32 task_attempt = 2;
-    // Tells a reused started event id apart, for example after a dropped speculative task.
-    google.protobuf.Timestamp task_started_time = 5;
-    // When the server scheduled an Activity's attempt. A reset makes it later.
-    google.protobuf.Timestamp attempt_scheduled_time = 3;
-    // Activity, Local Activity and client attempt.
-    int32 attempt = 4;
+    oneof kind {
+        // A Workflow run, which writes in its Workflow Task. A higher epoch withdraws the Records
+        // of the run's Workflow Tasks that never completed, also those of their Local Activities.
+        WorkflowTaskEpoch workflow = 1;
+        // A Local Activity. A higher epoch withdraws the Producer's lower epochs.
+        LocalActivityEpoch local_activity = 2;
+        // An Activity of a Workflow. A higher epoch withdraws the Producer's lower epochs.
+        ActivityEpoch activity = 3;
+        // A Standalone Activity. A higher epoch withdraws the Producer's lower epochs.
+        ActivityEpoch standalone_activity = 4;
+        // A client. A higher epoch only fences the lower ones, since a restarted client's earlier
+        // Records are real messages, not the Records of a failed attempt.
+        ClientEpoch client = 5;
+    }
 }
 
 // Experimental. Might change in the future.
-message Producer {
-    temporal.api.enums.v1.StreamProducerKind kind = 1;
-    string id = 2;
-    ProducerEpoch epoch = 3;
-    // The run of the Producer, so nobody parses the id. Empty for a client.
-    string run_id = 4;
-}
-
-// Experimental. Might change in the future.
+// One Workflow Task attempt of a run. It orders by started_event_id, then attempt, then
+// started_time.
 message WorkflowTaskEpoch {
     int64 started_event_id = 1;
     int32 attempt = 2;
+    // Tells a reused started event id apart, for example after a dropped speculative task.
     google.protobuf.Timestamp started_time = 3;
 }
 
 // Experimental. Might change in the future.
-message AppendRecord {
-    reserved 1;
-    reserved "topic";
-    temporal.api.common.v1.Payload body = 2;
+// The attempt of a Local Activity. It orders by task, then attempt, so a Local Activity of a
+// later Workflow Task supersedes one of an earlier task.
+message LocalActivityEpoch {
+    // The Workflow Task attempt that dispatched the Local Activity.
+    WorkflowTaskEpoch task = 1;
+    // The Local Activity's own attempt in that Workflow Task.
+    int32 attempt = 2;
 }
 
 // Experimental. Might change in the future.
-message StreamSuperseded {
-    temporal.api.enums.v1.StreamProducerKind producer_kind = 1;
-    string producer_id = 2;
-    ProducerEpoch epoch = 3;
-    // Workflow only.
-    WorkflowTaskEpoch previous_completed_task = 4;
-    repeated int64 failed_tasks = 5;
-    // Workflow retry only. The previous run. Every Record whose Producer carries it is withdrawn.
-    string withdraw_run = 6;
+// The attempt of an Activity. It orders by attempt_scheduled_time, then attempt.
+message ActivityEpoch {
+    // When the server scheduled this attempt. An Activity reset starts the attempt count again,
+    // so only this time orders the attempts across a reset.
+    google.protobuf.Timestamp attempt_scheduled_time = 1;
+    int32 attempt = 2;
+}
+
+// Experimental. Might change in the future.
+// The attempt of a client Producer, which the client picks.
+message ClientEpoch {
+    int32 attempt = 1;
+}
+
+// Experimental. Might change in the future.
+// The code that wrote a batch. Its id stays the same across attempts, and its epoch orders them.
+message Producer {
+    // Stable across attempts, such as `wf:<run id>` for the Workflow Producer of a run.
+    string id = 1;
+    // Required. Its case gives the kind of the Producer.
+    ProducerEpoch epoch = 2;
     // The run of the Producer, so nobody parses the id. Empty for a client.
-    string run_id = 7;
+    string run_id = 3;
+}
+
+// Experimental. Might change in the future.
+// One Record of a batch to append. The Store adds the batch's Producer and an offset.
+message AppendRecord {
+    temporal.api.common.v1.Payload body = 1;
+}
+
+// Experimental. Might change in the future.
+// Which earlier Records a retried Producer withdraws. The Store keeps these facts for the first
+// batch of a higher epoch, or for a retry run's first write, and a read builds a Superseded item
+// from them. A reader drops the earlier Records that the facts name.
+message StreamSuperseded {
+    // The id of the Producer that withdraws.
+    string producer_id = 1;
+    // The epoch of the Producer that withdraws, whose case picks the rule. Empty when only
+    // withdraw_run applies.
+    ProducerEpoch epoch = 2;
+    // Workflow only. The run's last completed Workflow Task.
+    WorkflowTaskEpoch previous_completed_task = 3;
+    // Workflow only. The started event ids of the run's failed or timed out Workflow Tasks.
+    repeated int64 failed_tasks = 4;
+    // Workflow retry only. The previous run. Every Record whose Producer carries it is withdrawn.
+    string withdraw_run = 5;
+    // The run of the Producer, so nobody parses the id. Empty for a client.
+    string run_id = 6;
 }
 
 // Experimental. Might change in the future.
 // One Record that a Producer appended.
 message StreamData {
-    reserved 1;
-    reserved "topic";
-    Producer producer = 2;
-    temporal.api.common.v1.Payload body = 3;
+    Producer producer = 1;
+    temporal.api.common.v1.Payload body = 2;
 }
 
 // Experimental. Might change in the future.
@@ -99,7 +137,7 @@ message StreamClose {
     Producer producer = 1;
     temporal.api.common.v1.Payload result = 2;
     temporal.api.failure.v1.Failure failure = 3;
-    // The result or the failure stays next to it.
+    // How the Stream closed, so a reader doesn't parse the failure.
     temporal.api.enums.v1.StreamCloseStatus status = 4;
 }
 

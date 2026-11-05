@@ -10,10 +10,11 @@ use crate::{
     epoch::withdraws,
     ids::local_activity_producer_id,
     proto::{
-        AppendRecord, Producer, ProducerEpoch, StreamClose, StreamData, StreamHandle,
-        StreamProducerKind, StreamRecord, StreamSuperseded, stream_record::Item,
+        AppendRecord, LocalActivityEpoch, Producer, ProducerEpoch, StreamClose, StreamData,
+        StreamHandle, StreamRecord, StreamSuperseded, WorkflowTaskEpoch, producer_epoch::Kind,
+        stream_record::Item,
     },
-    store::{Appended, Batch, Closed, Entry, Owner, Store, Withdrawal},
+    store::{Appended, Batch, Closed, Create, Created, Entry, Owner, Store, Withdrawal},
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -124,15 +125,18 @@ impl Run {
         task_attempt: i32,
         attempt: i32,
     ) -> Producer {
+        let task = WorkflowTaskEpoch {
+            started_event_id: started,
+            attempt: task_attempt,
+            started_time: at(100),
+        };
         Producer {
-            kind: StreamProducerKind::LocalActivity as i32,
             id: local_activity_producer_id(&self.id, call),
             epoch: Some(ProducerEpoch {
-                task_started_event_id: started,
-                task_attempt,
-                task_started_time: at(100),
-                attempt,
-                ..Default::default()
+                kind: Some(Kind::LocalActivity(LocalActivityEpoch {
+                    task: Some(task),
+                    attempt,
+                })),
             }),
             run_id: self.id.clone(),
         }
@@ -190,7 +194,6 @@ pub(crate) fn digest(texts: &[&str]) -> [u8; crate::digest::DIGEST_LEN] {
 
 pub(crate) fn superseded(producer: &Producer, withdrawal: &Withdrawal<'_>) -> Vec<u8> {
     StreamSuperseded {
-        producer_kind: producer.kind,
         producer_id: producer.id.clone(),
         epoch: producer.epoch,
         withdraw_run: withdrawal.withdraw_run.to_string(),
@@ -222,16 +225,19 @@ impl Target {
     }
 
     pub(crate) async fn create(&self, owner: Owner) {
+        self.create_with(&Create {
+            owner,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Creates the Stream, and gives the Store's answer.
+    pub(crate) async fn create_with(&self, create: &Create<'_>) -> StreamResult<Created> {
         self.store
-            .create(
-                &self.namespace,
-                &self.handle(),
-                None,
-                owner,
-                &Withdrawal::default(),
-            )
+            .create(&self.namespace, &self.handle(), create)
             .await
-            .unwrap();
     }
 
     /// Sets one meta field under the Store's calls.
