@@ -22,7 +22,7 @@ pub enum Reason {
     /// Workflow retry withdrew its run.
     Fenced,
     /// The batch has a lower `sequence` than the last one of its epoch.
-    Sequence,
+    SequenceTooLow,
     /// The batch has the `sequence` of the last one of its epoch, and other content.
     SeqDivergent,
     /// The Stream's owner doesn't allow this Producer to close it.
@@ -31,17 +31,19 @@ pub enum Reason {
     FormatTooNew,
     /// The offset is past the newest offset + 1, for example after a failover lost the newest
     /// Records.
-    Offset,
+    OffsetTooHigh,
     /// A Record or a batch is over the Store's limit.
     TooLarge,
     /// The request is malformed.
     Invalid,
-    /// The Store failed or did not answer.
+    /// The Store failed, did not answer, or gave back data that isn't valid.
     Storage,
     /// No writer has the id.
     UnknownWriter,
     /// The Store lacks a capability that the call needs.
     Unsupported,
+    /// A create that doesn't use an existing Stream names a Stream that exists.
+    AlreadyExists,
 }
 
 impl Reason {
@@ -53,16 +55,17 @@ impl Reason {
             Reason::Expired => "stream_expired",
             Reason::Closed => "stream_closed",
             Reason::Fenced => "stream_fenced",
-            Reason::Sequence => "stream_sequence",
+            Reason::SequenceTooLow => "stream_sequence_too_low",
             Reason::SeqDivergent => "seq_divergent",
             Reason::NotOwner => "stream_not_owner",
             Reason::FormatTooNew => "stream_format_too_new",
-            Reason::Offset => "stream_offset",
+            Reason::OffsetTooHigh => "stream_offset_too_high",
             Reason::TooLarge => "stream_too_large",
             Reason::Invalid => "stream_invalid",
             Reason::Storage => "stream_storage",
             Reason::UnknownWriter => "stream_unknown_writer",
             Reason::Unsupported => "stream_unsupported",
+            Reason::AlreadyExists => "stream_already_exists",
         }
     }
 
@@ -73,16 +76,17 @@ impl Reason {
             Reason::Expired => StreamErrorReason::Expired,
             Reason::Closed => StreamErrorReason::Closed,
             Reason::Fenced => StreamErrorReason::Fenced,
-            Reason::Sequence => StreamErrorReason::Sequence,
+            Reason::SequenceTooLow => StreamErrorReason::SequenceTooLow,
             Reason::SeqDivergent => StreamErrorReason::SeqDivergent,
             Reason::NotOwner => StreamErrorReason::NotOwner,
             Reason::FormatTooNew => StreamErrorReason::FormatTooNew,
-            Reason::Offset => StreamErrorReason::Offset,
+            Reason::OffsetTooHigh => StreamErrorReason::OffsetTooHigh,
             Reason::TooLarge => StreamErrorReason::TooLarge,
             Reason::Invalid => StreamErrorReason::Invalid,
             Reason::Storage => StreamErrorReason::Storage,
             Reason::UnknownWriter => StreamErrorReason::UnknownWriter,
             Reason::Unsupported => StreamErrorReason::Unsupported,
+            Reason::AlreadyExists => StreamErrorReason::AlreadyExists,
         }
     }
 
@@ -92,15 +96,16 @@ impl Reason {
             Reason::NotFound | Reason::Expired | Reason::UnknownWriter => Code::NotFound,
             Reason::Closed
             | Reason::Fenced
-            | Reason::Sequence
+            | Reason::SequenceTooLow
             | Reason::SeqDivergent
             | Reason::NotOwner
             | Reason::FormatTooNew => Code::FailedPrecondition,
             Reason::TooLarge | Reason::Invalid => Code::InvalidArgument,
             // A read from the offset works again once the Stream has Records up to it.
-            Reason::Offset => Code::OutOfRange,
+            Reason::OffsetTooHigh => Code::OutOfRange,
             Reason::Storage => Code::Unavailable,
             Reason::Unsupported => Code::Unimplemented,
+            Reason::AlreadyExists => Code::AlreadyExists,
         }
     }
 }
