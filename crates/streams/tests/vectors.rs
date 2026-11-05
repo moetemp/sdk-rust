@@ -13,8 +13,8 @@ use temporalio_streams::{
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{
         ActivityEpoch, AppendRecord, ClientEpoch, LocalActivityEpoch, Producer, ProducerEpoch,
-        StreamData, StreamRecord, StreamSuperseded, WorkflowTaskEpoch, producer_epoch::Kind,
-        stream_record::Item,
+        StreamData, StreamRecord, StreamSuperseded, StreamWriter, WorkflowTaskEpoch,
+        producer_epoch::Kind, stream_record::Item,
     },
 };
 
@@ -152,23 +152,30 @@ fn the_appendix_e_withdrawals_match() {
     assert!(cases.as_array().unwrap().len() >= 35);
     for case in cases.as_array().unwrap() {
         let s = &case["superseded"];
-        let superseded = StreamSuperseded {
-            producer_id: text(s, "producer_id").to_string(),
+        let withdrawing = Producer {
+            id: text(s, "producer_id").to_string(),
             // A create's item has no epoch, and a Reader must not read it as an empty one.
             epoch: s
                 .get("epoch")
                 .map(|value| epoch(text(s, "producer_kind"), value)),
-            previous_completed_task: s.get("previous_completed_task").map(|c| WorkflowTaskEpoch {
-                started_event_id: number(c, "started_event_id"),
-                attempt: number(c, "attempt") as i32,
-                started_time: time(&c["started_time"]),
-            }),
-            failed_tasks: s["failed_tasks"]
-                .as_array()
-                .map(|list| list.iter().map(|v| v.as_i64().unwrap()).collect())
-                .unwrap_or_default(),
-            withdraw_run: s["withdraw_run"].as_str().unwrap_or_default().to_string(),
             run_id: s["run_id"].as_str().unwrap_or_default().to_string(),
+        };
+        let superseded = StreamSuperseded {
+            writer: Some(StreamWriter {
+                producer: Some(withdrawing),
+                previous_completed_task: s.get("previous_completed_task").map(|c| {
+                    WorkflowTaskEpoch {
+                        started_event_id: number(c, "started_event_id"),
+                        attempt: number(c, "attempt") as i32,
+                        started_time: time(&c["started_time"]),
+                    }
+                }),
+                failed_tasks: s["failed_tasks"]
+                    .as_array()
+                    .map(|list| list.iter().map(|v| v.as_i64().unwrap()).collect())
+                    .unwrap_or_default(),
+                withdraw_run: s["withdraw_run"].as_str().unwrap_or_default().to_string(),
+            }),
         };
         let p = &case["record"]["producer"];
         let record = StreamRecord {
