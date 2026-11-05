@@ -4,7 +4,10 @@ use crate::{
     Reason, StreamError, StreamResult,
     memory::MemoryStore,
     metrics::Metrics,
-    proto::{AppendRecordsRequest, CloseStreamRequest, DescribeStreamRequest, MemoryStreamConfig},
+    proto::{
+        AppendRecordsRequest, CloseStreamRequest, DescribeStreamRequest, MemoryStreamConfig,
+        ReadRecordsRequest,
+    },
     service::StreamService,
     store::{DEFAULT_RETENTION, DEFAULT_SAFETY_TTL, Store},
 };
@@ -127,6 +130,10 @@ impl StreamRuntime {
                 .close_stream(decode::<CloseStreamRequest>(input)?)
                 .await?
                 .encode_to_vec(),
+            "ReadRecords" => service
+                .read_records(decode::<ReadRecordsRequest>(input)?)
+                .await?
+                .encode_to_vec(),
             "DescribeStream" => service
                 .describe_stream(decode::<DescribeStreamRequest>(input)?)
                 .await?
@@ -193,10 +200,11 @@ pub(crate) fn decode<M: Message + Default>(input: &[u8]) -> StreamResult<M> {
 mod tests {
     use super::*;
 
-    const METHODS: [&str; 4] = [
+    const METHODS: [&str; 5] = [
         "CreateStream",
         "AppendRecords",
         "CloseStream",
+        "ReadRecords",
         "DescribeStream",
     ];
 
