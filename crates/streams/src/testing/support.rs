@@ -10,8 +10,8 @@ use crate::{
     epoch::withdraws,
     ids::local_activity_producer_id,
     proto::{
-        AppendRecord, LocalActivityEpoch, Producer, ProducerEpoch, StreamClose, StreamData,
-        StreamHandle, StreamRecord, StreamSuperseded, WorkflowTaskEpoch, producer_epoch::Kind,
+        AppendRecord, LocalActivityEpoch, Producer, ProducerEpoch, StreamData, StreamHandle,
+        StreamRecord, StreamSuperseded, WorkflowTaskEpoch, producer_epoch::Kind,
         stream_record::Item,
     },
     store::{Appended, Batch, Closed, Create, Created, Entry, Owner, Store, Withdrawal},
@@ -355,17 +355,7 @@ impl Target {
         handle: &StreamHandle,
         producer: &Producer,
     ) -> StreamResult<Closed> {
-        let record = StreamRecord {
-            item: Some(Item::Close(StreamClose {
-                producer: Some(producer.clone()),
-                ..Default::default()
-            })),
-            ..Default::default()
-        }
-        .encode_to_vec();
-        self.store
-            .close(&self.namespace, handle, producer, &record)
-            .await
+        self.store.close(&self.namespace, handle, producer).await
     }
 }
 

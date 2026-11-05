@@ -13,11 +13,10 @@ use crate::{
         Producer, ReadRecordsRequest, ReadRecordsResponse, StreamHandle, StreamIdConflictPolicy,
         StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded, stream_record::Item,
     },
-    record::{caller_status, close_record, data_records, superseded},
+    record::{data_records, superseded},
     store::{
-        Batch, Capabilities, ConflictPolicy, Create, CreateOutcome, FORMAT_VERSION,
-        MAX_RECORD_BYTES, MAX_SEQUENCE, MAX_TTL, MIN_RETENTION, Owner, Store, StreamState,
-        Withdrawal, owner_chain,
+        Batch, Capabilities, ConflictPolicy, Create, CreateOutcome, FORMAT_VERSION, MAX_SEQUENCE,
+        MAX_TTL, MIN_RETENTION, Owner, Store, StreamState, Withdrawal, owner_chain,
     },
 };
 use prost::Message;
@@ -297,20 +296,8 @@ impl StreamService {
         let stream = request.handle.clone().unwrap_or_default();
         let producer = close_producer(request.producer.as_ref())?;
         self.store.capabilities().require(Capabilities::CLOSE)?;
-        let status = caller_status(request.failure.as_ref());
-        let record = close_record(producer, request.result, request.failure, status);
-        // Every read past the close returns the close Record again.
-        if record.len() > MAX_RECORD_BYTES {
-            return Err(StreamError::new(
-                Reason::TooLarge,
-                format!(
-                    "The close Record has {} bytes, more than {MAX_RECORD_BYTES}",
-                    record.len()
-                ),
-            ));
-        }
         self.store
-            .close(&request.namespace, &stream, producer, &record)
+            .close(&request.namespace, &stream, producer)
             .await?;
         Ok(CloseStreamResponse {})
     }
@@ -327,10 +314,10 @@ impl StreamService {
                 "Nobody created the Stream",
             ));
         }
-        // A closed Stream that expired has lost its close Record, and every read fails.
+        // A closed Stream that expired has lost its log, and every read fails.
         let status = if state.expired() {
             StreamStatus::Expired
-        } else if state.closed_at.is_some() {
+        } else if state.closed {
             StreamStatus::Closed
         } else {
             StreamStatus::Open

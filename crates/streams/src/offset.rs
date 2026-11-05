@@ -12,12 +12,12 @@ const MAX_MS: u64 = (i64::MAX >> SEQ_BITS) as u64;
 
 /// Packs a Redis entry id.
 pub fn offset_of_entry_id(id: &str) -> StreamResult<i64> {
-    let bad = || StreamError::storage(format!("The Store gave the entry id {id:?}"));
+    let bad = || StreamError::storage_corrupt(format!("The Store gave the entry id {id:?}"));
     let (ms, seq) = id.split_once('-').ok_or_else(bad)?;
     let ms: u64 = ms.parse().map_err(|_| bad())?;
     let seq: u64 = seq.parse().map_err(|_| bad())?;
     if ms > MAX_MS || seq > SEQ_MASK as u64 {
-        return Err(StreamError::storage(format!(
+        return Err(StreamError::storage_corrupt(format!(
             "The entry id {id:?} doesn't fit in an offset"
         )));
     }
@@ -36,9 +36,10 @@ mod tests {
 
     #[test]
     fn an_entry_id_that_doesnt_fit_is_refused() {
-        assert!(offset_of_entry_id("1-1048576").is_err());
-        assert!(offset_of_entry_id(&format!("{}-0", MAX_MS + 1)).is_err());
-        assert!(offset_of_entry_id("x").is_err());
+        for id in ["1-1048576", &format!("{}-0", MAX_MS + 1), "x"] {
+            let error = offset_of_entry_id(id).unwrap_err();
+            assert_eq!(error.reason, crate::Reason::StorageCorrupt, "{id}");
+        }
         assert_eq!(
             offset_of_entry_id(&format!("{MAX_MS}-{SEQ_MASK}")).unwrap(),
             i64::MAX
