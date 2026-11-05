@@ -14,11 +14,12 @@ use temporalio_streams::{
     ids::client_producer_id,
     memory::MemoryStore,
     proto::{
-        AppendRecord, AppendRecordsRequest, AppendRecordsResponse, CreateStreamRequest,
-        CreateStreamResponse, Producer, ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse,
-        StreamErrorDetails, StreamErrorReason, StreamHandle, StreamProducerKind,
+        AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientEpoch,
+        CreateStreamRequest, CreateStreamResponse, Producer, ProducerEpoch, ReadRecordsRequest,
+        ReadRecordsResponse, StreamErrorDetails, StreamErrorReason, StreamHandle,
+        producer_epoch::Kind,
     },
-    store::{Appended, Batch, Capabilities, Created, Entry, Owner, Store, StreamState, Withdrawal},
+    store::{Appended, Batch, Capabilities, Create, Created, Entry, Store, StreamState},
 };
 use tokio::time::Instant;
 
@@ -43,13 +44,9 @@ impl Store for Trimming {
         &self,
         namespace: &str,
         handle: &StreamHandle,
-        retention: Option<Duration>,
-        owner: Owner,
-        withdrawal: &Withdrawal<'_>,
+        create: &Create<'_>,
     ) -> StreamResult<Created> {
-        self.inner
-            .create(namespace, handle, retention, owner, withdrawal)
-            .await
+        self.inner.create(namespace, handle, create).await
     }
 
     async fn append(
@@ -122,7 +119,7 @@ async fn create(ext: &StreamRuntime) {
         "CreateStream",
         CreateStreamRequest {
             namespace: NAMESPACE.to_string(),
-            stream_id: STREAM.to_string(),
+            stream_handle: handle(),
             ..Default::default()
         },
     )
@@ -131,11 +128,9 @@ async fn create(ext: &StreamRuntime) {
 
 fn client() -> Producer {
     Producer {
-        kind: StreamProducerKind::Client as i32,
         id: client_producer_id("me", "p"),
         epoch: Some(ProducerEpoch {
-            attempt: 1,
-            ..Default::default()
+            kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
         }),
         run_id: String::new(),
     }

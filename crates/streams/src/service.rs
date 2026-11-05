@@ -11,8 +11,7 @@ use crate::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
         Producer, ReadRecordsRequest, ReadRecordsResponse, StreamHandle, StreamIdConflictPolicy,
-        StreamProducerKind, StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded,
-        stream_record::Item,
+        StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded, stream_record::Item,
     },
     record::{caller_status, close_record, data_records, superseded},
     store::{
@@ -396,7 +395,7 @@ impl StreamService {
         if from > state.newest + 1 {
             let next = state.newest + 1;
             return Err(StreamError::new(
-                Reason::Offset,
+                Reason::OffsetTooHigh,
                 format!(
                     "The offset {from} is past the newest offset + 1, {next}. A failover may have \
                      lost the newest Records. Read from {next}, or read again once newer Records \

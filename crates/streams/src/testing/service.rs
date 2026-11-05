@@ -13,9 +13,9 @@ use crate::{
         CloseStreamRequest, CloseStreamResponse, CreateStreamRequest, CreateStreamResponse,
         DescribeStreamRequest, DescribeStreamResponse, LocalActivityEpoch, Producer, ProducerEpoch,
         ReadRecordsRequest, ReadRecordsResponse, StreamClose, StreamCloseStatus,
-        StreamErrorDetails, StreamHandle, StreamIdConflictPolicy, StreamProducerKind,
-        StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded, WorkflowTaskEpoch,
-        producer_epoch::Kind, stream_record::Item,
+        StreamErrorDetails, StreamHandle, StreamIdConflictPolicy, StreamReadStart, StreamRecord,
+        StreamStatus, StreamSuperseded, WorkflowTaskEpoch, producer_epoch::Kind,
+        stream_record::Item,
     },
 };
 use prost::Message;
@@ -94,13 +94,8 @@ fn client(attempt: i32) -> Producer {
 /// A client Producer that a test names, at `attempt`. Every backend accepts it as sent.
 fn named(name: &str, attempt: i32) -> Producer {
     Producer {
-        kind: StreamProducerKind::Client as i32,
         id: named_client_producer_id(name),
-        epoch: Some(ProducerEpoch {
-            attempt,
-            ..Default::default()
-        }),
-        run_id: String::new(),
+        ..client(attempt)
     }
 }
 
@@ -108,15 +103,15 @@ fn named(name: &str, attempt: i32) -> Producer {
 /// Records. The server requires the Activity's task token, so only Redis and memory accept it.
 fn activity(attempt: i32, scheduled: i64) -> Producer {
     Producer {
-        kind: StreamProducerKind::Activity as i32,
         id: activity_producer_id("r1", "a", "s"),
         epoch: Some(ProducerEpoch {
-            attempt_scheduled_time: Some(Timestamp {
-                seconds: scheduled,
-                nanos: 0,
-            }),
-            attempt,
-            ..Default::default()
+            kind: Some(Kind::Activity(ActivityEpoch {
+                attempt_scheduled_time: Some(Timestamp {
+                    seconds: scheduled,
+                    nanos: 0,
+                }),
+                attempt,
+            })),
         }),
         run_id: "r1".to_string(),
     }
@@ -188,16 +183,6 @@ impl Case {
             ..request
         };
         call(&self.ext, "CreateStream", request).await
-    }
-
-    async fn close(&self, producer: Producer) -> Result<CloseStreamResponse, StreamError> {
-        let close = CloseStreamRequest {
-            namespace: self.namespace.clone(),
-            handle: self.handle(),
-            producer: Some(producer),
-            ..Default::default()
-        };
-        call(&self.ext, "CloseStream", close).await
     }
 
     async fn append(
@@ -553,7 +538,7 @@ async fn an_append_with_no_sequence_takes_the_next_one_of_its_epoch() {
 }
 
 /// A read is inclusive from its offset, a read from the end gives only new Records, an offset past
-/// the newest + 1 fails with `stream_offset`, and one below zero is invalid.
+/// the newest + 1 fails with `stream_offset_too_high`, and one below zero is invalid.
 async fn a_read_is_inclusive_from_its_offset_and_get_offset_reads_only_new_records() {
     for case in cases_for(Needs::CALLS).await {
         case.create(None).await.unwrap();
@@ -600,7 +585,7 @@ async fn a_read_is_inclusive_from_its_offset_and_get_offset_reads_only_new_recor
             .unwrap_err();
         assert_eq!(
             (error.code(), reason(&error).as_str()),
-            (Code::OutOfRange, "stream_offset")
+            (Code::OutOfRange, "stream_offset_too_high")
         );
         let error = case
             .read(ReadRecordsRequest {
@@ -672,7 +657,10 @@ async fn a_read_waits_for_the_create_only_as_long_as_create_wait() {
             tokio::time::sleep(Duration::from_millis(150)).await;
             let request = CreateStreamRequest {
                 namespace,
-                stream_id: stream,
+                stream_handle: Some(StreamHandle {
+                    id: stream,
+                    ..Default::default()
+                }),
                 ..Default::default()
             };
             call::<_, CreateStreamResponse>(&ext, "CreateStream", request).await
@@ -859,9 +847,8 @@ async fn create_owned_short(case: &Case, run: &str) {
         "CreateStream",
         CreateStreamRequest {
             namespace: case.namespace.clone(),
-            stream_id: case.stream.clone(),
             retention: millis(300),
-            owner: Some(workflow_owner(run)),
+            owner: Some(workflow(run)),
             stream_handle: owned_handle(case),
             ..Default::default()
         },
@@ -911,7 +898,7 @@ async fn a_close_after_the_log_expired_keeps_the_gap() {
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
             handle: owned_handle(&case),
-            producer: Some(workflow_owner(&run)),
+            producer: Some(workflow(&run)),
             ..Default::default()
         };
         let _: CloseStreamResponse = call(&case.ext, "CloseStream", close).await.unwrap();
@@ -1013,15 +1000,6 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
     }
 }
 
-fn workflow_owner(run: &str) -> Producer {
-    Producer {
-        kind: StreamProducerKind::Workflow as i32,
-        id: crate::ids::workflow_producer_id(run),
-        run_id: run.to_string(),
-        ..Default::default()
-    }
-}
-
 /// The case's handle with the owner of a made-up run chain, which a create with an owner needs.
 fn owned_handle(case: &Case) -> Option<StreamHandle> {
     Some(StreamHandle {
@@ -1034,15 +1012,18 @@ fn owned_handle(case: &Case) -> Option<StreamHandle> {
 /// The user Local Activity `call-1` of `run`, dispatched by the Workflow Task `[started]`. A rerun
 /// in a later task keeps the Producer id and has a newer dispatching task.
 fn user_local_activity(run: &str, started: i64, seconds: i64) -> Producer {
+    let task = WorkflowTaskEpoch {
+        started_event_id: started,
+        attempt: 1,
+        started_time: Some(Timestamp { seconds, nanos: 0 }),
+    };
     Producer {
-        kind: StreamProducerKind::LocalActivity as i32,
         id: crate::ids::local_activity_producer_id(run, "call-1"),
         epoch: Some(ProducerEpoch {
-            task_started_event_id: started,
-            task_attempt: 1,
-            task_started_time: Some(Timestamp { seconds, nanos: 0 }),
-            attempt: 1,
-            ..Default::default()
+            kind: Some(Kind::LocalActivity(LocalActivityEpoch {
+                task: Some(task),
+                attempt: 1,
+            })),
         }),
         run_id: run.to_string(),
     }
@@ -1057,8 +1038,7 @@ async fn a_rerun_local_activity_supersedes_its_first_attempt() {
             "CreateStream",
             CreateStreamRequest {
                 namespace: case.namespace.clone(),
-                stream_id: case.stream.clone(),
-                owner: Some(workflow_owner(&run)),
+                owner: Some(workflow(&run)),
                 stream_handle: owned_handle(&case),
                 ..Default::default()
             },
