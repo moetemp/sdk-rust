@@ -1,12 +1,14 @@
 syntax = "proto3";
 
-// The messages of the crate's own calls, in addition to the five Stream service operations. Lang
-// sends them through the bridge's call on the runtime object, by the method name in each comment.
-// One generic call keeps Stream logic out of every bridge.
-package temporal.sdk.streams.v1;
+package coresdk.streams;
+option ruby_package = "Temporalio::Internal::Bridge::Api::Streams";
 
 import "google/protobuf/duration.proto";
 import "temporal/api/stream/v1/message.proto";
+
+// The messages of the calls that `temporalio-streams` adds to the five Stream service operations.
+// Lang sends them through the bridge's call on the runtime object, by the method name in each
+// comment. One generic call keeps Stream logic out of every bridge.
 
 // The settings of the memory Stream runtime, for tests. Each field has the number of the same
 // field in the config of the other Stores, such as Redis, so a backend can send that config here
@@ -16,7 +18,7 @@ message MemoryStreamConfig {
     google.protobuf.Duration retention = 4;
     // How long an open Workflow-owned Stream stays after its last write. Empty is 90 days.
     google.protobuf.Duration safety_ttl = 5;
-    // The backend name that lang registered this runtime under. The crate sets it on each
+    // The backend name that lang registered this runtime under. The runtime sets it on each
     // StreamRef that it builds, such as the one in a create response.
     string backend = 10;
 }
