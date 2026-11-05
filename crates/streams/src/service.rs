@@ -10,9 +10,9 @@ use crate::{
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        Producer, ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse, StreamHandle,
-        StreamIdConflictPolicy, StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded,
-        WorkflowTaskEpoch, producer_epoch::Kind, stream_record::Item,
+        Producer, ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy,
+        StreamReadStart, StreamRecord, StreamRef, StreamStatus, StreamSuperseded, WorkflowTaskEpoch,
+        producer_epoch::Kind, stream_record::Item,
     },
     record::{data_records, superseded},
     store::{
@@ -39,7 +39,7 @@ const CREATE_POLL: Duration = Duration::from_millis(100);
 pub(crate) struct StreamService {
     pub(crate) store: Arc<dyn Store>,
     pub(crate) metrics: Metrics,
-    /// The backend name for the handles the service builds.
+    /// The backend name for the refs the service builds.
     pub(crate) backend: String,
 }
 
@@ -96,8 +96,10 @@ fn proto_duration(value: Duration) -> prost_types::Duration {
     }
 }
 
-fn stream_id(handle: Option<&StreamHandle>) -> StreamResult<&str> {
-    let id = handle.map(|handle| handle.id.as_str()).unwrap_or_default();
+fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
+    let id = stream_ref
+        .map(|stream_ref| stream_ref.id.as_str())
+        .unwrap_or_default();
     check_stream_id(id)?;
     Ok(id)
 }
@@ -182,18 +184,18 @@ fn check_task_facts(kind: ProducerKind, request: &AppendRecordsRequest) -> Strea
     Ok(())
 }
 
-/// Checks the owner of a create, which must be a Workflow run with a handle of its run chain. A
+/// Checks the owner of a create, which must be a Workflow run with a ref of its run chain. A
 /// Store stores that chain and checks every later create and close against it.
-fn create_owner<'a>(owner: &'a Producer, handle: &StreamHandle) -> StreamResult<&'a Producer> {
+fn create_owner<'a>(owner: &'a Producer, stream_ref: &StreamRef) -> StreamResult<&'a Producer> {
     check_producer(owner)?;
     if ProducerKind::try_from(owner)? != ProducerKind::Workflow {
         return Err(StreamError::invalid(
             "The owner of a create is a Workflow Producer",
         ));
     }
-    if owner_chain(handle).is_empty() {
+    if owner_chain(stream_ref).is_empty() {
         return Err(StreamError::invalid(
-            "A create with an owner needs a handle whose owner is the Workflow's run chain",
+            "A create with an owner needs a ref whose owner is the Workflow's run chain",
         ));
     }
     Ok(owner)
@@ -212,8 +214,8 @@ impl StreamService {
         &self,
         request: CreateStreamRequest,
     ) -> StreamResult<CreateStreamResponse> {
-        stream_id(request.stream_handle.as_ref())?;
-        let stream = request.stream_handle.clone().unwrap_or_default();
+        stream_id(request.stream_ref.as_ref())?;
+        let stream = request.stream_ref.clone().unwrap_or_default();
         let retention = retention(request.retention)?;
         let conflict = conflict_policy(request.id_conflict_policy)?;
         // A Workflow's call from outside Workflow code, such as from a Local Activity, sets the
@@ -261,7 +263,7 @@ impl StreamService {
             self.metrics.superseded();
         }
         Ok(CreateStreamResponse {
-            handle: Some(StreamHandle {
+            r#ref: Some(StreamRef {
                 id: stream.id,
                 owner: stream.owner.filter(|_| owner == Owner::Workflow),
                 backend: self.backend.clone(),
@@ -274,8 +276,8 @@ impl StreamService {
         &self,
         request: AppendRecordsRequest,
     ) -> StreamResult<AppendRecordsResponse> {
-        stream_id(request.handle.as_ref())?;
-        let stream = request.handle.clone().unwrap_or_default();
+        stream_id(request.r#ref.as_ref())?;
+        let stream = request.r#ref.clone().unwrap_or_default();
         let producer = outside_producer(request.producer.as_ref())?;
         let kind = ProducerKind::try_from(producer)?;
         if !(0..=MAX_SEQUENCE).contains(&request.sequence) {
@@ -354,8 +356,8 @@ impl StreamService {
         &self,
         request: CloseStreamRequest,
     ) -> StreamResult<CloseStreamResponse> {
-        stream_id(request.handle.as_ref())?;
-        let stream = request.handle.clone().unwrap_or_default();
+        stream_id(request.r#ref.as_ref())?;
+        let stream = request.r#ref.clone().unwrap_or_default();
         let producer = close_producer(request.producer.as_ref())?;
         self.store.capabilities().require(Capabilities::CLOSE)?;
         self.store
@@ -368,7 +370,7 @@ impl StreamService {
         &self,
         request: DescribeStreamRequest,
     ) -> StreamResult<DescribeStreamResponse> {
-        let id = stream_id(request.handle.as_ref())?;
+        let id = stream_id(request.r#ref.as_ref())?;
         let (state, _) = self.store.read(&request.namespace, id, 0, 0).await?;
         if !state.exists {
             return Err(StreamError::new(
@@ -397,7 +399,7 @@ impl StreamService {
         &self,
         request: ReadRecordsRequest,
     ) -> StreamResult<ReadRecordsResponse> {
-        let id = stream_id(request.handle.as_ref())?.to_string();
+        let id = stream_id(request.r#ref.as_ref())?.to_string();
         let namespace = request.namespace.as_str();
         if request.from_offset < 0 {
             return Err(StreamError::invalid("The offset is below zero"));
@@ -484,7 +486,7 @@ impl StreamService {
         request: ReadRecordsRequest,
         max_bytes: usize,
     ) -> StreamResult<ReadRecordsResponse> {
-        let id = stream_id(request.handle.as_ref())?.to_string();
+        let id = stream_id(request.r#ref.as_ref())?.to_string();
         let namespace = request.namespace.as_str();
         let count = (request.last as usize).min(MAX_RECORDS);
         let create_wait = duration(request.create_wait)

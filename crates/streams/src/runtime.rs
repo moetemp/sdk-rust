@@ -82,7 +82,7 @@ impl std::fmt::Debug for StreamRuntime {
 impl StreamRuntime {
     /// Builds a runtime that connects its Store with `factory` on its first call that needs it.
     /// `name` identifies the runtime in logs. `backend` is the name that lang registered the
-    /// runtime under, which the handles that the runtime builds carry. The runtime records metrics
+    /// runtime under, which the refs that the runtime builds carry. The runtime records metrics
     /// on `meter`, lang's runtime meter, if set.
     pub fn new(
         name: &'static str,
