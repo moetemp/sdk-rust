@@ -446,11 +446,13 @@ async fn closing_every_writer_drops_them_all() {
 }
 
 /// A Store over another one, whose appends fail. It can write an append and lose its answer, as on
-/// a dropped connection, and it refuses every append while it is down.
+/// a dropped connection, and it refuses every append while it is down. It can also refuse the next
+/// append as corrupt Store data.
 struct Flaky {
     inner: Arc<dyn Store>,
     lose_next: AtomicBool,
     down: AtomicBool,
+    corrupt_next: AtomicBool,
 }
 
 impl Flaky {
@@ -460,6 +462,7 @@ impl Flaky {
             inner,
             lose_next: AtomicBool::new(false),
             down: AtomicBool::new(false),
+            corrupt_next: AtomicBool::new(false),
         }
     }
 }
@@ -486,11 +489,14 @@ impl Store for Flaky {
         batch: &Batch<'_>,
     ) -> StreamResult<Appended> {
         if self.down.load(Ordering::SeqCst) {
-            return Err(StreamError::storage("the Store is down"));
+            return Err(StreamError::storage_unavailable("the Store is down"));
+        }
+        if self.corrupt_next.swap(false, Ordering::SeqCst) {
+            return Err(StreamError::storage_corrupt("a stored field is bad"));
         }
         let appended = self.inner.append(namespace, handle, batch).await?;
         if self.lose_next.swap(false, Ordering::SeqCst) {
-            return Err(StreamError::storage("the answer was lost"));
+            return Err(StreamError::storage_unavailable("the answer was lost"));
         }
         Ok(appended)
     }
@@ -522,9 +528,8 @@ impl Store for Flaky {
         namespace: &str,
         handle: &StreamHandle,
         producer: &Producer,
-        record: &[u8],
     ) -> StreamResult<Closed> {
-        self.inner.close(namespace, handle, producer, record).await
+        self.inner.close(namespace, handle, producer).await
     }
 
     async fn read_back(
@@ -600,7 +605,7 @@ async fn a_writer_writes_again_after_a_store_outage() {
         let error = case.write(writer, &["lost"]).await.unwrap_err();
         assert_eq!(
             (error.code(), reason(&error).as_str()),
-            (Code::Unavailable, "stream_storage")
+            (Code::Unavailable, "stream_storage_unavailable")
         );
         store.down.store(false, Ordering::SeqCst);
         case.write(writer, &["b"]).await.unwrap();
@@ -610,6 +615,23 @@ async fn a_writer_writes_again_after_a_store_outage() {
             .await
             .unwrap();
         assert!(closed.last_offset > 0);
+    }
+}
+
+/// A write that meets corrupt Store data fails at once, since a retry reads the same data. The
+/// writer then fails every later write.
+async fn a_write_on_corrupt_store_data_fails_with_no_retry() {
+    for (store, case) in flaky_cases(false).await {
+        let writer = case.open(client(), |_| {}).await;
+        store.corrupt_next.store(true, Ordering::SeqCst);
+        let error = case.write(writer, &["a"]).await.unwrap_err();
+        assert_eq!(
+            (error.code(), reason(&error).as_str()),
+            (Code::DataLoss, "stream_storage_corrupt")
+        );
+        assert!(case.visible().await.is_empty());
+        let again = case.write(writer, &["b"]).await.unwrap_err();
+        assert_eq!(reason(&again), "stream_storage_corrupt");
     }
 }
 
@@ -689,6 +711,7 @@ pub const CASES: &[super::Case] = &[
     case!(closing_every_writer_drops_them_all),
     case!(a_write_whose_answer_is_lost_goes_in_once),
     case!(a_writer_writes_again_after_a_store_outage),
+    case!(a_write_on_corrupt_store_data_fails_with_no_retry),
     case!(a_write_that_waits_behind_a_close_is_refused),
     case!(a_local_activity_writer_withdraws_the_records_of_a_failed_task),
 ];

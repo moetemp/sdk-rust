@@ -108,7 +108,7 @@ impl Writer {
                 Ok(offsets) => offsets,
                 // The next write takes a higher `sequence`, so the Store refuses a late copy of
                 // this batch after it.
-                Err(error) if error.reason == Reason::Storage => return Err(error),
+                Err(error) if error.reason == Reason::StorageUnavailable => return Err(error),
                 Err(error) => {
                     self.state.lock().failed = Some(error.clone());
                     return Err(error);
@@ -144,7 +144,8 @@ impl Writer {
             match self.service.append_records(request.clone()).await {
                 Ok(response) => return Ok((response.first_offset, response.last_offset)),
                 Err(error)
-                    if error.reason == Reason::Storage && Instant::now() + backoff < until =>
+                    if error.reason == Reason::StorageUnavailable
+                        && Instant::now() + backoff < until =>
                 {
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(1));
