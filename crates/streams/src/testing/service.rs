@@ -12,10 +12,9 @@ use crate::{
         ActivityEpoch, AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientEpoch,
         CloseStreamRequest, CloseStreamResponse, CreateStreamRequest, CreateStreamResponse,
         DescribeStreamRequest, DescribeStreamResponse, LocalActivityEpoch, Producer, ProducerEpoch,
-        ReadRecordsRequest, ReadRecordsResponse, StreamClose, StreamCloseStatus,
-        StreamErrorDetails, StreamHandle, StreamIdConflictPolicy, StreamReadStart, StreamRecord,
-        StreamStatus, StreamSuperseded, WorkflowTaskEpoch, producer_epoch::Kind,
-        stream_record::Item,
+        ReadRecordsRequest, ReadRecordsResponse, StreamErrorDetails, StreamHandle,
+        StreamIdConflictPolicy, StreamReadStart, StreamRecord, StreamStatus, StreamSuperseded,
+        WorkflowTaskEpoch, producer_epoch::Kind, stream_record::Item,
     },
 };
 use prost::Message;
@@ -24,10 +23,7 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
-use temporalio_common::protos::temporal::api::{
-    common::v1::Payload,
-    failure::v1::{Failure, failure::FailureInfo},
-};
+use temporalio_common::protos::temporal::api::common::v1::Payload;
 use tonic::Code;
 
 struct Case {
@@ -239,10 +235,6 @@ impl Case {
                 namespace: self.namespace.clone(),
                 handle: self.handle(),
                 producer: Some(producer),
-                result: Some(Payload {
-                    data: b"done".to_vec(),
-                    ..Default::default()
-                }),
                 ..Default::default()
             },
         )
@@ -257,7 +249,6 @@ fn texts(response: &ReadRecordsResponse) -> Vec<String> {
         .map(|record| match &record.item {
             Some(Item::Data(data)) => String::from_utf8(data.body.clone().unwrap().data).unwrap(),
             Some(Item::Superseded(_)) => "<superseded>".to_string(),
-            Some(Item::Close(_)) => "<close>".to_string(),
             None => "?".to_string(),
         })
         .collect()
@@ -267,13 +258,6 @@ fn superseded_of(record: &StreamRecord) -> &StreamSuperseded {
     match &record.item {
         Some(Item::Superseded(superseded)) => superseded,
         other => panic!("not a Superseded item: {other:?}"),
-    }
-}
-
-fn close_of(record: &StreamRecord) -> &StreamClose {
-    match &record.item {
-        Some(Item::Close(close)) => close,
-        other => panic!("not the close: {other:?}"),
     }
 }
 
@@ -361,6 +345,30 @@ async fn a_create_of_a_closed_stream_fails() {
                 (Code::FailedPrecondition, "stream_closed")
             );
         }
+    }
+}
+
+/// A close writes no Record, so the describe's last offset stays at the newest Record. A second
+/// close of the closed Stream succeeds, and a later append fails as closed.
+async fn a_close_writes_no_record_and_a_second_close_succeeds() {
+    for case in cases_for(Needs::CALLS).await {
+        case.create(None).await.unwrap();
+        let written = case.append(client(1), 1, vec![record("a")]).await.unwrap();
+        case.close(client(1)).await.unwrap();
+        case.close(client(1)).await.unwrap();
+        let error = case
+            .append(client(1), 2, vec![record("b")])
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "stream_closed");
+        let describe = DescribeStreamRequest {
+            namespace: case.namespace.clone(),
+            handle: case.handle(),
+        };
+        let described: DescribeStreamResponse =
+            call(&case.ext, "DescribeStream", describe).await.unwrap();
+        assert_eq!(described.status, StreamStatus::Closed as i32);
+        assert_eq!(described.last_offset, written.last_offset);
     }
 }
 
@@ -727,19 +735,16 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
     }
 }
 
-/// A close ends every read with its close Record and refuses later appends.
-async fn a_close_ends_every_read_with_its_record() {
+/// A read that gives the last item of a closed Stream is done, and so is every later read, which
+/// gives no item. A close refuses later appends.
+async fn a_close_ends_every_read_with_done() {
     for case in cases_for(Needs::CALLS).await {
         case.create(None).await.unwrap();
         case.append(client(1), 1, vec![record("1")]).await.unwrap();
         case.close(client(1)).await.unwrap();
         let read = case.read(ReadRecordsRequest::default()).await.unwrap();
-        assert_eq!(texts(&read), ["1", "<close>"]);
+        assert_eq!(texts(&read), ["1"]);
         assert!(read.done);
-        assert_eq!(
-            close_of(&read.records[1]).result.as_ref().unwrap().data,
-            b"done"
-        );
         let again = case
             .read(ReadRecordsRequest {
                 from_offset: read.next_offset,
@@ -747,8 +752,8 @@ async fn a_close_ends_every_read_with_its_record() {
             })
             .await
             .unwrap();
-        assert_eq!(texts(&again), ["<close>"]);
-        assert!(again.done);
+        assert!(again.records.is_empty() && again.done);
+        assert_eq!(again.next_offset, read.next_offset);
         assert_eq!(
             case.describe().await.unwrap().status,
             StreamStatus::Closed as i32
@@ -884,8 +889,8 @@ async fn a_read_behind_an_expired_log_fails_before_and_after_the_next_write() {
     }
 }
 
-/// A close as the first write after an idle open Stream's log expired keeps the gap, so a read from
-/// an offset that the log took fails as expired.
+/// A close after an idle open Stream's log expired keeps the gap, so a read from an offset that the
+/// log took fails as expired.
 async fn a_close_after_the_log_expired_keeps_the_gap() {
     for case in cases_for(Needs::UNCHECKED.and(Needs::SHORT_TIMES)).await {
         let run = format!("{}-run", case.stream);
@@ -1725,60 +1730,90 @@ async fn a_retry_run_s_create_after_the_log_expired_keeps_the_gap() {
     }
 }
 
-/// A close Record takes its status from the failure. A failure is canceled when it is a cancel, or
-/// an Activity, child Workflow or Nexus Operation failure whose cause is a cancel, and failed
-/// otherwise. A close Record over the Record limit is refused.
-async fn a_close_record_takes_its_status_from_the_failure() {
-    let canceled_activity = Failure {
-        message: "boom".to_string(),
-        failure_info: Some(FailureInfo::ActivityFailureInfo(Default::default())),
-        cause: Some(Box::new(Failure {
-            failure_info: Some(FailureInfo::CanceledFailureInfo(Default::default())),
-            ..Default::default()
-        })),
-        ..Default::default()
-    };
-    let other = Failure {
-        message: "boom".to_string(),
-        ..Default::default()
-    };
-    for (failure, status) in [
-        (other, StreamCloseStatus::Failed),
-        (canceled_activity, StreamCloseStatus::Canceled),
-    ] {
-        for case in cases_for(Needs::CALLS).await {
-            case.create(None).await.unwrap();
-            let close = CloseStreamRequest {
-                namespace: case.namespace.clone(),
-                handle: case.handle(),
-                producer: Some(client(1)),
-                failure: Some(failure.clone()),
+/// A read of a closed Stream gives `done` only with its last item. With no item left, a read
+/// answers at once with `done`, even with a long wait.
+async fn a_read_of_a_closed_stream_with_no_item_left_answers_at_once() {
+    for case in cases_for(Needs::CALLS).await {
+        case.create(None).await.unwrap();
+        let records = vec![record("1"), record("2")];
+        let written = case.append(client(1), 1, records).await.unwrap();
+        case.close(client(1)).await.unwrap();
+        let first = case
+            .read(ReadRecordsRequest {
+                max_records: 1,
                 ..Default::default()
-            };
-            let huge = CloseStreamRequest {
-                result: Some(Payload {
-                    data: vec![0; crate::store::MAX_RECORD_BYTES],
-                    ..Default::default()
-                }),
-                ..close.clone()
-            };
-            let error = call::<_, CloseStreamResponse>(&case.ext, "CloseStream", huge)
-                .await
-                .unwrap_err();
-            assert_eq!(reason(&error), "stream_too_large");
-            call::<_, CloseStreamResponse>(&case.ext, "CloseStream", close)
+            })
+            .await
+            .unwrap();
+        assert_eq!(texts(&first), ["1"]);
+        assert!(!first.done);
+        let rest = case
+            .read(ReadRecordsRequest {
+                from_offset: first.next_offset,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(texts(&rest), ["2"]);
+        assert!(rest.done);
+        for request in [
+            ReadRecordsRequest {
+                from_offset: written.last_offset + 1,
+                ..Default::default()
+            },
+            ReadRecordsRequest {
+                start: StreamReadStart::End as i32,
+                ..Default::default()
+            },
+        ] {
+            let started = Instant::now();
+            let read = case
+                .read(ReadRecordsRequest {
+                    wait: millis(5000),
+                    ..request
+                })
                 .await
                 .unwrap();
-            let read = case.read(ReadRecordsRequest::default()).await.unwrap();
-            let record = read.records.last().unwrap();
-            assert_eq!(close_of(record).status, status as i32);
-            assert_eq!(close_of(record).failure.as_ref().unwrap().message, "boom");
+            assert!(started.elapsed() < Duration::from_secs(2));
+            assert!(read.records.is_empty() && read.done);
+            assert_eq!(read.next_offset, written.last_offset + 1);
         }
     }
 }
 
-/// A last read gives the newest Records oldest first, skips withdrawn ones, and ends with the
-/// close Record of a closed Stream.
+/// A long poll at the end of an open Stream wakes on its close and answers with `done`.
+async fn a_waiting_read_wakes_with_done_on_a_close() {
+    for case in cases_for(Needs::CALLS).await {
+        case.create(None).await.unwrap();
+        let written = case.append(client(1), 1, vec![record("1")]).await.unwrap();
+        let ext = case.ext.clone();
+        let close = CloseStreamRequest {
+            namespace: case.namespace.clone(),
+            handle: case.handle(),
+            producer: Some(client(1)),
+            ..Default::default()
+        };
+        let closer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            call::<_, CloseStreamResponse>(&ext, "CloseStream", close).await
+        });
+        let started = Instant::now();
+        let woke = case
+            .read(ReadRecordsRequest {
+                from_offset: written.last_offset + 1,
+                wait: millis(5000),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(4));
+        assert!(woke.records.is_empty() && woke.done);
+        closer.await.unwrap().unwrap();
+    }
+}
+
+/// A last read gives the newest Records oldest first, skips withdrawn ones, and gives `done` for a
+/// closed Stream.
 async fn a_last_read_gives_the_newest_records_oldest_first_without_withdrawn_ones() {
     for case in cases_for(Needs::CALLS).await {
         case.create(None).await.unwrap();
@@ -1821,7 +1856,7 @@ async fn a_last_read_gives_the_newest_records_oldest_first_without_withdrawn_one
         assert_eq!(reason(&error), "stream_invalid");
         case.close(client(1)).await.unwrap();
         let read = case.read(last(1)).await.unwrap();
-        assert_eq!(texts(&read), ["a2", "<close>"]);
+        assert_eq!(texts(&read), ["a2"]);
         assert!(read.done);
     }
 }
@@ -1852,6 +1887,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_create_returns_the_stream_that_exists_whatever_its_retention),
     case!(a_create_of_an_open_stream_fails_unless_it_uses_it_or_retries),
     case!(a_create_of_a_closed_stream_fails),
+    case!(a_close_writes_no_record_and_a_second_close_succeeds),
     case!(a_workflow_or_a_client_closes_a_stream_with_no_owner),
     case!(a_create_of_an_expired_stream_fails),
     case!(a_create_checks_its_owner_and_its_handle),
@@ -1861,7 +1897,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_higher_attempt_puts_its_superseded_item_before_its_batch),
     case!(a_read_waits_for_the_create_only_as_long_as_create_wait),
     case!(a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append),
-    case!(a_close_ends_every_read_with_its_record),
+    case!(a_close_ends_every_read_with_done),
     case!(an_unknown_method_is_unimplemented),
     case!(a_read_of_an_expired_open_stream_fails_instead_of_waiting),
     case!(a_read_of_an_expired_closed_stream_fails_instead_of_waiting),
@@ -1885,7 +1921,8 @@ pub const CASES: &[super::Case] = &[
     case!(a_withdrawn_run_cant_close_the_stream),
     case!(a_retry_run_s_create_of_a_new_stream_fences_the_previous_run),
     case!(a_retry_run_s_create_after_the_log_expired_keeps_the_gap),
-    case!(a_close_record_takes_its_status_from_the_failure),
+    case!(a_read_of_a_closed_stream_with_no_item_left_answers_at_once),
+    case!(a_waiting_read_wakes_with_done_on_a_close),
     case!(a_last_read_gives_the_newest_records_oldest_first_without_withdrawn_ones),
     case!(a_page_keeps_under_max_bytes_and_a_larger_record_comes_alone),
 ];

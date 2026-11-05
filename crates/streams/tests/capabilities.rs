@@ -80,9 +80,8 @@ impl Store for Masked {
         namespace: &str,
         handle: &StreamHandle,
         producer: &Producer,
-        record: &[u8],
     ) -> StreamResult<Closed> {
-        self.inner.close(namespace, handle, producer, record).await
+        self.inner.close(namespace, handle, producer).await
     }
 }
 

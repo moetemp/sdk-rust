@@ -136,7 +136,12 @@ impl TryFrom<&[u8]> for ProducerField {
     type Error = StreamError;
 
     fn try_from(value: &[u8]) -> StreamResult<Self> {
-        let unknown = || refuse(Reason::Storage, "the Producer field has an unknown format");
+        let unknown = || {
+            refuse(
+                Reason::StorageCorrupt,
+                "the Producer field has an unknown format",
+            )
+        };
         let Some((&flags, rest)) = value.split_first() else {
             return Err(unknown());
         };
@@ -176,7 +181,7 @@ impl TryFrom<&[u8]> for ProducerField {
 
 /// The [EntryId] of an entry id's text, `<ms>-<seq>`.
 fn entry_id(text: &str) -> StreamResult<EntryId> {
-    let bad = || refuse(Reason::Storage, "an entry id isn't <ms>-<seq>");
+    let bad = || refuse(Reason::StorageCorrupt, "an entry id isn't <ms>-<seq>");
     let (ms, seq) = text.split_once('-').ok_or_else(bad)?;
     Ok((
         ms.parse().map_err(|_| bad())?,
@@ -235,7 +240,7 @@ fn task_keys(value: &[u8]) -> StreamResult<Vec<TaskKey>> {
     let (keys, rest) = value.as_chunks::<TASK_KEY_LEN>();
     if !rest.is_empty() {
         return Err(refuse(
-            Reason::Storage,
+            Reason::StorageCorrupt,
             "a field of task keys ends in a partial key",
         ));
     }
@@ -247,7 +252,7 @@ fn task_keys(value: &[u8]) -> StreamResult<Vec<TaskKey>> {
 fn fenced_by_facts(facts: &[TaskKey], key: &TaskKey) -> StreamResult<bool> {
     let [t, c, failed @ ..] = facts else {
         return Err(refuse(
-            Reason::Storage,
+            Reason::StorageCorrupt,
             "the run's task facts have fewer than two task keys",
         ));
     };
@@ -447,7 +452,7 @@ impl Keys {
         let first = if now > ms as i64 { 0 } else { seq + 1 };
         if first + count > SEQ_LIMIT {
             return Err(refuse(
-                Reason::Storage,
+                Reason::StorageUnavailable,
                 "the entry ids of this millisecond would not fit an offset",
             ));
         }
@@ -935,7 +940,6 @@ impl Store for MemoryStore {
         namespace: &str,
         handle: &StreamHandle,
         producer: &Producer,
-        record: &[u8],
     ) -> StreamResult<Closed> {
         let stream_id = handle.id.as_str();
         let kind = ProducerKind::try_from(producer)?;
@@ -948,8 +952,7 @@ impl Store for MemoryStore {
             keys.check_live(now)?;
             keys.check_owner(kind, &chain)?;
             if keys.get("closed").is_some() {
-                let id = keys.text("close_id").unwrap_or_default().to_string();
-                return Ok((id, true));
+                return Ok(true);
             }
             if !run.is_empty() && keys.get(format!("wr|{run}")).is_some() {
                 return Err(refuse(
@@ -964,29 +967,16 @@ impl Store for MemoryStore {
                     "the epoch is lower than the newest one of the Producer",
                 ));
             }
-            keys.check_ids_fit(now, 1)?;
-            keys.trim(now);
-            let id = keys.add(
-                now,
-                Fields {
-                    record: Some(record.to_vec()),
-                    superseded: None,
-                },
-            );
             keys.set("closed", "1");
-            keys.set("close_id", id.clone());
-            keys.set("newest", id.clone());
             keys.refresh(now, 0, tombstone);
-            Ok((id, false))
+            Ok(false)
         });
-        let (id, already) = closed?;
+        let already = closed?;
+        // No entry wakes a waiting read, so the close wakes it.
         if !already {
             self.appended.notify_waiters();
         }
-        Ok(Closed {
-            offset: offset_of_entry_id(&id)?,
-            already,
-        })
+        Ok(Closed { already })
     }
 
     async fn read(
@@ -1009,11 +999,7 @@ impl Store for MemoryStore {
             let state = StreamState {
                 exists: keys.get("v").is_some(),
                 version: number("v") as u32,
-                closed_at: if keys.get("closed").is_some() {
-                    Some(offset("close_id")?)
-                } else {
-                    None
-                },
+                closed: keys.get("closed").is_some(),
                 newest: offset("newest")?,
                 trimmed: offset("trimmed")?,
                 retention: Duration::from_millis(number("ret").max(0) as u64),
@@ -1076,10 +1062,12 @@ impl Store for MemoryStore {
             // Listen before the check, so an append between the two still wakes the wait.
             let appended = self.appended.notified();
             let found = self.with(namespace, stream_id, |keys, _| {
-                keys.log
-                    .as_ref()
-                    .and_then(|log| log.keys().next_back())
-                    .is_some_and(|id| *id > after)
+                keys.get("closed").is_some()
+                    || keys
+                        .log
+                        .as_ref()
+                        .and_then(|log| log.keys().next_back())
+                        .is_some_and(|id| *id > after)
             });
             if found {
                 return Ok(true);
