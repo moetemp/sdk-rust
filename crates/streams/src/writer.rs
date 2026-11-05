@@ -10,8 +10,8 @@ use crate::{
     Reason, StreamError, StreamResult,
     epoch::ProducerKind,
     proto::{
-        AppendRecord, AppendRecordsRequest, OpenWriterRequest, Producer, StreamRef,
-        WorkflowTaskEpoch, producer_epoch::Kind,
+        AppendRecord, AppendRecordsRequest, OpenWriterRequest, Producer, StreamRef, StreamWriter,
+        producer_epoch::Kind,
     },
     service::StreamService,
     store::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES},
@@ -52,8 +52,8 @@ struct Writer {
     namespace: String,
     stream_ref: StreamRef,
     producer: Producer,
-    previous_completed_task: Option<WorkflowTaskEpoch>,
-    failed_tasks: Vec<i64>,
+    /// The open's writer, with its Producer and withdrawal facts, which each batch sends.
+    stream_writer: StreamWriter,
     max_batch: usize,
     max_retry: Duration,
     service: Arc<StreamService>,
@@ -131,11 +131,9 @@ impl Writer {
         let request = AppendRecordsRequest {
             namespace: self.namespace.clone(),
             r#ref: Some(self.stream_ref.clone()),
-            producer: Some(self.producer.clone()),
+            writer: Some(self.stream_writer.clone()),
             sequence,
             records,
-            previous_completed_task: self.previous_completed_task,
-            failed_tasks: self.failed_tasks.clone(),
             ..Default::default()
         };
         let until = Instant::now() + self.max_retry;
@@ -232,8 +230,10 @@ impl Writers {
             .r#ref
             .ok_or_else(|| StreamError::invalid("The writer has no Stream"))?;
         crate::ids::check_stream_id(&stream.id)?;
-        let producer = request
+        let stream_writer = request.writer.unwrap_or_default();
+        let producer = stream_writer
             .producer
+            .clone()
             .ok_or_else(|| StreamError::invalid("The writer has no Producer"))?;
         crate::ids::check_producer(&producer)?;
         if ProducerKind::try_from(&producer)? == ProducerKind::Workflow {
@@ -253,8 +253,7 @@ impl Writers {
             namespace: request.namespace,
             stream_ref: stream,
             producer,
-            previous_completed_task: request.previous_completed_task,
-            failed_tasks: request.failed_tasks,
+            stream_writer,
             // The Store refuses a batch over its Record limit, so no batch can be larger.
             max_batch: match request.max_batch_size {
                 n if n > 0 => (n as usize).min(MAX_BATCH_RECORDS),

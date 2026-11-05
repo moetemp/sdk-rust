@@ -17,8 +17,9 @@ use crate::{
         ActivityEpoch, AppendRecord, ClientEpoch, CloseStreamRequest, CloseWriterRequest,
         CloseWriterResponse, CreateStreamRequest, CreateStreamResponse, LocalActivityEpoch,
         OpenWriterRequest, OpenWriterResponse, Producer, ProducerEpoch, ReadRecordsRequest,
-        ReadRecordsResponse, StreamErrorDetails, StreamRecord, StreamRef, WorkflowTaskEpoch,
-        WriteRecordsRequest, WriteRecordsResponse, producer_epoch::Kind, stream_record::Item,
+        ReadRecordsResponse, StreamErrorDetails, StreamRecord, StreamRef, StreamWriter,
+        WorkflowTaskEpoch, WriteRecordsRequest, WriteRecordsResponse, producer_epoch::Kind,
+        stream_record::Item,
     },
     store::{
         Appended, Batch, Capabilities, Closed, Create, Created, Entry, MAX_BATCH_RECORDS, Store,
@@ -76,6 +77,14 @@ async fn cases() -> Vec<Case> {
         cases.push(case);
     }
     cases
+}
+
+/// The writer of a write by `producer`, with no withdrawal facts.
+fn writer_for(producer: Producer) -> Option<StreamWriter> {
+    Some(StreamWriter {
+        producer: Some(producer),
+        ..Default::default()
+    })
 }
 
 fn client() -> Producer {
@@ -146,7 +155,7 @@ impl Case {
                 id: self.stream.clone(),
                 ..Default::default()
             }),
-            producer: Some(producer),
+            writer: writer_for(producer),
             ..Default::default()
         };
         change(&mut request);
@@ -258,7 +267,7 @@ async fn a_failed_write_fails_every_later_write_and_the_close() {
                 id: case.stream.clone(),
                 ..Default::default()
             }),
-            producer: Some(client()),
+            writer: writer_for(client()),
             ..Default::default()
         };
         let _: crate::proto::CloseStreamResponse = case.call("CloseStream", close).await.unwrap();
@@ -300,7 +309,7 @@ async fn an_activity_retry_opens_on_a_closed_or_expired_stream() {
                 id: case.stream.clone(),
                 ..Default::default()
             }),
-            producer: Some(client()),
+            writer: writer_for(client()),
             ..Default::default()
         };
         let _: crate::proto::CloseStreamResponse = case.call("CloseStream", close).await.unwrap();
@@ -675,11 +684,12 @@ async fn a_local_activity_writer_withdraws_the_records_of_a_failed_task() {
         };
         let facts = |completed: i64, failed: Vec<i64>| {
             move |request: &mut OpenWriterRequest| {
-                request.previous_completed_task = Some(WorkflowTaskEpoch {
+                let writer = request.writer.get_or_insert_with(Default::default);
+                writer.previous_completed_task = Some(WorkflowTaskEpoch {
                     started_event_id: completed,
                     ..Default::default()
                 });
-                request.failed_tasks = failed.clone();
+                writer.failed_tasks = failed.clone();
             }
         };
         // Task [3] fails after its Local Activity writes, and task [4] completes with no write.
