@@ -240,7 +240,7 @@ fn task_keys(value: &[u8]) -> StreamResult<Vec<TaskKey>> {
     let (keys, rest) = value.as_chunks::<TASK_KEY_LEN>();
     if !rest.is_empty() {
         return Err(refuse(
-            Reason::Storage,
+            Reason::StorageCorrupt,
             "a field of task keys ends in a partial key",
         ));
     }
@@ -252,7 +252,7 @@ fn task_keys(value: &[u8]) -> StreamResult<Vec<TaskKey>> {
 fn fenced_by_facts(facts: &[TaskKey], key: &TaskKey) -> StreamResult<bool> {
     let [t, c, failed @ ..] = facts else {
         return Err(refuse(
-            Reason::Storage,
+            Reason::StorageCorrupt,
             "the run's task facts have fewer than two task keys",
         ));
     };
