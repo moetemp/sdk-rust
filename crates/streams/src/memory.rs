@@ -5,13 +5,13 @@
 use crate::{
     Reason, StreamError, StreamResult,
     digest::DIGEST_LEN,
-    epoch::{EPOCH_KEY_LEN, epoch_key},
+    epoch::{EPOCH_KEY_LEN, ProducerKind, epoch_key},
     ids::StreamKeys,
     offset::{entry_id_of_offset, offset_of_entry_id},
-    proto::{Producer, StreamHandle, StreamProducerKind},
+    proto::{Producer, StreamHandle},
     store::{
-        Appended, Batch, Capabilities, Closed, CreateOutcome, Created, Entry, FORMAT_VERSION,
-        MAX_SEQUENCE, Owner, Store, StreamState, TOMBSTONE, Withdrawal, owner_chain,
+        Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, CreateOutcome, Created,
+        Entry, FORMAT_VERSION, MAX_SEQUENCE, Owner, Store, StreamState, TOMBSTONE, owner_chain,
     },
 };
 use parking_lot::Mutex;
@@ -233,9 +233,9 @@ impl Keys {
     }
 
     /// The `check_owner` step of a close, as in `lib.lua`.
-    fn check_owner(&self, kind: i32, chain: &str) -> StreamResult<()> {
+    fn check_owner(&self, kind: ProducerKind, chain: &str) -> StreamResult<()> {
         if self.text("own") == Some("wf") {
-            if kind != StreamProducerKind::Workflow as i32 {
+            if kind != ProducerKind::Workflow {
                 return Err(refuse(
                     Reason::NotOwner,
                     "only the close Activity of the owner run chain closes a Workflow-owned Stream",
@@ -247,10 +247,10 @@ impl Keys {
                     "the handle names another run chain than the owner",
                 ));
             }
-        } else if kind != StreamProducerKind::Client as i32 {
+        } else if !matches!(kind, ProducerKind::Workflow | ProducerKind::Client) {
             return Err(refuse(
                 Reason::NotOwner,
-                "only a client closes a Stream that a client created",
+                "only a Workflow or a client closes a Stream with no owner",
             ));
         }
         Ok(())
@@ -512,13 +512,13 @@ impl Store for MemoryStore {
         &self,
         namespace: &str,
         handle: &StreamHandle,
-        retention: Option<Duration>,
-        owner: Owner,
-        _withdrawal: &Withdrawal<'_>,
+        create: &Create<'_>,
     ) -> StreamResult<Created> {
         let stream_id = handle.id.as_str();
-        let retention = millis(retention.filter(|r| !r.is_zero()).unwrap_or(self.retention));
-        let owner = match owner {
+        let retention = create.retention.filter(|r| !r.is_zero());
+        let retention = millis(retention.unwrap_or(self.retention));
+        let request_id = create.request_id;
+        let owner = match create.owner {
             Owner::Workflow => "wf",
             Owner::Client => "client",
         };
@@ -536,6 +536,9 @@ impl Store for MemoryStore {
                 if !chain.is_empty() {
                     keys.set("oc", chain.clone());
                 }
+                if !request_id.is_empty() {
+                    keys.set("rid", request_id);
+                }
                 keys.refresh(now, safety, tombstone);
                 return Ok((CreateOutcome::Created, retention));
             }
@@ -543,6 +546,13 @@ impl Store for MemoryStore {
             keys.check_identity(owner, &chain)?;
             if keys.get("closed").is_some() {
                 return Err(refuse(Reason::Closed, "the Stream is closed"));
+            }
+            // A retry of the create that made the Stream gets its answer again.
+            if !request_id.is_empty() && keys.get("rid") == Some(request_id.as_bytes()) {
+                return Ok((CreateOutcome::Created, keys.number("ret")));
+            }
+            if create.conflict == ConflictPolicy::Fail {
+                return Err(refuse(Reason::AlreadyExists, "the Stream exists"));
             }
             Ok((CreateOutcome::Exists, keys.number("ret")))
         });
@@ -562,11 +572,12 @@ impl Store for MemoryStore {
     ) -> StreamResult<Appended> {
         let stream_id = handle.id.as_str();
         let producer = batch.producer;
+        let kind = ProducerKind::try_from(producer)?;
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
         let withdrawal = &batch.withdrawal;
         let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
-        let field = format!("p|{}|{}", producer.kind, producer.id);
-        let member = format!("{}|{}", producer.kind, producer.id);
+        let field = format!("p|{}|{}", kind as i32, producer.id);
+        let member = format!("{}|{}", kind as i32, producer.id);
         let appended = self.with(namespace, stream_id, |keys, now| {
             let stored = keys.get(&field).map(ProducerField::try_from).transpose()?;
             // Every append sets the fence to its epoch, so the fence is the last batch's epoch.
@@ -604,7 +615,7 @@ impl Store for MemoryStore {
                 }
                 if sequence < previous.sequence {
                     return Err(refuse(
-                        Reason::Sequence,
+                        Reason::SequenceTooLow,
                         &format!(
                             "sequence {sequence} is below the last one, {}",
                             previous.sequence
@@ -625,7 +636,7 @@ impl Store for MemoryStore {
             keys.check_ids_fit(now, records + 1)?;
 
             // A client's newer epoch only fences, as in `append.lua`.
-            let flagged = producer.kind != StreamProducerKind::Client as i32
+            let flagged = kind != ProducerKind::Client
                 && stored
                     .and_then(|stored| stored.held)
                     .is_some_and(|held| held < epoch);
@@ -704,13 +715,14 @@ impl Store for MemoryStore {
         record: &[u8],
     ) -> StreamResult<Closed> {
         let stream_id = handle.id.as_str();
+        let kind = ProducerKind::try_from(producer)?;
         let epoch = epoch_key(&producer.epoch.unwrap_or_default());
-        let field = format!("p|{}|{}", producer.kind, producer.id);
+        let field = format!("p|{}|{}", kind as i32, producer.id);
         let tombstone = millis(TOMBSTONE);
         let chain = owner_chain(handle);
         let closed = self.with(namespace, stream_id, |keys, now| {
             keys.check_live(now)?;
-            keys.check_owner(producer.kind, &chain)?;
+            keys.check_owner(kind, &chain)?;
             if keys.get("closed").is_some() {
                 let id = keys.text("close_id").unwrap_or_default().to_string();
                 return Ok((id, true));

@@ -8,12 +8,13 @@ use temporalio_common::protos::temporal::api::common::v1::{
 };
 use temporalio_streams::{
     digest::batch_digest,
-    epoch::{epoch_key, task_key, withdraws},
+    epoch::{epoch_key, task_key, task_of, withdraws},
     ids::{self, StreamKeys},
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{
-        AppendRecord, Producer, ProducerEpoch, StreamData, StreamProducerKind, StreamRecord,
-        StreamSuperseded, WorkflowTaskEpoch, stream_record::Item,
+        ActivityEpoch, AppendRecord, ClientEpoch, LocalActivityEpoch, Producer, ProducerEpoch,
+        StreamData, StreamRecord, StreamSuperseded, WorkflowTaskEpoch, producer_epoch::Kind,
+        stream_record::Item,
     },
 };
 
@@ -38,25 +39,31 @@ fn number(value: &Value, field: &str) -> i64 {
     value[field].as_i64().unwrap_or(0)
 }
 
-fn epoch(value: &Value) -> ProducerEpoch {
-    ProducerEpoch {
-        task_started_event_id: number(value, "task_started_event_id"),
-        task_attempt: number(value, "task_attempt") as i32,
-        task_started_time: time(&value["task_started_time"]),
+/// The epoch of a kind, from the flat fields of the vectors. The case takes the fields of its kind.
+fn epoch(kind: &str, value: &Value) -> ProducerEpoch {
+    let task = WorkflowTaskEpoch {
+        started_event_id: number(value, "task_started_event_id"),
+        attempt: number(value, "task_attempt") as i32,
+        started_time: time(&value["task_started_time"]),
+    };
+    let attempt = number(value, "attempt") as i32;
+    let activity = ActivityEpoch {
         attempt_scheduled_time: time(&value["attempt_scheduled_time"]),
-        attempt: number(value, "attempt") as i32,
-    }
-}
-
-fn kind(name: &str) -> StreamProducerKind {
-    match name {
-        "workflow" => StreamProducerKind::Workflow,
-        "local_activity" => StreamProducerKind::LocalActivity,
-        "activity" => StreamProducerKind::Activity,
-        "standalone_activity" => StreamProducerKind::StandaloneActivity,
-        "client" => StreamProducerKind::Client,
+        attempt,
+    };
+    let kind = match kind {
+        "workflow" => Some(Kind::Workflow(task)),
+        "local_activity" => Some(Kind::LocalActivity(LocalActivityEpoch {
+            task: Some(task),
+            attempt,
+        })),
+        "activity" => Some(Kind::Activity(activity)),
+        "standalone_activity" => Some(Kind::StandaloneActivity(activity)),
+        "client" => Some(Kind::Client(ClientEpoch { attempt })),
+        "empty" => None,
         other => panic!("unknown kind {other}"),
-    }
+    };
+    ProducerEpoch { kind }
 }
 
 #[test]
@@ -129,14 +136,12 @@ fn offsets_match() {
 #[test]
 fn epoch_keys_match() {
     for case in load("epochs.json").as_array().unwrap() {
-        let epoch = epoch(&case["epoch"]);
+        let epoch = epoch(text(case, "kind"), &case["epoch"]);
         assert_eq!(epoch_key(&epoch).to_vec(), hex(text(case, "key")));
-        let task = WorkflowTaskEpoch {
-            started_event_id: epoch.task_started_event_id,
-            attempt: epoch.task_attempt,
-            started_time: epoch.task_started_time,
-        };
-        assert_eq!(task_key(&task).to_vec(), hex(text(case, "task_key")));
+        assert_eq!(
+            task_key(&task_of(&epoch)).to_vec(),
+            hex(text(case, "task_key"))
+        );
     }
 }
 
@@ -147,10 +152,11 @@ fn the_appendix_e_withdrawals_match() {
     for case in cases.as_array().unwrap() {
         let s = &case["superseded"];
         let superseded = StreamSuperseded {
-            producer_kind: kind(text(s, "producer_kind")) as i32,
             producer_id: text(s, "producer_id").to_string(),
             // A create's item has no epoch, and a Reader must not read it as an empty one.
-            epoch: s.get("epoch").map(epoch),
+            epoch: s
+                .get("epoch")
+                .map(|value| epoch(text(s, "producer_kind"), value)),
             previous_completed_task: s.get("previous_completed_task").map(|c| WorkflowTaskEpoch {
                 started_event_id: number(c, "started_event_id"),
                 attempt: number(c, "attempt") as i32,
@@ -167,9 +173,8 @@ fn the_appendix_e_withdrawals_match() {
         let record = StreamRecord {
             item: Some(Item::Data(StreamData {
                 producer: Some(Producer {
-                    kind: kind(text(p, "kind")) as i32,
                     id: text(p, "id").to_string(),
-                    epoch: p.get("epoch").map(epoch),
+                    epoch: p.get("epoch").map(|value| epoch(text(p, "kind"), value)),
                     run_id: p["run_id"].as_str().unwrap_or_default().to_string(),
                 }),
                 ..Default::default()
