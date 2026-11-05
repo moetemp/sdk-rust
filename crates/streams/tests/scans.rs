@@ -16,7 +16,7 @@ use temporalio_streams::{
     proto::{
         AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientEpoch,
         CreateStreamRequest, CreateStreamResponse, Producer, ProducerEpoch, ReadRecordsRequest,
-        ReadRecordsResponse, StreamErrorDetails, StreamErrorReason, StreamHandle,
+        ReadRecordsResponse, StreamErrorDetails, StreamErrorReason, StreamRef,
         producer_epoch::Kind,
     },
     store::{Appended, Batch, Capabilities, Create, Created, Entry, Store, StreamState},
@@ -43,19 +43,19 @@ impl Store for Trimming {
     async fn create(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         create: &Create<'_>,
     ) -> StreamResult<Created> {
-        self.inner.create(namespace, handle, create).await
+        self.inner.create(namespace, stream_ref, create).await
     }
 
     async fn append(
         &self,
         namespace: &str,
-        handle: &StreamHandle,
+        stream_ref: &StreamRef,
         batch: &Batch<'_>,
     ) -> StreamResult<Appended> {
-        self.inner.append(namespace, handle, batch).await
+        self.inner.append(namespace, stream_ref, batch).await
     }
 
     async fn read(
@@ -119,7 +119,7 @@ async fn create(ext: &StreamRuntime) {
         "CreateStream",
         CreateStreamRequest {
             namespace: NAMESPACE.to_string(),
-            stream_handle: handle(),
+            stream_ref: stream_ref(),
             ..Default::default()
         },
     )
@@ -136,8 +136,8 @@ fn client() -> Producer {
     }
 }
 
-fn handle() -> Option<StreamHandle> {
-    Some(StreamHandle {
+fn stream_ref() -> Option<StreamRef> {
+    Some(StreamRef {
         id: STREAM.to_string(),
         ..Default::default()
     })
@@ -167,7 +167,7 @@ async fn append_sized(
         "AppendRecords",
         AppendRecordsRequest {
             namespace: NAMESPACE.to_string(),
-            handle: handle(),
+            r#ref: stream_ref(),
             producer: Some(client()),
             sequence,
             records,
@@ -186,7 +186,7 @@ async fn a_trim_under_a_read_from_an_offset_fails_it_as_expired() {
     let first = append(&ext, 1, 3).await;
     let read = |from_offset| ReadRecordsRequest {
         namespace: NAMESPACE.to_string(),
-        handle: handle(),
+        r#ref: stream_ref(),
         from_offset,
         ..Default::default()
     };
@@ -214,7 +214,7 @@ async fn a_capped_read_pulls_about_its_page_from_the_store() {
         "ReadRecords",
         ReadRecordsRequest {
             namespace: NAMESPACE.to_string(),
-            handle: handle(),
+            r#ref: stream_ref(),
             max_bytes: 2500,
             ..Default::default()
         },

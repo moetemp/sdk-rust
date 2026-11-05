@@ -337,7 +337,7 @@ impl StreamService {
         &self,
         request: ReadRecordsRequest,
     ) -> StreamResult<ReadRecordsResponse> {
-        let id = stream_id(request.handle.as_ref())?.to_string();
+        let id = stream_id(request.r#ref.as_ref())?.to_string();
         let namespace = request.namespace.as_str();
         if request.from_offset < 0 {
             return Err(StreamError::invalid("The offset is below zero"));
@@ -424,7 +424,7 @@ impl StreamService {
         request: ReadRecordsRequest,
         max_bytes: usize,
     ) -> StreamResult<ReadRecordsResponse> {
-        let id = stream_id(request.handle.as_ref())?.to_string();
+        let id = stream_id(request.r#ref.as_ref())?.to_string();
         let namespace = request.namespace.as_str();
         let count = (request.last as usize).min(MAX_RECORDS);
         let create_wait = duration(request.create_wait)
