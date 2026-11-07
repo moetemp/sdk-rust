@@ -4,15 +4,18 @@
 use crate::{
     Reason, StreamError, StreamResult,
     digest::batch_digest,
-    epoch::{ProducerKind, task_of, withdraws},
+    epoch::{
+        ProducerKind, producer_run_id, task_of, withdraws, writer_failed_tasks,
+        writer_previous_completed_task, writer_withdraw_run,
+    },
     ids::{check_producer, check_stream_id},
     metrics::Metrics,
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        Producer, ProducerEpoch, ReadRecordsRequest, ReadRecordsResponse, StreamIdConflictPolicy,
+        Producer, ReadRecordsRequest, ReadRecordsResponse, RunWithdrawal, StreamIdConflictPolicy,
         StreamReadStart, StreamRecord, StreamRef, StreamStatus, StreamSuperseded, StreamWriter,
-        WorkflowTaskEpoch, producer_epoch::Kind, stream_record::Item,
+        WorkflowProducer, WorkflowTaskEpoch, producer::Kind, stream_record::Item,
     },
     record::{data_records, superseded},
     store::{
@@ -108,7 +111,7 @@ fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
 /// so a Reader withdraws only that run's Records.
 fn run_superseded(owner: Option<&Producer>, withdraw_run: &str) -> Vec<u8> {
     let producer = Producer {
-        epoch: None,
+        kind: None,
         ..owner.cloned().unwrap_or_default()
     };
     superseded(&producer, withdraw_run)
@@ -121,20 +124,23 @@ fn orphan_superseded(
     completed: Option<&WorkflowTaskEpoch>,
     failed_tasks: &[i64],
 ) -> Vec<u8> {
-    let task = producer.epoch.as_ref().map(task_of).unwrap_or_default();
+    let run_id = producer_run_id(producer);
+    let task = task_of(producer.kind.as_ref());
     let workflow = Producer {
-        id: crate::ids::workflow_producer_id(&producer.run_id),
-        epoch: Some(ProducerEpoch {
-            kind: Some(Kind::Workflow(task)),
-        }),
-        run_id: producer.run_id.clone(),
+        id: crate::ids::workflow_producer_id(run_id),
+        kind: Some(Kind::Workflow(WorkflowProducer {
+            run_id: run_id.to_string(),
+            epoch: Some(task),
+        })),
     };
     StreamSuperseded {
         writer: Some(StreamWriter {
             producer: Some(workflow),
-            previous_completed_task: completed.copied(),
-            failed_tasks: failed_tasks.to_vec(),
-            ..Default::default()
+            withdrawal: Some(RunWithdrawal {
+                previous_completed_task: completed.copied(),
+                failed_tasks: failed_tasks.to_vec(),
+                withdraw_run: String::new(),
+            }),
         }),
     }
     .encode_to_vec()
@@ -151,9 +157,7 @@ fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
         ));
     }
     // Without its task, a re-dispatch in a later task has the same epoch as the first dispatch.
-    let task = producer
-        .epoch
-        .map_or(0, |epoch| task_of(&epoch).started_event_id);
+    let task = task_of(producer.kind.as_ref()).started_event_id;
     if kind == ProducerKind::LocalActivity && task <= 0 {
         return Err(StreamError::invalid(
             "A Local Activity Producer's epoch must name the Workflow Task that dispatched it",
@@ -165,8 +169,8 @@ fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
 /// Refuses task facts that a Store would drop or misread. Only a Local Activity has its run's task
 /// facts, and a failed task is a started event id, which is never zero or negative.
 fn check_task_facts(kind: ProducerKind, writer: &StreamWriter) -> StreamResult<()> {
-    let completed = writer.previous_completed_task.as_ref();
-    if completed.is_none() && writer.failed_tasks.is_empty() {
+    let completed = writer_previous_completed_task(writer);
+    if completed.is_none() && writer_failed_tasks(writer).is_empty() {
         return Ok(());
     }
     if kind != ProducerKind::LocalActivity {
@@ -180,7 +184,7 @@ fn check_task_facts(kind: ProducerKind, writer: &StreamWriter) -> StreamResult<(
         ));
     }
     if completed.is_some_and(|c| c.started_event_id < 0)
-        || writer.failed_tasks.iter().any(|&id| id <= 0)
+        || writer_failed_tasks(writer).iter().any(|&id| id <= 0)
     {
         return Err(StreamError::invalid(
             "A task's started event id must be positive",
@@ -243,7 +247,7 @@ impl StreamService {
                     "A create with withdraw_run needs the owner run",
                 ));
             };
-            if request.withdraw_run == owner.run_id {
+            if request.withdraw_run == producer_run_id(owner) {
                 return Err(StreamError::invalid("A run doesn't withdraw itself"));
             }
             self.store.capabilities().require(Capabilities::RUN_FENCE)?;
@@ -302,10 +306,11 @@ impl StreamService {
                 .capabilities()
                 .require(Capabilities::NEXT_SEQUENCE)?;
         }
-        if !writer.withdraw_run.is_empty() {
+        let withdraw_run = writer_withdraw_run(&writer);
+        if !withdraw_run.is_empty() {
             // Only a retry run's Local Activity withdraws its previous run, as only the owner's
             // create does. Any other Producer could withdraw and fence an unrelated run.
-            if kind != ProducerKind::LocalActivity || writer.withdraw_run == producer.run_id {
+            if kind != ProducerKind::LocalActivity || withdraw_run == producer_run_id(producer) {
                 return Err(StreamError::invalid(
                     "Only a Local Activity of a later run withdraws a run",
                 ));
@@ -315,26 +320,24 @@ impl StreamService {
         check_task_facts(kind, &writer)?;
         let digest = batch_digest(&request.records);
         let records = data_records(producer, request.records)?;
-        let bytes = superseded(producer, &writer.withdraw_run);
+        let bytes = superseded(producer, withdraw_run);
         // A Local Activity sends its run's task facts, so that the batch withdraws the run's
         // orphaned Local Activity Records. These are the Records of the tasks that never completed.
-        let completed = writer
-            .previous_completed_task
-            .filter(|c| c.started_event_id > 0);
+        let completed = writer_previous_completed_task(&writer).filter(|c| c.started_event_id > 0);
         let orphans = (kind == ProducerKind::LocalActivity
-            && writer.previous_completed_task.is_some())
-        .then(|| orphan_superseded(producer, completed.as_ref(), &writer.failed_tasks));
+            && writer_previous_completed_task(&writer).is_some())
+        .then(|| orphan_superseded(producer, completed, writer_failed_tasks(&writer)));
         let batch = Batch {
             producer,
             sequence: request.sequence,
             records: &records,
             digest,
             withdrawal: Withdrawal {
-                withdraw_run: &writer.withdraw_run,
+                withdraw_run,
                 superseded: &bytes,
                 tasks: orphans.as_ref().map(|orphans| TaskFacts {
-                    completed: completed.as_ref(),
-                    failed_tasks: &writer.failed_tasks,
+                    completed,
+                    failed_tasks: writer_failed_tasks(&writer),
                     superseded: orphans,
                 }),
             },

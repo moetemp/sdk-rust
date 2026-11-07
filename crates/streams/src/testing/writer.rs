@@ -14,12 +14,12 @@ use crate::{
         named_client_producer_id,
     },
     proto::{
-        ActivityEpoch, AppendRecord, ClientEpoch, CloseStreamRequest, CloseWriterRequest,
-        CloseWriterResponse, CreateStreamRequest, CreateStreamResponse, LocalActivityEpoch,
-        OpenWriterRequest, OpenWriterResponse, Producer, ProducerEpoch, ReadRecordsRequest,
-        ReadRecordsResponse, StreamErrorDetails, StreamRecord, StreamRef, StreamWriter,
-        WorkflowTaskEpoch, WriteRecordsRequest, WriteRecordsResponse, producer_epoch::Kind,
-        stream_record::Item,
+        ActivityEpoch, ActivityProducer, AppendRecord, ClientEpoch, ClientProducer,
+        CloseStreamRequest, CloseWriterRequest, CloseWriterResponse, CreateStreamRequest,
+        CreateStreamResponse, LocalActivityEpoch, LocalActivityProducer, OpenWriterRequest,
+        OpenWriterResponse, Producer, ReadRecordsRequest, ReadRecordsResponse, RunWithdrawal,
+        StreamErrorDetails, StreamRecord, StreamRef, StreamWriter, WorkflowTaskEpoch,
+        WriteRecordsRequest, WriteRecordsResponse, producer::Kind, stream_record::Item,
     },
     store::{
         Appended, Batch, Capabilities, Closed, Create, Created, Entry, MAX_BATCH_RECORDS, Store,
@@ -90,26 +90,25 @@ fn writer_for(producer: Producer) -> Option<StreamWriter> {
 fn client() -> Producer {
     Producer {
         id: client_producer_id("me", "p"),
-        epoch: Some(ProducerEpoch {
-            kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
-        }),
-        run_id: String::new(),
+        kind: Some(Kind::Client(ClientProducer {
+            epoch: Some(ClientEpoch { attempt: 1 }),
+        })),
     }
 }
 
 fn activity(attempt: i32) -> Producer {
     Producer {
         id: activity_producer_id("r1", "a", "s"),
-        epoch: Some(ProducerEpoch {
-            kind: Some(Kind::Activity(ActivityEpoch {
+        kind: Some(Kind::Activity(ActivityProducer {
+            run_id: "r1".to_string(),
+            epoch: Some(ActivityEpoch {
                 attempt_scheduled_time: Some(Timestamp {
                     seconds: 10 * attempt as i64,
                     nanos: 0,
                 }),
                 attempt,
-            })),
-        }),
-        run_id: "r1".to_string(),
+            }),
+        })),
     }
 }
 
@@ -422,10 +421,9 @@ async fn a_named_client_with_a_higher_epoch_fences_its_earlier_self() {
     for case in cases().await {
         let named = |attempt| Producer {
             id: named_client_producer_id("ingest-1"),
-            epoch: Some(ProducerEpoch {
-                kind: Some(Kind::Client(ClientEpoch { attempt })),
-            }),
-            run_id: String::new(),
+            kind: Some(Kind::Client(ClientProducer {
+                epoch: Some(ClientEpoch { attempt }),
+            })),
         };
         let old = case.open(named(1), |_| {}).await;
         case.write(old, &["old"]).await.unwrap();
@@ -656,8 +654,10 @@ async fn a_writer_with_a_run_to_withdraw_is_refused() {
             }),
             writer: Some(StreamWriter {
                 producer: Some(client()),
-                withdraw_run: "r1".to_string(),
-                ..Default::default()
+                withdrawal: Some(RunWithdrawal {
+                    withdraw_run: "r1".to_string(),
+                    ..Default::default()
+                }),
             }),
             ..Default::default()
         };
@@ -696,8 +696,9 @@ async fn a_local_activity_writer_withdraws_the_records_of_a_failed_task() {
     for case in cases().await {
         let local_activity = |call: &str, started: i64| Producer {
             id: local_activity_producer_id("r1", call),
-            epoch: Some(ProducerEpoch {
-                kind: Some(Kind::LocalActivity(LocalActivityEpoch {
+            kind: Some(Kind::LocalActivity(LocalActivityProducer {
+                run_id: "r1".to_string(),
+                epoch: Some(LocalActivityEpoch {
                     task: Some(WorkflowTaskEpoch {
                         started_event_id: started,
                         attempt: 1,
@@ -707,18 +708,18 @@ async fn a_local_activity_writer_withdraws_the_records_of_a_failed_task() {
                         }),
                     }),
                     attempt: 1,
-                })),
-            }),
-            run_id: "r1".to_string(),
+                }),
+            })),
         };
         let facts = |completed: i64, failed: Vec<i64>| {
             move |request: &mut OpenWriterRequest| {
                 let writer = request.writer.get_or_insert_with(Default::default);
-                writer.previous_completed_task = Some(WorkflowTaskEpoch {
+                let withdrawal = writer.withdrawal.get_or_insert_with(Default::default);
+                withdrawal.previous_completed_task = Some(WorkflowTaskEpoch {
                     started_event_id: completed,
                     ..Default::default()
                 });
-                writer.failed_tasks = failed.clone();
+                withdrawal.failed_tasks = failed.clone();
             }
         };
         // Task [3] fails after its Local Activity writes, and task [4] completes with no write.

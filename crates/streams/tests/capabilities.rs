@@ -12,10 +12,10 @@ use temporalio_streams::{
     ids::client_producer_id,
     memory::MemoryStore,
     proto::{
-        AppendRecord, AppendRecordsRequest, ClientEpoch, CloseStreamRequest, CreateStreamRequest,
-        DescribeStreamRequest, DescribeStreamResponse, Producer, ProducerEpoch, StreamErrorDetails,
-        StreamErrorReason, StreamRef, StreamStatus, StreamWriter, WorkflowTaskEpoch,
-        producer_epoch::Kind,
+        AppendRecord, AppendRecordsRequest, ClientEpoch, ClientProducer, CloseStreamRequest,
+        CreateStreamRequest, DescribeStreamRequest, DescribeStreamResponse, Producer,
+        StreamErrorDetails, StreamErrorReason, StreamRef, StreamStatus, StreamWriter,
+        WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
     },
     store::{Appended, Batch, Capabilities, Closed, Create, Created, Entry, Store, StreamState},
 };
@@ -120,10 +120,9 @@ fn case(without: Capabilities) -> Case {
 fn client() -> Producer {
     Producer {
         id: client_producer_id("me", "p"),
-        epoch: Some(ProducerEpoch {
-            kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
-        }),
-        run_id: String::new(),
+        kind: Some(Kind::Client(ClientProducer {
+            epoch: Some(ClientEpoch { attempt: 1 }),
+        })),
     }
 }
 
@@ -186,10 +185,10 @@ impl Case {
             withdraw_run: withdraw_run.to_string(),
             owner: Some(Producer {
                 id: temporalio_streams::ids::workflow_producer_id(&self.run_id),
-                epoch: Some(ProducerEpoch {
-                    kind: Some(Kind::Workflow(WorkflowTaskEpoch::default())),
-                }),
-                run_id: self.run_id.clone(),
+                kind: Some(Kind::Workflow(WorkflowProducer {
+                    run_id: self.run_id.clone(),
+                    epoch: Some(WorkflowTaskEpoch::default()),
+                })),
             }),
             stream_ref: Some(StreamRef {
                 id: self.stream.clone(),

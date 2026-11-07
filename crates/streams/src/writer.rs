@@ -8,10 +8,10 @@
 
 use crate::{
     Reason, StreamError, StreamResult,
-    epoch::ProducerKind,
+    epoch::{ProducerKind, writer_withdraw_run},
     proto::{
         AppendRecord, AppendRecordsRequest, OpenWriterRequest, Producer, StreamRef, StreamWriter,
-        producer_epoch::Kind,
+        producer::Kind,
     },
     service::StreamService,
     store::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES},
@@ -232,7 +232,7 @@ impl Writers {
         crate::ids::check_stream_id(&stream.id)?;
         let stream_writer = request.writer.unwrap_or_default();
         // Only a retry run's first append withdraws a run, and a writer sends many batches.
-        if !stream_writer.withdraw_run.is_empty() {
+        if !writer_withdraw_run(&stream_writer).is_empty() {
             return Err(StreamError::invalid("A writer doesn't withdraw a run"));
         }
         let producer = stream_writer
@@ -243,16 +243,24 @@ impl Writers {
         if ProducerKind::try_from(&producer)? == ProducerKind::Workflow {
             return Err(StreamError::invalid("Workflow code doesn't open a writer"));
         }
-        let epoch = producer.epoch.unwrap_or_default();
         let key = (
             request.namespace.clone(),
             stream.id.clone(),
             producer.id.clone(),
-            crate::epoch::epoch_key(&epoch),
+            crate::epoch::epoch_key(producer.kind.as_ref()),
         );
         if let Some(id) = self.share(&key) {
             return Ok(id);
         }
+        // A Local Activity that runs again in a later task has attempt 1 again, so its writer
+        // always sends the empty batch.
+        let retry = match producer.kind.as_ref() {
+            Some(Kind::LocalActivity(_)) => true,
+            Some(Kind::Activity(activity) | Kind::StandaloneActivity(activity)) => {
+                activity.epoch.map_or(0, |e| e.attempt) > 1
+            }
+            _ => false,
+        };
         let writer = Arc::new(Writer {
             namespace: request.namespace,
             stream_ref: stream,
@@ -268,15 +276,6 @@ impl Writers {
             state: Mutex::default(),
             writing: tokio::sync::Mutex::new(()),
         });
-        // A Local Activity that runs again in a later task has attempt 1 again, so its writer
-        // always sends the empty batch.
-        let retry = match epoch.kind {
-            Some(Kind::LocalActivity(_)) => true,
-            Some(Kind::Activity(activity) | Kind::StandaloneActivity(activity)) => {
-                activity.attempt > 1
-            }
-            _ => false,
-        };
         if retry {
             match writer.send(vec![], next_sequence()).await {
                 // A Stream with no key has nothing to withdraw yet. A closed or expired one accepts

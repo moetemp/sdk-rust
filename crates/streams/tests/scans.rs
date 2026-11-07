@@ -14,10 +14,10 @@ use temporalio_streams::{
     ids::client_producer_id,
     memory::MemoryStore,
     proto::{
-        AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientEpoch,
-        CreateStreamRequest, CreateStreamResponse, Producer, ProducerEpoch, ReadRecordsRequest,
+        AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientEpoch, ClientProducer,
+        CreateStreamRequest, CreateStreamResponse, Producer, ReadRecordsRequest,
         ReadRecordsResponse, StreamErrorDetails, StreamErrorReason, StreamRef, StreamWriter,
-        producer_epoch::Kind,
+        producer::Kind,
     },
     store::{Appended, Batch, Capabilities, Create, Created, Entry, Store, StreamState},
 };
@@ -129,10 +129,9 @@ async fn create(ext: &StreamRuntime) {
 fn client() -> Producer {
     Producer {
         id: client_producer_id("me", "p"),
-        epoch: Some(ProducerEpoch {
-            kind: Some(Kind::Client(ClientEpoch { attempt: 1 })),
-        }),
-        run_id: String::new(),
+        kind: Some(Kind::Client(ClientProducer {
+            epoch: Some(ClientEpoch { attempt: 1 }),
+        })),
     }
 }
 
