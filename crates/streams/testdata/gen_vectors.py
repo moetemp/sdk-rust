@@ -132,6 +132,45 @@ def epochs():
     return cases
 
 
+def entry_id(text):
+    """An entry id in a Producer field, the ms in 8 bytes and the seq in 4, zero for none."""
+    if not text:
+        return bytes(12)
+    ms, seq = (int(x) for x in text.split("-"))
+    return ms.to_bytes(8, "big") + seq.to_bytes(4, "big")
+
+
+def producer_value(fence, held, sequence, first, last, digest):
+    """The 129 bytes of a `p|` field."""
+    flags = bytes([1 if held else 0])
+    return (flags + fence + (held or bytes(40)) + sequence.to_bytes(8, "big") + entry_id(first)
+            + entry_id(last) + digest)
+
+
+def producer_values():
+    held = epoch_key({"attempt_scheduled_time": [1760000001, 999999999], "attempt": 2})
+    newer = epoch_key({"attempt_scheduled_time": [1760000002, 0], "attempt": 3})
+    cases = []
+    for name, fence, held_key, sequence, first, last, records in [
+        ("a batch with Records", held, held, 3, "1760000000123-4", "1760000000123-6",
+         [{"data": "01"}]),
+        ("an empty batch that wrote no entry", newer, None, 1, "", "", []),
+    ]:
+        batch_digest = bytes.fromhex(digest(records))
+        value = producer_value(fence, held_key, sequence, first, last, batch_digest)
+        cases.append({
+            "name": name,
+            "fence": fence.hex(),
+            "held": held_key.hex() if held_key else None,
+            "sequence": sequence,
+            "first": first,
+            "last": last,
+            "digest": batch_digest.hex(),
+            "value": value.hex(),
+        })
+    return cases
+
+
 def fields():
     run = "run:1"
     producer = "act:" + join(run, "a", "s")
@@ -139,11 +178,10 @@ def fields():
         "kind": 3,
         "producer_id": producer,
         "run_id": run,
-        "fence": f"e|3|{producer}",
-        "dedupe": f"d|3|{producer}",
-        "holds": f"h|3|{producer}",
+        "producer": f"p|3|{producer}",
         "run_wrote": f"run|{part(run)}",
         "withdrawn_run": f"wr|{part(run)}",
+        "producer_values": producer_values(),
     }
 
 

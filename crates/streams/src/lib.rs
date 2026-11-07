@@ -10,6 +10,7 @@ pub mod digest;
 pub mod epoch;
 mod error;
 pub mod ids;
+pub mod memory;
 pub mod offset;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
