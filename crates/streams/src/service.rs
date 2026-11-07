@@ -4,7 +4,7 @@
 use crate::{
     Reason, StreamError, StreamResult,
     digest::batch_digest,
-    epoch::{ProducerKind, task_of, withdraws},
+    epoch::{ProducerKind, producer_run_id, task_of, withdraws, writer_withdraw_run},
     ids::{check_producer, check_stream_id},
     metrics::Metrics,
     proto::{
@@ -107,7 +107,7 @@ fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
 /// so a Reader withdraws only that run's Records.
 fn run_superseded(owner: Option<&Producer>, withdraw_run: &str) -> Vec<u8> {
     let producer = Producer {
-        epoch: None,
+        kind: None,
         ..owner.cloned().unwrap_or_default()
     };
     superseded(&producer, withdraw_run)
@@ -124,9 +124,7 @@ fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
         ));
     }
     // Without its task, a re-dispatch in a later task has the same epoch as the first dispatch.
-    let task = producer
-        .epoch
-        .map_or(0, |epoch| task_of(&epoch).started_event_id);
+    let task = task_of(producer.kind.as_ref()).started_event_id;
     if kind == ProducerKind::LocalActivity && task <= 0 {
         return Err(StreamError::invalid(
             "A Local Activity Producer's epoch must name the Workflow Task that dispatched it",
@@ -189,7 +187,7 @@ impl StreamService {
                     "A create with withdraw_run needs the owner run",
                 ));
             };
-            if request.withdraw_run == owner.run_id {
+            if request.withdraw_run == producer_run_id(owner) {
                 return Err(StreamError::invalid("A run doesn't withdraw itself"));
             }
             self.store.capabilities().require(Capabilities::RUN_FENCE)?;
@@ -248,10 +246,11 @@ impl StreamService {
                 .capabilities()
                 .require(Capabilities::NEXT_SEQUENCE)?;
         }
-        if !writer.withdraw_run.is_empty() {
+        let withdraw_run = writer_withdraw_run(&writer);
+        if !withdraw_run.is_empty() {
             // Only a retry run's Local Activity withdraws its previous run, as only the owner's
             // create does. Any other Producer could withdraw and fence an unrelated run.
-            if kind != ProducerKind::LocalActivity || writer.withdraw_run == producer.run_id {
+            if kind != ProducerKind::LocalActivity || withdraw_run == producer_run_id(producer) {
                 return Err(StreamError::invalid(
                     "Only a Local Activity of a later run withdraws a run",
                 ));
@@ -260,14 +259,14 @@ impl StreamService {
         }
         let digest = batch_digest(&request.records);
         let records = data_records(producer, request.records)?;
-        let bytes = superseded(producer, &writer.withdraw_run);
+        let bytes = superseded(producer, withdraw_run);
         let batch = Batch {
             producer,
             sequence: request.sequence,
             records: &records,
             digest,
             withdrawal: Withdrawal {
-                withdraw_run: &writer.withdraw_run,
+                withdraw_run,
                 superseded: &bytes,
                 tasks: None,
             },

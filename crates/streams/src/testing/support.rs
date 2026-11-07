@@ -10,9 +10,9 @@ use crate::{
     epoch::withdraws,
     ids::local_activity_producer_id,
     proto::{
-        AppendRecord, LocalActivityEpoch, Producer, ProducerEpoch, StreamData, StreamRecord,
-        StreamRef, StreamSuperseded, StreamWriter, WorkflowTaskEpoch, producer_epoch::Kind,
-        stream_record::Item,
+        AppendRecord, LocalActivityEpoch, LocalActivityProducer, Producer, RunWithdrawal,
+        StreamData, StreamRecord, StreamRef, StreamSuperseded, StreamWriter, WorkflowTaskEpoch,
+        producer::Kind, stream_record::Item,
     },
     store::{Appended, Batch, Closed, Create, Created, Entry, Owner, Store, Withdrawal},
 };
@@ -132,13 +132,13 @@ impl Run {
         };
         Producer {
             id: local_activity_producer_id(&self.id, call),
-            epoch: Some(ProducerEpoch {
-                kind: Some(Kind::LocalActivity(LocalActivityEpoch {
+            kind: Some(Kind::LocalActivity(LocalActivityProducer {
+                run_id: self.id.clone(),
+                epoch: Some(LocalActivityEpoch {
                     task: Some(task),
                     attempt,
-                })),
-            }),
-            run_id: self.id.clone(),
+                }),
+            })),
         }
     }
 }
@@ -185,11 +185,14 @@ pub(crate) fn digest(texts: &[&str]) -> [u8; crate::digest::DIGEST_LEN] {
 }
 
 pub(crate) fn superseded(producer: &Producer, withdrawal: &Withdrawal<'_>) -> Vec<u8> {
+    let run = (!withdrawal.withdraw_run.is_empty()).then(|| RunWithdrawal {
+        withdraw_run: withdrawal.withdraw_run.to_string(),
+        ..Default::default()
+    });
     StreamSuperseded {
         writer: Some(StreamWriter {
             producer: Some(producer.clone()),
-            withdraw_run: withdrawal.withdraw_run.to_string(),
-            ..Default::default()
+            withdrawal: run,
         }),
     }
     .encode_to_vec()

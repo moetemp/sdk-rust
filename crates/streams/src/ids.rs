@@ -11,7 +11,11 @@
 //! script. Each part is percent-encoded, so a `:` or a brace in an id can't make two Streams share
 //! a key.
 
-use crate::{StreamError, StreamResult, epoch::ProducerKind, proto::Producer};
+use crate::{
+    StreamError, StreamResult,
+    epoch::{ProducerKind, producer_run_id},
+    proto::Producer,
+};
 
 /// The longest Stream id, in bytes.
 pub const MAX_STREAM_ID_BYTES: usize = 4096;
@@ -151,13 +155,14 @@ pub fn check_producer(producer: &Producer) -> StreamResult<()> {
         kind,
         ProducerKind::Workflow | ProducerKind::LocalActivity | ProducerKind::Activity
     );
-    if runs && decode_part(parts[0]).as_deref() != Some(producer.run_id.as_str()) {
+    if runs && decode_part(parts[0]).as_deref() != Some(producer_run_id(producer)) {
         return Err(StreamError::invalid(format!(
             "The Producer id {:?} names another run than its run id {:?}",
-            producer.id, producer.run_id
+            producer.id,
+            producer_run_id(producer)
         )));
     }
-    if kind == ProducerKind::Client && !producer.run_id.is_empty() {
+    if kind == ProducerKind::Client && !producer_run_id(producer).is_empty() {
         return Err(StreamError::invalid("A client Producer has no run id"));
     }
     Ok(())
@@ -207,20 +212,34 @@ impl StreamKeys {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{ProducerEpoch, producer_epoch::Kind};
+    use crate::proto::{
+        ActivityProducer, ClientProducer, LocalActivityProducer, WorkflowProducer, producer::Kind,
+    };
 
     fn producer(kind: ProducerKind, id: &str, run_id: &str) -> Producer {
+        let run_id = run_id.to_string();
         let kind = match kind {
-            ProducerKind::Workflow => Kind::Workflow(Default::default()),
-            ProducerKind::LocalActivity => Kind::LocalActivity(Default::default()),
-            ProducerKind::Activity => Kind::Activity(Default::default()),
-            ProducerKind::StandaloneActivity => Kind::StandaloneActivity(Default::default()),
-            ProducerKind::Client => Kind::Client(Default::default()),
+            ProducerKind::Workflow => Kind::Workflow(WorkflowProducer {
+                run_id,
+                ..Default::default()
+            }),
+            ProducerKind::LocalActivity => Kind::LocalActivity(LocalActivityProducer {
+                run_id,
+                ..Default::default()
+            }),
+            ProducerKind::Activity => Kind::Activity(ActivityProducer {
+                run_id,
+                ..Default::default()
+            }),
+            ProducerKind::StandaloneActivity => Kind::StandaloneActivity(ActivityProducer {
+                run_id,
+                ..Default::default()
+            }),
+            ProducerKind::Client => Kind::Client(ClientProducer::default()),
         };
         Producer {
             id: id.to_string(),
-            epoch: Some(ProducerEpoch { kind: Some(kind) }),
-            run_id: run_id.to_string(),
+            kind: Some(kind),
         }
     }
 
@@ -267,14 +286,9 @@ mod tests {
             producer(ProducerKind::Workflow, &workflow_producer_id(run), "other"),
             producer(ProducerKind::Activity, "act:run%3A1:a", run),
             Producer {
-                epoch: None,
+                kind: None,
                 ..producer(ProducerKind::Workflow, "wf:x", "x")
             },
-            Producer {
-                epoch: Some(ProducerEpoch::default()),
-                ..producer(ProducerKind::Workflow, "wf:x", "x")
-            },
-            producer(ProducerKind::Client, "client:a:b", "run"),
             producer(ProducerKind::Client, "client:a|b", ""),
             producer(ProducerKind::Client, "client:run%3a1", ""),
         ];

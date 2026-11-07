@@ -578,7 +578,7 @@ impl Store for MemoryStore {
         let stream_id = stream_ref.id.as_str();
         let producer = batch.producer;
         let kind = ProducerKind::try_from(producer)?;
-        let epoch = epoch_key(&producer.epoch.unwrap_or_default());
+        let epoch = epoch_key(producer.kind.as_ref());
         let withdrawal = &batch.withdrawal;
         let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
         let field = format!("p|{}|{}", kind as i32, producer.id);
@@ -721,7 +721,7 @@ impl Store for MemoryStore {
     ) -> StreamResult<Closed> {
         let stream_id = stream_ref.id.as_str();
         let kind = ProducerKind::try_from(producer)?;
-        let epoch = epoch_key(&producer.epoch.unwrap_or_default());
+        let epoch = epoch_key(producer.kind.as_ref());
         let field = format!("p|{}|{}", kind as i32, producer.id);
         let tombstone = millis(TOMBSTONE);
         let chain = owner_chain(stream_ref);
