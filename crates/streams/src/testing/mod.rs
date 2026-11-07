@@ -6,6 +6,7 @@ mod support;
 pub mod fields;
 pub mod service;
 pub mod store;
+pub mod writer;
 
 pub use support::Needs;
 
@@ -152,5 +153,10 @@ mod tests {
     #[tokio::test]
     async fn the_service_suite_passes_on_the_memory_store() {
         run(vec![Arc::new(MemoryBackend)], service::CASES).await;
+    }
+
+    #[tokio::test]
+    async fn the_writer_suite_passes_on_the_memory_store() {
+        run(vec![Arc::new(MemoryBackend)], writer::CASES).await;
     }
 }
