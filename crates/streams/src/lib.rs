@@ -11,12 +11,17 @@ pub mod epoch;
 mod error;
 pub mod ids;
 pub mod memory;
+mod metrics;
 pub mod offset;
+mod record;
+mod runtime;
+mod service;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
 pub use error::{Reason, StreamError, StreamResult};
+pub use runtime::{MemoryStreamRuntime, StoreFactory, StreamRuntime};
 
 /// The protos that lang and the crate exchange. `temporalio-protos` generates them, so a value
 /// needs no conversion between the crates.
