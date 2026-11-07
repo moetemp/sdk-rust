@@ -17,8 +17,8 @@ use crate::{
     memory::{EntryId, ProducerField},
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{
-        ActivityEpoch, ClientEpoch, Producer, ProducerEpoch, StreamRef, WorkflowTaskEpoch,
-        producer_epoch::Kind,
+        ActivityEpoch, ActivityProducer, ClientEpoch, ClientProducer, Producer, StreamRef,
+        WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
     },
     store::{Batch, ConflictPolicy, Create, CreateOutcome, Created, Owner, Withdrawal},
 };
@@ -29,26 +29,25 @@ use std::time::Duration;
 fn activity(run: &str, attempt: i32, scheduled: i64) -> Producer {
     Producer {
         id: activity_producer_id(run, "a", "s"),
-        epoch: Some(ProducerEpoch {
-            kind: Some(Kind::Activity(ActivityEpoch {
+        kind: Some(Kind::Activity(ActivityProducer {
+            run_id: run.to_string(),
+            epoch: Some(ActivityEpoch {
                 attempt_scheduled_time: Some(Timestamp {
                     seconds: scheduled,
                     nanos: 0,
                 }),
                 attempt,
-            })),
-        }),
-        run_id: run.to_string(),
+            }),
+        })),
     }
 }
 
 fn client(attempt: i32) -> Producer {
     Producer {
         id: client_producer_id("me", "p1"),
-        epoch: Some(ProducerEpoch {
-            kind: Some(Kind::Client(ClientEpoch { attempt })),
-        }),
-        run_id: String::new(),
+        kind: Some(Kind::Client(ClientProducer {
+            epoch: Some(ClientEpoch { attempt }),
+        })),
     }
 }
 
@@ -718,10 +717,10 @@ async fn a_stale_producer_cant_close_the_stream() {
 fn workflow(run: &str) -> Producer {
     Producer {
         id: workflow_producer_id(run),
-        run_id: run.to_string(),
-        epoch: Some(ProducerEpoch {
-            kind: Some(Kind::Workflow(WorkflowTaskEpoch::default())),
-        }),
+        kind: Some(Kind::Workflow(WorkflowProducer {
+            run_id: run.to_string(),
+            epoch: Some(WorkflowTaskEpoch::default()),
+        })),
     }
 }
 
@@ -744,13 +743,14 @@ async fn a_workflow_or_a_client_closes_a_stream_with_no_owner() {
 async fn a_producer_with_no_epoch_case_is_refused() {
     for target in stores_for(Needs::CALLS).await {
         target.create(Owner::Client).await;
-        for epoch in [None, Some(ProducerEpoch::default())] {
-            let producer = Producer { epoch, ..client(1) };
-            let error = append(&target, &producer, 1, &["a"]).await.unwrap_err();
-            assert_eq!(error.reason, Reason::Invalid);
-            let error = target.close(&producer).await.unwrap_err();
-            assert_eq!(error.reason, Reason::Invalid);
-        }
+        let producer = Producer {
+            kind: None,
+            ..client(1)
+        };
+        let error = append(&target, &producer, 1, &["a"]).await.unwrap_err();
+        assert_eq!(error.reason, Reason::Invalid);
+        let error = target.close(&producer).await.unwrap_err();
+        assert_eq!(error.reason, Reason::Invalid);
         assert!(target.texts().await.is_empty());
     }
 }
@@ -856,7 +856,7 @@ async fn a_producer_field_has_the_shared_layout() {
         target.create(Owner::Workflow).await;
         let kind = ProducerKind::Activity as i32;
         let field = |producer: &Producer, held: Option<&Producer>, offsets, texts: &[&str]| {
-            let epoch = |producer: &Producer| epoch_key(&producer.epoch.unwrap_or_default());
+            let epoch = |producer: &Producer| epoch_key(producer.kind.as_ref());
             ProducerField {
                 fence: epoch(producer),
                 held: held.map(epoch),
