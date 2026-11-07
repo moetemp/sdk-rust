@@ -11,6 +11,7 @@ pub mod epoch;
 mod error;
 pub mod ids;
 pub mod offset;
+pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
