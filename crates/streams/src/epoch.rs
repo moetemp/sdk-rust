@@ -7,8 +7,8 @@
 use crate::{
     StreamError, StreamResult,
     proto::{
-        Producer, ProducerEpoch, StreamRecord, StreamSuperseded, WorkflowTaskEpoch,
-        producer_epoch::Kind, stream_record::Item,
+        Producer, StreamRecord, StreamSuperseded, StreamWriter, WorkflowTaskEpoch, producer::Kind,
+        stream_record::Item,
     },
 };
 use prost_types::Timestamp;
@@ -42,22 +42,52 @@ impl From<&Kind> for ProducerKind {
     }
 }
 
-/// Refuses a Producer with no epoch, or with an epoch that has no case.
+/// Refuses a Producer with no kind case.
 impl TryFrom<&Producer> for ProducerKind {
     type Error = StreamError;
 
     fn try_from(producer: &Producer) -> StreamResult<Self> {
-        let epoch = producer
-            .epoch
-            .as_ref()
-            .ok_or_else(|| StreamError::invalid("The Producer has no epoch"))?;
-        kind(epoch).ok_or_else(|| StreamError::invalid("The Producer's epoch has no kind"))
+        kind_of(producer).ok_or_else(|| StreamError::invalid("The Producer has no kind"))
     }
 }
 
-/// The kind of an epoch's case, `None` when the epoch has no case.
-fn kind(epoch: &ProducerEpoch) -> Option<ProducerKind> {
-    epoch.kind.as_ref().map(ProducerKind::from)
+/// The kind case of a Producer, `None` when it has none.
+pub fn kind_of(producer: &Producer) -> Option<ProducerKind> {
+    producer.kind.as_ref().map(ProducerKind::from)
+}
+
+/// The run of a Producer. Empty for a client, which has no run.
+pub fn producer_run_id(producer: &Producer) -> &str {
+    match &producer.kind {
+        Some(Kind::Workflow(w)) => &w.run_id,
+        Some(Kind::LocalActivity(l)) => &l.run_id,
+        Some(Kind::Activity(a) | Kind::StandaloneActivity(a)) => &a.run_id,
+        Some(Kind::Client(_)) | None => "",
+    }
+}
+
+/// The run that a writer withdraws, empty for none.
+pub fn writer_withdraw_run(writer: &StreamWriter) -> &str {
+    writer
+        .withdrawal
+        .as_ref()
+        .map_or("", |w| w.withdraw_run.as_str())
+}
+
+/// The started event ids of the run's failed Workflow Tasks that a writer reports.
+pub fn writer_failed_tasks(writer: &StreamWriter) -> &[i64] {
+    writer
+        .withdrawal
+        .as_ref()
+        .map_or(&[], |w| w.failed_tasks.as_slice())
+}
+
+/// The run's last completed Workflow Task that a writer reports, `None` for none.
+pub fn writer_previous_completed_task(writer: &StreamWriter) -> Option<&WorkflowTaskEpoch> {
+    writer
+        .withdrawal
+        .as_ref()
+        .and_then(|w| w.previous_completed_task.as_ref())
 }
 
 /// The length of a [task_key].
@@ -92,20 +122,24 @@ pub fn task_key(task: &WorkflowTaskEpoch) -> [u8; TASK_KEY_LEN] {
 }
 
 /// The key of an epoch. It is the [task_of] key, then the attempt's scheduled seconds and nanos
-/// and the attempt, in 8, 4 and 4 bytes. A field that the case doesn't have is zero, and an epoch
+/// and the attempt, in 8, 4 and 4 bytes. A field that the case doesn't have is zero, and a Producer
 /// with no case is all zeros.
-pub fn epoch_key(epoch: &ProducerEpoch) -> [u8; EPOCH_KEY_LEN] {
-    let (scheduled, attempt) = match &epoch.kind {
-        Some(Kind::LocalActivity(local)) => (None, local.attempt),
+pub fn epoch_key(kind: Option<&Kind>) -> [u8; EPOCH_KEY_LEN] {
+    let (scheduled, attempt) = match kind {
+        Some(Kind::LocalActivity(local)) => (None, local.epoch.map_or(0, |e| e.attempt)),
         Some(Kind::Activity(activity) | Kind::StandaloneActivity(activity)) => {
-            (activity.attempt_scheduled_time.as_ref(), activity.attempt)
+            let epoch = activity.epoch;
+            (
+                epoch.and_then(|e| e.attempt_scheduled_time),
+                epoch.map_or(0, |e| e.attempt),
+            )
         }
-        Some(Kind::Client(client)) => (None, client.attempt),
+        Some(Kind::Client(client)) => (None, client.epoch.map_or(0, |e| e.attempt)),
         Some(Kind::Workflow(_)) | None => (None, 0),
     };
-    let (seconds, nanos) = time_fields(scheduled);
+    let (seconds, nanos) = time_fields(scheduled.as_ref());
     let mut key = [0; EPOCH_KEY_LEN];
-    key[..TASK_KEY_LEN].copy_from_slice(&task_key(&task_of(epoch)));
+    key[..TASK_KEY_LEN].copy_from_slice(&task_key(&task_of(kind)));
     key[24..32].copy_from_slice(&be64(seconds));
     key[32..36].copy_from_slice(&be32(nanos));
     key[36..].copy_from_slice(&be32(attempt));
@@ -114,16 +148,16 @@ pub fn epoch_key(epoch: &ProducerEpoch) -> [u8; EPOCH_KEY_LEN] {
 
 /// The Workflow Task of an epoch. It is a Workflow's own task, or the task that dispatched a Local
 /// Activity, and zero for the other kinds.
-pub fn task_of(epoch: &ProducerEpoch) -> WorkflowTaskEpoch {
-    match &epoch.kind {
-        Some(Kind::Workflow(task)) => *task,
-        Some(Kind::LocalActivity(local)) => local.task.unwrap_or_default(),
+pub fn task_of(kind: Option<&Kind>) -> WorkflowTaskEpoch {
+    match kind {
+        Some(Kind::Workflow(w)) => w.epoch.unwrap_or_default(),
+        Some(Kind::LocalActivity(local)) => local.epoch.and_then(|e| e.task).unwrap_or_default(),
         _ => WorkflowTaskEpoch::default(),
     }
 }
 
 /// Orders two epochs field by field.
-pub fn compare_epochs(a: &ProducerEpoch, b: &ProducerEpoch) -> Ordering {
+pub fn compare_epochs(a: Option<&Kind>, b: Option<&Kind>) -> Ordering {
     epoch_key(a).cmp(&epoch_key(b))
 }
 
@@ -150,48 +184,52 @@ pub fn withdraws(superseded: &StreamSuperseded, record: &StreamRecord) -> bool {
     let Some(producer) = data.producer.as_ref() else {
         return false;
     };
-    if !writer.withdraw_run.is_empty() && producer.run_id == writer.withdraw_run {
+    let withdraw_run = writer_withdraw_run(writer);
+    if !withdraw_run.is_empty() && producer_run_id(producer) == withdraw_run {
         return true;
     }
     let Some(withdrawing) = writer.producer.as_ref() else {
         return false;
     };
-    let (Some(epoch), Some(old)) = (withdrawing.epoch.as_ref(), producer.epoch.as_ref()) else {
+    let (new, old) = (withdrawing.kind.as_ref(), producer.kind.as_ref());
+    let (Some(new_kind), Some(old_kind)) = (new, old) else {
         return false;
     };
-    match kind(epoch) {
-        None | Some(ProducerKind::Client) => return false,
-        Some(ProducerKind::Workflow) => {}
+    match ProducerKind::from(new_kind) {
+        ProducerKind::Client => return false,
+        ProducerKind::Workflow => {}
         same => {
-            return kind(old) == same
+            return ProducerKind::from(old_kind) == same
                 && producer.id == withdrawing.id
-                && compare_epochs(old, epoch) == Ordering::Less;
+                && compare_epochs(old, new) == Ordering::Less;
         }
     }
     if !of_run(producer, withdrawing) {
         return false;
     }
-    let (task, old) = (task_of(epoch), task_of(old));
-    let started = old.started_event_id;
-    if writer.failed_tasks.contains(&started) {
+    let (task, old_task) = (task_of(new), task_of(old));
+    let started = old_task.started_event_id;
+    if writer_failed_tasks(writer).contains(&started) {
         return true;
     }
-    let completed = writer.previous_completed_task.as_ref();
+    let completed = writer_previous_completed_task(writer);
     let after = completed.map_or(0, |c| c.started_event_id);
     if after < started && started < task.started_event_id {
         return true;
     }
     let lower_at = |at: &WorkflowTaskEpoch| {
-        started == at.started_event_id && compare_tasks(&old, at) == Ordering::Less
+        started == at.started_event_id && compare_tasks(&old_task, at) == Ordering::Less
     };
     lower_at(&task) || completed.is_some_and(lower_at)
 }
 
 /// Whether a Producer is the Workflow run that withdraws, or one of its Local Activities.
 fn of_run(producer: &Producer, withdrawing: &Producer) -> bool {
-    match producer.epoch.as_ref().and_then(kind) {
+    match kind_of(producer) {
         Some(ProducerKind::Workflow) => producer.id == withdrawing.id,
-        Some(ProducerKind::LocalActivity) => producer.run_id == withdrawing.run_id,
+        Some(ProducerKind::LocalActivity) => {
+            producer_run_id(producer) == producer_run_id(withdrawing)
+        }
         _ => false,
     }
 }
@@ -199,17 +237,14 @@ fn of_run(producer: &Producer, withdrawing: &Producer) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::ClientEpoch;
+    use crate::proto::{ClientEpoch, ClientProducer, producer::Kind};
 
     // Without the clamp, the bytes of a negative field would outrank every real epoch.
     #[test]
     fn a_negative_field_compares_as_zero() {
-        let negative = ProducerEpoch {
-            kind: Some(Kind::Client(ClientEpoch { attempt: -1 })),
-        };
-        assert_eq!(
-            compare_epochs(&negative, &ProducerEpoch::default()),
-            Ordering::Equal
-        );
+        let negative = Kind::Client(ClientProducer {
+            epoch: Some(ClientEpoch { attempt: -1 }),
+        });
+        assert_eq!(compare_epochs(Some(&negative), None), Ordering::Equal);
     }
 }

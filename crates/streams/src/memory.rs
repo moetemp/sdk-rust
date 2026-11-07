@@ -5,7 +5,9 @@
 use crate::{
     Reason, StreamError, StreamResult,
     digest::DIGEST_LEN,
-    epoch::{EPOCH_KEY_LEN, ProducerKind, TASK_KEY_LEN, epoch_key, task_key, task_of},
+    epoch::{
+        EPOCH_KEY_LEN, ProducerKind, TASK_KEY_LEN, epoch_key, producer_run_id, task_key, task_of,
+    },
     ids::{StreamKeys, encode_part},
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{Producer, StreamRef, WorkflowTaskEpoch},
@@ -693,8 +695,8 @@ impl Store for MemoryStore {
         let stream_id = stream_ref.id.as_str();
         let producer = batch.producer;
         let kind = ProducerKind::try_from(producer)?;
-        let epoch = epoch_key(&producer.epoch.unwrap_or_default());
-        let run = encode_run(&producer.run_id);
+        let epoch = epoch_key(producer.kind.as_ref());
+        let run = encode_run(producer_run_id(producer));
         let withdrawal = &batch.withdrawal;
         let withdrawn_run = encode_run(withdrawal.withdraw_run);
         let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
@@ -702,7 +704,7 @@ impl Store for MemoryStore {
         let member = format!("{}|{}", kind as i32, producer.id);
         // The Workflow Task of a Local Activity of a run, which the run's task facts can withdraw.
         let task = (kind == ProducerKind::LocalActivity && !run.is_empty())
-            .then(|| task_key(&task_of(&producer.epoch.unwrap_or_default())));
+            .then(|| task_key(&task_of(producer.kind.as_ref())));
         let facts = withdrawal.tasks.filter(|_| task.is_some());
         let completed = facts.and_then(|facts| facts.completed).map(task_key);
         let open_field = format!("oa|{run}");
@@ -944,8 +946,8 @@ impl Store for MemoryStore {
     ) -> StreamResult<Closed> {
         let stream_id = stream_ref.id.as_str();
         let kind = ProducerKind::try_from(producer)?;
-        let epoch = epoch_key(&producer.epoch.unwrap_or_default());
-        let run = encode_run(&producer.run_id);
+        let epoch = epoch_key(producer.kind.as_ref());
+        let run = encode_run(producer_run_id(producer));
         let field = format!("p|{}|{}", kind as i32, producer.id);
         let tombstone = millis(TOMBSTONE);
         let chain = owner_chain(stream_ref);

@@ -3,8 +3,8 @@
 use crate::{
     Reason, StreamError, StreamResult,
     proto::{
-        AppendRecord, Producer, StreamData, StreamRecord, StreamSuperseded, StreamWriter,
-        stream_record::Item,
+        AppendRecord, Producer, RunWithdrawal, StreamData, StreamRecord, StreamSuperseded,
+        StreamWriter, stream_record::Item,
     },
     store::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES},
 };
@@ -65,11 +65,14 @@ pub(crate) fn data_records(
 
 /// The facts a `Superseded` item of this batch gives the Reader.
 pub(crate) fn superseded(producer: &Producer, withdraw_run: &str) -> Vec<u8> {
+    let withdrawal = (!withdraw_run.is_empty()).then(|| RunWithdrawal {
+        withdraw_run: withdraw_run.to_string(),
+        ..Default::default()
+    });
     StreamSuperseded {
         writer: Some(StreamWriter {
             producer: Some(producer.clone()),
-            withdraw_run: withdraw_run.to_string(),
-            ..Default::default()
+            withdrawal,
         }),
     }
     .encode_to_vec()
