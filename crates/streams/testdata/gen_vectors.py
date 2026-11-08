@@ -140,28 +140,25 @@ def entry_id(text):
     return ms.to_bytes(8, "big") + seq.to_bytes(4, "big")
 
 
-def producer_value(fence, held, sequence, first, last, digest):
-    """The 129 bytes of a `p|` field."""
-    flags = bytes([1 if held else 0])
-    return (flags + fence + (held or bytes(40)) + sequence.to_bytes(8, "big") + entry_id(first)
-            + entry_id(last) + digest)
+def producer_value(fence, sequence, first, last, digest):
+    """The 88 bytes of a `p|` field."""
+    return fence + sequence.to_bytes(8, "big") + entry_id(first) + entry_id(last) + digest
 
 
 def producer_values():
-    held = epoch_key({"attempt_scheduled_time": [1760000001, 999999999], "attempt": 2})
-    newer = epoch_key({"attempt_scheduled_time": [1760000002, 0], "attempt": 3})
+    with_records = epoch_key({"attempt_scheduled_time": [1760000001, 999999999], "attempt": 2})
+    empty = epoch_key({"attempt_scheduled_time": [1760000002, 0], "attempt": 3})
     cases = []
-    for name, fence, held_key, sequence, first, last, records in [
-        ("a batch with Records", held, held, 3, "1760000000123-4", "1760000000123-6",
+    for name, fence, sequence, first, last, records in [
+        ("a batch with Records", with_records, 3, "1760000000123-4", "1760000000123-6",
          [{"data": "01"}]),
-        ("an empty batch that wrote no entry", newer, None, 1, "", "", []),
+        ("an empty batch that wrote no entry", empty, 1, "", "", []),
     ]:
         batch_digest = bytes.fromhex(digest(records))
-        value = producer_value(fence, held_key, sequence, first, last, batch_digest)
+        value = producer_value(fence, sequence, first, last, batch_digest)
         cases.append({
             "name": name,
             "fence": fence.hex(),
-            "held": held_key.hex() if held_key else None,
             "sequence": sequence,
             "first": first,
             "last": last,
@@ -174,23 +171,12 @@ def producer_values():
 def fields():
     run = "run:1"
     producer = "act:" + join(run, "a", "s")
-    # Task [3] fails, and a write of task [5] with the completed task [4] withdraws it.
-    withdrawn = task_key(3, 1, (100, 0))
-    task, completed = task_key(5, 1, (100, 0)), task_key(4)
     return {
         "kind": 3,
         "producer_id": producer,
         "run_id": run,
         "producer": f"p|3|{producer}",
-        "run_wrote": f"run|{part(run)}",
-        "withdrawn_run": f"wr|{part(run)}",
         "producer_values": producer_values(),
-        # The task keys are binary, so the vectors give them in hex after the field name's prefix.
-        "task_key": withdrawn.hex(),
-        "open_tasks": f"oa|{part(run)}",
-        "withdrawn_task_prefix": f"ow|{part(run)}|",
-        "task_facts": f"tf|{part(run)}",
-        "task_facts_value": (task + completed + task_key(3)).hex(),
     }
 
 
@@ -258,186 +244,12 @@ def digests():
     return cases
 
 
-def withdraws(superseded, record):
-    """The reader rule of a Superseded item, as the API proposal states it."""
-    producer = record["producer"]
-    if superseded.get("withdraw_run") and producer.get("run_id") == superseded["withdraw_run"]:
-        return True
-    # A client's newer epoch only fences. Its earlier Records are real messages.
-    if superseded["producer_kind"] == "client":
-        return False
-    # An item with no epoch, such as a create's, withdraws only a run.
-    if "epoch" not in superseded or "epoch" not in producer:
-        return False
-    old, new = producer["epoch"], superseded["epoch"]
-    if superseded["producer_kind"] != "workflow":
-        return (
-            producer["kind"] == superseded["producer_kind"]
-            and producer["id"] == superseded["producer_id"]
-            and epoch_key(old) < epoch_key(new)
-        )
-    if producer["kind"] == "workflow":
-        if producer["id"] != superseded["producer_id"]:
-            return False
-    elif producer["kind"] == "local_activity":
-        if producer.get("run_id", "") != superseded["run_id"]:
-            return False
-    else:
-        return False
-
-    def task(epoch):
-        return (
-            epoch.get("task_started_event_id", 0),
-            task_key(
-                epoch.get("task_started_event_id", 0),
-                epoch.get("task_attempt", 0),
-                tuple(epoch.get("task_started_time", (0, 0))),
-            ),
-        )
-
-    started, old_key = task(old)
-    t_started, t_key = task(new)
-    c = superseded.get("previous_completed_task")
-    c_started = c["started_event_id"] if c else 0
-    if started in superseded.get("failed_tasks", []):
-        return True
-    if c_started < started < t_started:
-        return True
-    if started == t_started and old_key < t_key:
-        return True
-    if c and started == c_started:
-        c_key = task_key(c_started, c.get("attempt", 0), tuple(c.get("started_time", (0, 0))))
-        if old_key < c_key:
-            return True
-    return False
-
-
-def wf(run, started, attempt=1, time=(100, 0)):
-    return {"kind": "workflow", "id": "wf:" + part(run), "run_id": run,
-            "epoch": {"task_started_event_id": started, "task_attempt": attempt,
-                      "task_started_time": list(time)}}
-
-
-def withdrawal_examples():
-    """Appendix E of the API proposal, one case per Record that a Superseded item meets."""
-    r1 = "r1"
-    cases = []
-
-    def case(name, superseded, producer, expected):
-        record = {"producer": producer}
-        assert withdraws(superseded, record) == expected, name
-        cases.append({"name": name, "superseded": superseded, "record": record,
-                      "withdraws": expected})
-
-    def sup(task, c=None, failed=(), withdraw_run=None, run=r1):
-        s = {"producer_kind": "workflow", "producer_id": "wf:" + part(run), "run_id": run,
-             "epoch": task["epoch"], "failed_tasks": list(failed)}
-        if c:
-            s["previous_completed_task"] = c
-        if withdraw_run:
-            s["withdraw_run"] = withdraw_run
-        return s
-
-    def completed(started, attempt=1, time=(100, 0)):
-        return {"started_event_id": started, "attempt": attempt, "started_time": list(time)}
-
-    # 1. A retried task writes nothing. B at [5] failed, [8] wrote nothing, C at [11], c = [8].
-    s = sup(wf(r1, 11), completed(8), failed=[5])
-    case("e1 B at the failed task 5 goes", s, wf(r1, 5), True)
-    case("e1 a Record at the completed task 8 stays", s, wf(r1, 8), False)
-    case("e1 a Record before c stays", s, wf(r1, 3), False)
-    # 2. A refused completion. B at [5] refused, B' at [8] with failed [5].
-    s = sup(wf(r1, 8), completed(2), failed=[5])
-    case("e2 B goes", s, wf(r1, 5), True)
-    case("e2 an older completed Record stays", s, wf(r1, 2), False)
-    # 3. A transient retry. D at [8] attempt 2, D' at [8] attempt 3.
-    s = sup(wf(r1, 8, attempt=3), completed(5))
-    case("e3 D at a lower attempt of t goes", s, wf(r1, 8, attempt=2), True)
-    case("e3 a Record of t itself stays", s, wf(r1, 8, attempt=3), False)
-    # 4. A dropped speculative task. U at [9] T1, the next task at [9] T2.
-    s = sup(wf(r1, 9, time=(200, 0)), completed(6))
-    case("e4 U at an earlier started time goes", s, wf(r1, 9, time=(150, 0)), True)
-    # 5. A refused transient attempt. c = [5], D at [11] refused, D' at [14].
-    s = sup(wf(r1, 14), completed(5))
-    case("e5 D between c and t goes", s, wf(r1, 11, attempt=2), True)
-    case("e5 a Record at c stays", s, wf(r1, 5), False)
-    # c is the third attempt of task [8], as Core sends it. The transient attempts 1 and 2 have
-    # no failed event, so only c's attempt withdraws them.
-    s = sup(wf(r1, 14), completed(8, attempt=3, time=(300, 0)))
-    case("c attempt 3, attempt 2 at c goes", s, wf(r1, 8, attempt=2, time=(200, 0)), True)
-    case("c attempt 3, c itself stays", s, wf(r1, 8, attempt=3, time=(300, 0)), False)
-    # A c with only its started id, from a Core that sends no attempt, withdraws nothing at c.
-    s = sup(wf(r1, 14), {"started_event_id": 8})
-    case("c with no attempt keeps every Record at c", s, wf(r1, 8, attempt=1, time=(200, 0)),
-         False)
-    # A Local Activity of a withdrawn task is withdrawn too.
-    la = {"kind": "local_activity", "id": "la:" + join(r1, "k"), "run_id": r1,
-          "epoch": {"task_started_event_id": 5, "task_attempt": 1,
-                    "task_started_time": [100, 0], "attempt": 2}}
-    case("e1 a Local Activity of the failed task goes", sup(wf(r1, 11), completed(8), [5]), la,
-         True)
-    other_run = wf("r9", 5)
-    case("another run's Record stays", sup(wf(r1, 11), completed(8), [5]), other_run, False)
-    # 6. A Workflow retry. r2's first batch withdraws r1 and its Activity.
-    act = {"kind": "activity", "id": "act:" + join(r1, "a", "s"), "run_id": r1,
-           "epoch": {"attempt_scheduled_time": [100, 0], "attempt": 1}}
-    s = sup(wf("r2", 3), None, withdraw_run=r1, run="r2")
-    case("e6 r1's Record goes", s, wf(r1, 20), True)
-    case("e6 r1's Activity Record goes", s, act, True)
-    case("e6 r2's own earlier Record of t stays", s, wf("r2", 3), False)
-    # An Activity retry withdraws only its own earlier attempt.
-    s = {"producer_kind": "activity", "producer_id": act["id"], "run_id": r1,
-         "epoch": {"attempt_scheduled_time": [130, 0], "attempt": 2}}
-    case("an Activity retry withdraws attempt 1", s, act, True)
-    other = dict(act, id="act:" + join(r1, "b", "s"))
-    case("an Activity retry keeps another Activity", s, other, False)
-    # A client's newer epoch fences its earlier one and withdraws nothing.
-    named = {"kind": "client", "id": "client:" + join("ingest"), "epoch": {"attempt": 1}}
-    s = {"producer_kind": "client", "producer_id": named["id"], "epoch": {"attempt": 2}}
-    case("a client's newer epoch keeps its earlier Records", s, named, False)
-
-    def la_at(started, task_attempt=1, attempt=1, run=r1, call="k"):
-        return {"kind": "local_activity", "id": "la:" + join(run, call), "run_id": run,
-                "epoch": {"task_started_event_id": started, "task_attempt": task_attempt,
-                          "task_started_time": [100, 0], "attempt": attempt}}
-
-    # A retry run's create writes an item with no epoch. It withdraws only the previous run, even
-    # when it names failed tasks.
-    s = {"producer_kind": "workflow", "producer_id": "wf:" + part("r2"), "run_id": "r2",
-         "withdraw_run": r1, "failed_tasks": [5]}
-    case("no epoch, r1's Record goes", s, wf(r1, 5), True)
-    case("no epoch, r1's Local Activity Record goes", s, la_at(5), True)
-    case("no epoch, r2's Local Activity Record at a failed task stays", s, la_at(5, run="r2"),
-         False)
-    case("no epoch, r2's Record stays", s, wf("r2", 5), False)
-    # A Local Activity's newer epoch withdraws only its own lower epochs.
-    s = {"producer_kind": "local_activity", "producer_id": "la:" + join(r1, "k"), "run_id": r1,
-         "epoch": la_at(8, attempt=3)["epoch"]}
-    case("a Local Activity's newer epoch withdraws a lower attempt", s, la_at(8, attempt=2), True)
-    case("a Local Activity's newer epoch withdraws an earlier task", s, la_at(5, attempt=4), True)
-    case("a Local Activity's newer epoch keeps its own epoch", s, la_at(8, attempt=3), False)
-    case("a Local Activity's newer epoch keeps another call", s, la_at(5, call="j"), False)
-    case("a Local Activity's item keeps the run's Workflow Record", s, wf(r1, 5), False)
-    # Local Activity Records under a Workflow item with c = [8], t = [14] attempt 2, failed [5].
-    s = sup(wf(r1, 14, attempt=2), completed(8), failed=[5])
-    case("a Local Activity before c stays", s, la_at(3), False)
-    case("a Local Activity at c stays", s, la_at(8), False)
-    case("a Local Activity between c and t goes", s, la_at(11), True)
-    case("a Local Activity of a lower attempt of t goes", s, la_at(14, task_attempt=1), True)
-    case("a Local Activity of t itself stays", s, la_at(14, task_attempt=2), False)
-    case("a Local Activity of another run stays", s, la_at(11, run="r9"), False)
-    no_epoch = {"kind": "local_activity", "id": "la:" + join(r1, "k"), "run_id": r1}
-    case("a Local Activity Record with no epoch stays", s, no_epoch, False)
-    return cases
-
-
 def main():
     for name, value in [
         ("ids.json", ids()),
         ("offsets.json", offsets()),
         ("epochs.json", epochs()),
         ("fields.json", fields()),
-        ("withdrawals.json", withdrawal_examples()),
         ("digests.json", digests()),
     ]:
         with open(name, "w") as out:

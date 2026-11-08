@@ -8,7 +8,7 @@
 
 use crate::{
     Reason, StreamError, StreamResult,
-    epoch::{ProducerKind, writer_withdraw_run},
+    epoch::ProducerKind,
     proto::{
         AppendRecord, AppendRecordsRequest, OpenWriterRequest, Producer, StreamRef, StreamWriter,
         producer::Kind,
@@ -218,9 +218,9 @@ pub(crate) struct Writers {
 
 impl Writers {
     /// Opens a writer, or adds a reference to the one that this Producer epoch has on the Stream. A
-    /// writer of a Local Activity, or of an Activity attempt above 1, first sends an empty batch.
-    /// So the new epoch withdraws the earlier one's Records even when it publishes nothing. On a
-    /// closed or expired Stream the open still succeeds, and the first write fails with the reason.
+    /// writer of a Local Activity, or of an Activity attempt above 1, first sends an empty batch, so
+    /// the new epoch sets its fence even when it publishes nothing. On a closed or expired Stream the
+    /// open still succeeds, and the first write fails with the reason.
     pub(crate) async fn open(
         &self,
         service: &Arc<StreamService>,
@@ -231,10 +231,6 @@ impl Writers {
             .ok_or_else(|| StreamError::invalid("The writer has no Stream"))?;
         crate::ids::check_stream_id(&stream.id)?;
         let stream_writer = request.writer.unwrap_or_default();
-        // Only a retry run's first append withdraws a run, and a writer sends many batches.
-        if !writer_withdraw_run(&stream_writer).is_empty() {
-            return Err(StreamError::invalid("A writer doesn't withdraw a run"));
-        }
         let producer = stream_writer
             .producer
             .clone()
@@ -278,7 +274,7 @@ impl Writers {
         });
         if retry {
             match writer.send(vec![], next_sequence()).await {
-                // A Stream with no key has nothing to withdraw yet. A closed or expired one accepts
+                // A Stream with no key has no fence to set yet. A closed or expired one accepts
                 // no more Records, and a retry that only reads it must still run.
                 Ok(_) => {}
                 Err(error)

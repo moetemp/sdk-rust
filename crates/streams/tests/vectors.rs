@@ -8,14 +8,13 @@ use temporalio_common::protos::temporal::api::common::v1::{
 };
 use temporalio_streams::{
     digest::batch_digest,
-    epoch::{epoch_key, task_key, task_of, withdraws},
+    epoch::{epoch_key, task_key, task_of},
     ids::{self, StreamKeys},
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{
         ActivityEpoch, ActivityProducer, AppendRecord, ClientEpoch, ClientProducer,
-        LocalActivityEpoch, LocalActivityProducer, Producer, RunWithdrawal, StreamData,
-        StreamRecord, StreamSuperseded, StreamWriter, WorkflowProducer, WorkflowTaskEpoch,
-        producer::Kind, stream_record::Item,
+        LocalActivityEpoch, LocalActivityProducer, WorkflowProducer, WorkflowTaskEpoch,
+        producer::Kind,
     },
 };
 
@@ -155,68 +154,6 @@ fn epoch_keys_match() {
         assert_eq!(
             task_key(&task_of(kind.as_ref())).to_vec(),
             hex(text(case, "task_key"))
-        );
-    }
-}
-
-#[test]
-fn the_appendix_e_withdrawals_match() {
-    let cases = load("withdrawals.json");
-    assert!(cases.as_array().unwrap().len() >= 35);
-    for case in cases.as_array().unwrap() {
-        let s = &case["superseded"];
-        // A create's item has no epoch, and a Reader must not read it as an empty one.
-        let withdrawing = Producer {
-            id: text(s, "producer_id").to_string(),
-            kind: s.get("epoch").and_then(|value| {
-                kind_of(
-                    text(s, "producer_kind"),
-                    value,
-                    s["run_id"].as_str().unwrap_or_default(),
-                )
-            }),
-        };
-        let superseded = StreamSuperseded {
-            writer: Some(StreamWriter {
-                producer: Some(withdrawing),
-                withdrawal: Some(RunWithdrawal {
-                    previous_completed_task: s.get("previous_completed_task").map(|c| {
-                        WorkflowTaskEpoch {
-                            started_event_id: number(c, "started_event_id"),
-                            attempt: number(c, "attempt") as i32,
-                            started_time: time(&c["started_time"]),
-                        }
-                    }),
-                    failed_tasks: s["failed_tasks"]
-                        .as_array()
-                        .map(|list| list.iter().map(|v| v.as_i64().unwrap()).collect())
-                        .unwrap_or_default(),
-                    withdraw_run: s["withdraw_run"].as_str().unwrap_or_default().to_string(),
-                }),
-            }),
-        };
-        let p = &case["record"]["producer"];
-        let record = StreamRecord {
-            item: Some(Item::Data(StreamData {
-                producer: Some(Producer {
-                    id: text(p, "id").to_string(),
-                    kind: p.get("epoch").and_then(|value| {
-                        kind_of(
-                            text(p, "kind"),
-                            value,
-                            p["run_id"].as_str().unwrap_or_default(),
-                        )
-                    }),
-                }),
-                ..Default::default()
-            })),
-            ..Default::default()
-        };
-        assert_eq!(
-            withdraws(&superseded, &record),
-            case["withdraws"].as_bool().unwrap(),
-            "{}",
-            text(case, "name")
         );
     }
 }

@@ -7,14 +7,12 @@ use super::{RawKeys, backends};
 use crate::{
     StreamResult, StreamRuntime,
     digest::batch_digest,
-    epoch::withdraws,
     ids::local_activity_producer_id,
     proto::{
-        AppendRecord, LocalActivityEpoch, LocalActivityProducer, Producer, RunWithdrawal,
-        StreamData, StreamRecord, StreamRef, StreamSuperseded, StreamWriter, WorkflowTaskEpoch,
-        producer::Kind, stream_record::Item,
+        AppendRecord, LocalActivityEpoch, LocalActivityProducer, Producer, StreamData,
+        StreamRecord, StreamRef, WorkflowTaskEpoch, producer::Kind, stream_record::Item,
     },
-    store::{Appended, Batch, Closed, Create, Created, Entry, Owner, Store, Withdrawal},
+    store::{Appended, Batch, Closed, Create, Created, Entry, Store},
 };
 use prost::Message;
 use prost_types::Timestamp;
@@ -22,7 +20,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use temporalio_common::protos::temporal::api::{common::v1::Execution, enums::v1::ExecutionType};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -143,15 +140,6 @@ impl Run {
     }
 }
 
-/// The owner of a ref that a Workflow's run chain makes, with the chain's first run id.
-pub(crate) fn workflow_execution(workflow_id: &str, first_run_id: &str) -> Option<Execution> {
-    Some(Execution {
-        r#type: ExecutionType::Workflow as i32,
-        business_id: workflow_id.to_string(),
-        run_id: first_run_id.to_string(),
-    })
-}
-
 pub(crate) fn record(producer: &Producer, text: &str) -> Vec<u8> {
     StreamRecord {
         item: Some(Item::Data(StreamData {
@@ -192,20 +180,6 @@ pub(crate) fn digest(texts: &[&str]) -> [u8; crate::digest::DIGEST_LEN] {
     batch_digest(&records)
 }
 
-pub(crate) fn superseded(producer: &Producer, withdrawal: &Withdrawal<'_>) -> Vec<u8> {
-    let run = (!withdrawal.withdraw_run.is_empty()).then(|| RunWithdrawal {
-        withdraw_run: withdrawal.withdraw_run.to_string(),
-        ..Default::default()
-    });
-    StreamSuperseded {
-        writer: Some(StreamWriter {
-            producer: Some(producer.clone()),
-            withdrawal: run,
-        }),
-    }
-    .encode_to_vec()
-}
-
 /// The data texts of the entries, in log order.
 pub(crate) fn records_of(entries: &[Entry]) -> Vec<String> {
     entries
@@ -227,13 +201,8 @@ impl Target {
         }
     }
 
-    pub(crate) async fn create(&self, owner: Owner) {
-        self.create_with(&Create {
-            owner,
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+    pub(crate) async fn create(&self) {
+        self.create_with(&Create::default()).await.unwrap();
     }
 
     /// Creates the Stream, and gives the Store's answer.
@@ -289,69 +258,19 @@ impl Target {
         entries
     }
 
-    /// The data texts in the log, withdrawn or not.
+    /// The data texts in the log.
     pub(crate) async fn texts(&self) -> Vec<String> {
         records_of(&self.entries().await)
     }
 
-    /// The data texts a Reader keeps after it applies each `Superseded` item.
-    pub(crate) async fn visible(&self) -> Vec<String> {
-        let mut kept: Vec<StreamRecord> = vec![];
-        for entry in self.entries().await {
-            if let Some(bytes) = &entry.superseded {
-                let s = StreamSuperseded::decode(bytes.as_slice()).unwrap();
-                kept.retain(|old| !withdraws(&s, old));
-            }
-            if let Some(bytes) = &entry.record {
-                let record = StreamRecord::decode(bytes.as_slice()).unwrap();
-                if matches!(record.item, Some(Item::Data(_))) {
-                    kept.push(record);
-                }
-            }
-        }
-        kept.into_iter()
-            .filter_map(|record| match record.item {
-                Some(Item::Data(data)) => Some(String::from_utf8(data.body.unwrap().data).unwrap()),
-                _ => None,
-            })
-            .collect()
-    }
-
+    /// Appends a batch of `texts` as `producer` with `sequence`.
     pub(crate) async fn batch(
         &self,
         producer: &Producer,
         sequence: i64,
         texts: &[&str],
     ) -> StreamResult<Appended> {
-        self.write(producer, sequence, "", texts).await
-    }
-
-    /// A retry run's first batch, which withdraws `previous`.
-    pub(crate) async fn batch_retry(
-        &self,
-        producer: &Producer,
-        previous: &str,
-        texts: &[&str],
-    ) -> StreamResult<Appended> {
-        self.write(producer, 1, previous, texts).await
-    }
-
-    /// A batch that withdraws `withdraw_run`, or no run when it is empty.
-    pub(crate) async fn write(
-        &self,
-        producer: &Producer,
-        sequence: i64,
-        withdraw_run: &str,
-        texts: &[&str],
-    ) -> StreamResult<Appended> {
         let records: Vec<_> = texts.iter().map(|text| record(producer, text)).collect();
-        let mut withdrawal = Withdrawal {
-            withdraw_run,
-            superseded: &[],
-            tasks: None,
-        };
-        let bytes = superseded(producer, &withdrawal);
-        withdrawal.superseded = &bytes;
         self.store
             .append(
                 &self.namespace,
@@ -361,24 +280,14 @@ impl Target {
                     sequence,
                     records: &records,
                     digest: digest(texts),
-                    withdrawal,
                 },
             )
             .await
     }
 
     pub(crate) async fn close(&self, producer: &Producer) -> StreamResult<Closed> {
-        self.close_at(&self.stream_ref(), producer).await
-    }
-
-    /// Closes the Stream of `stream_ref`, with the owner fields it has.
-    pub(crate) async fn close_at(
-        &self,
-        stream_ref: &StreamRef,
-        producer: &Producer,
-    ) -> StreamResult<Closed> {
         self.store
-            .close(&self.namespace, stream_ref, producer)
+            .close(&self.namespace, &self.stream_ref(), producer)
             .await
     }
 }

@@ -169,7 +169,6 @@ async fn append_sized(
             r#ref: stream_ref(),
             writer: Some(StreamWriter {
                 producer: Some(client()),
-                ..Default::default()
             }),
             sequence,
             records,

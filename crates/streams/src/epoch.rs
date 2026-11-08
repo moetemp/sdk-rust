@@ -1,4 +1,4 @@
-//! Producer epochs, their order, and the withdrawal rule of a `Superseded` item.
+//! Producer epochs and their order.
 //!
 //! A Store keeps an epoch as a key of fixed-width big-endian fields, in the order of comparison.
 //! A byte comparison of two keys then orders the epochs field by field. `testdata/epochs.json` has
@@ -6,10 +6,7 @@
 
 use crate::{
     StreamError, StreamResult,
-    proto::{
-        Producer, StreamRecord, StreamSuperseded, StreamWriter, WorkflowTaskEpoch, producer::Kind,
-        stream_record::Item,
-    },
+    proto::{Producer, WorkflowTaskEpoch, producer::Kind},
 };
 use prost_types::Timestamp;
 use std::cmp::Ordering;
@@ -64,30 +61,6 @@ pub fn producer_run_id(producer: &Producer) -> &str {
         Some(Kind::Activity(a) | Kind::StandaloneActivity(a)) => &a.run_id,
         Some(Kind::Client(_)) | None => "",
     }
-}
-
-/// The run that a writer withdraws, empty for none.
-pub fn writer_withdraw_run(writer: &StreamWriter) -> &str {
-    writer
-        .withdrawal
-        .as_ref()
-        .map_or("", |w| w.withdraw_run.as_str())
-}
-
-/// The started event ids of the run's failed Workflow Tasks that a writer reports.
-pub fn writer_failed_tasks(writer: &StreamWriter) -> &[i64] {
-    writer
-        .withdrawal
-        .as_ref()
-        .map_or(&[], |w| w.failed_tasks.as_slice())
-}
-
-/// The run's last completed Workflow Task that a writer reports, `None` for none.
-pub fn writer_previous_completed_task(writer: &StreamWriter) -> Option<&WorkflowTaskEpoch> {
-    writer
-        .withdrawal
-        .as_ref()
-        .and_then(|w| w.previous_completed_task.as_ref())
 }
 
 /// The length of a [task_key].
@@ -159,79 +132,6 @@ pub fn task_of(kind: Option<&Kind>) -> WorkflowTaskEpoch {
 /// Orders two epochs field by field.
 pub fn compare_epochs(a: Option<&Kind>, b: Option<&Kind>) -> Ordering {
     epoch_key(a).cmp(&epoch_key(b))
-}
-
-fn compare_tasks(a: &WorkflowTaskEpoch, b: &WorkflowTaskEpoch) -> Ordering {
-    task_key(a).cmp(&task_key(b))
-}
-
-/// Whether a `Superseded` item withdraws an earlier Record. The case of the epoch of the item's
-/// writer picks the rule.
-///
-/// For an Activity or a Local Activity, it withdraws that Producer's Records with a lower epoch.
-/// For a Workflow task t with the previous completed task c, it withdraws the Records of the run
-/// and of its Local Activities whose task is in `failed_tasks` or strictly between c and t, and
-/// those at c or at t with a lower epoch. The item of a retry run withdraws every Record of the
-/// previous run. A client's newer epoch fences the earlier ones but withdraws nothing, since a
-/// restarted client's earlier Records are real messages, not a failed attempt's.
-pub fn withdraws(superseded: &StreamSuperseded, record: &StreamRecord) -> bool {
-    let Some(writer) = superseded.writer.as_ref() else {
-        return false;
-    };
-    let Some(Item::Data(data)) = &record.item else {
-        return false;
-    };
-    let Some(producer) = data.producer.as_ref() else {
-        return false;
-    };
-    let withdraw_run = writer_withdraw_run(writer);
-    if !withdraw_run.is_empty() && producer_run_id(producer) == withdraw_run {
-        return true;
-    }
-    let Some(withdrawing) = writer.producer.as_ref() else {
-        return false;
-    };
-    let (new, old) = (withdrawing.kind.as_ref(), producer.kind.as_ref());
-    let (Some(new_kind), Some(old_kind)) = (new, old) else {
-        return false;
-    };
-    match ProducerKind::from(new_kind) {
-        ProducerKind::Client => return false,
-        ProducerKind::Workflow => {}
-        same => {
-            return ProducerKind::from(old_kind) == same
-                && producer.id == withdrawing.id
-                && compare_epochs(old, new) == Ordering::Less;
-        }
-    }
-    if !of_run(producer, withdrawing) {
-        return false;
-    }
-    let (task, old_task) = (task_of(new), task_of(old));
-    let started = old_task.started_event_id;
-    if writer_failed_tasks(writer).contains(&started) {
-        return true;
-    }
-    let completed = writer_previous_completed_task(writer);
-    let after = completed.map_or(0, |c| c.started_event_id);
-    if after < started && started < task.started_event_id {
-        return true;
-    }
-    let lower_at = |at: &WorkflowTaskEpoch| {
-        started == at.started_event_id && compare_tasks(&old_task, at) == Ordering::Less
-    };
-    lower_at(&task) || completed.is_some_and(lower_at)
-}
-
-/// Whether a Producer is the Workflow run that withdraws, or one of its Local Activities.
-fn of_run(producer: &Producer, withdrawing: &Producer) -> bool {
-    match kind_of(producer) {
-        Some(ProducerKind::Workflow) => producer.id == withdrawing.id,
-        Some(ProducerKind::LocalActivity) => {
-            producer_run_id(producer) == producer_run_id(withdrawing)
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]

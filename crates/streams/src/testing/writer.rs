@@ -8,18 +8,13 @@ use super::{
 };
 use crate::{
     MemoryStreamRuntime, StreamError, StreamResult, StreamRuntime,
-    epoch::withdraws,
-    ids::{
-        activity_producer_id, client_producer_id, local_activity_producer_id,
-        named_client_producer_id,
-    },
+    ids::{activity_producer_id, client_producer_id, named_client_producer_id},
     proto::{
         ActivityEpoch, ActivityProducer, AppendRecord, ClientEpoch, ClientProducer,
         CloseStreamRequest, CloseWriterRequest, CloseWriterResponse, CreateStreamRequest,
-        CreateStreamResponse, LocalActivityEpoch, LocalActivityProducer, OpenWriterRequest,
-        OpenWriterResponse, Producer, ReadRecordsRequest, ReadRecordsResponse, RunWithdrawal,
-        StreamErrorDetails, StreamRecord, StreamRef, StreamWriter, WorkflowTaskEpoch,
-        WriteRecordsRequest, WriteRecordsResponse, producer::Kind, stream_record::Item,
+        CreateStreamResponse, OpenWriterRequest, OpenWriterResponse, Producer, ReadRecordsRequest,
+        ReadRecordsResponse, StreamErrorDetails, StreamRef, StreamWriter, WriteRecordsRequest,
+        WriteRecordsResponse, producer::Kind, stream_record::Item,
     },
     store::{
         Appended, Batch, Capabilities, Closed, Create, Created, Entry, MAX_BATCH_RECORDS, Store,
@@ -79,11 +74,10 @@ async fn cases() -> Vec<Case> {
     cases
 }
 
-/// The writer of a write by `producer`, with no withdrawal facts.
+/// The writer of a write by `producer`.
 fn writer_for(producer: Producer) -> Option<StreamWriter> {
     Some(StreamWriter {
         producer: Some(producer),
-        ..Default::default()
     })
 }
 
@@ -194,15 +188,10 @@ impl Case {
     }
 
     async fn visible(&self) -> Vec<String> {
-        let mut kept: Vec<StreamRecord> = vec![];
-        for record in self.read(0).await.records {
-            match &record.item {
-                Some(Item::Superseded(s)) => kept.retain(|old| !withdraws(s, old)),
-                Some(Item::Data(_)) => kept.push(record),
-                _ => {}
-            }
-        }
-        kept.into_iter()
+        self.read(0)
+            .await
+            .records
+            .into_iter()
             .filter_map(|record| match record.item {
                 Some(Item::Data(data)) => Some(String::from_utf8(data.body.unwrap().data).unwrap()),
                 _ => None,
@@ -287,15 +276,6 @@ async fn a_failed_write_fails_every_later_write_and_the_close() {
     }
 }
 
-async fn an_activity_retry_withdraws_the_earlier_attempt_even_with_nothing_to_write() {
-    for case in cases().await {
-        let first = case.open(activity(1), |_| {}).await;
-        case.write(first, &["a1"]).await.unwrap();
-        case.open(activity(2), |_| {}).await;
-        assert!(case.visible().await.is_empty());
-    }
-}
-
 /// An Activity retry opens its writer on a closed or expired Stream, so a retry that only reads
 /// the Stream still runs. Its first write fails with the real reason.
 async fn an_activity_retry_opens_on_a_closed_or_expired_stream() {
@@ -340,6 +320,17 @@ async fn an_activity_retry_opens_on_a_closed_or_expired_stream() {
         };
         let first = case.open(activity(1), on_short).await;
         case.write(first, &["a1"]).await.unwrap();
+        let close_short = CloseStreamRequest {
+            namespace: case.namespace.clone(),
+            r#ref: Some(StreamRef {
+                id: short.clone(),
+                ..Default::default()
+            }),
+            writer: writer_for(client()),
+            ..Default::default()
+        };
+        let _: crate::proto::CloseStreamResponse =
+            case.call("CloseStream", close_short).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         let retry = case.open(activity(2), on_short).await;
         let error = case.write(retry, &["a2"]).await.unwrap_err();
@@ -431,7 +422,7 @@ async fn a_named_client_with_a_higher_epoch_fences_its_earlier_self() {
         case.write(new, &["new"]).await.unwrap();
         let error = case.write(old, &["late"]).await.unwrap_err();
         assert_eq!(reason(&error), "stream_fenced");
-        // The earlier epoch's Records are real messages, so the new epoch withdraws none.
+        // A fence blocks the old epoch's later writes but keeps its earlier Records.
         assert_eq!(case.visible().await, ["old", "new"]);
     }
 }
@@ -642,37 +633,6 @@ async fn a_write_on_corrupt_store_data_fails_with_no_retry() {
     }
 }
 
-/// An open of a writer with a run to withdraw fails with `stream_invalid` and writes nothing, since
-/// only a retry run's first append withdraws a run and a writer sends many batches.
-async fn a_writer_with_a_run_to_withdraw_is_refused() {
-    for case in cases().await {
-        let request = OpenWriterRequest {
-            namespace: case.namespace.clone(),
-            r#ref: Some(StreamRef {
-                id: case.stream.clone(),
-                ..Default::default()
-            }),
-            writer: Some(StreamWriter {
-                producer: Some(client()),
-                withdrawal: Some(RunWithdrawal {
-                    withdraw_run: "r1".to_string(),
-                    ..Default::default()
-                }),
-            }),
-            ..Default::default()
-        };
-        let error = case
-            .call::<_, OpenWriterResponse>("OpenWriter", request)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            (error.code(), reason(&error).as_str()),
-            (Code::InvalidArgument, "stream_invalid")
-        );
-        assert!(case.visible().await.is_empty());
-    }
-}
-
 async fn a_write_that_waits_behind_a_close_is_refused() {
     for case in cases().await {
         let writer = case.open(client(), |_| {}).await;
@@ -692,56 +652,12 @@ async fn a_write_that_waits_behind_a_close_is_refused() {
     }
 }
 
-async fn a_local_activity_writer_withdraws_the_records_of_a_failed_task() {
-    for case in cases().await {
-        let local_activity = |call: &str, started: i64| Producer {
-            id: local_activity_producer_id("r1", call),
-            kind: Some(Kind::LocalActivity(LocalActivityProducer {
-                run_id: "r1".to_string(),
-                epoch: Some(LocalActivityEpoch {
-                    task: Some(WorkflowTaskEpoch {
-                        started_event_id: started,
-                        attempt: 1,
-                        started_time: Some(Timestamp {
-                            seconds: started,
-                            nanos: 0,
-                        }),
-                    }),
-                    attempt: 1,
-                }),
-            })),
-        };
-        let facts = |completed: i64, failed: Vec<i64>| {
-            move |request: &mut OpenWriterRequest| {
-                let writer = request.writer.get_or_insert_with(Default::default);
-                let withdrawal = writer.withdrawal.get_or_insert_with(Default::default);
-                withdrawal.previous_completed_task = Some(WorkflowTaskEpoch {
-                    started_event_id: completed,
-                    ..Default::default()
-                });
-                withdrawal.failed_tasks = failed.clone();
-            }
-        };
-        // Task [3] fails after its Local Activity writes, and task [4] completes with no write.
-        let orphan = case.open(local_activity("1", 3), facts(2, vec![])).await;
-        case.write(orphan, &["orphan"]).await.unwrap();
-        let next = case.open(local_activity("2", 5), facts(4, vec![3])).await;
-        case.write(next, &["next"]).await.unwrap();
-        assert_eq!(case.visible().await, ["next"]);
-        // Task [5] completed while call 2 ran, and task [6], where the call resolved, failed.
-        // Call 2 runs again in task [8] and writes nothing. Its open withdraws its earlier task.
-        case.open(local_activity("2", 8), facts(5, vec![6])).await;
-        assert!(case.visible().await.is_empty());
-    }
-}
-
 /// The cases of the suite, in file order.
 pub const CASES: &[super::Case] = &[
     case!(a_write_is_in_the_store_when_it_answers_its_offsets),
     case!(writes_split_at_the_batch_size_and_keep_one_sequence),
     case!(a_batch_size_over_the_store_limit_writes_in_more_batches),
     case!(a_failed_write_fails_every_later_write_and_the_close),
-    case!(an_activity_retry_withdraws_the_earlier_attempt_even_with_nothing_to_write),
     case!(an_activity_retry_opens_on_a_closed_or_expired_stream),
     case!(a_closed_writer_is_gone),
     case!(a_write_splits_big_records_by_bytes_and_refuses_an_oversize_one),
@@ -752,7 +668,5 @@ pub const CASES: &[super::Case] = &[
     case!(a_write_whose_answer_is_lost_goes_in_once),
     case!(a_writer_writes_again_after_a_store_outage),
     case!(a_write_on_corrupt_store_data_fails_with_no_retry),
-    case!(a_writer_with_a_run_to_withdraw_is_refused),
     case!(a_write_that_waits_behind_a_close_is_refused),
-    case!(a_local_activity_writer_withdraws_the_records_of_a_failed_task),
 ];

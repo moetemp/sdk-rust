@@ -4,24 +4,18 @@
 
 use super::{
     case, fields,
-    support::{
-        Needs, Run, Target, digest, hex, record, records_of, stores_for, superseded,
-        workflow_execution,
-    },
+    support::{Needs, Run, Target, digest, record, records_of, stores_for},
 };
 use crate::{
     Reason, StreamResult,
     epoch::{ProducerKind, epoch_key},
-    ids::{
-        activity_producer_id, client_producer_id, named_client_producer_id, workflow_producer_id,
-    },
+    ids::{activity_producer_id, client_producer_id, named_client_producer_id},
     memory::{EntryId, ProducerField},
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{
-        ActivityEpoch, ActivityProducer, ClientEpoch, ClientProducer, Producer, StreamRef,
-        WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
+        ActivityEpoch, ActivityProducer, ClientEpoch, ClientProducer, Producer, producer::Kind,
     },
-    store::{Batch, ConflictPolicy, Create, CreateOutcome, Created, Owner, TaskFacts, Withdrawal},
+    store::{Batch, ConflictPolicy, Create, CreateOutcome, Created},
 };
 use futures_util::future::join_all;
 use prost_types::Timestamp;
@@ -67,9 +61,6 @@ async fn append(
     texts: &[&str],
 ) -> Result<crate::store::Appended, crate::StreamError> {
     let records: Vec<_> = texts.iter().map(|text| record(producer, text)).collect();
-    let mut withdrawal = Withdrawal::default();
-    let bytes = superseded(producer, &withdrawal);
-    withdrawal.superseded = &bytes;
     target
         .store
         .append(
@@ -80,7 +71,6 @@ async fn append(
                 sequence,
                 records: &records,
                 digest: digest(texts),
-                withdrawal,
             },
         )
         .await
@@ -171,10 +161,9 @@ async fn a_create_of_an_open_stream_fails_unless_it_uses_it_or_retries() {
     }
 }
 
-/// A create of an expired, another owner's or a closed Stream fails as `expired`, `not_owner` or
-/// `closed`, in this order. These come before the conflict policy and before a retry of the create
-/// that made the Stream.
-async fn closed_expired_and_not_owner_come_before_already_exists() {
+/// A create of an expired or a closed Stream fails as `expired` or `closed`, in this order. These
+/// come before the conflict policy and before a retry of the create that made the Stream.
+async fn closed_and_expired_come_before_already_exists() {
     for target in stores_for(Needs::RAW_KEYS).await {
         let first = Create {
             request_id: "create-1",
@@ -182,23 +171,11 @@ async fn closed_expired_and_not_owner_come_before_already_exists() {
         };
         target.create_with(&first).await.unwrap();
         let reason = |created: StreamResult<Created>| created.unwrap_err().reason;
-        let owned = StreamRef {
-            owner: workflow_execution("agent", "first-run"),
-            ..target.stream_ref()
-        };
-        let workflow = Create {
-            owner: Owner::Workflow,
-            ..first.clone()
-        };
-        let not_owner = || target.store.create(&target.namespace, &owned, &workflow);
-        assert_eq!(reason(not_owner().await), Reason::NotOwner);
         target.close(&client(1)).await.unwrap();
-        assert_eq!(reason(not_owner().await), Reason::NotOwner);
         for create in [&first, &Create::default()] {
             assert_eq!(reason(target.create_with(create).await), Reason::Closed);
         }
         target.set_meta("exp", "1").await;
-        assert_eq!(reason(not_owner().await), Reason::Expired);
         assert_eq!(reason(target.create_with(&first).await), Reason::Expired);
     }
 }
@@ -207,7 +184,7 @@ async fn closed_expired_and_not_owner_come_before_already_exists() {
 /// Producer wrote, and a lower sequence is refused.
 async fn a_resend_gets_its_first_positions_and_a_lower_sequence_is_refused() {
     for target in stores_for(Needs::CALLS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         let p = client(1);
         let first = append(&target, &p, 1, &["p1", "p2"]).await.unwrap();
         // Another Producer writes between the batch and its resend.
@@ -230,7 +207,7 @@ async fn a_resend_gets_its_first_positions_and_a_lower_sequence_is_refused() {
 /// A resend with the last sequence and other content fails as `seq_divergent` and writes nothing.
 async fn a_resend_with_other_content_fails_as_divergent() {
     for target in stores_for(Needs::CALLS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         let p = client(1);
         append(&target, &p, 1, &["p1"]).await.unwrap();
         let divergent = append(&target, &p, 1, &["other"]).await.unwrap_err();
@@ -242,7 +219,7 @@ async fn a_resend_with_other_content_fails_as_divergent() {
 /// A lower epoch is fenced for each Producer kind.
 async fn a_lower_epoch_is_fenced_for_each_producer_kind() {
     for target in stores_for(Needs::UNCHECKED).await {
-        target.create(Owner::Workflow).await;
+        target.create().await;
         let run = Run::new("r1");
         let la = run.local_activity("k", 8, 1, 2);
         target.batch(&la, 1, &["la2"]).await.unwrap();
@@ -266,7 +243,7 @@ async fn a_lower_epoch_is_fenced_for_each_producer_kind() {
 /// fails as closed. With `STORE_ANSWERS`, a second close returns `already`.
 async fn a_close_stops_appends_but_not_a_resend() {
     for target in stores_for(Needs::CALLS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         let p = client(1);
         let first = append(&target, &p, 1, &["a"]).await.unwrap();
         let closed = target.close(&p).await.unwrap();
@@ -291,7 +268,7 @@ async fn a_close_stops_appends_but_not_a_resend() {
 /// reads the Producer's `p|` field, since a newer format can change that field.
 async fn a_newer_format_refuses_every_write() {
     for target in stores_for(Needs::RAW_KEYS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         let p = client(1);
         append(&target, &p, 1, &["a"]).await.unwrap();
         target.set_meta(fields::VERSION, "2").await;
@@ -311,7 +288,7 @@ async fn a_newer_format_refuses_every_write() {
 /// An expired Stream refuses writes and its create.
 async fn an_expired_stream_refuses_writes_and_its_create() {
     for target in stores_for(Needs::RAW_KEYS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         target.set_meta("exp", "1").await;
         let error = append(&target, &client(1), 1, &["a"]).await.unwrap_err();
         assert_eq!(error.reason, Reason::Expired);
@@ -320,113 +297,12 @@ async fn an_expired_stream_refuses_writes_and_its_create() {
     }
 }
 
-/// An Activity retry flags only its first batch, which withdraws the earlier attempt.
-async fn an_activity_retry_flags_its_first_batch_only() {
-    for target in stores_for(Needs::UNCHECKED.and(Needs::STORE_ANSWERS)).await {
-        target.create(Owner::Workflow).await;
-        let (a1, a2) = (activity("r1", 1, 10), activity("r1", 2, 20));
-        let other = Producer {
-            id: activity_producer_id("r1", "b", "s"),
-            ..activity("r1", 1, 10)
-        };
-        append(&target, &a1, 1, &["x1"]).await.unwrap();
-        append(&target, &other, 1, &["y1"]).await.unwrap();
-        assert!(append(&target, &a2, 1, &["x2"]).await.unwrap().flagged);
-        assert!(!append(&target, &a2, 2, &["x3"]).await.unwrap().flagged);
-        assert_eq!(target.visible().await, ["y1", "x2", "x3"]);
-    }
-}
-
-/// An empty batch of an Activity retry withdraws the earlier attempt's Records.
-async fn an_empty_batch_of_a_retry_withdraws_the_earlier_attempt() {
-    for target in stores_for(Needs::UNCHECKED).await {
-        target.create(Owner::Workflow).await;
-        append(&target, &activity("r1", 1, 10), 1, &["x1"])
-            .await
-            .unwrap();
-        let empty = append(&target, &activity("r1", 2, 20), 1, &[])
-            .await
-            .unwrap();
-        assert!(empty.flagged);
-        assert!(empty.offsets.is_some());
-        assert!(target.visible().await.is_empty());
-        // The withdrawal is done, so another empty batch writes nothing.
-        let again = append(&target, &activity("r1", 3, 30), 1, &[])
-            .await
-            .unwrap();
-        assert!(!again.flagged);
-        assert_eq!(again.offsets, None);
-        // An empty batch still raises the fence.
-        let stale = append(&target, &activity("r1", 2, 20), 2, &["late"]).await;
-        assert_eq!(stale.unwrap_err().reason, Reason::Fenced);
-    }
-}
-
-/// A retry run's first write withdraws the previous run and fences its Producers.
-async fn a_retry_run_withdraws_and_fences_the_previous_run() {
-    for target in stores_for(Needs::UNCHECKED).await {
-        target.create(Owner::Workflow).await;
-        let (r1, r2) = (Run::new("r1"), Run::new("r2"));
-        target
-            .batch(&r1.local_activity("k", 3, 1, 1), 1, &["A"])
-            .await
-            .unwrap();
-        append(&target, &activity("r1", 1, 10), 1, &["A'"])
-            .await
-            .unwrap();
-        let b = target
-            .batch_retry(&r2.local_activity("k", 3, 1, 1), "r1", &["B"])
-            .await
-            .unwrap();
-        assert!(b.flagged);
-        assert_eq!(target.visible().await, ["B"]);
-        let late = append(&target, &activity("r1", 1, 10), 2, &["A''"]).await;
-        assert_eq!(late.unwrap_err().reason, Reason::Fenced);
-        let late = target
-            .batch(&r1.local_activity("j", 6, 1, 1), 1, &["A3"])
-            .await;
-        assert_eq!(late.unwrap_err().reason, Reason::Fenced);
-        // A second withdrawal of the same run withdraws nothing more.
-        let again = target
-            .batch_retry(&r2.local_activity("j", 6, 1, 1), "r1", &["B2"])
-            .await
-            .unwrap();
-        assert!(!again.flagged);
-    }
-}
-
-/// An empty batch that withdraws a run keeps its Producer's held epoch, whose Records it doesn't
-/// withdraw. So the Producer's next epoch still withdraws them.
-async fn an_empty_batch_that_withdraws_a_run_keeps_the_held_epoch() {
-    for target in stores_for(Needs::UNCHECKED).await {
-        target.create(Owner::Workflow).await;
-        let (r1, r2) = (Run::new("r1"), Run::new("r2"));
-        target
-            .batch(&r1.local_activity("k", 3, 1, 1), 1, &["A"])
-            .await
-            .unwrap();
-        let first = r2.local_activity("k", 3, 1, 1);
-        target.batch(&first, 1, &["B1"]).await.unwrap();
-        target.write(&first, 2, "r1", &[]).await.unwrap();
-        assert_eq!(target.visible().await, ["B1"]);
-        target
-            .batch(&r2.local_activity("k", 3, 1, 2), 1, &["B2"])
-            .await
-            .unwrap();
-        assert_eq!(target.visible().await, ["B2"]);
-    }
-}
-
-/// An open Workflow Stream's meta keeps the safety TTL, and its log keeps the Retention, after
-/// which a read hides every Record. Its close gives the meta the Retention too.
-async fn the_ttl_follows_the_owner_and_the_close() {
+/// An open Stream's meta keeps the safety TTL, and its log keeps the Retention, after which a read
+/// hides every Record. Its close gives the meta the Retention too.
+async fn the_ttl_is_the_safety_ttl_until_the_close() {
     for target in stores_for(Needs::RAW_KEYS).await {
-        target.create(Owner::Workflow).await;
-        let run = Run::new("r1");
-        target
-            .batch(&run.local_activity("k", 3, 1, 1), 1, &["a"])
-            .await
-            .unwrap();
+        target.create().await;
+        append(&target, &client(1), 1, &["a"]).await.unwrap();
         let week = Duration::from_secs(7 * 86_400).as_millis() as i64;
         let (ttl, meta) = target.ttls().await;
         assert!(0 < ttl && ttl <= week, "{ttl}");
@@ -434,7 +310,7 @@ async fn the_ttl_follows_the_owner_and_the_close() {
             meta > Duration::from_secs(80 * 86_400).as_millis() as i64,
             "{meta}"
         );
-        target.close(&workflow("r1")).await.unwrap();
+        target.close(&client(1)).await.unwrap();
         let (ttl, meta) = target.ttls().await;
         assert!(0 < ttl && ttl <= week, "{ttl}");
         assert!(
@@ -451,7 +327,6 @@ async fn an_append_trims_by_retention_and_keeps_the_watermark() {
         target
             .create_with(&Create {
                 retention: Some(Duration::from_millis(600)),
-                owner: Owner::Workflow,
                 ..Default::default()
             })
             .await
@@ -487,7 +362,6 @@ async fn offsets_go_on_after_the_log_expires() {
         target
             .create_with(&Create {
                 retention: Some(Duration::from_millis(200)),
-                owner: Owner::Workflow,
                 ..Default::default()
             })
             .await
@@ -518,7 +392,7 @@ async fn offsets_go_on_after_the_log_expires() {
 /// A wait for the next entry wakes on an append and ends at its deadline.
 async fn a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline() {
     for target in stores_for(Needs::RAW_KEYS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         let first = append(&target, &client(1), 1, &["a"]).await.unwrap();
         let newest = first.offsets.unwrap().1;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
@@ -546,7 +420,7 @@ async fn a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline() {
 /// ends at once, so a waiting read sees the close.
 async fn a_close_writes_no_entry_and_ends_a_wait() {
     for target in stores_for(Needs::RAW_KEYS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         let first = append(&target, &client(1), 1, &["a"]).await.unwrap();
         let newest = first.offsets.unwrap().1;
         let store = target.store.clone();
@@ -582,7 +456,7 @@ async fn a_close_writes_no_entry_and_ends_a_wait() {
 /// caller knows the offset of each one.
 async fn a_batch_gets_consecutive_offsets_that_end_at_its_last_offset() {
     for target in stores_for(Needs::RAW_KEYS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         append(&target, &client(1), 1, &["before"]).await.unwrap();
         // Enough Records that `XADD *` on Redis 7.0 would cross a millisecond.
         let texts: Vec<String> = (0..1000).map(|i| i.to_string()).collect();
@@ -607,7 +481,7 @@ async fn a_batch_gets_consecutive_offsets_that_end_at_its_last_offset() {
 /// A negative sequence is refused.
 async fn a_negative_sequence_is_refused() {
     for target in stores_for(Needs::CALLS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         let error = append(&target, &client(1), -1, &["x"]).await.unwrap_err();
         assert_eq!(error.reason, Reason::Invalid);
         assert!(target.texts().await.is_empty());
@@ -619,7 +493,7 @@ async fn a_negative_sequence_is_refused() {
 /// number is a resend.
 async fn a_batch_with_no_sequence_takes_the_next_one_of_its_epoch() {
     for target in stores_for(Needs::CALLS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         let p = client(1);
         append(&target, &p, 0, &["a"]).await.unwrap();
         let retry = append(&target, &p, 0, &["a"]).await.unwrap();
@@ -643,7 +517,7 @@ async fn a_batch_with_no_sequence_takes_the_next_one_of_its_epoch() {
 /// the Store writes all of them.
 async fn batches_with_no_sequence_at_once_each_take_their_own_number() {
     for target in stores_for(Needs::CALLS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         let p = client(1);
         let texts = ["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8"];
         let appends = texts
@@ -665,7 +539,7 @@ async fn batches_with_no_sequence_at_once_each_take_their_own_number() {
 /// divergent batch is refused. A sequence past 2^53 - 1 is refused.
 async fn a_large_sequence_dedupes_and_one_past_2_53_is_refused() {
     for target in stores_for(Needs::CALLS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         let p = client(1);
         let large = 100_000_000_000_000;
         let first = append(&target, &p, large, &["x"]).await.unwrap();
@@ -683,55 +557,6 @@ async fn a_large_sequence_dedupes_and_one_past_2_53_is_refused() {
     }
 }
 
-/// A create that names another owner than the Stream has fails and changes nothing. So a Workflow
-/// doesn't take a Stream with no owner, and another run chain of a Workflow id is another owner.
-async fn a_create_with_another_owner_is_refused() {
-    for target in stores_for(Needs::RAW_KEYS.and(Needs::STORE_ANSWERS)).await {
-        let target = &target;
-        let create = |stream_ref: StreamRef, owner: Owner| async move {
-            let create = Create {
-                owner,
-                ..use_existing()
-            };
-            target
-                .store
-                .create(&target.namespace, &stream_ref, &create)
-                .await
-        };
-        let owned = |workflow_id: &str, first_run_id: &str| StreamRef {
-            owner: workflow_execution(workflow_id, first_run_id),
-            ..target.stream_ref()
-        };
-        target.create(Owner::Client).await;
-        let refused = create(owned("agent", "first-run"), Owner::Workflow).await;
-        assert_eq!(refused.unwrap_err().reason, Reason::NotOwner);
-        assert_eq!(target.meta("own").await.as_deref(), Some(&b"client"[..]));
-        // The meta keeps the TTL of a client's Stream, below the safety TTL of 90 days.
-        let (_, ttl) = target.ttls().await;
-        assert!(
-            ttl < Duration::from_secs(90 * 86_400).as_millis() as i64,
-            "{ttl}"
-        );
-
-        let owned = |workflow_id: &str, first_run_id: &str| StreamRef {
-            id: format!("{}-owned", target.stream),
-            ..owned(workflow_id, first_run_id)
-        };
-        let created = create(owned("agent", "first-run"), Owner::Workflow).await;
-        assert_eq!(created.unwrap().outcome, CreateOutcome::Created);
-        for (stream, owner) in [
-            (owned("agent", "other-run"), Owner::Workflow),
-            (owned("another-agent", "first-run"), Owner::Workflow),
-            (owned("agent", "first-run"), Owner::Client),
-        ] {
-            let refused = create(stream, owner).await;
-            assert_eq!(refused.unwrap_err().reason, Reason::NotOwner);
-        }
-        let again = create(owned("agent", "first-run"), Owner::Workflow).await;
-        assert_eq!(again.unwrap().outcome, CreateOutcome::Exists);
-    }
-}
-
 /// An append removes the `p|` field of a Producer whose last append is older than the Retention,
 /// since its Records are gone too. A lower epoch of that Producer then writes.
 async fn an_append_forgets_the_producers_that_the_retention_outlived() {
@@ -739,7 +564,6 @@ async fn an_append_forgets_the_producers_that_the_retention_outlived() {
         target
             .create_with(&Create {
                 retention: Some(Duration::from_millis(300)),
-                owner: Owner::Workflow,
                 ..Default::default()
             })
             .await
@@ -759,7 +583,7 @@ async fn an_append_forgets_the_producers_that_the_retention_outlived() {
 /// A Producer with a lower epoch can't close the Stream.
 async fn a_stale_producer_cant_close_the_stream() {
     for target in stores_for(Needs::CALLS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         append(&target, &client(2), 1, &["a"]).await.unwrap();
         assert_eq!(
             target.close(&client(1)).await.unwrap_err().reason,
@@ -769,36 +593,11 @@ async fn a_stale_producer_cant_close_the_stream() {
     }
 }
 
-/// The close Activity's Producer of run `run`.
-fn workflow(run: &str) -> Producer {
-    Producer {
-        id: workflow_producer_id(run),
-        kind: Some(Kind::Workflow(WorkflowProducer {
-            run_id: run.to_string(),
-            epoch: Some(WorkflowTaskEpoch::default()),
-        })),
-    }
-}
-
-/// A Stream with no owner takes a close from a Workflow or a client. A Local Activity or an
-/// Activity can't close it.
-async fn a_workflow_or_a_client_closes_a_stream_with_no_owner() {
-    for target in stores_for(Needs::UNCHECKED).await {
-        target.create(Owner::Client).await;
-        let la = Run::new("r1").local_activity("k", 3, 1, 1);
-        for producer in [&la, &activity("r1", 1, 10)] {
-            let refused = target.close(producer).await.unwrap_err();
-            assert_eq!(refused.reason, Reason::NotOwner);
-        }
-        target.close(&workflow("r1")).await.unwrap();
-    }
-}
-
 /// A Store refuses an append or a close of a Producer with no epoch, or with an epoch that has no
 /// case, since the case gives the kind of the Producer.
 async fn a_producer_with_no_epoch_case_is_refused() {
     for target in stores_for(Needs::CALLS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         let producer = Producer {
             kind: None,
             ..client(1)
@@ -811,56 +610,10 @@ async fn a_producer_with_no_epoch_case_is_refused() {
     }
 }
 
-/// Only the owner closes a Stream. That's the close Activity of its run chain for a Workflow-owned
-/// Stream, and a Workflow or a client for a Stream with no owner. A Local Activity of the chain
-/// can't close it, and a ref with no chain can't either.
-async fn only_the_owner_closes_a_stream() {
-    for target in stores_for(Needs::UNCHECKED.and(Needs::STORE_ANSWERS)).await {
-        let run = Run::new("r1");
-        let la = run.local_activity("k", 3, 1, 1);
-        target.create(Owner::Client).await;
-        for producer in [&la, &activity("r1", 1, 10)] {
-            let refused = target.close(producer).await.unwrap_err();
-            assert_eq!(refused.reason, Reason::NotOwner);
-        }
-        target.close(&client(1)).await.unwrap();
-
-        let owned = |workflow_id: &str| StreamRef {
-            id: format!("{}-owned", target.stream),
-            owner: workflow_execution(workflow_id, "first-run").filter(|_| !workflow_id.is_empty()),
-            ..Default::default()
-        };
-        let create = Create {
-            owner: Owner::Workflow,
-            ..Default::default()
-        };
-        target
-            .store
-            .create(&target.namespace, &owned("agent"), &create)
-            .await
-            .unwrap();
-        for (stream, producer) in [
-            (owned("agent"), client(1)),
-            (owned("agent"), activity("r1", 1, 10)),
-            (owned("agent"), la.clone()),
-            (owned("another-agent"), workflow("r1")),
-            (owned(""), workflow("r1")),
-        ] {
-            let refused = target.close_at(&stream, &producer).await.unwrap_err();
-            assert_eq!(refused.reason, Reason::NotOwner);
-        }
-        let closed = target.close_at(&owned("agent"), &workflow("r1")).await;
-        assert!(!closed.unwrap().already);
-        // The owner check comes first, even on a closed Stream.
-        let refused = target.close_at(&owned("agent"), &la).await.unwrap_err();
-        assert_eq!(refused.reason, Reason::NotOwner);
-    }
-}
-
 /// An append whose entry ids would not fit an offset is refused before it writes.
 async fn an_append_whose_ids_would_not_fit_an_offset_is_refused_before_it_writes() {
     for target in stores_for(Needs::RAW_KEYS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         // An entry a minute ahead of the clock, with nearly the last 20-bit sequence.
         let ahead = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -876,90 +629,6 @@ async fn an_append_whose_ids_would_not_fit_an_offset_is_refused_before_it_writes
     }
 }
 
-/// Every Store keeps the meta fields that the shared vectors name.
-async fn every_store_keeps_the_meta_fields_of_the_shared_vectors() {
-    let vectors: serde_json::Value =
-        serde_json::from_str(include_str!("../../testdata/fields.json")).unwrap();
-    for target in stores_for(Needs::RAW_KEYS).await {
-        target.create(Owner::Workflow).await;
-        let producer = activity("run:1", 1, 10);
-        append(&target, &producer, 1, &["a"]).await.unwrap();
-        let kind = ProducerKind::Activity as i32;
-        // The vector's Producer is this one, so its field names are the ones the Store keeps.
-        assert_eq!(producer.id, vectors["producer_id"].as_str().unwrap());
-        let field = fields::producer(kind, &producer.id);
-        assert_eq!(field, vectors["producer"].as_str().unwrap());
-        for field in [
-            field,
-            vectors["run_wrote"].as_str().unwrap().to_string(),
-            fields::VERSION.to_string(),
-        ] {
-            assert!(target.meta(&field).await.is_some(), "{field}");
-        }
-        // Task [3] fails, and a write of task [5] with the completed task [4] withdraws it.
-        let run = Run::new("run:1");
-        task_batch(&target, &run.local_activity("k", 3, 1, 1), 2, &[], &["b"])
-            .await
-            .unwrap();
-        task_batch(&target, &run.local_activity("j", 5, 1, 1), 4, &[3], &["c"])
-            .await
-            .unwrap();
-        let text = |field: &str| vectors[field].as_str().unwrap();
-        let withdrawn = [
-            text("withdrawn_task_prefix").as_bytes(),
-            &hex(text("task_key")),
-        ]
-        .concat();
-        assert!(target.meta(text("open_tasks")).await.is_some());
-        assert!(target.meta(withdrawn).await.is_some());
-        assert_eq!(
-            target.meta(text("task_facts")).await,
-            Some(hex(text("task_facts_value")))
-        );
-    }
-}
-
-/// A batch of a Local Activity with its run's task facts, the run's completed task
-/// `[completed]` and its failed tasks.
-async fn task_batch(
-    target: &Target,
-    producer: &Producer,
-    completed: i64,
-    failed_tasks: &[i64],
-    texts: &[&str],
-) -> Result<crate::store::Appended, crate::StreamError> {
-    let records: Vec<_> = texts.iter().map(|text| record(producer, text)).collect();
-    let completed = WorkflowTaskEpoch {
-        started_event_id: completed,
-        ..Default::default()
-    };
-    // The Store keeps the `Superseded` facts as sent, so these do for both items.
-    let bytes = superseded(producer, &Withdrawal::default());
-    let withdrawal = Withdrawal {
-        withdraw_run: "",
-        superseded: &bytes,
-        tasks: Some(TaskFacts {
-            completed: Some(&completed),
-            failed_tasks,
-            superseded: &bytes,
-        }),
-    };
-    target
-        .store
-        .append(
-            &target.namespace,
-            &target.stream_ref(),
-            &Batch {
-                producer,
-                sequence: 1,
-                records: &records,
-                digest: digest(texts),
-                withdrawal,
-            },
-        )
-        .await
-}
-
 /// The entry ids of an append's offsets.
 fn entry_ids(offsets: Option<(i64, i64)>) -> Option<(EntryId, EntryId)> {
     let id = |offset: i64| {
@@ -970,17 +639,15 @@ fn entry_ids(offsets: Option<(i64, i64)>) -> Option<(EntryId, EntryId)> {
     offsets.map(|(first, last)| (id(first), id(last)))
 }
 
-/// A Producer's `p|` field has the same 129 bytes on every Store. These are the flags, the fence,
-/// the held epoch, and the last batch's sequence, entry ids and digest.
+/// A Producer's `p|` field has the same 88 bytes on every Store. These are the fence, and the last
+/// batch's sequence, entry ids and digest.
 async fn a_producer_field_has_the_shared_layout() {
     for target in stores_for(Needs::RAW_KEYS).await {
-        target.create(Owner::Workflow).await;
+        target.create().await;
         let kind = ProducerKind::Activity as i32;
-        let field = |producer: &Producer, held: Option<&Producer>, offsets, texts: &[&str]| {
-            let epoch = |producer: &Producer| epoch_key(producer.kind.as_ref());
+        let field = |producer: &Producer, offsets, texts: &[&str]| {
             ProducerField {
-                fence: epoch(producer),
-                held: held.map(epoch),
+                fence: epoch_key(producer.kind.as_ref()),
                 sequence: 1,
                 entries: entry_ids(offsets),
                 digest: digest(texts),
@@ -990,34 +657,26 @@ async fn a_producer_field_has_the_shared_layout() {
         let a1 = activity("r1", 1, 10);
         let stored = || async { target.meta(fields::producer(kind, &a1.id)).await.unwrap() };
         let written = append(&target, &a1, 1, &["x", "y"]).await.unwrap();
-        assert_eq!(
-            stored().await,
-            field(&a1, Some(&a1), written.offsets, &["x", "y"])
-        );
-        // A newer attempt's empty batch withdraws the held epoch's Records, so none is held.
+        assert_eq!(stored().await, field(&a1, written.offsets, &["x", "y"]));
+        // A newer attempt's empty batch sets its fence but writes no entry.
         let a2 = activity("r1", 2, 20);
-        let flagged = append(&target, &a2, 1, &[]).await.unwrap();
-        assert_eq!(stored().await, field(&a2, None, flagged.offsets, &[]));
-        // Nothing is left to withdraw, so the next empty batch writes no entry.
-        let a3 = activity("r1", 3, 30);
-        let empty = append(&target, &a3, 1, &[]).await.unwrap();
+        let empty = append(&target, &a2, 1, &[]).await.unwrap();
         assert_eq!(empty.offsets, None);
-        assert_eq!(stored().await, field(&a3, None, None, &[]));
+        assert_eq!(stored().await, field(&a2, None, &[]));
     }
 }
 
-/// A Store refuses a write of a Producer whose `p|` field has another length or another flag bit,
-/// which a later format may write.
+/// A Store refuses a write of a Producer whose `p|` field has another length, which a later format
+/// may write.
 async fn a_producer_field_of_another_format_is_refused() {
     for target in stores_for(Needs::RAW_KEYS).await {
-        target.create(Owner::Client).await;
+        target.create().await;
         let p = client(1);
         append(&target, &p, 1, &["a"]).await.unwrap();
         let field = fields::producer(ProducerKind::Client as i32, &p.id);
         let value = target.meta(&field).await.unwrap();
-        let mut flagged = value.clone();
-        flagged[0] |= 2;
-        for other in [flagged, value[..value.len() - 1].to_vec()] {
+        let longer = [value.clone(), vec![0]].concat();
+        for other in [longer, value[..value.len() - 1].to_vec()] {
             target.set_meta(&field, &other).await;
             let error = append(&target, &p, 2, &["b"]).await.unwrap_err();
             assert_eq!(error.reason, Reason::StorageCorrupt);
@@ -1032,18 +691,14 @@ async fn a_producer_field_of_another_format_is_refused() {
 pub const CASES: &[super::Case] = &[
     case!(a_create_writes_the_key_once_and_keeps_its_retention),
     case!(a_create_of_an_open_stream_fails_unless_it_uses_it_or_retries),
-    case!(closed_expired_and_not_owner_come_before_already_exists),
+    case!(closed_and_expired_come_before_already_exists),
     case!(a_resend_gets_its_first_positions_and_a_lower_sequence_is_refused),
     case!(a_resend_with_other_content_fails_as_divergent),
     case!(a_lower_epoch_is_fenced_for_each_producer_kind),
     case!(a_close_stops_appends_but_not_a_resend),
     case!(a_newer_format_refuses_every_write),
     case!(an_expired_stream_refuses_writes_and_its_create),
-    case!(an_activity_retry_flags_its_first_batch_only),
-    case!(an_empty_batch_of_a_retry_withdraws_the_earlier_attempt),
-    case!(a_retry_run_withdraws_and_fences_the_previous_run),
-    case!(an_empty_batch_that_withdraws_a_run_keeps_the_held_epoch),
-    case!(the_ttl_follows_the_owner_and_the_close),
+    case!(the_ttl_is_the_safety_ttl_until_the_close),
     case!(an_append_trims_by_retention_and_keeps_the_watermark),
     case!(offsets_go_on_after_the_log_expires),
     case!(a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline),
@@ -1053,14 +708,10 @@ pub const CASES: &[super::Case] = &[
     case!(a_batch_with_no_sequence_takes_the_next_one_of_its_epoch),
     case!(batches_with_no_sequence_at_once_each_take_their_own_number),
     case!(a_large_sequence_dedupes_and_one_past_2_53_is_refused),
-    case!(a_create_with_another_owner_is_refused),
     case!(an_append_forgets_the_producers_that_the_retention_outlived),
     case!(a_stale_producer_cant_close_the_stream),
-    case!(a_workflow_or_a_client_closes_a_stream_with_no_owner),
     case!(a_producer_with_no_epoch_case_is_refused),
-    case!(only_the_owner_closes_a_stream),
     case!(an_append_whose_ids_would_not_fit_an_offset_is_refused_before_it_writes),
-    case!(every_store_keeps_the_meta_fields_of_the_shared_vectors),
     case!(a_producer_field_has_the_shared_layout),
     case!(a_producer_field_of_another_format_is_refused),
 ];

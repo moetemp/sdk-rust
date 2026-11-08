@@ -19,11 +19,6 @@ import "temporal/api/failure/v1/message.proto";
 // Identifies one Stream. The id is opaque to callers.
 message StreamRef {
     string id = 1;
-    // Unset for a standalone Stream. For a Stream bound to a Workflow, business_id is the Workflow
-    // ID and run_id is the first execution run id of its run chain. For a Standalone Activity,
-    // business_id is the activity ID and run_id is its run id. A create and a close of a
-    // Workflow-owned Stream must carry its owner.
-    temporal.api.common.v1.Execution owner = 2;
     // The name of the backend that holds the Stream, as the Worker and client config register
     // it, so every process routes a ref it receives. Empty is the default backend. The Store
     // never reads it.
@@ -114,45 +109,17 @@ message Producer {
 }
 
 // Experimental. Might change in the future.
-// The Producer of a write, and which earlier Records the write withdraws. An append, a close and
-// a writer carry the same fields, so the Store orders and withdraws each write the same way.
+// The Producer of a write. An append and a close carry the same writer, so the Store orders each
+// write the same way.
 message StreamWriter {
-    // Required on a write. Its Producer's kind picks the withdrawal rule.
+    // Required on a write.
     Producer producer = 1;
-    // Set only by a Workflow or Local Activity write, since only a run withdraws orphaned Local
-    // Activity Records or a previous run. Unset for an Activity or client write.
-    RunWithdrawal withdrawal = 2;
-}
-
-// Experimental. Might change in the future.
-// What a Workflow or Local Activity write withdraws from its run. One write can carry both the task
-// facts and a run to withdraw, so these are fields of one message and not a oneof.
-message RunWithdrawal {
-    // The run's last completed Workflow Task, from a Local Activity's start. Its started_event_id
-    // is 0 before the first. The write withdraws the run's Local Activity Records whose Workflow
-    // Task never completed.
-    WorkflowTaskEpoch previous_completed_task = 1;
-    // The started event ids of the run's failed or timed out Workflow Tasks. The write withdraws
-    // the run's Local Activity Records of these tasks.
-    repeated int64 failed_tasks = 2;
-    // Retry run only. The previous run, on the retry run's first write. Every Record whose Producer
-    // carries it is withdrawn.
-    string withdraw_run = 3;
 }
 
 // Experimental. Might change in the future.
 // One Record of a batch to append. The Store adds the batch's Producer and an offset.
 message AppendRecord {
     temporal.api.common.v1.Payload body = 1;
-}
-
-// Experimental. Might change in the future.
-// Which earlier Records a retried Producer withdraws. The Store keeps these facts for the first
-// batch of a higher epoch, or for a retry run's first write, and a read builds a Superseded item
-// from them. A reader drops the earlier Records that the facts match.
-message StreamSuperseded {
-    // The writer of the batch that withdraws, with its withdrawal facts.
-    StreamWriter writer = 1;
 }
 
 // Experimental. Might change in the future.
@@ -179,13 +146,9 @@ message StreamClose {
 // offset against that Stream.
 message StreamRecord {
     int64 offset = 1;
-    // A read item is a Record, a Superseded item or the close.
+    // A read item is a Record or the close.
     oneof item {
         StreamData data = 2;
-        // The Store keeps only the withdrawal facts of the first batch of a higher epoch. A read
-        // builds this item from them. It withdraws the earlier Records that the facts match, and a
-        // reader drops them.
-        StreamSuperseded superseded = 3;
         StreamClose close = 4;
     }
 }

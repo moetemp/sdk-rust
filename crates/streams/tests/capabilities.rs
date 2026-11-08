@@ -6,7 +6,6 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use temporalio_common::protos::temporal::api::{common::v1::Execution, enums::v1::ExecutionType};
 use temporalio_streams::{
     MemoryStreamRuntime, StreamError, StreamResult, StreamRuntime,
     ids::client_producer_id,
@@ -15,7 +14,7 @@ use temporalio_streams::{
         AppendRecord, AppendRecordsRequest, ClientEpoch, ClientProducer, CloseStreamRequest,
         CreateStreamRequest, DescribeStreamRequest, DescribeStreamResponse, Producer,
         StreamErrorDetails, StreamErrorReason, StreamRef, StreamStatus, StreamWriter,
-        WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
+        producer::Kind,
     },
     store::{Appended, Batch, Capabilities, Closed, Create, Created, Entry, Store, StreamState},
 };
@@ -91,7 +90,6 @@ const NAMESPACE: &str = "ns";
 struct Case {
     ext: Arc<StreamRuntime>,
     memory: Arc<MemoryStore>,
-    run_id: String,
     stream: String,
 }
 
@@ -108,12 +106,10 @@ fn case(without: Capabilities) -> Case {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let run_id = format!("run-{unique}");
     Case {
         ext: MemoryStreamRuntime::with_store(store, None),
         memory,
-        stream: format!("wf:{run_id}"),
-        run_id,
+        stream: format!("wf:run-{unique}"),
     }
 }
 
@@ -126,11 +122,10 @@ fn client() -> Producer {
     }
 }
 
-/// The writer of a client's write, with no withdrawal facts.
+/// The writer of a client's write.
 fn client_writer() -> Option<StreamWriter> {
     Some(StreamWriter {
         producer: Some(client()),
-        ..Default::default()
     })
 }
 
@@ -171,60 +166,23 @@ impl Case {
     fn log_len(&self) -> usize {
         self.memory.test_log_len(NAMESPACE, &self.stream)
     }
-
-    fn created(&self) -> bool {
-        self.memory
-            .test_meta(NAMESPACE, &self.stream, b"v")
-            .is_some()
-    }
-
-    /// A create from a Workflow's call outside Workflow code, which names the owning run.
-    async fn create_owned(&self, withdraw_run: &str) -> Result<Vec<u8>, StreamError> {
-        let request = CreateStreamRequest {
-            namespace: NAMESPACE.to_string(),
-            withdraw_run: withdraw_run.to_string(),
-            owner: Some(Producer {
-                id: temporalio_streams::ids::workflow_producer_id(&self.run_id),
-                kind: Some(Kind::Workflow(WorkflowProducer {
-                    run_id: self.run_id.clone(),
-                    epoch: Some(WorkflowTaskEpoch::default()),
-                })),
-            }),
-            stream_ref: Some(StreamRef {
-                id: self.stream.clone(),
-                owner: Some(Execution {
-                    r#type: ExecutionType::Workflow as i32,
-                    business_id: "agent".to_string(),
-                    run_id: self.run_id.clone(),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        self.call("CreateStream", request).await
-    }
 }
 
 #[tokio::test]
-async fn an_append_without_the_fence_or_the_flag_is_refused_with_nothing_written() {
-    for (capability, name) in [
-        (Capabilities::PRODUCER_FENCE, "producer_fence"),
-        (Capabilities::WITHDRAWAL, "withdrawal"),
-    ] {
-        let case = case(capability);
-        case.create().await;
-        let request = AppendRecordsRequest {
-            namespace: NAMESPACE.to_string(),
-            r#ref: case.stream_ref(),
-            writer: client_writer(),
-            sequence: 1,
-            records: vec![AppendRecord::default()],
-            ..Default::default()
-        };
-        let error = case.call("AppendRecords", request).await.unwrap_err();
-        assert_eq!(refused_capability(&error), name);
-        assert_eq!(case.log_len(), 0);
-    }
+async fn an_append_without_the_fence_is_refused_with_nothing_written() {
+    let case = case(Capabilities::PRODUCER_FENCE);
+    case.create().await;
+    let request = AppendRecordsRequest {
+        namespace: NAMESPACE.to_string(),
+        r#ref: case.stream_ref(),
+        writer: client_writer(),
+        sequence: 1,
+        records: vec![AppendRecord::default()],
+        ..Default::default()
+    };
+    let error = case.call("AppendRecords", request).await.unwrap_err();
+    assert_eq!(refused_capability(&error), "producer_fence");
+    assert_eq!(case.log_len(), 0);
 }
 
 #[tokio::test]
@@ -273,23 +231,4 @@ async fn a_close_without_the_capability_is_refused_and_the_stream_stays_open() {
     let bytes = case.call("DescribeStream", describe).await.unwrap();
     let described = DescribeStreamResponse::decode(bytes.as_slice()).unwrap();
     assert_eq!(described.status, StreamStatus::Open as i32);
-}
-
-#[tokio::test]
-async fn a_workflow_create_without_the_safety_ttl_is_refused_before_it_writes() {
-    let case = case(Capabilities::SAFETY_TTL);
-    let error = case.create_owned("").await.unwrap_err();
-    assert_eq!(refused_capability(&error), "safety_ttl");
-    assert!(!case.created());
-}
-
-#[tokio::test]
-async fn a_retry_run_without_the_run_fence_is_refused_before_it_writes() {
-    let case = case(Capabilities::RUN_FENCE);
-    let error = case.create_owned("previous-run").await.unwrap_err();
-    assert_eq!(refused_capability(&error), "run_fence");
-    assert!(!case.created());
-    // A run that isn't a retry needs no run fence.
-    case.create_owned("").await.unwrap();
-    assert!(case.created());
 }

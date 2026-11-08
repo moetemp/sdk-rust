@@ -4,18 +4,15 @@
 
 use crate::{
     Reason, StreamError, StreamResult,
-    ids::encode_part,
-    proto::{Producer, StreamRef, WorkflowTaskEpoch},
+    proto::{Producer, StreamRef},
 };
 use std::time::Duration;
-use temporalio_common::protos::temporal::api::enums::v1::ExecutionType;
 use tokio::time::Instant;
 
 /// The Retention of a Stream whose create sets none, when a Store's options set no other.
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// How long an open Workflow-owned Stream stays after its last write, when a Store's options set
-/// no other.
+/// How long an open Stream stays after its last write, when a Store's options set no other.
 pub const DEFAULT_SAFETY_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 /// The format version this crate writes. A Stream with a higher one refuses writes.
@@ -39,33 +36,6 @@ pub const MAX_TTL: Duration = Duration::from_secs(315_576_000_000);
 /// next write.
 pub const MIN_RETENTION: Duration = Duration::from_millis(1);
 
-/// The owner run chain of a ref as `<workflow id>:<first run id>`, each part encoded, or empty
-/// for another owner. A Store keeps it on a Workflow-owned Stream and checks creates and closes on
-/// it.
-pub fn owner_chain(stream_ref: &StreamRef) -> String {
-    stream_ref
-        .owner
-        .as_ref()
-        .filter(|owner| owner.r#type == ExecutionType::Workflow as i32)
-        .map_or_else(String::new, |owner| {
-            format!(
-                "{}:{}",
-                encode_part(&owner.business_id),
-                encode_part(&owner.run_id)
-            )
-        })
-}
-
-/// Who created a Stream, which decides its TTL while it is open.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Owner {
-    /// Until it closes, the Stream expires `safety_ttl` after its last write.
-    Workflow,
-    /// The Stream has no owner. It expires one Retention after its last write.
-    #[default]
-    Client,
-}
-
 /// What a create does when its Stream exists and is open, and the create isn't a retry of the
 /// create that made the Stream.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -82,15 +52,11 @@ pub enum ConflictPolicy {
 pub struct Create<'a> {
     /// The Retention, `None` for the Store default.
     pub retention: Option<Duration>,
-    /// Who creates the Stream.
-    pub owner: Owner,
     /// What the create does when the Stream exists.
     pub conflict: ConflictPolicy,
     /// Unique for each create call, and the same on its retries. Empty for none. The Store keeps
     /// the request id of the create that made the Stream, so a retry after a lost answer succeeds.
     pub request_id: &'a str,
-    /// What a retry run's create withdraws.
-    pub withdrawal: Withdrawal<'a>,
 }
 
 /// What a create found.
@@ -110,38 +76,6 @@ pub struct Created {
     pub outcome: CreateOutcome,
     /// The Retention of the Stream, the stored one if it existed.
     pub retention: Duration,
-    /// Whether the create withdrew a retry run's previous run.
-    pub flagged: bool,
-}
-
-/// The withdrawal facts of a batch, and the `Superseded` item that they make.
-#[derive(Debug, Clone, Default)]
-pub struct Withdrawal<'a> {
-    /// A retry run's previous run.
-    pub withdraw_run: &'a str,
-    /// The encoded `Superseded` facts, which the log keeps when the batch withdraws something.
-    pub superseded: &'a [u8],
-    /// The run's task facts of a Local Activity batch, which withdraw the run's orphaned Local
-    /// Activity Records and fence their later writes.
-    pub tasks: Option<TaskFacts<'a>>,
-}
-
-/// The run's Workflow Task facts that a Local Activity batch gives. A task of the run after
-/// `completed` and before the batch's own task, or one in `failed_tasks`, never completed, so
-/// its Local Activity Records are orphans.
-///
-/// A Store keeps the task of each Local Activity batch with Records, also of one with no facts, so
-/// that a later batch's facts withdraw it. It also keeps the facts of the run's highest task and
-/// fences a write whose task they show never completed, since a task can fail before its call
-/// writes.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct TaskFacts<'a> {
-    /// The run's last completed Workflow Task, `None` before the first one.
-    pub completed: Option<&'a WorkflowTaskEpoch>,
-    /// The started event ids of the run's failed Workflow Tasks.
-    pub failed_tasks: &'a [i64],
-    /// The encoded Workflow-kind `Superseded` facts that withdraw the orphans.
-    pub superseded: &'a [u8],
 }
 
 /// One batch of one Producer.
@@ -156,20 +90,15 @@ pub struct Batch<'a> {
     pub records: &'a [Vec<u8>],
     /// The [crate::digest::batch_digest] of the batch, which the dedupe entry keeps.
     pub digest: [u8; crate::digest::DIGEST_LEN],
-    /// What the batch withdraws.
-    pub withdrawal: Withdrawal<'a>,
 }
 
 /// The result of an append.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Appended {
-    /// The offsets of the first and the last entry, `None` for an empty batch with no
-    /// `Superseded` item.
+    /// The offsets of the first and the last entry, `None` for an empty batch.
     pub offsets: Option<(i64, i64)>,
     /// The Store already had the batch, so the offsets are those of the first result.
     pub resend: bool,
-    /// The batch withdrew earlier Records.
-    pub flagged: bool,
 }
 
 /// The result of a close.
@@ -229,10 +158,8 @@ impl StreamState {
 pub struct Entry {
     /// Its offset.
     pub offset: i64,
-    /// The encoded Record, absent on an entry that only withdraws.
+    /// The encoded Record.
     pub record: Option<Vec<u8>>,
-    /// The encoded `Superseded` facts of a flagged batch.
-    pub superseded: Option<Vec<u8>>,
 }
 
 /// The rules that a Store applies atomically beyond the log. The service checks a capability before
@@ -244,28 +171,18 @@ pub struct Capabilities(u8);
 impl Capabilities {
     /// Each append checks the Producer's epoch and its last `sequence` before it writes.
     pub const PRODUCER_FENCE: Self = Self(1);
-    /// Each append flags the first batch of a Producer's newer epoch, which withdraws the
-    /// Records of its earlier ones.
-    pub const WITHDRAWAL: Self = Self(1 << 1);
-    /// A retry run's first write withdraws the previous run and fences its Producers.
-    pub const RUN_FENCE: Self = Self(1 << 2);
     /// A close marks the Stream closed and wakes the waiting reads. Every later append is
     /// refused.
-    pub const CLOSE: Self = Self(1 << 3);
-    /// An open Workflow-owned Stream keeps the safety TTL, not the Retention.
-    pub const SAFETY_TTL: Self = Self(1 << 4);
+    pub const CLOSE: Self = Self(1 << 1);
     /// An append with sequence zero takes the next one of the Producer's epoch, in the same atomic
     /// step as the dedupe check. So two such batches never get the same number.
-    pub const NEXT_SEQUENCE: Self = Self(1 << 5);
+    pub const NEXT_SEQUENCE: Self = Self(1 << 2);
     /// Every capability.
-    pub const ALL: Self = Self((1 << 6) - 1);
+    pub const ALL: Self = Self((1 << 3) - 1);
 
-    const NAMES: [(Self, &'static str); 6] = [
+    const NAMES: [(Self, &'static str); 3] = [
         (Self::PRODUCER_FENCE, "producer_fence"),
-        (Self::WITHDRAWAL, "withdrawal"),
-        (Self::RUN_FENCE, "run_fence"),
         (Self::CLOSE, "close"),
-        (Self::SAFETY_TTL, "safety_ttl"),
         (Self::NEXT_SEQUENCE, "next_sequence"),
     ];
 
@@ -322,14 +239,11 @@ pub trait Store: Send + Sync + 'static {
     /// another one must say what it forwards.
     fn capabilities(&self) -> Capabilities;
 
-    /// Creates a Stream. The calls that write take the Stream's whole ref, since the server
-    /// finds a Workflow's Stream by its owner.
+    /// Creates a Stream.
     ///
-    /// The create of an existing Stream fails with [Reason::Expired], [Reason::NotOwner] or
-    /// [Reason::Closed], in this order. Then a retry of the create that made the Stream, with the
-    /// same request id, gets [CreateOutcome::Created] and changes nothing. Any other create
-    /// applies its [ConflictPolicy]. With [Capabilities::RUN_FENCE], a retry run's create
-    /// withdraws its previous run.
+    /// The create of an existing Stream fails with [Reason::Expired] or [Reason::Closed], in this
+    /// order. Then a retry of the create that made the Stream, with the same request id, gets
+    /// [CreateOutcome::Created] and changes nothing. Any other create applies its [ConflictPolicy].
     async fn create(
         &self,
         namespace: &str,
@@ -400,9 +314,13 @@ mod tests {
         let some = Capabilities::PRODUCER_FENCE.union(Capabilities::CLOSE);
         some.require(Capabilities::CLOSE).unwrap();
         let error = some
-            .require(Capabilities::CLOSE.union(Capabilities::SAFETY_TTL))
+            .require(Capabilities::CLOSE.union(Capabilities::NEXT_SEQUENCE))
             .unwrap_err();
         assert_eq!(error.reason, Reason::Unsupported);
-        assert!(error.message.ends_with("safety_ttl"), "{}", error.message);
+        assert!(
+            error.message.ends_with("next_sequence"),
+            "{}",
+            error.message
+        );
     }
 }

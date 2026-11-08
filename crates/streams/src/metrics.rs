@@ -8,7 +8,6 @@ use temporalio_common::telemetry::metrics::{
 pub(crate) struct Metrics {
     attributes: MetricAttributes,
     fenced: Counter,
-    superseded: Counter,
     blocking_reads_waiting: UpDownCounter,
 }
 
@@ -30,12 +29,7 @@ impl Metrics {
             attributes: meter.get_default_attributes().clone(),
             fenced: meter.counter(parameters(
                 "stream_fenced",
-                "Batches that the Store refused for a lower epoch or a withdrawn run",
-                "",
-            )),
-            superseded: meter.counter(parameters(
-                "stream_superseded",
-                "Superseded flags that the Store set",
+                "Batches that the Store refused for a lower epoch",
                 "",
             )),
             blocking_reads_waiting: meter.up_down_counter(parameters(
@@ -48,10 +42,6 @@ impl Metrics {
 
     pub(crate) fn fenced(&self) {
         self.fenced.add(1, &self.attributes);
-    }
-
-    pub(crate) fn superseded(&self) {
-        self.superseded.add(1, &self.attributes);
     }
 
     pub(crate) fn read_waits(&self, waiting: bool) {

@@ -4,24 +4,19 @@
 use crate::{
     Reason, StreamError, StreamResult,
     digest::batch_digest,
-    epoch::{
-        ProducerKind, producer_run_id, task_of, withdraws, writer_failed_tasks,
-        writer_previous_completed_task, writer_withdraw_run,
-    },
+    epoch::{ProducerKind, task_of},
     ids::{check_producer, check_stream_id},
     metrics::Metrics,
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        Producer, ReadRecordsRequest, ReadRecordsResponse, RunWithdrawal, StreamClose,
-        StreamIdConflictPolicy, StreamReadStart, StreamRecord, StreamRef, StreamStatus,
-        StreamSuperseded, StreamWriter, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
-        stream_record::Item,
+        Producer, ReadRecordsRequest, ReadRecordsResponse, StreamClose, StreamIdConflictPolicy,
+        StreamReadStart, StreamRecord, StreamRef, StreamStatus, stream_record::Item,
     },
-    record::{data_records, superseded},
+    record::data_records,
     store::{
         Batch, Capabilities, ConflictPolicy, Create, CreateOutcome, FORMAT_VERSION, MAX_SEQUENCE,
-        MAX_TTL, MIN_RETENTION, Owner, Store, StreamState, TaskFacts, Withdrawal, owner_chain,
+        MAX_TTL, MIN_RETENTION, Store, StreamState,
     },
 };
 use prost::Message;
@@ -108,45 +103,6 @@ fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
     Ok(id)
 }
 
-/// The `Superseded` facts of a create that withdraws a retry run's previous run. It has no epoch,
-/// so a Reader withdraws only that run's Records.
-fn run_superseded(owner: Option<&Producer>, withdraw_run: &str) -> Vec<u8> {
-    let producer = Producer {
-        kind: None,
-        ..owner.cloned().unwrap_or_default()
-    };
-    superseded(&producer, withdraw_run)
-}
-
-/// The `Superseded` facts that withdraw a run's orphaned Local Activity Records. Their writer is
-/// the run's Workflow Producer in the batch's task, so that a Reader applies the Workflow rule.
-fn orphan_superseded(
-    producer: &Producer,
-    completed: Option<&WorkflowTaskEpoch>,
-    failed_tasks: &[i64],
-) -> Vec<u8> {
-    let run_id = producer_run_id(producer);
-    let task = task_of(producer.kind.as_ref());
-    let workflow = Producer {
-        id: crate::ids::workflow_producer_id(run_id),
-        kind: Some(Kind::Workflow(WorkflowProducer {
-            run_id: run_id.to_string(),
-            epoch: Some(task),
-        })),
-    };
-    StreamSuperseded {
-        writer: Some(StreamWriter {
-            producer: Some(workflow),
-            withdrawal: Some(RunWithdrawal {
-                previous_completed_task: completed.copied(),
-                failed_tasks: failed_tasks.to_vec(),
-                withdraw_run: String::new(),
-            }),
-        }),
-    }
-    .encode_to_vec()
-}
-
 /// Checks a Producer that writes outside Workflow code.
 fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
     let producer = producer.ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
@@ -167,52 +123,7 @@ fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
     Ok(producer)
 }
 
-/// Refuses task facts that a Store would drop or misread. Only a Local Activity has its run's task
-/// facts, and a failed task is a started event id, which is never zero or negative.
-fn check_task_facts(kind: ProducerKind, writer: &StreamWriter) -> StreamResult<()> {
-    let completed = writer_previous_completed_task(writer);
-    if completed.is_none() && writer_failed_tasks(writer).is_empty() {
-        return Ok(());
-    }
-    if kind != ProducerKind::LocalActivity {
-        return Err(StreamError::invalid(
-            "Only a Local Activity sends its run's task facts",
-        ));
-    }
-    if completed.is_none() {
-        return Err(StreamError::invalid(
-            "Failed tasks need the run's last completed task",
-        ));
-    }
-    if completed.is_some_and(|c| c.started_event_id < 0)
-        || writer_failed_tasks(writer).iter().any(|&id| id <= 0)
-    {
-        return Err(StreamError::invalid(
-            "A task's started event id must be positive",
-        ));
-    }
-    Ok(())
-}
-
-/// Checks the owner of a create, which must be a Workflow run with a ref of its run chain. A
-/// Store stores that chain and checks every later create and close against it.
-fn create_owner<'a>(owner: &'a Producer, stream_ref: &StreamRef) -> StreamResult<&'a Producer> {
-    check_producer(owner)?;
-    if ProducerKind::try_from(owner)? != ProducerKind::Workflow {
-        return Err(StreamError::invalid(
-            "The owner of a create is a Workflow Producer",
-        ));
-    }
-    if owner_chain(stream_ref).is_empty() {
-        return Err(StreamError::invalid(
-            "A create with an owner needs a ref whose owner is the Workflow's run chain",
-        ));
-    }
-    Ok(owner)
-}
-
-/// Checks the Producer of a close. A Workflow's close Activity closes as the run's Workflow
-/// Producer, so a Workflow Producer may close.
+/// Checks the Producer of a close.
 fn close_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
     let producer = producer.ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
     check_producer(producer)?;
@@ -228,54 +139,18 @@ impl StreamService {
         let stream = request.stream_ref.clone().unwrap_or_default();
         let retention = retention(request.retention)?;
         let conflict = conflict_policy(request.id_conflict_policy)?;
-        // A Workflow's call from outside Workflow code, such as from a Local Activity, sets the
-        // owner run. Then the Stream has the safety TTL of a Workflow-owned Stream.
-        let owner = match &request.owner {
-            Some(owner) => {
-                create_owner(owner, &stream)?;
-                self.store
-                    .capabilities()
-                    .require(Capabilities::SAFETY_TTL)?;
-                Owner::Workflow
-            }
-            None => Owner::Client,
-        };
-        if !request.withdraw_run.is_empty() {
-            // The `Superseded` item names its Producer, which here can only be the owner. Any other
-            // caller could withdraw and fence an unrelated run, as on the append.
-            let Some(owner) = &request.owner else {
-                return Err(StreamError::invalid(
-                    "A create with withdraw_run needs the owner run",
-                ));
-            };
-            if request.withdraw_run == producer_run_id(owner) {
-                return Err(StreamError::invalid("A run doesn't withdraw itself"));
-            }
-            self.store.capabilities().require(Capabilities::RUN_FENCE)?;
-        }
-        let bytes = run_superseded(request.owner.as_ref(), &request.withdraw_run);
         let create = Create {
             retention,
-            owner,
             conflict,
             request_id: &request.request_id,
-            withdrawal: Withdrawal {
-                withdraw_run: &request.withdraw_run,
-                superseded: &bytes,
-                tasks: None,
-            },
         };
         let created = self
             .store
             .create(&request.namespace, &stream, &create)
             .await?;
-        if created.flagged {
-            self.metrics.superseded();
-        }
         Ok(CreateStreamResponse {
             r#ref: Some(StreamRef {
                 id: stream.id,
-                owner: stream.owner.filter(|_| owner == Owner::Workflow),
                 backend: self.backend.clone(),
             }),
             created: created.outcome == CreateOutcome::Created,
@@ -290,16 +165,15 @@ impl StreamService {
         let stream = request.r#ref.clone().unwrap_or_default();
         let writer = request.writer.unwrap_or_default();
         let producer = outside_producer(writer.producer.as_ref())?;
-        let kind = ProducerKind::try_from(producer)?;
         if !(0..=MAX_SEQUENCE).contains(&request.sequence) {
             return Err(StreamError::invalid(
                 "The sequence must be from 1 to 2^53 - 1, or zero for the next one",
             ));
         }
-        // Without the fence and the flag, a copy or a stale batch would reach Readers.
+        // Without the fence, a stale batch would reach Readers.
         self.store
             .capabilities()
-            .require(Capabilities::PRODUCER_FENCE.union(Capabilities::WITHDRAWAL))?;
+            .require(Capabilities::PRODUCER_FENCE)?;
         if request.sequence == 0 {
             // A call with no writer state sends no sequence. Only the Store can number the batch in
             // the same step as its dedupe check.
@@ -307,41 +181,13 @@ impl StreamService {
                 .capabilities()
                 .require(Capabilities::NEXT_SEQUENCE)?;
         }
-        let withdraw_run = writer_withdraw_run(&writer);
-        if !withdraw_run.is_empty() {
-            // Only a retry run's Local Activity withdraws its previous run, as only the owner's
-            // create does. Any other Producer could withdraw and fence an unrelated run.
-            if kind != ProducerKind::LocalActivity || withdraw_run == producer_run_id(producer) {
-                return Err(StreamError::invalid(
-                    "Only a Local Activity of a later run withdraws a run",
-                ));
-            }
-            self.store.capabilities().require(Capabilities::RUN_FENCE)?;
-        }
-        check_task_facts(kind, &writer)?;
         let digest = batch_digest(&request.records);
         let records = data_records(producer, request.records)?;
-        let bytes = superseded(producer, withdraw_run);
-        // A Local Activity sends its run's task facts, so that the batch withdraws the run's
-        // orphaned Local Activity Records. These are the Records of the tasks that never completed.
-        let completed = writer_previous_completed_task(&writer).filter(|c| c.started_event_id > 0);
-        let orphans = (kind == ProducerKind::LocalActivity
-            && writer_previous_completed_task(&writer).is_some())
-        .then(|| orphan_superseded(producer, completed, writer_failed_tasks(&writer)));
         let batch = Batch {
             producer,
             sequence: request.sequence,
             records: &records,
             digest,
-            withdrawal: Withdrawal {
-                withdraw_run,
-                superseded: &bytes,
-                tasks: orphans.as_ref().map(|orphans| TaskFacts {
-                    completed,
-                    failed_tasks: writer_failed_tasks(&writer),
-                    superseded: orphans,
-                }),
-            },
         };
         let appended = self.store.append(&request.namespace, &stream, &batch).await;
         let appended = self.count(appended)?;
@@ -352,12 +198,12 @@ impl StreamService {
         })
     }
 
-    /// Counts a fence or a flag of an append on the metrics.
-    pub(crate) fn count<T: Flagged>(&self, result: StreamResult<T>) -> StreamResult<T> {
-        match &result {
-            Ok(value) if value.flagged() => self.metrics.superseded(),
-            Err(error) if error.reason == Reason::Fenced => self.metrics.fenced(),
-            _ => {}
+    /// Counts a fence of an append on the metrics.
+    fn count<T>(&self, result: StreamResult<T>) -> StreamResult<T> {
+        if let Err(error) = &result
+            && error.reason == Reason::Fenced
+        {
+            self.metrics.fenced();
         }
         result
     }
@@ -489,9 +335,8 @@ impl StreamService {
         }
     }
 
-    /// The newest `last` Records, oldest first, and `done` for a closed Stream. A Record that a
-    /// newer `Superseded` item withdraws doesn't count. It never waits, and it stops after
-    /// [MAX_SCAN] entries or [MAX_SCAN_BYTES] of them.
+    /// The newest `last` Records, oldest first, and `done` for a closed Stream. It never waits, and
+    /// it stops after [MAX_SCAN] entries or [MAX_SCAN_BYTES] of them.
     async fn read_last(
         &self,
         request: ReadRecordsRequest,
@@ -515,7 +360,6 @@ impl StreamService {
         check_expiry(&state, 0)?;
         let retained = state.retained_from();
         let mut picked = vec![];
-        let mut withdrawals: Vec<StreamSuperseded> = vec![];
         let (mut bytes, mut scanned, mut scanned_bytes) = (0, 0, 0);
         let mut before = state.newest;
         'scan: while before >= retained
@@ -538,30 +382,20 @@ impl StreamService {
                 }
                 before = entry.offset - 1;
                 scanned += 1;
-                scanned_bytes += entry.record.as_ref().map_or(0, Vec::len)
-                    + entry.superseded.as_ref().map_or(0, Vec::len);
-                // An entry's `Superseded` item withdraws earlier Records, not the entry's own.
-                if let Some(record) = entry.record {
-                    let record = decode(&record, entry.offset)?;
+                scanned_bytes += entry.record.as_ref().map_or(0, Vec::len);
+                if let Some(encoded) = entry.record {
+                    let record = decode(&encoded, entry.offset)?;
                     let size = record.encoded_len();
-                    if !withdrawals.iter().any(|s| withdraws(s, &record)) {
-                        // A Record over the cap is still returned alone, so that the read always
-                        // returns a Record.
-                        if !picked.is_empty() && bytes + size > max_bytes {
-                            break 'scan;
-                        }
-                        bytes += size;
-                        picked.push(record);
-                        if picked.len() == count {
-                            break 'scan;
-                        }
+                    // A Record over the cap is still returned alone, so that the read always
+                    // returns a Record.
+                    if !picked.is_empty() && bytes + size > max_bytes {
+                        break 'scan;
                     }
-                }
-                if let Some(superseded) = entry.superseded {
-                    withdrawals.push(
-                        StreamSuperseded::decode(superseded.as_slice())
-                            .map_err(|error| StreamError::storage_corrupt(error.to_string()))?,
-                    );
+                    bytes += size;
+                    picked.push(record);
+                    if picked.len() == count {
+                        break 'scan;
+                    }
                 }
             }
         }
@@ -649,30 +483,24 @@ impl StreamService {
                     start = next;
                     continue;
                 }
-                let mut items = vec![];
-                if let Some(bytes) = entry.superseded {
-                    let superseded = StreamSuperseded::decode(bytes.as_slice())
-                        .map_err(|error| StreamError::storage_corrupt(error.to_string()))?;
-                    items.push(StreamRecord {
-                        offset: entry.offset,
-                        item: Some(Item::Superseded(superseded)),
-                    });
-                }
-                if let Some(bytes) = entry.record {
-                    items.push(decode(&bytes, entry.offset)?);
-                }
+                let Some(encoded) = entry.record else {
+                    next = entry.offset + 1;
+                    start = next;
+                    continue;
+                };
+                let record = decode(&encoded, entry.offset)?;
                 // An entry over the caps is still returned alone, so that the read always makes
                 // progress. The next read starts at the entry that didn't fit.
-                let size: usize = items.iter().map(Message::encoded_len).sum();
+                let size = record.encoded_len();
                 pulled = (pulled.0 + size, pulled.1 + 1);
-                let over = bytes + size > max_bytes || records.len() + items.len() > max;
+                let over = bytes + size > max_bytes || records.len() + 1 > max;
                 if !records.is_empty() && over {
                     full = true;
                     next = entry.offset;
                     break;
                 }
                 bytes += size;
-                records.extend(items);
+                records.push(record);
                 next = entry.offset + 1;
                 start = next;
                 if records.len() >= max {
@@ -758,15 +586,4 @@ fn max_bytes(value: i64) -> StreamResult<usize> {
 
 fn expired() -> StreamError {
     StreamError::new(Reason::Expired, "The Records at the offset expired")
-}
-
-/// A Store answer that may have withdrawn Records.
-pub(crate) trait Flagged {
-    fn flagged(&self) -> bool;
-}
-
-impl Flagged for crate::store::Appended {
-    fn flagged(&self) -> bool {
-        self.flagged
-    }
 }
