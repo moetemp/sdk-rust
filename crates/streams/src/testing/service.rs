@@ -13,9 +13,9 @@ use crate::{
         ClientEpoch, ClientProducer, CloseStreamRequest, CloseStreamResponse, CreateStreamRequest,
         CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse, LocalActivityEpoch,
         LocalActivityProducer, Producer, ReadRecordsRequest, ReadRecordsResponse, RunWithdrawal,
-        StreamErrorDetails, StreamIdConflictPolicy, StreamReadStart, StreamRecord, StreamRef,
-        StreamStatus, StreamSuperseded, StreamWriter, WorkflowProducer, WorkflowTaskEpoch,
-        producer::Kind, stream_record::Item,
+        StreamCloseStatus, StreamErrorDetails, StreamIdConflictPolicy, StreamReadStart,
+        StreamRecord, StreamRef, StreamStatus, StreamSuperseded, StreamWriter, WorkflowProducer,
+        WorkflowTaskEpoch, producer::Kind, stream_record::Item,
     },
 };
 use prost::Message;
@@ -257,6 +257,7 @@ fn texts(response: &ReadRecordsResponse) -> Vec<String> {
         .map(|record| match &record.item {
             Some(Item::Data(data)) => String::from_utf8(data.body.clone().unwrap().data).unwrap(),
             Some(Item::Superseded(_)) => "<superseded>".to_string(),
+            Some(Item::Close(_)) => "<close>".to_string(),
             None => "?".to_string(),
         })
         .collect()
@@ -753,7 +754,7 @@ async fn a_close_ends_every_read_with_done() {
         case.append(client(1), 1, vec![record("1")]).await.unwrap();
         case.close(client(1)).await.unwrap();
         let read = case.read(ReadRecordsRequest::default()).await.unwrap();
-        assert_eq!(texts(&read), ["1"]);
+        assert_eq!(texts(&read), ["1", "<close>"]);
         assert!(read.done);
         let again = case
             .read(ReadRecordsRequest {
@@ -776,6 +777,26 @@ async fn a_close_ends_every_read_with_done() {
             (error.code(), reason(&error).as_str()),
             (Code::FailedPrecondition, "stream_closed")
         );
+    }
+}
+
+/// A read of a closed Stream ends with a StreamClose item, at the offset after the newest Record.
+/// Its status is CLOSED, and its Producer is the one that closed the Stream.
+async fn a_closed_read_ends_with_a_close_item() {
+    for case in cases_for(Needs::CALLS).await {
+        case.create(None).await.unwrap();
+        let written = case.append(client(1), 1, vec![record("1")]).await.unwrap();
+        case.close(client(1)).await.unwrap();
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert!(read.done);
+        let last = read.records.last().expect("a close item");
+        assert_eq!(last.offset, written.last_offset + 1);
+        let Some(Item::Close(close)) = &last.item else {
+            panic!("not a close item: {:?}", last.item);
+        };
+        assert_eq!(close.status, StreamCloseStatus::Closed as i32);
+        assert_eq!(close.producer, Some(client(1)));
+        assert!(close.result.is_none() && close.failure.is_none());
     }
 }
 
@@ -1802,7 +1823,7 @@ async fn a_read_of_a_closed_stream_with_no_item_left_answers_at_once() {
             })
             .await
             .unwrap();
-        assert_eq!(texts(&rest), ["2"]);
+        assert_eq!(texts(&rest), ["2", "<close>"]);
         assert!(rest.done);
         for request in [
             ReadRecordsRequest {
@@ -1946,6 +1967,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_read_waits_for_the_create_only_as_long_as_create_wait),
     case!(a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append),
     case!(a_close_ends_every_read_with_done),
+    case!(a_closed_read_ends_with_a_close_item),
     case!(an_unknown_method_is_unimplemented),
     case!(a_read_of_an_expired_open_stream_fails_instead_of_waiting),
     case!(a_read_of_an_expired_closed_stream_fails_instead_of_waiting),

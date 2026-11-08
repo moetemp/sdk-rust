@@ -13,9 +13,10 @@ use crate::{
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        Producer, ReadRecordsRequest, ReadRecordsResponse, RunWithdrawal, StreamIdConflictPolicy,
-        StreamReadStart, StreamRecord, StreamRef, StreamStatus, StreamSuperseded, StreamWriter,
-        WorkflowProducer, WorkflowTaskEpoch, producer::Kind, stream_record::Item,
+        Producer, ReadRecordsRequest, ReadRecordsResponse, RunWithdrawal, StreamClose,
+        StreamIdConflictPolicy, StreamReadStart, StreamRecord, StreamRef, StreamStatus,
+        StreamSuperseded, StreamWriter, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
+        stream_record::Item,
     },
     record::{data_records, superseded},
     store::{
@@ -620,6 +621,9 @@ impl StreamService {
         let mut pulled = (0, 0);
         // Whether the Stream was closed, and its newest offset, at the newest Store read.
         let mut end = (state.closed, state.newest);
+        // The closer and the status at the newest Store read, for the final close item.
+        let mut closer = state.closer.clone();
+        let mut close_status = state.close_status;
         while records.len() < max && !full {
             let room = (max_bytes != usize::MAX).then(|| max_bytes.saturating_sub(bytes));
             let chunk = chunk_len(max - records.len(), room, pulled);
@@ -627,6 +631,8 @@ impl StreamService {
             // A trim after the state read leaves a gap before these entries.
             check_expiry(&chunk_state, if from > 0 { start } else { 0 })?;
             end = (chunk_state.closed, chunk_state.newest);
+            close_status = chunk_state.close_status;
+            closer = chunk_state.closer;
             if entries.is_empty() {
                 // Only an expired log has no entry at an offset up to `newest`.
                 if from > 0 && start == from && from <= chunk_state.newest {
@@ -678,6 +684,25 @@ impl StreamService {
         let done = end.0 && start > end.1;
         if records.is_empty() && !done {
             return Ok(None);
+        }
+        // The read that reaches the end of a closed Stream ends with its close item, at the offset
+        // after the newest Record. A read that starts past the newest Record already saw it, so it
+        // doesn't repeat it, and `next_offset` stays at the close offset.
+        if done && from <= end.1 {
+            let producer = closer
+                .as_deref()
+                .map(Producer::decode)
+                .transpose()
+                .map_err(|error| StreamError::storage_corrupt(error.to_string()))?;
+            records.push(StreamRecord {
+                offset: end.1 + 1,
+                item: Some(Item::Close(StreamClose {
+                    producer,
+                    result: None,
+                    failure: None,
+                    status: close_status,
+                })),
+            });
         }
         let page = ReadRecordsResponse {
             records,

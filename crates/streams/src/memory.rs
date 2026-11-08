@@ -10,13 +10,14 @@ use crate::{
     },
     ids::{StreamKeys, encode_part},
     offset::{entry_id_of_offset, offset_of_entry_id},
-    proto::{Producer, StreamRef, WorkflowTaskEpoch},
+    proto::{Producer, StreamCloseStatus, StreamRef, WorkflowTaskEpoch},
     store::{
         Appended, Batch, Capabilities, Closed, ConflictPolicy, Create, CreateOutcome, Created,
         Entry, FORMAT_VERSION, MAX_SEQUENCE, Owner, Store, StreamState, TOMBSTONE, owner_chain,
     },
 };
 use parking_lot::Mutex;
+use prost::Message;
 use std::{
     collections::{BTreeMap, HashMap},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -971,6 +972,10 @@ impl Store for MemoryStore {
                 ));
             }
             keys.set("closed", "1");
+            // A read builds the final StreamClose item from the closer and the status. A Brook
+            // Store only ever closes with CLOSED.
+            keys.set("closer", producer.encode_to_vec());
+            keys.set("cstat", (StreamCloseStatus::Closed as i32).to_string());
             keys.refresh(now, 0, tombstone);
             Ok(false)
         });
@@ -1003,6 +1008,8 @@ impl Store for MemoryStore {
                 exists: keys.get("v").is_some(),
                 version: number("v") as u32,
                 closed: keys.get("closed").is_some(),
+                closer: keys.get("closer").map(<[u8]>::to_vec),
+                close_status: number("cstat") as i32,
                 newest: offset("newest")?,
                 trimmed: offset("trimmed")?,
                 retention: Duration::from_millis(number("ret").max(0) as u64),

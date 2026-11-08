@@ -188,6 +188,12 @@ pub struct StreamState {
     pub version: u32,
     /// The Stream is closed. Every later append fails, so `newest` is final.
     pub closed: bool,
+    /// The encoded [Producer] that closed the Stream, `None` when it is open. A read builds the
+    /// final `StreamClose` item from it.
+    pub closer: Option<Vec<u8>>,
+    /// Why the Stream closed, as a `StreamCloseStatus`, zero when it is open. A Brook Store only
+    /// sets CLOSED.
+    pub close_status: i32,
     /// The offset of the newest entry written, zero if none.
     pub newest: i64,
     /// The offset of the newest entry that Retention dropped, zero if none.
