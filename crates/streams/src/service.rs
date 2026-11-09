@@ -526,8 +526,6 @@ impl StreamService {
                 offset: end.1 + 1,
                 item: Some(Item::Close(StreamClose {
                     producer,
-                    result: None,
-                    failure: None,
                     status: close_status,
                 })),
             });

@@ -627,7 +627,6 @@ async fn a_closed_read_ends_with_a_close_item() {
         };
         assert_eq!(close.status, StreamCloseStatus::Closed as i32);
         assert_eq!(close.producer, Some(client(1)));
-        assert!(close.result.is_none() && close.failure.is_none());
     }
 }
 

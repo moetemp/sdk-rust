@@ -13,7 +13,6 @@ import "google/protobuf/timestamp.proto";
 
 import "temporal/api/common/v1/message.proto";
 import "temporal/api/enums/v1/stream.proto";
-import "temporal/api/failure/v1/message.proto";
 
 // Experimental. Might change in the future.
 // Identifies one Stream. The id is opaque to callers.
@@ -61,7 +60,7 @@ message ClientEpoch {
 }
 
 // Experimental. Might change in the future.
-// A Workflow run Producer. It writes in its Workflow Task. A higher epoch withdraws the Records of
+// A Workflow run Producer. It writes in its Workflow Task. A higher epoch supersedes the Records of
 // the run's Workflow Tasks that never completed, with those of their Local Activities.
 message WorkflowProducer {
     // The first execution run id of the run chain.
@@ -70,7 +69,7 @@ message WorkflowProducer {
 }
 
 // Experimental. Might change in the future.
-// A Local Activity Producer. A higher epoch withdraws the Producer's lower epochs.
+// A Local Activity Producer. A higher epoch supersedes the Producer's lower epochs.
 message LocalActivityProducer {
     string run_id = 1;
     LocalActivityEpoch epoch = 2;
@@ -78,7 +77,7 @@ message LocalActivityProducer {
 
 // Experimental. Might change in the future.
 // An Activity Producer, for an Activity of a Workflow or a Standalone Activity. A higher epoch
-// withdraws the Producer's lower epochs.
+// supersedes the Producer's lower epochs.
 message ActivityProducer {
     string run_id = 1;
     ActivityEpoch epoch = 2;
@@ -93,7 +92,7 @@ message ClientProducer {
 
 // Experimental. Might change in the future.
 // The code that wrote a batch. Its id stays the same across attempts, and the kind's case orders
-// its epochs and picks which earlier Records a higher epoch withdraws. A run-based kind carries its
+// its epochs and picks which earlier Records a higher epoch supersedes. A run-based kind carries its
 // run, so a client can't.
 message Producer {
     // Stable across attempts, such as `wf:<run id>` for the Workflow Producer of a run.
@@ -134,9 +133,9 @@ message StreamData {
 message StreamClose {
     // The Producer that closed the Stream.
     Producer producer = 1;
-    temporal.api.common.v1.Payload result = 2;
-    temporal.api.failure.v1.Failure failure = 3;
-    // Which of result or failure is set, and why the Stream closed.
+    reserved 2, 3;
+    reserved "result", "failure";
+    // Why the Stream closed.
     temporal.api.enums.v1.StreamCloseStatus status = 4;
 }
 
