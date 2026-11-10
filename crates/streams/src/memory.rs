@@ -24,8 +24,6 @@ use tokio::{sync::Notify, time::Instant};
 
 /// The number of sequence numbers in one millisecond, since an offset packs them in 20 bits.
 const SEQ_LIMIT: u64 = 1 << crate::offset::SEQ_BITS;
-/// The most Producers that one append prunes, as `PRUNE_LIMIT` in `lib.lua`.
-const PRUNE_LIMIT: usize = 64;
 
 #[derive(Clone, Default)]
 struct Fields {
@@ -43,9 +41,6 @@ struct Keys {
     log_expires: i64,
     /// The newest id of the log, which Redis drops with the expired key.
     last_id: (u64, u64),
-    /// The `producers` sorted set, each `<kind>|<producer id>` with the ms of its last append.
-    producers: HashMap<String, i64>,
-    producers_expires: i64,
 }
 
 /// A Store in process memory, with the rules of the Redis scripts.
@@ -196,10 +191,6 @@ impl Keys {
         self.meta.insert(field.into(), value.into());
     }
 
-    fn remove(&mut self, field: impl AsRef<[u8]>) {
-        self.meta.remove(field.as_ref());
-    }
-
     /// The `check_live` step, which checks the create key, the format version and the expiry.
     fn check_live(&self, now: i64) -> StreamResult<()> {
         if self.get("v").is_none() {
@@ -236,27 +227,6 @@ impl Keys {
         if self.log.is_some() {
             self.log_expires = exp;
         }
-        if !self.producers.is_empty() {
-            self.producers_expires = exp;
-        }
-    }
-
-    /// Removes the `p|` field of the Producers whose last append is older than the Retention, as
-    /// `prune` in `lib.lua`.
-    fn prune(&mut self, now: i64) {
-        let retention = self.number("ret");
-        let min = now - retention;
-        let mut old: Vec<_> = self
-            .producers
-            .iter()
-            .filter(|(_, at)| **at < min)
-            .map(|(producer, at)| (*at, producer.clone()))
-            .collect();
-        old.sort();
-        for (_, producer) in old.into_iter().take(PRUNE_LIMIT) {
-            self.remove(format!("p|{producer}"));
-            self.producers.remove(&producer);
-        }
     }
 
     /// The newest id the Stream gave. Redis drops it with an expired log, so the meta's `newest`
@@ -264,11 +234,6 @@ impl Keys {
     fn newest_id(&self) -> (u64, u64) {
         let newest = self.text("newest").and_then(parse_id);
         self.last_id.max(newest.unwrap_or_default())
-    }
-
-    /// The ms of the ids that the next `add` gives, as `next_ms` in `lib.lua`.
-    fn next_ms(&self, now: i64) -> i64 {
-        now.max(self.newest_id().0 as i64)
     }
 
     /// Raises the trimmed offset to `newest` when the log is gone, as `mark_log_gone` in `lib.lua`.
@@ -361,13 +326,9 @@ impl MemoryStore {
             keys.log_expires = 0;
             keys.last_id = (0, 0);
         }
-        if keys.producers_expires > 0 && keys.producers_expires <= now {
-            keys.producers.clear();
-            keys.producers_expires = 0;
-        }
         let result = step(keys, now);
         // Once every key is gone, Redis has no state of the Stream, not even its newest id.
-        if keys.meta.is_empty() && keys.log.is_none() && keys.producers.is_empty() {
+        if keys.meta.is_empty() && keys.log.is_none() {
             streams.remove(&key);
         }
         result
@@ -508,7 +469,6 @@ impl Store for MemoryStore {
         let epoch = epoch_key(producer.kind.as_ref());
         let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
         let field = format!("p|{}|{}", kind as i32, producer.id);
-        let member = format!("{}|{}", kind as i32, producer.id);
         let appended = self.with(namespace, stream_id, |keys, now| {
             // The format version comes first, since a newer format can change the Producer field.
             keys.check_live(now)?;
@@ -568,8 +528,6 @@ impl Store for MemoryStore {
             keys.check_ids_fit(now, records)?;
 
             keys.mark_log_gone();
-            keys.prune(now);
-            let at = keys.next_ms(now);
             let (mut first, mut last) = (String::new(), String::new());
             for record in batch.records {
                 last = keys.add(
@@ -597,7 +555,6 @@ impl Store for MemoryStore {
             if !last.is_empty() {
                 keys.set("newest", last.clone());
             }
-            keys.producers.insert(member.clone(), at);
             keys.refresh(now, safety, tombstone);
             Ok((false, first, last))
         });

@@ -164,7 +164,8 @@ pub struct Entry {
 pub struct Capabilities(u8);
 
 impl Capabilities {
-    /// Each append checks the Producer's epoch and its last `sequence` before it writes.
+    /// Each append checks the Producer's epoch and its last `sequence` before it writes. The Store
+    /// keeps both for as long as the Stream exists, also for a Producer with no recent append.
     pub const PRODUCER_FENCE: Self = Self(1);
     /// A close marks the Stream closed and wakes the waiting reads. Every later append is
     /// refused.

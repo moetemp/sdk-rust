@@ -26,7 +26,6 @@ def keys(prefix, namespace, stream_id):
     return {
         "meta": f"{base}:meta",
         "log": f"{base}:log",
-        "producers": f"{base}:producers",
         "closed": f"{base}:closed",
     }
 

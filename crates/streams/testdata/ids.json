@@ -9,7 +9,6 @@
       "stream_id": "agent-1:run-1:turn-3",
       "meta": "temporal-streams:{default:agent-1%3Arun-1%3Aturn-3}:meta",
       "log": "temporal-streams:{default:agent-1%3Arun-1%3Aturn-3}:log",
-      "producers": "temporal-streams:{default:agent-1%3Arun-1%3Aturn-3}:producers",
       "closed": "temporal-streams:{default:agent-1%3Arun-1%3Aturn-3}:closed"
     },
     {
@@ -21,7 +20,6 @@
       "stream_id": "a%3Ab%2Fc:r%251:%C3%A9%20name",
       "meta": "p%3Ax:{ns%7B1%7D:a%253Ab%252Fc%3Ar%25251%3A%25C3%25A9%2520name}:meta",
       "log": "p%3Ax:{ns%7B1%7D:a%253Ab%252Fc%3Ar%25251%3A%25C3%25A9%2520name}:log",
-      "producers": "p%3Ax:{ns%7B1%7D:a%253Ab%252Fc%3Ar%25251%3A%25C3%25A9%2520name}:producers",
       "closed": "p%3Ax:{ns%7B1%7D:a%253Ab%252Fc%3Ar%25251%3A%25C3%25A9%2520name}:closed"
     }
   ],

@@ -4,7 +4,6 @@
 //! ```text
 //! <prefix>:{<namespace>:<stream id>}:meta       the create key, the fence, dedupe and close state
 //! <prefix>:{<namespace>:<stream id>}:log        the log, one entry per Record
-//! <prefix>:{<namespace>:<stream id>}:producers  each Producer's last append, to prune its fields
 //! ```
 //!
 //! The part in braces is the Redis Cluster hash tag, so that the keys are in one slot for one
@@ -194,12 +193,6 @@ impl StreamKeys {
     /// The log.
     pub fn log(&self) -> String {
         format!("{}:log", self.base)
-    }
-
-    /// The sorted set of each Producer's last append time. An append finds in it the Producers
-    /// whose last append is older than the Retention.
-    pub fn producers(&self) -> String {
-        format!("{}:producers", self.base)
     }
 
     /// The key that a close adds one entry to. A close writes no log entry, so a waiting read also

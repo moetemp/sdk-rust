@@ -544,10 +544,11 @@ async fn a_large_sequence_dedupes_and_one_past_2_53_is_refused() {
     }
 }
 
-/// An append removes the `p|` field of a Producer whose last append is older than the Retention.
-/// A lower epoch of that Producer then writes, and the open Stream keeps the older Records.
-async fn an_append_forgets_the_producers_that_the_retention_outlived() {
-    for target in stores_for(Needs::RAW_KEYS.and(Needs::SHORT_TIMES)).await {
+/// An open Stream keeps a Producer's dedupe past the Retention. A resend of the last batch of a
+/// Producer with no append for longer than the Retention gets the first answer, and the Stream
+/// has one copy of the batch.
+async fn a_silent_producer_resends_its_last_batch_once_past_the_retention() {
+    for target in stores_for(Needs::SHORT_TIMES).await {
         target
             .create_with(&Create {
                 retention: Some(Duration::from_millis(300)),
@@ -555,15 +556,39 @@ async fn an_append_forgets_the_producers_that_the_retention_outlived() {
             })
             .await
             .unwrap();
-        let (old, new) = (client(2), other_client());
-        append(&target, &old, 1, &["old"]).await.unwrap();
+        let p = client(1);
+        let first = append(&target, &p, 1, &["old"]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
-        append(&target, &new, 1, &["new"]).await.unwrap();
-        let kind = ProducerKind::Client as i32;
-        assert_eq!(target.meta(fields::producer(kind, &old.id)).await, None);
-        assert!(target.meta(fields::producer(kind, &new.id)).await.is_some());
-        append(&target, &client(1), 1, &["late"]).await.unwrap();
-        assert_eq!(target.texts().await, ["old", "new", "late"]);
+        // A Store that dropped a silent Producer's state would do it on another Producer's append.
+        append(&target, &other_client(), 1, &["new"]).await.unwrap();
+        let resend = append(&target, &p, 1, &["old"]).await.unwrap();
+        assert_eq!(resend.offsets, first.offsets);
+        if target.gives.gives(Needs::STORE_ANSWERS) {
+            assert!(resend.resend);
+        }
+        assert_eq!(target.texts().await, ["old", "new"]);
+    }
+}
+
+/// An open Stream keeps a Producer's fence past the Retention, so a lower epoch of a Producer with
+/// no append for longer than the Retention is still fenced.
+async fn a_silent_producer_stays_fenced_past_the_retention() {
+    for target in stores_for(Needs::SHORT_TIMES).await {
+        target
+            .create_with(&Create {
+                retention: Some(Duration::from_millis(300)),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        append(&target, &client(2), 1, &["new"]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        append(&target, &other_client(), 1, &["other"])
+            .await
+            .unwrap();
+        let stale = append(&target, &client(1), 1, &["stale"]).await;
+        assert_eq!(stale.unwrap_err().reason, Reason::Fenced);
+        assert_eq!(target.texts().await, ["new", "other"]);
     }
 }
 
@@ -695,7 +720,8 @@ pub const CASES: &[super::Case] = &[
     case!(a_batch_with_no_sequence_takes_the_next_one_of_its_epoch),
     case!(batches_with_no_sequence_at_once_each_take_their_own_number),
     case!(a_large_sequence_dedupes_and_one_past_2_53_is_refused),
-    case!(an_append_forgets_the_producers_that_the_retention_outlived),
+    case!(a_silent_producer_resends_its_last_batch_once_past_the_retention),
+    case!(a_silent_producer_stays_fenced_past_the_retention),
     case!(a_stale_producer_cant_close_the_stream),
     case!(a_producer_with_no_epoch_case_is_refused),
     case!(an_append_whose_ids_would_not_fit_an_offset_is_refused_before_it_writes),
