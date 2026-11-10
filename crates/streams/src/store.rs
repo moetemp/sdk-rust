@@ -125,7 +125,7 @@ pub struct StreamState {
     pub close_status: i32,
     /// The offset of the newest entry written, zero if none.
     pub newest: i64,
-    /// The offset of the newest entry that Retention dropped, zero if none.
+    /// The offset of the newest entry that a write found gone with the log, zero if none.
     pub trimmed: i64,
     /// The Retention.
     pub retention: Duration,
@@ -141,15 +141,10 @@ impl StreamState {
         self.exists && self.expires_ms <= self.now_ms
     }
 
-    /// The offset below which Retention dropped or hides the Records, as of the read.
+    /// The offset below which the log lost the Records. The Retention counts from the close, so
+    /// it hides no Record of a Stream that hasn't expired.
     pub fn retained_from(&self) -> i64 {
-        let cut = self.now_ms - self.retention.as_millis() as i64;
-        let hidden = if cut > 0 {
-            cut << crate::offset::SEQ_BITS
-        } else {
-            0
-        };
-        hidden.max(self.trimmed + 1)
+        self.trimmed + 1
     }
 }
 
@@ -230,9 +225,9 @@ fn unsupported(capability: &str) -> StreamError {
 /// The calls of a Store. Each one is atomic, as one Lua script is on Redis.
 ///
 /// The required calls make the log contract. They are a create key, an atomic batch append, an
-/// ordered read with the Stream's state, stable offsets, prefix Retention and a wait for the next
-/// entry. An append applies the rules of the capabilities that the Store declares. The optional
-/// calls fail by default.
+/// ordered read with the Stream's state, stable offsets, a Retention that counts from the close and
+/// a wait for the next entry. An append applies the rules of the capabilities that the Store
+/// declares. The optional calls fail by default.
 #[async_trait::async_trait]
 pub trait Store: Send + Sync + 'static {
     /// What the Store does atomically beyond the log. It has no default, so a Store that wraps

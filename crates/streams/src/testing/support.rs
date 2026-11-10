@@ -248,6 +248,11 @@ impl Target {
         self.raw.log_len(&self.namespace, &self.stream).await
     }
 
+    /// Deletes the log, as an eviction would.
+    pub(crate) async fn drop_log(&self) {
+        self.raw.drop_log(&self.namespace, &self.stream).await
+    }
+
     /// Every entry of the log.
     pub(crate) async fn entries(&self) -> Vec<Entry> {
         let (_, entries) = self

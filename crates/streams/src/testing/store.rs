@@ -297,19 +297,17 @@ async fn an_expired_stream_refuses_writes_and_its_create() {
     }
 }
 
-/// An open Stream's meta keeps the safety TTL, and its log keeps the Retention, after which a read
-/// hides every Record. Its close gives the meta the Retention too.
+/// An open Stream's meta and log keep the safety TTL, so the log keeps its Records past the
+/// Retention. Its close gives both the Retention, and the meta the Tombstone after it.
 async fn the_ttl_is_the_safety_ttl_until_the_close() {
     for target in stores_for(Needs::RAW_KEYS).await {
         target.create().await;
         append(&target, &client(1), 1, &["a"]).await.unwrap();
         let week = Duration::from_secs(7 * 86_400).as_millis() as i64;
+        let safety = Duration::from_secs(80 * 86_400).as_millis() as i64;
         let (ttl, meta) = target.ttls().await;
-        assert!(0 < ttl && ttl <= week, "{ttl}");
-        assert!(
-            meta > Duration::from_secs(80 * 86_400).as_millis() as i64,
-            "{meta}"
-        );
+        assert!(ttl > safety, "{ttl}");
+        assert!(meta > safety, "{meta}");
         target.close(&client(1)).await.unwrap();
         let (ttl, meta) = target.ttls().await;
         assert!(0 < ttl && ttl <= week, "{ttl}");
@@ -320,52 +318,41 @@ async fn the_ttl_is_the_safety_ttl_until_the_close() {
     }
 }
 
-/// A read hides Records past the Retention, and the next append trims them and keeps the
-/// newest trimmed offset.
-async fn an_append_trims_by_retention_and_keeps_the_watermark() {
+/// An open Stream keeps every Record past its Retention, while it is idle and after its next
+/// append. No append trims a Record and no read hides one, since the Retention counts from the
+/// close.
+async fn an_open_stream_keeps_its_records_past_its_retention() {
     for target in stores_for(Needs::RAW_KEYS.and(Needs::SHORT_TIMES)).await {
+        let retention = Duration::from_millis(300);
         target
             .create_with(&Create {
-                retention: Some(Duration::from_millis(600)),
+                retention: Some(retention),
                 ..Default::default()
             })
             .await
             .unwrap();
         let old = append(&target, &client(1), 1, &["old"]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
-        // This append keeps the log past the old Record's Retention.
-        append(&target, &client(1), 2, &["mid"]).await.unwrap();
-        tokio::time::sleep(Duration::from_millis(350)).await;
-        // The read hides the old Record before any append trims it.
+        assert_eq!(target.texts().await, ["old"]);
+        append(&target, &client(1), 2, &["new"]).await.unwrap();
         let (state, entries) = target
             .store
             .read(&target.namespace, &target.stream, 0, 10)
             .await
             .unwrap();
-        assert!(state.retained_from() > old.offsets.unwrap().1);
-        assert_eq!(entries.len(), 2);
-        append(&target, &client(1), 3, &["new"]).await.unwrap();
-        let (state, entries) = target
-            .store
-            .read(&target.namespace, &target.stream, 0, 10)
-            .await
-            .unwrap();
-        assert_eq!(state.trimmed, old.offsets.unwrap().1);
-        assert_eq!(records_of(&entries), ["mid", "new"]);
+        assert_eq!(state.trimmed, 0);
+        assert!(state.retained_from() <= old.offsets.unwrap().0);
+        assert_eq!(records_of(&entries), ["old", "new"]);
+        let (ttl, _) = target.ttls().await;
+        assert!(ttl > retention.as_millis() as i64, "{ttl}");
     }
 }
 
-/// The log expires one Retention after the last write. The next write raises the trimmed offset
-/// to the meta's newest one, and its offsets go above it, also with the clock behind it.
-async fn offsets_go_on_after_the_log_expires() {
-    for target in stores_for(Needs::RAW_KEYS.and(Needs::SHORT_TIMES)).await {
-        target
-            .create_with(&Create {
-                retention: Some(Duration::from_millis(200)),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+/// A write that finds the log gone, as after an eviction, raises the trimmed offset to the meta's
+/// newest one. Its offsets go above it, also with the clock behind it.
+async fn offsets_go_on_after_the_log_is_gone() {
+    for target in stores_for(Needs::RAW_KEYS).await {
+        target.create().await;
         append(&target, &client(1), 1, &["old"]).await.unwrap();
         // A newest id one minute ahead, as after the clock steps back.
         let now = std::time::SystemTime::now()
@@ -374,7 +361,7 @@ async fn offsets_go_on_after_the_log_expires() {
             .as_millis();
         let ahead = format!("{}-3", now + 60_000);
         target.set_meta("newest", &ahead).await;
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        target.drop_log().await;
         assert_eq!(target.ttls().await.0, -2);
         let new = append(&target, &client(1), 2, &["new"]).await.unwrap();
         let ahead = offset_of_entry_id(&ahead).unwrap();
@@ -557,8 +544,8 @@ async fn a_large_sequence_dedupes_and_one_past_2_53_is_refused() {
     }
 }
 
-/// An append removes the `p|` field of a Producer whose last append is older than the Retention,
-/// since its Records are gone too. A lower epoch of that Producer then writes.
+/// An append removes the `p|` field of a Producer whose last append is older than the Retention.
+/// A lower epoch of that Producer then writes, and the open Stream keeps the older Records.
 async fn an_append_forgets_the_producers_that_the_retention_outlived() {
     for target in stores_for(Needs::RAW_KEYS.and(Needs::SHORT_TIMES)).await {
         target
@@ -576,7 +563,7 @@ async fn an_append_forgets_the_producers_that_the_retention_outlived() {
         assert_eq!(target.meta(fields::producer(kind, &old.id)).await, None);
         assert!(target.meta(fields::producer(kind, &new.id)).await.is_some());
         append(&target, &client(1), 1, &["late"]).await.unwrap();
-        assert_eq!(target.texts().await, ["new", "late"]);
+        assert_eq!(target.texts().await, ["old", "new", "late"]);
     }
 }
 
@@ -699,8 +686,8 @@ pub const CASES: &[super::Case] = &[
     case!(a_newer_format_refuses_every_write),
     case!(an_expired_stream_refuses_writes_and_its_create),
     case!(the_ttl_is_the_safety_ttl_until_the_close),
-    case!(an_append_trims_by_retention_and_keeps_the_watermark),
-    case!(offsets_go_on_after_the_log_expires),
+    case!(an_open_stream_keeps_its_records_past_its_retention),
+    case!(offsets_go_on_after_the_log_is_gone),
     case!(a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline),
     case!(a_close_writes_no_entry_and_ends_a_wait),
     case!(a_batch_gets_consecutive_offsets_that_end_at_its_last_offset),

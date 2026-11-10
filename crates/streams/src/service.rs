@@ -448,8 +448,8 @@ impl StreamService {
         from: i64,
         (max, max_bytes): (usize, usize),
     ) -> StreamResult<Option<ReadRecordsResponse>> {
-        // A read from the start skips the Records that the Retention hides. A read from an offset
-        // fails on them, since the Reader asked for those Records.
+        // A read from the start skips the Records that the log lost. A read from an offset fails on
+        // them, since the Reader asked for those Records.
         let retained = state.retained_from();
         let mut start = if from > 0 { from } else { retained };
         let mut records = vec![];
@@ -466,7 +466,7 @@ impl StreamService {
             let room = (max_bytes != usize::MAX).then(|| max_bytes.saturating_sub(bytes));
             let chunk = chunk_len(max - records.len(), room, pulled);
             let (chunk_state, entries) = self.store.read(namespace, id, start, chunk).await?;
-            // A trim after the state read leaves a gap before these entries.
+            // Records that went away after the state read leave a gap before these entries.
             check_expiry(&chunk_state, if from > 0 { start } else { 0 })?;
             end = (chunk_state.closed, chunk_state.newest);
             close_status = chunk_state.close_status;
@@ -562,7 +562,7 @@ fn decode(bytes: &[u8], offset: i64) -> StreamResult<StreamRecord> {
     Ok(record)
 }
 
-/// Fails a read whose Records the Retention or the expiry removed, so that the Reader always sees
+/// Fails a read whose Records the log lost or the expiry removed, so that the Reader always sees
 /// the gap. A read from the start of the Stream has no gap.
 ///
 /// A Tombstone fails every read. An open Stream that expired gets no more Records, so the Reader

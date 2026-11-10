@@ -693,55 +693,33 @@ async fn a_read_of_an_expired_closed_stream_fails_instead_of_waiting() {
     }
 }
 
-/// Creates the case's Stream with a 300 ms Retention. While it is open, its meta stays and only
-/// its log expires.
-async fn create_short(case: &Case) {
-    case.create(millis(300)).await.unwrap();
-}
-
-/// A read from an offset that an idle open Stream's expired log took fails as expired at once,
-/// before the next write and after it. A read from the start skips the gap.
-async fn a_read_behind_an_expired_log_fails_before_and_after_the_next_write() {
+/// An open Stream keeps its Records past its Retention, which counts from the close. So a read
+/// gets every Record and the close item until one Retention after the close, and then the Stream
+/// is expired.
+async fn the_retention_counts_from_the_close() {
     for case in cases_for(Needs::SHORT_TIMES).await {
-        create_short(&case).await;
+        case.create(millis(300)).await.unwrap();
         let first = case
             .append(client(1), 1, vec![record("a"), record("b")])
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
-        let behind = ReadRecordsRequest {
+        let after_first = ReadRecordsRequest {
             from_offset: first.first_offset.clone(),
-            wait: millis(1500),
             ..Default::default()
         };
-        let started = Instant::now();
-        let error = case.read(behind.clone()).await.unwrap_err();
-        assert_eq!(reason(&error), "stream_expired");
-        assert!(started.elapsed() < Duration::from_secs(1));
+        let read = case.read(after_first.clone()).await.unwrap();
+        assert_eq!(texts(&read), ["b"]);
         case.append(client(1), 2, vec![record("c")]).await.unwrap();
-        let error = case.read(behind).await.unwrap_err();
-        assert_eq!(reason(&error), "stream_expired");
-        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
-        assert_eq!(texts(&read), ["c"]);
-    }
-}
-
-/// A close after an idle open Stream's log expired keeps the gap, so a read from an offset that the
-/// log took fails as expired.
-async fn a_close_after_the_log_expired_keeps_the_gap() {
-    for case in cases_for(Needs::SHORT_TIMES).await {
-        create_short(&case).await;
-        let first = case
-            .append(client(1), 1, vec![record("a"), record("b")])
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(400)).await;
         case.close(client(1)).await.unwrap();
-        let behind = ReadRecordsRequest {
-            from_offset: first.first_offset.clone(),
-            ..Default::default()
-        };
-        let error = case.read(behind).await.unwrap_err();
+        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
+        assert_eq!(texts(&read), ["a", "b", "c", "<close>"]);
+        let describe = case.describe().await.unwrap();
+        assert_eq!(describe.status, StreamStatus::Closed as i32);
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let describe = case.describe().await.unwrap();
+        assert_eq!(describe.status, StreamStatus::Expired as i32);
+        let error = case.read(after_first).await.unwrap_err();
         assert_eq!(reason(&error), "stream_expired");
     }
 }
@@ -949,8 +927,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_closed_read_ends_with_a_close_item),
     case!(an_unknown_method_is_unimplemented),
     case!(a_read_of_an_expired_closed_stream_fails_instead_of_waiting),
-    case!(a_read_behind_an_expired_log_fails_before_and_after_the_next_write),
-    case!(a_close_after_the_log_expired_keeps_the_gap),
+    case!(the_retention_counts_from_the_close),
     case!(a_create_answer_names_the_backend_and_the_store_never_reads_it),
     case!(a_read_of_a_closed_stream_with_no_item_left_answers_at_once),
     case!(a_waiting_read_wakes_with_done_on_a_close),

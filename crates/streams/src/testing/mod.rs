@@ -33,6 +33,8 @@ pub trait RawKeys: Send + Sync {
     async fn add_raw_entry(&self, namespace: &str, stream: &str, id: &str);
     /// The number of log entries.
     async fn log_len(&self, namespace: &str, stream: &str) -> usize;
+    /// Deletes the log, as an eviction would.
+    async fn drop_log(&self, namespace: &str, stream: &str);
 }
 
 /// A backend that the suites run on.
@@ -91,6 +93,10 @@ impl RawKeys for MemoryStore {
 
     async fn log_len(&self, namespace: &str, stream: &str) -> usize {
         self.test_log_len(namespace, stream)
+    }
+
+    async fn drop_log(&self, namespace: &str, stream: &str) {
+        self.test_drop_log(namespace, stream)
     }
 }
 

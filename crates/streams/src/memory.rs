@@ -41,7 +41,7 @@ struct Keys {
     /// `None` when the log key doesn't exist.
     log: Option<BTreeMap<(u64, u64), Fields>>,
     log_expires: i64,
-    /// The newest id of the log, which Redis keeps after a trim and drops with the expired key.
+    /// The newest id of the log, which Redis drops with the expired key.
     last_id: (u64, u64),
     /// The `producers` sorted set, each `<kind>|<producer id>` with the ms of its last append.
     producers: HashMap<String, i64>,
@@ -234,8 +234,7 @@ impl Keys {
         self.set("exp", exp.to_string());
         self.meta_expires = exp.saturating_add(tombstone);
         if self.log.is_some() {
-            // A read hides every Record one Retention after the last write, so the log goes then.
-            self.log_expires = exp.min(now.saturating_add(retention));
+            self.log_expires = exp;
         }
         if !self.producers.is_empty() {
             self.producers_expires = exp;
@@ -243,7 +242,7 @@ impl Keys {
     }
 
     /// Removes the `p|` field of the Producers whose last append is older than the Retention, as
-    /// `prune` in `lib.lua`. Their Records are older too, so they hold none.
+    /// `prune` in `lib.lua`.
     fn prune(&mut self, now: i64) {
         let retention = self.number("ret");
         let min = now - retention;
@@ -272,31 +271,14 @@ impl Keys {
         now.max(self.newest_id().0 as i64)
     }
 
-    fn trim(&mut self, now: i64) {
-        if self.log.is_none() {
-            // The expired log took every Record, so a read from an older offset must fail.
-            if let Some(newest) = self.text("newest").and_then(parse_id) {
-                self.raise_trimmed(newest);
-            }
+    /// Raises the trimmed offset to `newest` when the log is gone, as `mark_log_gone` in `lib.lua`.
+    /// The log took every Record with it, so a read from an older offset must fail.
+    fn mark_log_gone(&mut self) {
+        if self.log.is_some() {
             return;
         }
-        let retention = self.number("ret");
-        let min = now - retention;
-        if min <= 0 {
-            return;
-        }
-        let Some(log) = self.log.as_ref() else {
-            return;
-        };
-        let old: Vec<_> = log.range(..(min as u64, 0)).map(|(id, _)| *id).collect();
-        let Some(newest_old) = old.last().copied() else {
-            return;
-        };
-        self.raise_trimmed(newest_old);
-        if let Some(log) = self.log.as_mut() {
-            for id in old {
-                log.remove(&id);
-            }
+        if let Some(newest) = self.text("newest").and_then(parse_id) {
+            self.raise_trimmed(newest);
         }
     }
 
@@ -445,6 +427,16 @@ impl MemoryStore {
             keys.log.as_ref().map_or(0, BTreeMap::len)
         })
     }
+
+    /// Deletes the log, as `DEL`, for tests.
+    #[doc(hidden)]
+    pub fn test_drop_log(&self, namespace: &str, stream_id: &str) {
+        self.with(namespace, stream_id, |keys, _| {
+            keys.log = None;
+            keys.log_expires = 0;
+            keys.last_id = (0, 0);
+        });
+    }
 }
 
 fn offsets(first: &str, last: &str) -> StreamResult<Option<(i64, i64)>> {
@@ -575,7 +567,7 @@ impl Store for MemoryStore {
             let records = batch.records.len() as u64;
             keys.check_ids_fit(now, records)?;
 
-            keys.trim(now);
+            keys.mark_log_gone();
             keys.prune(now);
             let at = keys.next_ms(now);
             let (mut first, mut last) = (String::new(), String::new());
