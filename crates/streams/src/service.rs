@@ -466,7 +466,7 @@ impl StreamService {
             let room = (max_bytes != usize::MAX).then(|| max_bytes.saturating_sub(bytes));
             let chunk = chunk_len(max - records.len(), room, pulled);
             let (chunk_state, entries) = self.store.read(namespace, id, start, chunk).await?;
-            // Records that went away after the state read leave a gap before these entries.
+            // Records that the log lost after the state read leave a gap before these entries.
             check_expiry(&chunk_state, if from > 0 { start } else { 0 })?;
             end = (chunk_state.closed, chunk_state.newest);
             close_status = chunk_state.close_status;

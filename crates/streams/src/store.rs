@@ -125,7 +125,7 @@ pub struct StreamState {
     pub close_status: i32,
     /// The offset of the newest entry written, zero if none.
     pub newest: i64,
-    /// The offset of the newest entry that a write found gone with the log, zero if none.
+    /// The newest offset when a write found the log gone, zero if none.
     pub trimmed: i64,
     /// The Retention.
     pub retention: Duration,
