@@ -11,9 +11,10 @@ use crate::{
         ActivityEpoch, ActivityProducer, AppendRecord, AppendRecordsRequest, AppendRecordsResponse,
         ClientEpoch, ClientProducer, CloseStreamRequest, CloseStreamResponse, CreateStreamRequest,
         CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse, LocalActivityEpoch,
-        LocalActivityProducer, Producer, ReadRecordsRequest, ReadRecordsResponse, StreamCloseStatus,
-        StreamErrorDetails, StreamIdConflictPolicy, StreamReadStart, StreamRef, StreamStatus,
-        StreamWriter, WorkflowProducer, WorkflowTaskEpoch, producer::Kind, stream_record::Item,
+        LocalActivityProducer, Producer, ReadRecordsRequest, ReadRecordsResponse,
+        StreamCloseStatus, StreamErrorDetails, StreamIdConflictPolicy, StreamReadStart, StreamRef,
+        StreamStatus, StreamWriter, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
+        stream_record::Item,
     },
 };
 use prost::Message;
@@ -70,6 +71,16 @@ fn reason(error: &StreamError) -> String {
     let details = StreamErrorDetails::decode(error.details().as_slice()).unwrap();
     assert_eq!(details.reason(), error.reason.proto());
     error.reason.token().to_string()
+}
+
+/// The internal offset of a wire value, for the suite's assertions.
+fn off(wire: &[u8]) -> i64 {
+    crate::offset::offset_from_wire(wire).unwrap()
+}
+
+/// The wire value of an internal offset.
+fn wire(offset: i64) -> Vec<u8> {
+    crate::offset::offset_to_wire(offset)
 }
 
 /// The writer of a write by `producer`.
@@ -422,9 +433,9 @@ async fn an_append_with_no_sequence_takes_the_next_one_of_its_epoch() {
     }
 }
 
-/// A read is inclusive from its offset, a read from the end gives only new Records, an offset past
-/// the newest + 1 fails with `stream_offset_too_high`, and one below zero is invalid.
-async fn a_read_is_inclusive_from_its_offset_and_get_offset_reads_only_new_records() {
+/// A read is exclusive from its offset, a read from the end gives only new Records, an offset past
+/// the newest fails with `stream_offset_too_high`, and one that decodes below zero is invalid.
+async fn a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_records() {
     for case in cases_for(Needs::CALLS).await {
         case.create(None).await.unwrap();
         let first = case
@@ -434,25 +445,25 @@ async fn a_read_is_inclusive_from_its_offset_and_get_offset_reads_only_new_recor
         let all = case.read(ReadRecordsRequest::default()).await.unwrap();
         assert_eq!(texts(&all), ["1", "2"]);
         assert_eq!(all.records[0].offset, first.first_offset);
-        assert_eq!(all.next_offset, first.last_offset + 1);
+        assert_eq!(all.next_offset, first.last_offset);
         let from = case
             .read(ReadRecordsRequest {
-                from_offset: first.last_offset,
+                from_offset: first.first_offset.clone(),
                 ..Default::default()
             })
             .await
             .unwrap();
         assert_eq!(texts(&from), ["2"]);
-        let next = case.describe().await.unwrap().last_offset + 1;
+        let newest = case.describe().await.unwrap().last_offset;
         let none = case
             .read(ReadRecordsRequest {
-                from_offset: next,
+                from_offset: newest.clone(),
                 ..Default::default()
             })
             .await
             .unwrap();
         assert!(none.records.is_empty());
-        assert_eq!(none.next_offset, next);
+        assert_eq!(none.next_offset, newest);
         let end = case
             .read(ReadRecordsRequest {
                 start: StreamReadStart::End as i32,
@@ -460,10 +471,10 @@ async fn a_read_is_inclusive_from_its_offset_and_get_offset_reads_only_new_recor
             })
             .await
             .unwrap();
-        assert_eq!(end.next_offset, next);
+        assert_eq!(end.next_offset, newest);
         let error = case
             .read(ReadRecordsRequest {
-                from_offset: next + 1,
+                from_offset: wire(off(&newest) + 1),
                 ..Default::default()
             })
             .await
@@ -474,7 +485,8 @@ async fn a_read_is_inclusive_from_its_offset_and_get_offset_reads_only_new_recor
         );
         let error = case
             .read(ReadRecordsRequest {
-                from_offset: -1,
+                // An 8-byte value with the top bit set decodes to a negative offset.
+                from_offset: vec![0x80, 0, 0, 0, 0, 0, 0, 0],
                 ..Default::default()
             })
             .await
@@ -532,11 +544,11 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
     for case in cases_for(Needs::CALLS).await {
         case.create(None).await.unwrap();
         let first = case.append(client(1), 1, vec![record("1")]).await.unwrap();
-        let from = first.last_offset + 1;
+        let from = first.last_offset;
         let started = Instant::now();
         let quiet = case
             .read(ReadRecordsRequest {
-                from_offset: from,
+                from_offset: from.clone(),
                 wait: millis(200),
                 ..Default::default()
             })
@@ -589,7 +601,7 @@ async fn a_close_ends_every_read_with_done() {
         assert!(read.done);
         let again = case
             .read(ReadRecordsRequest {
-                from_offset: read.next_offset,
+                from_offset: read.next_offset.clone(),
                 ..Default::default()
             })
             .await
@@ -621,7 +633,7 @@ async fn a_closed_read_ends_with_a_close_item() {
         let read = case.read(ReadRecordsRequest::default()).await.unwrap();
         assert!(read.done);
         let last = read.records.last().expect("a close item");
-        assert_eq!(last.offset, written.last_offset + 1);
+        assert_eq!(off(&last.offset), off(&written.last_offset) + 1);
         let Some(Item::Close(close)) = &last.item else {
             panic!("not a close item: {:?}", last.item);
         };
@@ -655,7 +667,7 @@ async fn a_read_of_an_expired_closed_stream_fails_instead_of_waiting() {
                 ..Default::default()
             },
             ReadRecordsRequest {
-                from_offset: describe.last_offset + 1,
+                from_offset: describe.last_offset,
                 ..Default::default()
             },
         ] {
@@ -698,7 +710,7 @@ async fn a_read_behind_an_expired_log_fails_before_and_after_the_next_write() {
             .unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
         let behind = ReadRecordsRequest {
-            from_offset: first.first_offset + 1,
+            from_offset: first.first_offset.clone(),
             wait: millis(1500),
             ..Default::default()
         };
@@ -726,7 +738,7 @@ async fn a_close_after_the_log_expired_keeps_the_gap() {
         tokio::time::sleep(Duration::from_millis(400)).await;
         case.close(client(1)).await.unwrap();
         let behind = ReadRecordsRequest {
-            from_offset: first.first_offset + 1,
+            from_offset: first.first_offset.clone(),
             ..Default::default()
         };
         let error = case.read(behind).await.unwrap_err();
@@ -808,7 +820,7 @@ async fn a_read_of_a_closed_stream_with_no_item_left_answers_at_once() {
         assert!(rest.done);
         for request in [
             ReadRecordsRequest {
-                from_offset: written.last_offset + 1,
+                from_offset: written.last_offset.clone(),
                 ..Default::default()
             },
             ReadRecordsRequest {
@@ -826,7 +838,7 @@ async fn a_read_of_a_closed_stream_with_no_item_left_answers_at_once() {
                 .unwrap();
             assert!(started.elapsed() < Duration::from_secs(2));
             assert!(read.records.is_empty() && read.done);
-            assert_eq!(read.next_offset, written.last_offset + 1);
+            assert_eq!(read.next_offset, written.last_offset);
         }
     }
 }
@@ -850,7 +862,7 @@ async fn a_waiting_read_wakes_with_done_on_a_close() {
         let started = Instant::now();
         let woke = case
             .read(ReadRecordsRequest {
-                from_offset: written.last_offset + 1,
+                from_offset: written.last_offset,
                 wait: millis(5000),
                 ..Default::default()
             })
@@ -884,10 +896,10 @@ async fn a_last_read_gives_the_newest_records_oldest_first() {
         assert_eq!(texts(&read), ["c3", "a2"]);
         assert!(!read.done);
         let newest = case.describe().await.unwrap().last_offset;
-        assert_eq!(read.next_offset, newest + 1);
+        assert_eq!(read.next_offset, newest);
         let error = case
             .read(ReadRecordsRequest {
-                from_offset: 1,
+                from_offset: wire(1),
                 ..last(1)
             })
             .await
@@ -912,7 +924,7 @@ async fn a_page_keeps_under_max_bytes_and_a_larger_record_comes_alone() {
             max_bytes: 200,
             ..Default::default()
         };
-        let first = case.read(capped(0)).await.unwrap();
+        let first = case.read(capped(vec![])).await.unwrap();
         assert_eq!(texts(&first), ["a", "b"]);
         let second = case.read(capped(first.next_offset)).await.unwrap();
         assert_eq!(texts(&second), [big]);
@@ -930,7 +942,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_create_of_an_expired_stream_fails),
     case!(a_producer_must_match_its_kind_and_not_be_a_workflow),
     case!(an_append_with_no_sequence_takes_the_next_one_of_its_epoch),
-    case!(a_read_is_inclusive_from_its_offset_and_get_offset_reads_only_new_records),
+    case!(a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_records),
     case!(a_read_waits_for_the_create_only_as_long_as_create_wait),
     case!(a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append),
     case!(a_close_ends_every_read_with_done),

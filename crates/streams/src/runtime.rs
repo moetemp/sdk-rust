@@ -4,6 +4,7 @@ use crate::{
     Reason, StreamError, StreamResult,
     memory::MemoryStore,
     metrics::Metrics,
+    offset::offset_to_wire,
     proto::{
         AppendRecordsRequest, CloseStreamRequest, CloseWriterRequest, CloseWriterResponse,
         CloseWritersRequest, CloseWritersResponse, DescribeStreamRequest, FreeWriterRequest,
@@ -168,8 +169,8 @@ impl StreamRuntime {
                     .write(request.writer_id, request.records)
                     .await?;
                 WriteRecordsResponse {
-                    first_offset,
-                    last_offset,
+                    first_offset: offset_to_wire(first_offset),
+                    last_offset: offset_to_wire(last_offset),
                 }
                 .encode_to_vec()
             }
@@ -184,7 +185,10 @@ impl StreamRuntime {
             "CloseWriter" => {
                 let request = decode::<CloseWriterRequest>(input)?;
                 let last_offset = self.shared.writers.close(request.writer_id).await?;
-                CloseWriterResponse { last_offset }.encode_to_vec()
+                CloseWriterResponse {
+                    last_offset: offset_to_wire(last_offset),
+                }
+                .encode_to_vec()
             }
             _ => {
                 return Err(StreamError::new(

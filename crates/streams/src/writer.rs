@@ -9,6 +9,7 @@
 use crate::{
     Reason, StreamError, StreamResult,
     epoch::ProducerKind,
+    offset::offset_from_wire,
     proto::{
         AppendRecord, AppendRecordsRequest, OpenWriterRequest, Producer, StreamRef, StreamWriter,
         producer::Kind,
@@ -140,7 +141,12 @@ impl Writer {
         let mut backoff = FIRST_BACKOFF;
         loop {
             match self.service.append_records(request.clone()).await {
-                Ok(response) => return Ok((response.first_offset, response.last_offset)),
+                Ok(response) => {
+                    return Ok((
+                        offset_from_wire(&response.first_offset)?,
+                        offset_from_wire(&response.last_offset)?,
+                    ));
+                }
                 Err(error)
                     if error.reason == Reason::StorageUnavailable
                         && Instant::now() + backoff < until =>

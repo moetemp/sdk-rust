@@ -7,6 +7,7 @@ use crate::{
     epoch::{ProducerKind, task_of},
     ids::{check_producer, check_stream_id},
     metrics::Metrics,
+    offset::{offset_from_wire, offset_to_wire},
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
@@ -191,10 +192,11 @@ impl StreamService {
         };
         let appended = self.store.append(&request.namespace, &stream, &batch).await;
         let appended = self.count(appended)?;
+        // An empty batch has no offset, which is the empty wire value.
         let (first_offset, last_offset) = appended.offsets.unwrap_or_default();
         Ok(AppendRecordsResponse {
-            first_offset,
-            last_offset,
+            first_offset: offset_to_wire(first_offset),
+            last_offset: offset_to_wire(last_offset),
         })
     }
 
@@ -245,7 +247,7 @@ impl StreamService {
         };
         Ok(DescribeStreamResponse {
             status: status as i32,
-            last_offset: state.newest,
+            last_offset: offset_to_wire(state.newest),
             retention: Some(proto_duration(state.retention)),
         })
     }
@@ -258,7 +260,10 @@ impl StreamService {
     ) -> StreamResult<ReadRecordsResponse> {
         let id = stream_id(request.r#ref.as_ref())?.to_string();
         let namespace = request.namespace.as_str();
-        if request.from_offset < 0 {
+        // The wire from_offset is exclusive, so a read starts after it. The empty value is a read
+        // from the start.
+        let from_offset = offset_from_wire(&request.from_offset)?;
+        if from_offset < 0 {
             return Err(StreamError::invalid("The offset is below zero"));
         }
         let max_bytes = max_bytes(request.max_bytes)?;
@@ -266,14 +271,14 @@ impl StreamService {
             return Err(StreamError::invalid("last must be 0 or more"));
         }
         if request.last > 0 {
-            if request.wake_only || request.from_offset > 0 {
+            if request.wake_only || from_offset > 0 {
                 return Err(StreamError::invalid(
                     "A read of the last Records takes no from_offset and no wake_only",
                 ));
             }
             return self.read_last(request, max_bytes).await;
         }
-        if request.wake_only || request.to_offset != 0 {
+        if request.wake_only || !request.to_offset.is_empty() {
             return Err(StreamError::new(
                 Reason::Unsupported,
                 "The Store reads no to_offset or wake_only, which the native backend serves",
@@ -297,19 +302,17 @@ impl StreamService {
                 format!("format {} is newer than {FORMAT_VERSION}", state.version),
             ));
         }
-        let from = match request.from_offset {
+        // An exclusive from_offset reads after that Record, so the inclusive start is one past it.
+        let from = match from_offset {
             0 if request.start == StreamReadStart::End as i32 => state.newest + 1,
-            from => from,
+            0 => 0,
+            offset => offset + 1,
         };
         if from > state.newest + 1 {
-            let next = state.newest + 1;
             return Err(StreamError::new(
                 Reason::OffsetTooHigh,
-                format!(
-                    "The offset {from} is past the newest offset + 1, {next}. A failover may have \
-                     lost the newest Records. Read from {next}, or read again once newer Records \
-                     pass the offset"
-                ),
+                "The offset is past the newest Record. A failover may have lost the newest \
+                 Records. Resume from the newest offset, or read again once newer Records pass it",
             ));
         }
         loop {
@@ -321,8 +324,10 @@ impl StreamService {
                 return Ok(page);
             }
             if deadline <= Instant::now() {
+                // An empty read resumes from where it started, which is one before the inclusive
+                // start.
                 return Ok(ReadRecordsResponse {
-                    next_offset: from,
+                    next_offset: offset_to_wire(from - 1),
                     ..Default::default()
                 });
             }
@@ -400,10 +405,10 @@ impl StreamService {
             }
         }
         picked.reverse();
-        // The read ends at the newest offset, which a close makes final.
+        // The read resumes after the newest Record, which a close makes final.
         Ok(ReadRecordsResponse {
             records: picked,
-            next_offset: state.newest + 1,
+            next_offset: offset_to_wire(state.newest),
             done: state.closed,
             ..Default::default()
         })
@@ -448,7 +453,6 @@ impl StreamService {
         let retained = state.retained_from();
         let mut start = if from > 0 { from } else { retained };
         let mut records = vec![];
-        let mut next = from;
         let mut full = false;
         let mut bytes = 0;
         // The bytes and the entries that the page read from the Store.
@@ -479,13 +483,11 @@ impl StreamService {
                     if from > 0 {
                         return Err(expired());
                     }
-                    next = entry.offset + 1;
-                    start = next;
+                    start = entry.offset + 1;
                     continue;
                 }
                 let Some(encoded) = entry.record else {
-                    next = entry.offset + 1;
-                    start = next;
+                    start = entry.offset + 1;
                     continue;
                 };
                 let record = decode(&encoded, entry.offset)?;
@@ -496,13 +498,11 @@ impl StreamService {
                 let over = bytes + size > max_bytes || records.len() + 1 > max;
                 if !records.is_empty() && over {
                     full = true;
-                    next = entry.offset;
                     break;
                 }
                 bytes += size;
                 records.push(record);
-                next = entry.offset + 1;
-                start = next;
+                start = entry.offset + 1;
                 if records.len() >= max {
                     break;
                 }
@@ -515,7 +515,7 @@ impl StreamService {
         }
         // The read that reaches the end of a closed Stream ends with its close item, at the offset
         // after the newest Record. A read that starts past the newest Record already saw it, so it
-        // doesn't repeat it, and `next_offset` stays at the close offset.
+        // doesn't repeat it.
         if done && from <= end.1 {
             let producer = closer
                 .as_deref()
@@ -523,16 +523,17 @@ impl StreamService {
                 .transpose()
                 .map_err(|error| StreamError::storage_corrupt(error.to_string()))?;
             records.push(StreamRecord {
-                offset: end.1 + 1,
+                offset: offset_to_wire(end.1 + 1),
                 item: Some(Item::Close(StreamClose {
                     producer,
                     status: close_status,
                 })),
             });
         }
+        // The resume is after the last Record returned, which is one before the inclusive start.
         let page = ReadRecordsResponse {
             records,
-            next_offset: next,
+            next_offset: offset_to_wire(start - 1),
             done,
             ..Default::default()
         };
@@ -557,7 +558,7 @@ fn decode(bytes: &[u8], offset: i64) -> StreamResult<StreamRecord> {
     let mut record = StreamRecord::decode(bytes).map_err(|error| {
         StreamError::storage_corrupt(format!("A stored Record is bad: {error}"))
     })?;
-    record.offset = offset;
+    record.offset = offset_to_wire(offset);
     Ok(record)
 }
 

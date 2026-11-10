@@ -61,9 +61,9 @@ message WriteRecordsRequest {
 }
 
 message WriteRecordsResponse {
-    // The offsets of the first and the last Record. Zero when the request has no Record.
-    int64 first_offset = 1;
-    int64 last_offset = 2;
+    // The offsets of the first and the last Record. Empty when the request has no Record.
+    bytes first_offset = 1;
+    bytes last_offset = 2;
 }
 
 // Method `CloseWriter`, asynchronous. Releases one reference of the writer. The last reference
@@ -74,8 +74,8 @@ message CloseWriterRequest {
 }
 
 message CloseWriterResponse {
-    // The offset of the newest Record the writer wrote. Zero if it wrote none.
-    int64 last_offset = 1;
+    // The offset of the newest Record the writer wrote. Empty if it wrote none.
+    bytes last_offset = 1;
 }
 
 // Method `FreeWriter`. Releases one reference of the writer with no wait, for a reference that

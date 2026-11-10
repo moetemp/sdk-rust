@@ -124,6 +124,11 @@ fn reason(error: &StreamError) -> String {
     error.reason.token().to_string()
 }
 
+/// The internal offset of a wire value, for the suite's assertions.
+fn off(wire: &[u8]) -> i64 {
+    crate::offset::offset_from_wire(wire).unwrap()
+}
+
 fn millis(ms: u64) -> Option<prost_types::Duration> {
     Some(prost_types::Duration {
         seconds: (ms / 1000) as i64,
@@ -167,7 +172,7 @@ impl Case {
                 },
             )
             .await?;
-        Ok((written.first_offset, written.last_offset))
+        Ok((off(&written.first_offset), off(&written.last_offset)))
     }
 
     async fn read(&self, wait_ms: u64) -> ReadRecordsResponse {
@@ -206,7 +211,7 @@ async fn a_write_is_in_the_store_when_it_answers_its_offsets() {
         let (first, last) = case.write(writer, &["a", "b"]).await.unwrap();
         assert!(0 < first && first < last);
         let read = case.read(0).await;
-        let offsets: Vec<i64> = read.records.iter().map(|r| r.offset).collect();
+        let offsets: Vec<i64> = read.records.iter().map(|r| off(&r.offset)).collect();
         assert_eq!(offsets, [first, last]);
         let (one, same) = case.write(writer, &["c"]).await.unwrap();
         assert_eq!(one, same);
@@ -217,7 +222,7 @@ async fn a_write_is_in_the_store_when_it_answers_its_offsets() {
             .call("CloseWriter", CloseWriterRequest { writer_id: writer })
             .await
             .unwrap();
-        assert_eq!(closed.last_offset, one);
+        assert_eq!(off(&closed.last_offset), one);
     }
 }
 
@@ -228,8 +233,8 @@ async fn writes_split_at_the_batch_size_and_keep_one_sequence() {
         case.write(writer, &["4", "5"]).await.unwrap();
         let read = case.read(0).await;
         assert_eq!(case.visible().await, ["1", "2", "3", "4", "5"]);
-        assert_eq!(read.records[0].offset, first);
-        assert_eq!(read.records[2].offset, last);
+        assert_eq!(off(&read.records[0].offset), first);
+        assert_eq!(off(&read.records[2].offset), last);
         // Opening the same Producer epoch again returns the same writer, so it keeps the sequence.
         assert_eq!(case.open(client(), |_| {}).await, writer);
     }
@@ -346,7 +351,7 @@ async fn a_closed_writer_is_gone() {
             .call("CloseWriter", CloseWriterRequest { writer_id: writer })
             .await
             .unwrap();
-        assert!(closed.last_offset > 0);
+        assert!(off(&closed.last_offset) > 0);
         let error = case.write(writer, &["x"]).await.unwrap_err();
         assert_eq!(
             (error.code(), reason(&error).as_str()),
@@ -583,7 +588,7 @@ async fn a_write_whose_answer_is_lost_goes_in_once() {
         let read = case.read(0).await;
         assert_eq!(case.visible().await, ["a", "b"]);
         assert_eq!(
-            (read.records[0].offset, read.records[1].offset),
+            (off(&read.records[0].offset), off(&read.records[1].offset)),
             (first, last)
         );
         case.write(writer, &["c"]).await.unwrap();
@@ -612,7 +617,7 @@ async fn a_writer_writes_again_after_a_store_outage() {
             .call("CloseWriter", CloseWriterRequest { writer_id: writer })
             .await
             .unwrap();
-        assert!(closed.last_offset > 0);
+        assert!(off(&closed.last_offset) > 0);
     }
 }
 

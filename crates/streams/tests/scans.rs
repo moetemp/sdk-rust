@@ -198,7 +198,7 @@ async fn a_trim_under_a_read_from_an_offset_fails_it_as_expired() {
     let details = StreamErrorDetails::decode(error.details().as_slice()).unwrap();
     assert_eq!(details.reason(), StreamErrorReason::Expired);
     store.trim_next.store(true, Ordering::Relaxed);
-    let from_start: ReadRecordsResponse = call(&ext, "ReadRecords", read(0)).await;
+    let from_start: ReadRecordsResponse = call(&ext, "ReadRecords", read(vec![])).await;
     assert_eq!(from_start.records.len(), 2);
 }
 
