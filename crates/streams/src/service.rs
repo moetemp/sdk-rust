@@ -29,8 +29,6 @@ use tokio::time::Instant;
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
 /// The maximum number of Records in one read.
 const MAX_RECORDS: usize = 1000;
-/// How often a read looks again for a Stream that nobody created yet.
-const CREATE_POLL: Duration = Duration::from_millis(100);
 
 /// The Stream service on one Store. A Store has no namespaces, so the service ignores a request's
 /// `namespace`, which only the server's native Streams read.
@@ -250,12 +248,16 @@ impl StreamService {
         };
         let started = Instant::now();
         let wait = duration(request.wait).unwrap_or_default().min(MAX_WAIT);
-        let create_wait = duration(request.create_wait)
-            .unwrap_or_default()
-            .min(MAX_WAIT);
         let deadline = started + wait;
 
-        let mut state = self.created(&stream, started + create_wait).await?;
+        // A creator hands out the ref only after its create, so a read never waits for one.
+        let (mut state, _) = self.store.read(&stream, 0, 0).await?;
+        if !state.exists {
+            return Err(StreamError::new(
+                Reason::NotFound,
+                "Nobody created the Stream",
+            ));
+        }
         if state.version > FORMAT_VERSION {
             return Err(StreamError::new(
                 Reason::FormatTooNew,
@@ -294,24 +296,6 @@ impl StreamService {
             self.metrics.read_waits(false);
             woke?;
             state = self.store.read(&stream, 0, 0).await?.0;
-        }
-    }
-
-    /// The state of a Stream, after waiting up to `until` for its create.
-    async fn created(&self, stream: &StreamRef, until: Instant) -> StreamResult<StreamState> {
-        loop {
-            let (state, _) = self.store.read(stream, 0, 0).await?;
-            if state.exists {
-                return Ok(state);
-            }
-            let now = Instant::now();
-            if now >= until {
-                return Err(StreamError::new(
-                    Reason::NotFound,
-                    "Nobody created the Stream",
-                ));
-            }
-            tokio::time::sleep(CREATE_POLL.min(until - now)).await;
         }
     }
 

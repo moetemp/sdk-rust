@@ -478,47 +478,23 @@ async fn a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_recor
     }
 }
 
-/// A read waits for the Stream's create only as long as `create_wait`.
-async fn a_read_waits_for_the_create_only_as_long_as_create_wait() {
+/// A read of a Stream that nobody created fails at once with `stream_not_found`, also with a long
+/// wait.
+async fn a_read_of_an_uncreated_stream_fails_at_once() {
     for case in cases_for(Needs::CALLS).await {
-        let error = case.read(ReadRecordsRequest::default()).await.unwrap_err();
-        assert_eq!(
-            (error.code(), reason(&error).as_str()),
-            (Code::NotFound, "stream_not_found")
-        );
         let started = Instant::now();
         let error = case
             .read(ReadRecordsRequest {
-                create_wait: millis(200),
+                wait: millis(5000),
                 ..Default::default()
             })
             .await
             .unwrap_err();
-        assert_eq!(error.code(), Code::NotFound);
-        assert!(started.elapsed() >= Duration::from_millis(200));
-        let ext = case.ext.clone();
-        let (namespace, stream) = (case.namespace.clone(), case.stream.clone());
-        let creator = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            let request = CreateStreamRequest {
-                namespace,
-                stream_ref: Some(StreamRef {
-                    id: stream,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            };
-            call::<_, CreateStreamResponse>(&ext, "CreateStream", request).await
-        });
-        let read = case
-            .read(ReadRecordsRequest {
-                create_wait: millis(3000),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert!(read.records.is_empty());
-        creator.await.unwrap().unwrap();
+        assert_eq!(
+            (error.code(), reason(&error).as_str()),
+            (Code::NotFound, "stream_not_found")
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
 
@@ -887,7 +863,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_producer_must_match_its_kind_and_not_be_a_workflow),
     case!(an_append_with_no_sequence_takes_the_next_one_of_its_epoch),
     case!(a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_records),
-    case!(a_read_waits_for_the_create_only_as_long_as_create_wait),
+    case!(a_read_of_an_uncreated_stream_fails_at_once),
     case!(a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append),
     case!(a_close_ends_every_read_with_done),
     case!(a_closed_read_ends_with_a_close_item),
