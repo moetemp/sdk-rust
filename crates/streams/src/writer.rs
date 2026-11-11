@@ -197,11 +197,11 @@ impl StreamWriter {
         let records = request.records;
         {
             let state = self.state.lock();
-            if let Some(error) = &state.failed {
-                return Err(error.clone());
-            }
             if state.closed {
                 return Err(closed("The writer is closed"));
+            }
+            if let Some(error) = &state.failed {
+                return Err(error.clone());
             }
         }
         check_records(&records)?;
@@ -249,16 +249,20 @@ impl StreamWriter {
     async fn write_batches(&self, mut records: Vec<AppendRecord>) -> StreamResult<(i64, i64)> {
         let _lane = self.lane.0.lock().await;
         // A close that started while this write waited has closed the writer.
-        if self.state.lock().closed {
-            return Err(closed("The writer closed while the write waited"));
+        {
+            let state = self.state.lock();
+            if state.closed {
+                return Err(closed("The writer closed while the write waited"));
+            }
+            // A write that failed while this one waited fails it too, also when it has no Record.
+            if let Some(error) = &state.failed {
+                return Err(error.clone());
+            }
         }
         let (mut first, mut last) = (0, 0);
         while !records.is_empty() {
             let count = self.batch_len(records.iter());
             let rest = records.split_off(count);
-            if let Some(error) = &self.state.lock().failed {
-                return Err(error.clone());
-            }
             let sequence = next_sequence();
             let (batch_first, batch_last) = match self.send(records, sequence).await {
                 Ok(offsets) => offsets,

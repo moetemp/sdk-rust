@@ -590,6 +590,53 @@ async fn the_writers_of_one_epoch_send_their_batches_in_call_order() {
     }
 }
 
+/// A closed writer refuses a write as closed, also after it failed. Its close still fails with the
+/// writer's error.
+async fn a_closed_writer_refuses_writes_as_closed_after_a_failure() {
+    for case in cases().await {
+        let named = |attempt| Producer {
+            id: named_client_producer_id("ingest-2"),
+            kind: Some(Kind::Client(ClientProducer {
+                epoch: Some(ClientEpoch { attempt }),
+            })),
+        };
+        let old = case.open(named(1), |_| {}).await;
+        let new = case.open(named(2), |_| {}).await;
+        write(&new, &["new"]).await.unwrap();
+        assert_eq!(
+            reason(&write(&old, &["late"]).await.unwrap_err()),
+            "stream_fenced"
+        );
+        assert_eq!(reason(&close(&old).await.unwrap_err()), "stream_fenced");
+        assert_eq!(
+            reason(&write(&old, &["again"]).await.unwrap_err()),
+            "stream_closed"
+        );
+    }
+}
+
+/// A write that waits on the lane behind a write that fails the writer fails with that error, also
+/// when it has no Record.
+async fn an_empty_write_behind_a_failing_write_fails_with_it() {
+    for (store, case) in flaky_cases(false).await {
+        let writer = case.open(client(), |_| {}).await;
+        store.hold_next.store(true, Ordering::SeqCst);
+        store.corrupt_next.store(true, Ordering::SeqCst);
+        let failing = write(&writer, &["a"]);
+        let empty = async {
+            store.held.notified().await;
+            write(&writer, &[]).await
+        };
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            store.release.notify_one();
+        };
+        let (failing, empty, ()) = tokio::join!(failing, empty, release);
+        assert_eq!(reason(&failing.unwrap_err()), "stream_storage_corrupt");
+        assert_eq!(reason(&empty.unwrap_err()), "stream_storage_corrupt");
+    }
+}
+
 /// The first open of a retry epoch sends the empty batch that fences the earlier epoch, and a
 /// second open of the same epoch sends none.
 async fn a_retry_epoch_sends_its_empty_batch_once() {
@@ -690,6 +737,8 @@ pub const CASES: &[super::Case] = &[
     case!(a_writer_of_a_producer_with_a_missing_required_field_does_not_open),
     case!(a_write_of_a_record_with_no_body_is_refused_and_the_writer_goes_on),
     case!(the_writers_of_one_epoch_send_their_batches_in_call_order),
+    case!(a_closed_writer_refuses_writes_as_closed_after_a_failure),
+    case!(an_empty_write_behind_a_failing_write_fails_with_it),
     case!(a_retry_epoch_sends_its_empty_batch_once),
     case!(an_open_after_a_failed_or_cancelled_fence_sends_it),
 ];
