@@ -4,7 +4,7 @@
 
 use super::{
     RuntimeConfig, case,
-    support::{Needs, stores_for},
+    support::{Needs, item_offset, stores_for},
 };
 use crate::{
     MemoryStreamRuntime, StreamError, StreamResult, StreamRuntime,
@@ -13,7 +13,7 @@ use crate::{
         ActivityEpoch, ActivityProducer, AppendRecord, ClientEpoch, ClientProducer,
         CloseStreamRequest, CloseWriterRequest, CloseWriterResponse, CreateStreamRequest,
         CreateStreamResponse, OpenWriterRequest, OpenWriterResponse, Producer, ReadRecordsRequest,
-        ReadRecordsResponse, StreamErrorDetails, StreamRef, StreamWriter, WriteRecordsRequest,
+        ReadRecordsResponse, StreamErrorDetails, StreamRef, WriteRecordsRequest,
         WriteRecordsResponse, producer::Kind, stream_record::Item,
     },
     store::{
@@ -77,13 +77,6 @@ async fn cases_with(config: &RuntimeConfig) -> Vec<Case> {
         cases.push(case);
     }
     cases
-}
-
-/// The writer of a write by `producer`.
-fn writer_for(producer: Producer) -> Option<StreamWriter> {
-    Some(StreamWriter {
-        producer: Some(producer),
-    })
 }
 
 fn client() -> Producer {
@@ -157,7 +150,7 @@ impl Case {
                 id: self.stream.clone(),
                 ..Default::default()
             }),
-            writer: writer_for(producer),
+            producer: Some(producer),
             ..Default::default()
         };
         change(&mut request);
@@ -215,7 +208,7 @@ async fn a_write_is_in_the_store_when_it_answers_its_offsets() {
         let (first, last) = case.write(writer, &["a", "b"]).await.unwrap();
         assert!(0 < first && first < last);
         let read = case.read(0).await;
-        let offsets: Vec<i64> = read.records.iter().map(|r| off(&r.offset)).collect();
+        let offsets: Vec<i64> = read.records.iter().map(|r| off(item_offset(r))).collect();
         assert_eq!(offsets, [first, last]);
         let (one, same) = case.write(writer, &["c"]).await.unwrap();
         assert_eq!(one, same);
@@ -237,8 +230,8 @@ async fn writes_split_at_the_batch_size_and_keep_one_sequence() {
         case.write(writer, &["4", "5"]).await.unwrap();
         let read = case.read(0).await;
         assert_eq!(case.visible().await, ["1", "2", "3", "4", "5"]);
-        assert_eq!(off(&read.records[0].offset), first);
-        assert_eq!(off(&read.records[2].offset), last);
+        assert_eq!(off(item_offset(&read.records[0])), first);
+        assert_eq!(off(item_offset(&read.records[2])), last);
         // Opening the same Producer epoch again returns the same writer, so it keeps the sequence.
         assert_eq!(case.open(client(), |_| {}).await, writer);
     }
@@ -264,7 +257,7 @@ async fn a_failed_write_fails_every_later_write_and_the_close() {
                 id: case.stream.clone(),
                 ..Default::default()
             }),
-            writer: writer_for(client()),
+            producer: Some(client()),
             ..Default::default()
         };
         let _: crate::proto::CloseStreamResponse = case.call("CloseStream", close).await.unwrap();
@@ -297,7 +290,7 @@ async fn an_activity_retry_opens_on_a_closed_or_expired_stream() {
                 id: case.stream.clone(),
                 ..Default::default()
             }),
-            writer: writer_for(client()),
+            producer: Some(client()),
             ..Default::default()
         };
         let _: crate::proto::CloseStreamResponse = case.call("CloseStream", close).await.unwrap();
@@ -318,7 +311,7 @@ async fn an_activity_retry_opens_on_a_closed_or_expired_stream() {
                 id: case.stream.clone(),
                 ..Default::default()
             }),
-            writer: writer_for(client()),
+            producer: Some(client()),
             ..Default::default()
         };
         let _: crate::proto::CloseStreamResponse = case.call("CloseStream", close).await.unwrap();
@@ -543,7 +536,10 @@ async fn a_write_whose_answer_is_lost_goes_in_once() {
         let read = case.read(0).await;
         assert_eq!(case.visible().await, ["a", "b"]);
         assert_eq!(
-            (off(&read.records[0].offset), off(&read.records[1].offset)),
+            (
+                off(item_offset(&read.records[0])),
+                off(item_offset(&read.records[1]))
+            ),
             (first, last)
         );
         case.write(writer, &["c"]).await.unwrap();

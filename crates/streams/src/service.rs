@@ -130,8 +130,7 @@ impl StreamService {
     ) -> StreamResult<AppendRecordsResponse> {
         stream_id(request.r#ref.as_ref())?;
         let stream = request.r#ref.clone().unwrap_or_default();
-        let writer = request.writer.unwrap_or_default();
-        let producer = outside_producer(writer.producer.as_ref())?;
+        let producer = outside_producer(request.producer.as_ref())?;
         if !(0..=MAX_SEQUENCE).contains(&request.sequence) {
             return Err(StreamError::invalid(
                 "The sequence must be from 1 to 2^53 - 1, or zero for the next one",
@@ -182,8 +181,7 @@ impl StreamService {
     ) -> StreamResult<CloseStreamResponse> {
         stream_id(request.r#ref.as_ref())?;
         let stream = request.r#ref.clone().unwrap_or_default();
-        let writer = request.writer.unwrap_or_default();
-        let producer = close_producer(writer.producer.as_ref())?;
+        let producer = close_producer(request.producer.as_ref())?;
         self.store.capabilities().require(Capabilities::CLOSE)?;
         self.store.close(&stream, producer).await?;
         Ok(CloseStreamResponse {})
@@ -384,10 +382,10 @@ impl StreamService {
                 .transpose()
                 .map_err(|error| StreamError::storage_corrupt(error.to_string()))?;
             records.push(StreamRecord {
-                offset: offset_to_wire(end.1 + 1),
                 item: Some(Item::Close(StreamClose {
                     producer,
                     status: close_status,
+                    offset: offset_to_wire(end.1 + 1),
                 })),
             });
         }
@@ -419,7 +417,13 @@ fn decode(bytes: &[u8], offset: i64) -> StreamResult<StreamRecord> {
     let mut record = StreamRecord::decode(bytes).map_err(|error| {
         StreamError::storage_corrupt(format!("A stored Record is bad: {error}"))
     })?;
-    record.offset = offset_to_wire(offset);
+    match record.item.as_mut() {
+        Some(Item::Data(data)) => data.offset = offset_to_wire(offset),
+        Some(Item::Close(close)) => close.offset = offset_to_wire(offset),
+        None => {
+            return Err(StreamError::storage_corrupt("A stored Record has no item"));
+        }
+    }
     Ok(record)
 }
 

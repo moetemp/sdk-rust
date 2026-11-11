@@ -138,6 +138,15 @@ impl Run {
     }
 }
 
+/// The offset of a read item, which each item kind carries.
+pub(crate) fn item_offset(record: &StreamRecord) -> &[u8] {
+    match &record.item {
+        Some(Item::Data(data)) => &data.offset,
+        Some(Item::Close(close)) => &close.offset,
+        None => &[],
+    }
+}
+
 pub(crate) fn record(producer: &Producer, text: &str) -> Vec<u8> {
     StreamRecord {
         item: Some(Item::Data(StreamData {
@@ -148,8 +157,8 @@ pub(crate) fn record(producer: &Producer, text: &str) -> Vec<u8> {
                     ..Default::default()
                 },
             ),
+            ..Default::default()
         })),
-        ..Default::default()
     }
     .encode_to_vec()
 }

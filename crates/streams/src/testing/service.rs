@@ -2,7 +2,10 @@
 //!
 //! Every Store runs the suite through its own runtime.
 
-use super::{RuntimeConfig, case, support::Needs};
+use super::{
+    RuntimeConfig, case,
+    support::{Needs, item_offset},
+};
 
 use crate::{
     StreamError, StreamRuntime,
@@ -13,7 +16,7 @@ use crate::{
         CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse, LocalActivityEpoch,
         LocalActivityProducer, Producer, ReadRecordsRequest, ReadRecordsResponse,
         StreamCloseStatus, StreamErrorDetails, StreamIdConflictPolicy, StreamReadStart, StreamRef,
-        StreamStatus, StreamWriter, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
+        StreamStatus, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
         read_records_request::Position, stream_record::Item,
     },
 };
@@ -101,13 +104,6 @@ fn wire(offset: i64) -> Vec<u8> {
     crate::offset::offset_to_wire(offset)
 }
 
-/// The writer of a write by `producer`.
-fn writer_for(producer: Producer) -> Option<StreamWriter> {
-    Some(StreamWriter {
-        producer: Some(producer),
-    })
-}
-
 fn client(attempt: i32) -> Producer {
     Producer {
         id: client_producer_id("me", "p"),
@@ -190,7 +186,7 @@ impl Case {
             AppendRecordsRequest {
                 namespace: self.namespace.clone(),
                 r#ref: self.stream_ref(),
-                writer: writer_for(producer),
+                producer: Some(producer),
                 sequence,
                 records,
                 ..Default::default()
@@ -231,7 +227,7 @@ impl Case {
             CloseStreamRequest {
                 namespace: self.namespace.clone(),
                 r#ref: self.stream_ref(),
-                writer: writer_for(producer),
+                producer: Some(producer),
                 ..Default::default()
             },
         )
@@ -427,7 +423,7 @@ async fn a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_recor
             .unwrap();
         let all = case.read(ReadRecordsRequest::default()).await.unwrap();
         assert_eq!(texts(&all), ["1", "2"]);
-        assert_eq!(all.records[0].offset, first.first_offset);
+        assert_eq!(item_offset(&all.records[0]), first.first_offset);
         assert_eq!(all.last_offset, first.last_offset);
         let from = case
             .read(ReadRecordsRequest {
@@ -528,7 +524,7 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
                     id: stream,
                     ..Default::default()
                 }),
-                writer: writer_for(client(1)),
+                producer: Some(client(1)),
                 sequence: 2,
                 records: vec![record("2")],
                 ..Default::default()
@@ -592,7 +588,7 @@ async fn a_closed_read_ends_with_a_close_item() {
         let read = case.read(ReadRecordsRequest::default()).await.unwrap();
         assert!(read.done);
         let last = read.records.last().expect("a close item");
-        assert_eq!(off(&last.offset), off(&written.last_offset) + 1);
+        assert_eq!(off(item_offset(last)), off(&written.last_offset) + 1);
         let Some(Item::Close(close)) = &last.item else {
             panic!("not a close item: {:?}", last.item);
         };
@@ -729,7 +725,7 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
             let request = AppendRecordsRequest {
                 namespace: case.namespace.clone(),
                 r#ref: stream,
-                writer: writer_for(client(1)),
+                producer: Some(client(1)),
                 sequence,
                 records: vec![record(&sequence.to_string())],
                 ..Default::default()
@@ -811,7 +807,7 @@ async fn a_waiting_read_wakes_with_done_on_a_close() {
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
             r#ref: case.stream_ref(),
-            writer: writer_for(client(1)),
+            producer: Some(client(1)),
             ..Default::default()
         };
         let closer = tokio::spawn(async move {

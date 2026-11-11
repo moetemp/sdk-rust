@@ -7,14 +7,14 @@ use crate::{
 };
 use prost::Message;
 
-/// One stored data Record.
+/// One stored data Record. It has no offset, since the Store gives the entry its offset.
 pub(crate) fn data_record(producer: &Producer, record: AppendRecord) -> Vec<u8> {
     StreamRecord {
         item: Some(Item::Data(StreamData {
             producer: Some(producer.clone()),
             body: record.body,
+            ..Default::default()
         })),
-        ..Default::default()
     }
     .encode_to_vec()
 }

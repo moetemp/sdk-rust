@@ -11,8 +11,7 @@ use crate::{
     epoch::ProducerKind,
     offset::offset_from_wire,
     proto::{
-        AppendRecord, AppendRecordsRequest, OpenWriterRequest, Producer, StreamRef, StreamWriter,
-        producer::Kind,
+        AppendRecord, AppendRecordsRequest, OpenWriterRequest, Producer, StreamRef, producer::Kind,
     },
     service::StreamService,
     store::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES},
@@ -51,9 +50,8 @@ struct State {
 
 struct Writer {
     stream_ref: StreamRef,
+    /// The open's Producer, with its epoch, which each batch sends.
     producer: Producer,
-    /// The open's writer, with its Producer and task facts, which each batch sends.
-    stream_writer: StreamWriter,
     max_batch: usize,
     max_retry: Duration,
     service: Arc<StreamService>,
@@ -130,7 +128,7 @@ impl Writer {
     async fn send(&self, records: Vec<AppendRecord>, sequence: i64) -> StreamResult<(i64, i64)> {
         let request = AppendRecordsRequest {
             r#ref: Some(self.stream_ref.clone()),
-            writer: Some(self.stream_writer.clone()),
+            producer: Some(self.producer.clone()),
             sequence,
             records,
             ..Default::default()
@@ -234,10 +232,8 @@ impl Writers {
             .r#ref
             .ok_or_else(|| StreamError::invalid("The writer has no Stream"))?;
         crate::ids::check_stream_id(&stream.id)?;
-        let stream_writer = request.writer.unwrap_or_default();
-        let producer = stream_writer
+        let producer = request
             .producer
-            .clone()
             .ok_or_else(|| StreamError::invalid("The writer has no Producer"))?;
         crate::ids::check_producer(&producer)?;
         if ProducerKind::try_from(&producer)? == ProducerKind::Workflow {
@@ -263,7 +259,6 @@ impl Writers {
         let writer = Arc::new(Writer {
             stream_ref: stream,
             producer,
-            stream_writer,
             // The Store refuses a batch over its Record limit, so no batch can be larger.
             max_batch: match request.max_batch_size {
                 n if n > 0 => (n as usize).min(MAX_BATCH_RECORDS),

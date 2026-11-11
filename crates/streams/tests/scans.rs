@@ -16,8 +16,8 @@ use temporalio_streams::{
     proto::{
         AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientEpoch, ClientProducer,
         CreateStreamRequest, CreateStreamResponse, Producer, ReadRecordsRequest,
-        ReadRecordsResponse, StreamErrorDetails, StreamErrorReason, StreamRef, StreamWriter,
-        producer::Kind, read_records_request::Position,
+        ReadRecordsResponse, StreamErrorDetails, StreamErrorReason, StreamRef, producer::Kind,
+        read_records_request::Position,
     },
     store::{Appended, Batch, Capabilities, Create, Created, Entry, Store, StreamState},
 };
@@ -153,9 +153,7 @@ async fn append_sized(
         AppendRecordsRequest {
             namespace: NAMESPACE.to_string(),
             r#ref: stream_ref(),
-            writer: Some(StreamWriter {
-                producer: Some(client()),
-            }),
+            producer: Some(client()),
             sequence,
             records,
             ..Default::default()
