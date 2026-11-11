@@ -50,7 +50,6 @@ struct State {
 }
 
 struct Writer {
-    namespace: String,
     stream_ref: StreamRef,
     producer: Producer,
     /// The open's writer, with its Producer and task facts, which each batch sends.
@@ -130,7 +129,6 @@ impl Writer {
     /// batch again with the same `sequence`, so the dedupe key stops a second write.
     async fn send(&self, records: Vec<AppendRecord>, sequence: i64) -> StreamResult<(i64, i64)> {
         let request = AppendRecordsRequest {
-            namespace: self.namespace.clone(),
             r#ref: Some(self.stream_ref.clone()),
             writer: Some(self.stream_writer.clone()),
             sequence,
@@ -180,8 +178,8 @@ fn check_sizes(producer: &Producer, records: &[AppendRecord]) -> StreamResult<()
     Ok(())
 }
 
-/// The namespace, Stream id, Producer id and epoch key of a writer.
-type WriterKey = (String, String, String, [u8; crate::epoch::EPOCH_KEY_LEN]);
+/// The Stream id, Producer id and epoch key of a writer.
+type WriterKey = (String, String, [u8; crate::epoch::EPOCH_KEY_LEN]);
 
 /// One open writer and the references to it.
 struct Open {
@@ -246,7 +244,6 @@ impl Writers {
             return Err(StreamError::invalid("Workflow code doesn't open a writer"));
         }
         let key = (
-            request.namespace.clone(),
             stream.id.clone(),
             producer.id.clone(),
             crate::epoch::epoch_key(producer.kind.as_ref()),
@@ -264,7 +261,6 @@ impl Writers {
             _ => false,
         };
         let writer = Arc::new(Writer {
-            namespace: request.namespace,
             stream_ref: stream,
             producer,
             stream_writer,

@@ -236,27 +236,16 @@ pub trait Store: Send + Sync + 'static {
     /// The create of an existing Stream fails with [Reason::Expired] or [Reason::Closed], in this
     /// order. Then a retry of the create that made the Stream, with the same request id, gets
     /// [CreateOutcome::Created] and changes nothing. Any other create applies its [ConflictPolicy].
-    async fn create(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        create: &Create<'_>,
-    ) -> StreamResult<Created>;
+    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created>;
 
     /// Appends the whole batch, or nothing of it. The batch's Records get consecutive offsets that
     /// end at the last offset of [Appended::offsets], so a caller knows the offset of each one.
-    async fn append(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        batch: &Batch<'_>,
-    ) -> StreamResult<Appended>;
+    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended>;
 
     /// Reads the Stream's state and up to `count` entries from `from`, inclusive. Zero reads
     /// from the start of the log.
     async fn read(
         &self,
-        namespace: &str,
         stream_ref: &StreamRef,
         from: i64,
         count: usize,
@@ -267,7 +256,6 @@ pub trait Store: Send + Sync + 'static {
     /// deadline, and then the caller reads again.
     async fn wait_after(
         &self,
-        namespace: &str,
         stream_ref: &StreamRef,
         after: i64,
         deadline: Instant,
@@ -275,12 +263,7 @@ pub trait Store: Send + Sync + 'static {
 
     /// Closes a Stream. A close writes no log entry, and a close of a closed Stream changes
     /// nothing. Needs [Capabilities::CLOSE].
-    async fn close(
-        &self,
-        _namespace: &str,
-        _stream_ref: &StreamRef,
-        _producer: &Producer,
-    ) -> StreamResult<Closed> {
+    async fn close(&self, _stream_ref: &StreamRef, _producer: &Producer) -> StreamResult<Closed> {
         Err(unsupported("close"))
     }
 }

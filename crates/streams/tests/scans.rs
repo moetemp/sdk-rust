@@ -40,32 +40,21 @@ impl Store for Trimming {
         self.inner.capabilities()
     }
 
-    async fn create(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        create: &Create<'_>,
-    ) -> StreamResult<Created> {
-        self.inner.create(namespace, stream_ref, create).await
+    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
+        self.inner.create(stream_ref, create).await
     }
 
-    async fn append(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        batch: &Batch<'_>,
-    ) -> StreamResult<Appended> {
-        self.inner.append(namespace, stream_ref, batch).await
+    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
+        self.inner.append(stream_ref, batch).await
     }
 
     async fn read(
         &self,
-        namespace: &str,
         stream_ref: &StreamRef,
         from: i64,
         count: usize,
     ) -> StreamResult<(StreamState, Vec<Entry>)> {
-        let (mut state, mut entries) = self.inner.read(namespace, stream_ref, from, count).await?;
+        let (mut state, mut entries) = self.inner.read(stream_ref, from, count).await?;
         if count > 0 && !entries.is_empty() && self.trim_next.swap(false, Ordering::Relaxed) {
             state.trimmed = entries.remove(0).offset;
         }
@@ -75,14 +64,11 @@ impl Store for Trimming {
 
     async fn wait_after(
         &self,
-        namespace: &str,
         stream_ref: &StreamRef,
         after: i64,
         deadline: Instant,
     ) -> StreamResult<bool> {
-        self.inner
-            .wait_after(namespace, stream_ref, after, deadline)
-            .await
+        self.inner.wait_after(stream_ref, after, deadline).await
     }
 }
 

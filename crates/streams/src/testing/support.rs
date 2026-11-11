@@ -64,7 +64,6 @@ impl Needs {
 pub(crate) struct Target {
     pub(crate) store: Arc<dyn Store>,
     pub(crate) raw: Arc<dyn RawKeys>,
-    pub(crate) namespace: String,
     pub(crate) stream: String,
     /// What the backend gives. A case checks it before a step that needs more than it asked for.
     pub(crate) gives: Needs,
@@ -93,7 +92,6 @@ pub(crate) async fn stores_for(needs: Needs) -> Vec<Target> {
         targets.push(Target {
             store,
             raw,
-            namespace: format!("ns-{unique}"),
             stream: format!("wf:{unique}"),
             gives: backend.gives(),
         });
@@ -207,57 +205,46 @@ impl Target {
 
     /// Creates the Stream, and gives the Store's answer.
     pub(crate) async fn create_with(&self, create: &Create<'_>) -> StreamResult<Created> {
-        self.store
-            .create(&self.namespace, &self.stream_ref(), create)
-            .await
+        self.store.create(&self.stream_ref(), create).await
     }
 
     /// Sets one meta field under the Store's calls.
     pub(crate) async fn set_meta(&self, field: impl AsRef<[u8]>, value: impl AsRef<[u8]>) {
         self.raw
-            .set_meta(
-                &self.namespace,
-                &self.stream,
-                field.as_ref(),
-                value.as_ref(),
-            )
+            .set_meta(&self.stream, field.as_ref(), value.as_ref())
             .await
     }
 
     /// One meta field.
     pub(crate) async fn meta(&self, field: impl AsRef<[u8]>) -> Option<Vec<u8>> {
-        self.raw
-            .meta(&self.namespace, &self.stream, field.as_ref())
-            .await
+        self.raw.meta(&self.stream, field.as_ref()).await
     }
 
     /// The ms left on the log and on the meta, as `PTTL` gives them.
     pub(crate) async fn ttls(&self) -> (i64, i64) {
-        self.raw.ttls(&self.namespace, &self.stream).await
+        self.raw.ttls(&self.stream).await
     }
 
     /// Adds a log entry with an explicit id, as `XADD <id>`.
     pub(crate) async fn add_raw_entry(&self, id: &str) {
-        self.raw
-            .add_raw_entry(&self.namespace, &self.stream, id)
-            .await
+        self.raw.add_raw_entry(&self.stream, id).await
     }
 
     /// The number of log entries.
     pub(crate) async fn log_len(&self) -> usize {
-        self.raw.log_len(&self.namespace, &self.stream).await
+        self.raw.log_len(&self.stream).await
     }
 
     /// Deletes the log, as an eviction would.
     pub(crate) async fn drop_log(&self) {
-        self.raw.drop_log(&self.namespace, &self.stream).await
+        self.raw.drop_log(&self.stream).await
     }
 
     /// Every entry of the log.
     pub(crate) async fn entries(&self) -> Vec<Entry> {
         let (_, entries) = self
             .store
-            .read(&self.namespace, &self.stream_ref(), 0, 10_000)
+            .read(&self.stream_ref(), 0, 10_000)
             .await
             .unwrap();
         entries
@@ -278,7 +265,6 @@ impl Target {
         let records: Vec<_> = texts.iter().map(|text| record(producer, text)).collect();
         self.store
             .append(
-                &self.namespace,
                 &self.stream_ref(),
                 &Batch {
                     producer,
@@ -291,9 +277,7 @@ impl Target {
     }
 
     pub(crate) async fn close(&self, producer: &Producer) -> StreamResult<Closed> {
-        self.store
-            .close(&self.namespace, &self.stream_ref(), producer)
-            .await
+        self.store.close(&self.stream_ref(), producer).await
     }
 }
 

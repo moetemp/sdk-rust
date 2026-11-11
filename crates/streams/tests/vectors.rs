@@ -88,7 +88,7 @@ fn stream_ids_and_keys_match() {
             text(case, "name"),
         );
         assert_eq!(id, text(case, "stream_id"));
-        let keys = StreamKeys::new(text(case, "prefix"), text(case, "namespace"), &id);
+        let keys = StreamKeys::new(text(case, "prefix"), &id);
         assert_eq!(keys.meta(), text(case, "meta"));
         assert_eq!(keys.log(), text(case, "log"));
         assert_eq!(keys.closed(), text(case, "closed"));

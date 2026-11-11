@@ -312,20 +312,15 @@ impl MemoryStore {
         }
     }
 
-    fn key(&self, namespace: &str, stream_id: &str) -> String {
-        StreamKeys::new(&self.prefix, namespace, stream_id).meta()
+    fn key(&self, stream_id: &str) -> String {
+        StreamKeys::new(&self.prefix, stream_id).meta()
     }
 
     /// Runs `step` on one Stream's keys after it drops the expired keys, as Redis does.
-    fn with<T>(
-        &self,
-        namespace: &str,
-        stream_id: &str,
-        step: impl FnOnce(&mut Keys, i64) -> T,
-    ) -> T {
+    fn with<T>(&self, stream_id: &str, step: impl FnOnce(&mut Keys, i64) -> T) -> T {
         let now = now_ms();
         let mut streams = self.streams.lock();
-        let key = self.key(namespace, stream_id);
+        let key = self.key(stream_id);
         let keys = streams.entry(key.clone()).or_default();
         if keys.meta_expires > 0 && keys.meta_expires <= now {
             keys.meta.clear();
@@ -349,23 +344,21 @@ impl MemoryStore {
 impl MemoryStore {
     /// Changes one meta field, for tests of what the scripts refuse.
     #[doc(hidden)]
-    pub fn test_set_meta(&self, namespace: &str, stream_id: &str, field: &[u8], value: &[u8]) {
-        self.with(namespace, stream_id, |keys, _| keys.set(field, value));
+    pub fn test_set_meta(&self, stream_id: &str, field: &[u8], value: &[u8]) {
+        self.with(stream_id, |keys, _| keys.set(field, value));
     }
 
     /// One meta field, for tests.
     #[doc(hidden)]
-    pub fn test_meta(&self, namespace: &str, stream_id: &str, field: &[u8]) -> Option<Vec<u8>> {
-        self.with(namespace, stream_id, |keys, _| {
-            keys.get(field).map(<[u8]>::to_vec)
-        })
+    pub fn test_meta(&self, stream_id: &str, field: &[u8]) -> Option<Vec<u8>> {
+        self.with(stream_id, |keys, _| keys.get(field).map(<[u8]>::to_vec))
     }
 
     /// The ms left on the log and on the meta, -1 for a key with no expiry and -2 for a key that
     /// doesn't exist, as `PTTL`.
     #[doc(hidden)]
-    pub fn test_ttls(&self, namespace: &str, stream_id: &str) -> (i64, i64) {
-        self.with(namespace, stream_id, |keys, now| {
+    pub fn test_ttls(&self, stream_id: &str) -> (i64, i64) {
+        self.with(stream_id, |keys, now| {
             let ttl = |expires: i64| if expires > 0 { expires - now } else { -1 };
             let log = if keys.log.is_some() {
                 ttl(keys.log_expires)
@@ -383,8 +376,8 @@ impl MemoryStore {
 
     /// Adds an entry with an explicit id, as `XADD <id>`, for tests.
     #[doc(hidden)]
-    pub fn test_add_entry(&self, namespace: &str, stream_id: &str, id: &str) {
-        self.with(namespace, stream_id, |keys, _| {
+    pub fn test_add_entry(&self, stream_id: &str, id: &str) {
+        self.with(stream_id, |keys, _| {
             let id = parse_id(id).expect("an entry id");
             keys.last_id = keys.last_id.max(id);
             keys.log
@@ -395,16 +388,16 @@ impl MemoryStore {
 
     /// The number of log entries, as `XLEN`, for tests.
     #[doc(hidden)]
-    pub fn test_log_len(&self, namespace: &str, stream_id: &str) -> usize {
-        self.with(namespace, stream_id, |keys, _| {
+    pub fn test_log_len(&self, stream_id: &str) -> usize {
+        self.with(stream_id, |keys, _| {
             keys.log.as_ref().map_or(0, BTreeMap::len)
         })
     }
 
     /// Deletes the log, as `DEL`, for tests.
     #[doc(hidden)]
-    pub fn test_drop_log(&self, namespace: &str, stream_id: &str) {
-        self.with(namespace, stream_id, |keys, _| {
+    pub fn test_drop_log(&self, stream_id: &str) {
+        self.with(stream_id, |keys, _| {
             keys.log = None;
             keys.log_expires = 0;
             keys.last_id = (0, 0);
@@ -428,18 +421,13 @@ impl Store for MemoryStore {
         Capabilities::ALL
     }
 
-    async fn create(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        create: &Create<'_>,
-    ) -> StreamResult<Created> {
+    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
         let stream_id = stream_ref.id.as_str();
         let retention = create.retention.filter(|r| !r.is_zero());
         let retention = millis(retention.unwrap_or(self.retention));
         let request_id = create.request_id;
         let (last_write_ttl, tombstone) = (self.last_write_ttl.map(millis), millis(TOMBSTONE));
-        let created = self.with(namespace, stream_id, |keys, now| {
+        let created = self.with(stream_id, |keys, now| {
             if keys.get("ret").is_none() {
                 keys.set("v", FORMAT_VERSION.to_string());
                 keys.set("ret", retention.to_string());
@@ -469,19 +457,14 @@ impl Store for MemoryStore {
         })
     }
 
-    async fn append(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        batch: &Batch<'_>,
-    ) -> StreamResult<Appended> {
+    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
         let stream_id = stream_ref.id.as_str();
         let producer = batch.producer;
         let kind = ProducerKind::try_from(producer)?;
         let epoch = epoch_key(producer.kind.as_ref());
         let (last_write_ttl, tombstone) = (self.last_write_ttl.map(millis), millis(TOMBSTONE));
         let field = format!("p|{}|{}", kind as i32, producer.id);
-        let appended = self.with(namespace, stream_id, |keys, now| {
+        let appended = self.with(stream_id, |keys, now| {
             // The format version comes first, since a newer format can change the Producer field.
             keys.check_live(now)?;
             let stored = keys.get(&field).map(ProducerField::try_from).transpose()?;
@@ -580,18 +563,13 @@ impl Store for MemoryStore {
         })
     }
 
-    async fn close(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        producer: &Producer,
-    ) -> StreamResult<Closed> {
+    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
         let stream_id = stream_ref.id.as_str();
         let kind = ProducerKind::try_from(producer)?;
         let epoch = epoch_key(producer.kind.as_ref());
         let field = format!("p|{}|{}", kind as i32, producer.id);
         let tombstone = millis(TOMBSTONE);
-        let closed = self.with(namespace, stream_id, |keys, now| {
+        let closed = self.with(stream_id, |keys, now| {
             keys.check_live(now)?;
             if keys.get("closed").is_some() {
                 return Ok(true);
@@ -621,7 +599,6 @@ impl Store for MemoryStore {
 
     async fn read(
         &self,
-        namespace: &str,
         stream_ref: &StreamRef,
         from: i64,
         count: usize,
@@ -632,7 +609,7 @@ impl Store for MemoryStore {
         } else {
             (0, 0)
         };
-        self.with(namespace, stream_id, |keys, now| {
+        self.with(stream_id, |keys, now| {
             let offset = |field: &str| -> StreamResult<i64> {
                 keys.text(field).map_or(Ok(0), offset_of_entry_id)
             };
@@ -664,7 +641,6 @@ impl Store for MemoryStore {
 
     async fn wait_after(
         &self,
-        namespace: &str,
         stream_ref: &StreamRef,
         after: i64,
         deadline: Instant,
@@ -678,7 +654,7 @@ impl Store for MemoryStore {
         loop {
             // Listen before the check, so an append between the two still wakes the wait.
             let appended = self.appended.notified();
-            let found = self.with(namespace, stream_id, |keys, _| {
+            let found = self.with(stream_id, |keys, _| {
                 keys.get("closed").is_some()
                     || keys
                         .log

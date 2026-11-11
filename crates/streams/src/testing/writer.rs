@@ -153,7 +153,6 @@ impl Case {
 
     async fn open(&self, producer: Producer, change: impl Fn(&mut OpenWriterRequest)) -> u64 {
         let mut request = OpenWriterRequest {
-            namespace: self.namespace.clone(),
             r#ref: Some(StreamRef {
                 id: self.stream.clone(),
                 ..Default::default()
@@ -463,28 +462,18 @@ impl Store for Flaky {
         self.inner.capabilities()
     }
 
-    async fn create(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        create: &Create<'_>,
-    ) -> StreamResult<Created> {
-        self.inner.create(namespace, stream_ref, create).await
+    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
+        self.inner.create(stream_ref, create).await
     }
 
-    async fn append(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        batch: &Batch<'_>,
-    ) -> StreamResult<Appended> {
+    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
         if self.down.load(Ordering::SeqCst) {
             return Err(StreamError::storage_unavailable("the Store is down"));
         }
         if self.corrupt_next.swap(false, Ordering::SeqCst) {
             return Err(StreamError::storage_corrupt("a stored field is bad"));
         }
-        let appended = self.inner.append(namespace, stream_ref, batch).await?;
+        let appended = self.inner.append(stream_ref, batch).await?;
         if self.lose_next.swap(false, Ordering::SeqCst) {
             return Err(StreamError::storage_unavailable("the answer was lost"));
         }
@@ -493,33 +482,24 @@ impl Store for Flaky {
 
     async fn read(
         &self,
-        namespace: &str,
         stream_ref: &StreamRef,
         from: i64,
         count: usize,
     ) -> StreamResult<(StreamState, Vec<Entry>)> {
-        self.inner.read(namespace, stream_ref, from, count).await
+        self.inner.read(stream_ref, from, count).await
     }
 
     async fn wait_after(
         &self,
-        namespace: &str,
         stream_ref: &StreamRef,
         after: i64,
         deadline: tokio::time::Instant,
     ) -> StreamResult<bool> {
-        self.inner
-            .wait_after(namespace, stream_ref, after, deadline)
-            .await
+        self.inner.wait_after(stream_ref, after, deadline).await
     }
 
-    async fn close(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        producer: &Producer,
-    ) -> StreamResult<Closed> {
-        self.inner.close(namespace, stream_ref, producer).await
+    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
+        self.inner.close(stream_ref, producer).await
     }
 }
 
@@ -534,7 +514,7 @@ async fn flaky_cases(lose_next: bool) -> Vec<(Arc<Flaky>, Case)> {
         });
         let case = Case {
             ext: MemoryStreamRuntime::with_store(store.clone(), None),
-            namespace: target.namespace,
+            namespace: format!("ns-{}", target.stream),
             stream: target.stream,
         };
         let _: CreateStreamResponse = case

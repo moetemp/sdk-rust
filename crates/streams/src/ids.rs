@@ -2,13 +2,14 @@
 //! `testdata/ids.json` has the shared vectors that check it.
 //!
 //! ```text
-//! <prefix>:{<namespace>:<stream id>}:meta       the create key, the fence, dedupe and close state
-//! <prefix>:{<namespace>:<stream id>}:log        the log, one entry per Record
+//! <prefix>:{<stream id>}:meta     the create key, the fence, dedupe and close state
+//! <prefix>:{<stream id>}:log      the log, one entry per Record
+//! <prefix>:{<stream id>}:closed   the entry that a close adds, which wakes a waiting read
 //! ```
 //!
-//! The part in braces is the Redis Cluster hash tag, so that the keys are in one slot for one
-//! script. Each part is percent-encoded, so a `:` or a brace in an id can't make two Streams share
-//! a key.
+//! A key has no Temporal namespace, so a Stream id is unique in one Store and key prefix. The part
+//! in braces is the Redis Cluster hash tag, so that the keys are in one slot for one script. Each
+//! part is percent-encoded, so a `:` or a brace in an id can't make two Streams share a key.
 
 use crate::{
     StreamError, StreamResult,
@@ -174,14 +175,10 @@ pub struct StreamKeys {
 }
 
 impl StreamKeys {
-    /// The keys of `stream_id` in `namespace`, under `prefix`.
-    pub fn new(prefix: &str, namespace: &str, stream_id: &str) -> Self {
+    /// The keys of `stream_id` under `prefix`.
+    pub fn new(prefix: &str, stream_id: &str) -> Self {
         Self {
-            base: format!(
-                "{}:{{{}}}",
-                encode_part(prefix),
-                join(&[namespace, stream_id])
-            ),
+            base: format!("{}:{{{}}}", encode_part(prefix), encode_part(stream_id)),
         }
     }
 

@@ -33,55 +33,36 @@ impl Store for Masked {
         self.inner.capabilities().without(self.without)
     }
 
-    async fn create(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        create: &Create<'_>,
-    ) -> StreamResult<Created> {
-        self.inner.create(namespace, stream_ref, create).await
+    async fn create(&self, stream_ref: &StreamRef, create: &Create<'_>) -> StreamResult<Created> {
+        self.inner.create(stream_ref, create).await
     }
 
-    async fn append(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        batch: &Batch<'_>,
-    ) -> StreamResult<Appended> {
-        self.inner.append(namespace, stream_ref, batch).await
+    async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
+        self.inner.append(stream_ref, batch).await
     }
 
     async fn read(
         &self,
-        namespace: &str,
         stream_ref: &StreamRef,
         from: i64,
         count: usize,
     ) -> StreamResult<(StreamState, Vec<Entry>)> {
-        self.inner.read(namespace, stream_ref, from, count).await
+        self.inner.read(stream_ref, from, count).await
     }
 
     async fn wait_after(
         &self,
-        namespace: &str,
         stream_ref: &StreamRef,
         after: i64,
         deadline: Instant,
     ) -> StreamResult<bool> {
-        self.inner
-            .wait_after(namespace, stream_ref, after, deadline)
-            .await
+        self.inner.wait_after(stream_ref, after, deadline).await
     }
 
     // The masked calls still work underneath, so a call that skips the check would succeed,
     // and the tests would see it.
-    async fn close(
-        &self,
-        namespace: &str,
-        stream_ref: &StreamRef,
-        producer: &Producer,
-    ) -> StreamResult<Closed> {
-        self.inner.close(namespace, stream_ref, producer).await
+    async fn close(&self, stream_ref: &StreamRef, producer: &Producer) -> StreamResult<Closed> {
+        self.inner.close(stream_ref, producer).await
     }
 }
 
@@ -164,7 +145,7 @@ impl Case {
     }
 
     fn log_len(&self) -> usize {
-        self.memory.test_log_len(NAMESPACE, &self.stream)
+        self.memory.test_log_len(&self.stream)
     }
 }
 

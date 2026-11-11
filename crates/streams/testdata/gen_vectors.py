@@ -21,8 +21,8 @@ def join(*parts):
     return ":".join(part(p) for p in parts)
 
 
-def keys(prefix, namespace, stream_id):
-    base = f"{part(prefix)}:{{{join(namespace, stream_id)}}}"
+def keys(prefix, stream_id):
+    base = f"{part(prefix)}:{{{part(stream_id)}}}"
     return {
         "meta": f"{base}:meta",
         "log": f"{base}:log",
@@ -56,20 +56,19 @@ def epoch_key(epoch):
 
 def ids():
     cases = []
-    for prefix, namespace, workflow_id, first_run_id, name in [
-        ("temporal-streams", "default", "agent-1", "run-1", "turn-3"),
-        ("p:x", "ns{1}", "a:b/c", "r%1", "é name"),
+    for prefix, workflow_id, first_run_id, name in [
+        ("temporal-streams", "agent-1", "run-1", "turn-3"),
+        ("p:x", "a:b/c", "r%1", "é name"),
     ]:
         stream_id = join(workflow_id, first_run_id, name)
         cases.append(
             {
                 "prefix": prefix,
-                "namespace": namespace,
                 "workflow_id": workflow_id,
                 "first_run_id": first_run_id,
                 "name": name,
                 "stream_id": stream_id,
-                **keys(prefix, namespace, stream_id),
+                **keys(prefix, stream_id),
             }
         )
     producers = {
