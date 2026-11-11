@@ -32,9 +32,6 @@ pub const TOMBSTONE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// The longest Retention or safety TTL, which is the largest proto Duration. Its ms plus the time
 /// of a write stay exact in a Lua number.
 pub const MAX_TTL: Duration = Duration::from_secs(315_576_000_000);
-/// The shortest Retention. A Store keeps whole ms, so a shorter one would expire the Stream at its
-/// next write.
-pub const MIN_RETENTION: Duration = Duration::from_millis(1);
 
 /// What a create does when its Stream exists and is open, and the create isn't a retry of the
 /// create that made the Stream.
@@ -50,7 +47,8 @@ pub enum ConflictPolicy {
 /// A create of a Stream.
 #[derive(Debug, Clone, Default)]
 pub struct Create<'a> {
-    /// The Retention, `None` for the Store default.
+    /// The Retention, `None` for the Store default. The service always sends `None`, since the
+    /// backend config holds the Retention. A test may set a short one.
     pub retention: Option<Duration>,
     /// What the create does when the Stream exists.
     pub conflict: ConflictPolicy,
@@ -286,18 +284,6 @@ pub trait Store: Send + Sync + 'static {
         _producer: &Producer,
     ) -> StreamResult<Closed> {
         Err(unsupported("close"))
-    }
-
-    /// Reads up to `count` entries at or before `before`, newest first, for a read of the newest
-    /// Records.
-    async fn read_back(
-        &self,
-        _namespace: &str,
-        _stream_id: &str,
-        _before: i64,
-        _count: usize,
-    ) -> StreamResult<Vec<Entry>> {
-        Err(unsupported("last"))
     }
 }
 

@@ -24,7 +24,7 @@ use std::time::Duration;
 fn activity(run: &str, attempt: i32, scheduled: i64) -> Producer {
     Producer {
         id: activity_producer_id(run, "a", "s"),
-        kind: Some(Kind::Activity(ActivityProducer {
+        kind: Some(Kind::WorkflowActivity(ActivityProducer {
             run_id: run.to_string(),
             epoch: Some(ActivityEpoch {
                 attempt_scheduled_time: Some(Timestamp {

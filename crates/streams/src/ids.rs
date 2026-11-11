@@ -220,7 +220,7 @@ mod tests {
                 run_id,
                 ..Default::default()
             }),
-            ProducerKind::Activity => Kind::Activity(ActivityProducer {
+            ProducerKind::Activity => Kind::WorkflowActivity(ActivityProducer {
                 run_id,
                 ..Default::default()
             }),

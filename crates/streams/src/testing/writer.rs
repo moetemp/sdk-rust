@@ -3,7 +3,7 @@
 //! Every Store runs the suite through its own runtime.
 
 use super::{
-    case,
+    RuntimeConfig, case,
     support::{Needs, stores_for},
 };
 use crate::{
@@ -42,8 +42,13 @@ struct Case {
 }
 
 async fn cases() -> Vec<Case> {
+    cases_with(&RuntimeConfig::default()).await
+}
+
+/// A case on each backend under test, on a runtime with `config`, with its Stream created.
+async fn cases_with(config: &RuntimeConfig) -> Vec<Case> {
     let mut cases = vec![];
-    for ext in super::support::stream_runtimes() {
+    for ext in super::support::config_runtimes(config) {
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -93,7 +98,7 @@ fn client() -> Producer {
 fn activity(attempt: i32) -> Producer {
     Producer {
         id: activity_producer_id("r1", "a", "s"),
-        kind: Some(Kind::Activity(ActivityProducer {
+        kind: Some(Kind::WorkflowActivity(ActivityProducer {
             run_id: "r1".to_string(),
             epoch: Some(ActivityEpoch {
                 attempt_scheduled_time: Some(Timestamp {
@@ -300,44 +305,26 @@ async fn an_activity_retry_opens_on_a_closed_or_expired_stream() {
         let retry = case.open(activity(2), |_| {}).await;
         let error = case.write(retry, &["a2"]).await.unwrap_err();
         assert_eq!(reason(&error), "stream_closed");
-
-        let short = format!("{}-short", case.stream);
-        let _: CreateStreamResponse = case
-            .call(
-                "CreateStream",
-                CreateStreamRequest {
-                    namespace: case.namespace.clone(),
-                    stream_ref: Some(StreamRef {
-                        id: short.clone(),
-                        ..Default::default()
-                    }),
-                    retention: millis(300),
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let on_short = |request: &mut OpenWriterRequest| {
-            request.r#ref = Some(StreamRef {
-                id: short.clone(),
-                ..Default::default()
-            });
-        };
-        let first = case.open(activity(1), on_short).await;
+    }
+    let short = RuntimeConfig {
+        retention: Some(Duration::from_millis(300)),
+        ..Default::default()
+    };
+    for case in cases_with(&short).await {
+        let first = case.open(activity(1), |_| {}).await;
         case.write(first, &["a1"]).await.unwrap();
-        let close_short = CloseStreamRequest {
+        let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
             r#ref: Some(StreamRef {
-                id: short.clone(),
+                id: case.stream.clone(),
                 ..Default::default()
             }),
             writer: writer_for(client()),
             ..Default::default()
         };
-        let _: crate::proto::CloseStreamResponse =
-            case.call("CloseStream", close_short).await.unwrap();
+        let _: crate::proto::CloseStreamResponse = case.call("CloseStream", close).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
-        let retry = case.open(activity(2), on_short).await;
+        let retry = case.open(activity(2), |_| {}).await;
         let error = case.write(retry, &["a2"]).await.unwrap_err();
         assert_eq!(reason(&error), "stream_expired");
     }
@@ -533,18 +520,6 @@ impl Store for Flaky {
         producer: &Producer,
     ) -> StreamResult<Closed> {
         self.inner.close(namespace, stream_ref, producer).await
-    }
-
-    async fn read_back(
-        &self,
-        namespace: &str,
-        stream_id: &str,
-        before: i64,
-        count: usize,
-    ) -> StreamResult<Vec<Entry>> {
-        self.inner
-            .read_back(namespace, stream_id, before, count)
-            .await
     }
 }
 

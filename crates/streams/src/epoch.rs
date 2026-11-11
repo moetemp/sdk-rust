@@ -32,7 +32,7 @@ impl From<&Kind> for ProducerKind {
         match kind {
             Kind::Workflow(_) => Self::Workflow,
             Kind::LocalActivity(_) => Self::LocalActivity,
-            Kind::Activity(_) => Self::Activity,
+            Kind::WorkflowActivity(_) => Self::Activity,
             Kind::StandaloneActivity(_) => Self::StandaloneActivity,
             Kind::Client(_) => Self::Client,
         }
@@ -58,7 +58,7 @@ pub fn producer_run_id(producer: &Producer) -> &str {
     match &producer.kind {
         Some(Kind::Workflow(w)) => &w.run_id,
         Some(Kind::LocalActivity(l)) => &l.run_id,
-        Some(Kind::Activity(a) | Kind::StandaloneActivity(a)) => &a.run_id,
+        Some(Kind::WorkflowActivity(a) | Kind::StandaloneActivity(a)) => &a.run_id,
         Some(Kind::Client(_)) | None => "",
     }
 }
@@ -100,7 +100,7 @@ pub fn task_key(task: &WorkflowTaskEpoch) -> [u8; TASK_KEY_LEN] {
 pub fn epoch_key(kind: Option<&Kind>) -> [u8; EPOCH_KEY_LEN] {
     let (scheduled, attempt) = match kind {
         Some(Kind::LocalActivity(local)) => (None, local.epoch.map_or(0, |e| e.attempt)),
-        Some(Kind::Activity(activity) | Kind::StandaloneActivity(activity)) => {
+        Some(Kind::WorkflowActivity(activity) | Kind::StandaloneActivity(activity)) => {
             let epoch = activity.epoch;
             (
                 epoch.and_then(|e| e.attempt_scheduled_time),

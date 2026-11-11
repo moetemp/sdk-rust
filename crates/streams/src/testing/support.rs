@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-use super::{RawKeys, backends};
+use super::{RawKeys, RuntimeConfig, backends};
 use crate::{
     StreamResult, StreamRuntime,
     digest::batch_digest,
@@ -35,7 +35,7 @@ impl Needs {
     /// `flagged`, and a close's offset and `already`.
     pub const STORE_ANSWERS: Self = Self(1);
     /// The keys under the calls. These are the meta fields, TTLs and raw log entries, and the
-    /// Store's log calls `read`, `read_back` and `wait_after`.
+    /// Store's log calls `read` and `wait_after`.
     pub const RAW_KEYS: Self = Self(1 << 1);
     /// Producers, owners and runs as sent. The server checks them against its executions, so a
     /// case with made-up runs, or an Activity with no task token, can't run there.
@@ -306,28 +306,31 @@ pub(crate) struct Runtime {
     pub(crate) gives: Needs,
 }
 
-/// A runtime on each backend under test that gives `needs`.
-pub(crate) async fn runtimes(needs: Needs) -> Vec<Runtime> {
+/// A runtime with `config` on each backend under test that gives `needs`.
+pub(crate) async fn runtimes(needs: Needs, config: &RuntimeConfig) -> Vec<Runtime> {
     backends()
         .into_iter()
         .filter(|backend| backend.gives().gives(needs))
         .map(|backend| Runtime {
-            ext: backend.runtime(""),
+            ext: backend.runtime(config),
             namespace: None,
             gives: backend.gives(),
         })
         .collect()
 }
 
-/// A runtime on each backend under test.
-pub(crate) fn stream_runtimes() -> Vec<Arc<StreamRuntime>> {
-    named_runtimes("")
-}
-
 /// A runtime on each backend under test, whose refs carry `backend`.
 pub(crate) fn named_runtimes(backend: &str) -> Vec<Arc<StreamRuntime>> {
+    config_runtimes(&RuntimeConfig {
+        backend: backend.to_string(),
+        ..Default::default()
+    })
+}
+
+/// A runtime with `config` on each backend under test.
+pub(crate) fn config_runtimes(config: &RuntimeConfig) -> Vec<Arc<StreamRuntime>> {
     backends()
         .into_iter()
-        .map(|test_backend| test_backend.runtime(backend))
+        .map(|test_backend| test_backend.runtime(config))
         .collect()
 }

@@ -258,7 +258,7 @@ impl Writers {
         // always sends the empty batch.
         let retry = match producer.kind.as_ref() {
             Some(Kind::LocalActivity(_)) => true,
-            Some(Kind::Activity(activity) | Kind::StandaloneActivity(activity)) => {
+            Some(Kind::WorkflowActivity(activity) | Kind::StandaloneActivity(activity)) => {
                 activity.epoch.map_or(0, |e| e.attempt) > 1
             }
             _ => false,

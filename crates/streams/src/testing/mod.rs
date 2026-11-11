@@ -18,7 +18,7 @@ use crate::{
 };
 use futures_util::{FutureExt, future::join_all};
 use prost::Message;
-use std::{future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc};
+use std::{future::Future, panic::AssertUnwindSafe, pin::Pin, sync::Arc, time::Duration};
 
 /// The state under a Store's calls, which some cases read or change.
 #[async_trait::async_trait]
@@ -37,6 +37,15 @@ pub trait RawKeys: Send + Sync {
     async fn drop_log(&self, namespace: &str, stream: &str);
 }
 
+/// The backend config of a runtime under test. A field left `None` keeps the backend's own value.
+#[derive(Clone, Debug, Default)]
+pub struct RuntimeConfig {
+    /// The backend name that the runtime sets on each ref it builds.
+    pub backend: String,
+    /// The Retention of each Stream that the runtime creates.
+    pub retention: Option<Duration>,
+}
+
 /// A backend that the suites run on.
 #[async_trait::async_trait]
 pub trait TestBackend: Send + Sync {
@@ -44,8 +53,15 @@ pub trait TestBackend: Send + Sync {
     fn gives(&self) -> Needs;
     /// A Store for one case, and the state under it.
     async fn connect(&self) -> (Arc<dyn Store>, Arc<dyn RawKeys>);
-    /// A runtime on the backend, whose refs carry `backend`.
-    fn runtime(&self, backend: &str) -> Arc<StreamRuntime>;
+    /// A runtime on the backend with `config`.
+    fn runtime(&self, config: &RuntimeConfig) -> Arc<StreamRuntime>;
+}
+
+fn proto_duration(value: Option<Duration>) -> Option<prost_types::Duration> {
+    value.map(|value| prost_types::Duration {
+        seconds: i64::try_from(value.as_secs()).unwrap_or(i64::MAX),
+        nanos: i32::try_from(value.subsec_nanos()).unwrap_or_default(),
+    })
 }
 
 /// The memory Store, with a new Store for each case.
@@ -64,9 +80,10 @@ impl TestBackend for MemoryBackend {
     }
 
     // Through the config bytes, as a bridge builds it.
-    fn runtime(&self, backend: &str) -> Arc<StreamRuntime> {
+    fn runtime(&self, config: &RuntimeConfig) -> Arc<StreamRuntime> {
         let config = MemoryStreamConfig {
-            backend: backend.to_string(),
+            backend: config.backend.clone(),
+            retention: proto_duration(config.retention),
             ..Default::default()
         };
         MemoryStreamRuntime::from_config_bytes(&config.encode_to_vec(), None).unwrap()

@@ -12,12 +12,13 @@ use crate::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
         Producer, ReadRecordsRequest, ReadRecordsResponse, StreamClose, StreamIdConflictPolicy,
-        StreamReadStart, StreamRecord, StreamRef, StreamStatus, stream_record::Item,
+        StreamReadStart, StreamRecord, StreamRef, StreamStatus, read_records_request::Position,
+        stream_record::Item,
     },
     record::data_records,
     store::{
         Batch, Capabilities, ConflictPolicy, Create, CreateOutcome, FORMAT_VERSION, MAX_SEQUENCE,
-        MAX_TTL, MIN_RETENTION, Store, StreamState,
+        Store, StreamState,
     },
 };
 use prost::Message;
@@ -28,10 +29,6 @@ use tokio::time::Instant;
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
 /// The maximum number of Records in one read.
 const MAX_RECORDS: usize = 1000;
-/// The maximum number of log entries that a read of the last Records scans.
-const MAX_SCAN: usize = 10 * MAX_RECORDS;
-/// The most entry bytes that a read of the last Records scans.
-const MAX_SCAN_BYTES: usize = 64 * 1024 * 1024;
 /// How often a read looks again for a Stream that nobody created yet.
 const CREATE_POLL: Duration = Duration::from_millis(100);
 
@@ -47,33 +44,6 @@ fn duration(value: Option<prost_types::Duration>) -> Option<Duration> {
     let value = value?;
     let duration = Duration::new(value.seconds.max(0) as u64, value.nanos.max(0) as u32);
     (!duration.is_zero()).then_some(duration)
-}
-
-/// The Retention of a create, `None` for the Store default. A Store computes expiry times from it,
-/// so a value past [MAX_TTL] would overflow them after the create's first write.
-fn retention(value: Option<prost_types::Duration>) -> StreamResult<Option<Duration>> {
-    let Some(value) = value else {
-        return Ok(None);
-    };
-    let out_of_range = || {
-        StreamError::invalid(format!(
-            "The Retention must be 0 for the Store default, or from {} ms to {} s",
-            MIN_RETENTION.as_millis(),
-            MAX_TTL.as_secs()
-        ))
-    };
-    let (Ok(seconds), Ok(nanos)) = (u64::try_from(value.seconds), u32::try_from(value.nanos))
-    else {
-        return Err(out_of_range());
-    };
-    if nanos >= 1_000_000_000 || Duration::new(seconds, nanos) > MAX_TTL {
-        return Err(out_of_range());
-    }
-    let retention = duration(Some(value));
-    if retention.is_some_and(|retention| retention < MIN_RETENTION) {
-        return Err(out_of_range());
-    }
-    Ok(retention)
 }
 
 /// The conflict policy of a create. Unspecified is FAIL, as for a Workflow start.
@@ -138,10 +108,10 @@ impl StreamService {
     ) -> StreamResult<CreateStreamResponse> {
         stream_id(request.stream_ref.as_ref())?;
         let stream = request.stream_ref.clone().unwrap_or_default();
-        let retention = retention(request.retention)?;
         let conflict = conflict_policy(request.id_conflict_policy)?;
+        // The backend config holds the Retention, so a create takes the Store default.
         let create = Create {
-            retention,
+            retention: None,
             conflict,
             request_id: &request.request_id,
         };
@@ -262,22 +232,15 @@ impl StreamService {
         let namespace = request.namespace.as_str();
         // The wire from_offset is exclusive, so a read starts after it. The empty value is a read
         // from the start.
-        let from_offset = offset_from_wire(&request.from_offset)?;
+        let (from_offset, at_end) = match &request.position {
+            Some(Position::FromOffset(offset)) => (offset_from_wire(offset)?, false),
+            Some(Position::Start(start)) => (0, *start == StreamReadStart::End as i32),
+            None => (0, false),
+        };
         if from_offset < 0 {
             return Err(StreamError::invalid("The offset is below zero"));
         }
         let max_bytes = max_bytes(request.max_bytes)?;
-        if request.last < 0 {
-            return Err(StreamError::invalid("last must be 0 or more"));
-        }
-        if request.last > 0 {
-            if request.wake_only || from_offset > 0 {
-                return Err(StreamError::invalid(
-                    "A read of the last Records takes no from_offset and no wake_only",
-                ));
-            }
-            return self.read_last(request, max_bytes).await;
-        }
         if request.wake_only || !request.to_offset.is_empty() {
             return Err(StreamError::new(
                 Reason::Unsupported,
@@ -304,7 +267,7 @@ impl StreamService {
         }
         // An exclusive from_offset reads after that Record, so the inclusive start is one past it.
         let from = match from_offset {
-            0 if request.start == StreamReadStart::End as i32 => state.newest + 1,
+            0 if at_end => state.newest + 1,
             0 => 0,
             offset => offset + 1,
         };
@@ -327,7 +290,7 @@ impl StreamService {
                 // An empty read resumes from where it started, which is one before the inclusive
                 // start.
                 return Ok(ReadRecordsResponse {
-                    next_offset: offset_to_wire(from - 1),
+                    last_offset: offset_to_wire(from - 1),
                     ..Default::default()
                 });
             }
@@ -338,80 +301,6 @@ impl StreamService {
             woke?;
             state = self.store.read(namespace, &id, 0, 0).await?.0;
         }
-    }
-
-    /// The newest `last` Records, oldest first, and `done` for a closed Stream. It never waits, and
-    /// it stops after [MAX_SCAN] entries or [MAX_SCAN_BYTES] of them.
-    async fn read_last(
-        &self,
-        request: ReadRecordsRequest,
-        max_bytes: usize,
-    ) -> StreamResult<ReadRecordsResponse> {
-        let id = stream_id(request.r#ref.as_ref())?.to_string();
-        let namespace = request.namespace.as_str();
-        let count = (request.last as usize).min(MAX_RECORDS);
-        let create_wait = duration(request.create_wait)
-            .unwrap_or_default()
-            .min(MAX_WAIT);
-        let state = self
-            .created(namespace, &id, Instant::now() + create_wait)
-            .await?;
-        if state.version > FORMAT_VERSION {
-            return Err(StreamError::new(
-                Reason::FormatTooNew,
-                format!("format {} is newer than {FORMAT_VERSION}", state.version),
-            ));
-        }
-        check_expiry(&state, 0)?;
-        let retained = state.retained_from();
-        let mut picked = vec![];
-        let (mut bytes, mut scanned, mut scanned_bytes) = (0, 0, 0);
-        let mut before = state.newest;
-        'scan: while before >= retained
-            && picked.len() < count
-            && scanned < MAX_SCAN
-            && scanned_bytes < MAX_SCAN_BYTES
-        {
-            let left = (count - picked.len()).clamp(16, MAX_RECORDS);
-            let room = max_bytes
-                .saturating_sub(bytes)
-                .min(MAX_SCAN_BYTES.saturating_sub(scanned_bytes));
-            let chunk = chunk_len(left, Some(room), (scanned_bytes, scanned));
-            let entries = self.store.read_back(namespace, &id, before, chunk).await?;
-            if entries.is_empty() {
-                break;
-            }
-            for entry in entries {
-                if entry.offset < retained {
-                    break 'scan;
-                }
-                before = entry.offset - 1;
-                scanned += 1;
-                scanned_bytes += entry.record.as_ref().map_or(0, Vec::len);
-                if let Some(encoded) = entry.record {
-                    let record = decode(&encoded, entry.offset)?;
-                    let size = record.encoded_len();
-                    // A Record over the cap is still returned alone, so that the read always
-                    // returns a Record.
-                    if !picked.is_empty() && bytes + size > max_bytes {
-                        break 'scan;
-                    }
-                    bytes += size;
-                    picked.push(record);
-                    if picked.len() == count {
-                        break 'scan;
-                    }
-                }
-            }
-        }
-        picked.reverse();
-        // The read resumes after the newest Record, which a close makes final.
-        Ok(ReadRecordsResponse {
-            records: picked,
-            next_offset: offset_to_wire(state.newest),
-            done: state.closed,
-            ..Default::default()
-        })
     }
 
     /// The state of a Stream, after waiting up to `until` for its create.
@@ -533,7 +422,7 @@ impl StreamService {
         // The resume is after the last Record returned, which is one before the inclusive start.
         let page = ReadRecordsResponse {
             records,
-            next_offset: offset_to_wire(start - 1),
+            last_offset: offset_to_wire(start - 1),
             done,
             ..Default::default()
         };

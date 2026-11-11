@@ -68,7 +68,7 @@ fn kind_of(kind: &str, value: &Value, run_id: &str) -> Option<Kind> {
                 attempt,
             }),
         })),
-        "activity" => Some(Kind::Activity(activity)),
+        "activity" => Some(Kind::WorkflowActivity(activity)),
         "standalone_activity" => Some(Kind::StandaloneActivity(activity)),
         "client" => Some(Kind::Client(ClientProducer {
             epoch: Some(ClientEpoch { attempt }),

@@ -17,7 +17,7 @@ use temporalio_streams::{
         AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientEpoch, ClientProducer,
         CreateStreamRequest, CreateStreamResponse, Producer, ReadRecordsRequest,
         ReadRecordsResponse, StreamErrorDetails, StreamErrorReason, StreamRef, StreamWriter,
-        producer::Kind,
+        producer::Kind, read_records_request::Position,
     },
     store::{Appended, Batch, Capabilities, Create, Created, Entry, Store, StreamState},
 };
@@ -188,7 +188,7 @@ async fn a_trim_under_a_read_from_an_offset_fails_it_as_expired() {
     let read = |from_offset| ReadRecordsRequest {
         namespace: NAMESPACE.to_string(),
         r#ref: stream_ref(),
-        from_offset,
+        position: Some(Position::FromOffset(from_offset)),
         ..Default::default()
     };
     store.trim_next.store(true, Ordering::Relaxed);
