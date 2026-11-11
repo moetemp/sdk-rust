@@ -66,6 +66,7 @@ mod tests {
     };
     use std::sync::Arc;
     use temporalio_common::protos::temporal::api::common::v1::Payload;
+    use tonic::Code;
 
     const METHODS: [&str; 5] = [
         "CreateStream",
@@ -150,8 +151,12 @@ mod tests {
         assert_eq!(error.reason, Reason::Invalid);
         let error = runtime.call("Nope", &[]).await.unwrap_err();
         assert_eq!(
-            (error.reason, error.message.as_str()),
-            (Reason::Unsupported, "Unknown method Nope")
+            (error.reason, error.code(), error.message.as_str()),
+            (
+                Reason::Unsupported,
+                Code::Unimplemented,
+                "Unknown method Nope"
+            )
         );
     }
 
