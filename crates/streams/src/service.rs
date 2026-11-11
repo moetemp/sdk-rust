@@ -15,7 +15,7 @@ use crate::{
         StreamReadStart, StreamRecord, StreamRef, StreamStatus, read_records_request::Position,
         stream_record::Item,
     },
-    record::data_records,
+    record::{check_records, data_records},
     store::{
         Batch, Capabilities, ConflictPolicy, Create, CreateOutcome, FORMAT_VERSION, MAX_SEQUENCE,
         Store, StreamState,
@@ -130,6 +130,7 @@ impl StreamService {
                 "The sequence must be from 1 to 2^53 - 1, or zero for the next one",
             ));
         }
+        check_records(&request.records)?;
         // Without the fence, a stale batch would reach Readers.
         self.store
             .capabilities()

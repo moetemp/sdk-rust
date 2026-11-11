@@ -14,7 +14,7 @@
 use crate::{
     StreamError, StreamResult,
     epoch::{ProducerKind, producer_run_id},
-    proto::{Producer, producer::Kind},
+    proto::{Producer, WorkflowTaskEpoch, producer::Kind},
 };
 
 /// The longest Stream id, in bytes.
@@ -168,21 +168,41 @@ pub fn check_producer(producer: &Producer) -> StreamResult<()> {
     Ok(())
 }
 
+fn missing(what: &str) -> StreamResult<()> {
+    Err(StreamError::invalid(format!("The Producer has no {what}")))
+}
+
+fn at_least_one(attempt: i32, of: &str) -> StreamResult<()> {
+    if attempt < 1 {
+        return Err(StreamError::invalid(format!(
+            "The {of} attempt is {attempt}, and it must be 1 or more"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a Workflow Task epoch with no started event id, or with an attempt below 1.
+fn check_task(task: &WorkflowTaskEpoch) -> StreamResult<()> {
+    // Without its started event, a later task would have the epoch of an earlier one.
+    if task.started_event_id <= 0 {
+        return Err(StreamError::invalid(
+            "The Workflow Task of the epoch has no started event id",
+        ));
+    }
+    at_least_one(task.attempt, "Workflow Task")
+}
+
 /// Refuses a Producer that lacks a field the API requires. A Workflow Producer only closes a
-/// Stream, so it may send no epoch. A Workflow Task's started time stays optional, since Core
-/// leaves it empty when the server gave the task none.
+/// Stream, so it may send no epoch, but an epoch that it sends must order. A Workflow Task's
+/// started time stays optional, since Core leaves it empty when the server gave the task none.
 pub fn check_required(producer: &Producer) -> StreamResult<()> {
-    let missing = |what: &str| Err(StreamError::invalid(format!("The Producer has no {what}")));
-    let at_least_one = |attempt: i32, of: &str| {
-        if attempt < 1 {
-            return Err(StreamError::invalid(format!(
-                "The {of} attempt is {attempt}, and it must be 1 or more"
-            )));
-        }
-        Ok(())
-    };
     match producer.kind.as_ref() {
-        Some(Kind::Workflow(workflow)) if workflow.run_id.is_empty() => missing("run id"),
+        Some(Kind::Workflow(workflow)) => {
+            if workflow.run_id.is_empty() {
+                return missing("run id");
+            }
+            workflow.epoch.as_ref().map_or(Ok(()), check_task)
+        }
         Some(Kind::LocalActivity(local)) => {
             if local.run_id.is_empty() {
                 return missing("run id");
@@ -190,11 +210,10 @@ pub fn check_required(producer: &Producer) -> StreamResult<()> {
             let Some(epoch) = local.epoch.as_ref() else {
                 return missing("epoch");
             };
-            // Without its task, a re-dispatch in a later task has the epoch of the first dispatch.
-            let Some(task) = epoch.task.filter(|task| task.started_event_id > 0) else {
+            let Some(task) = epoch.task.as_ref() else {
                 return missing("Workflow Task that dispatched it");
             };
-            at_least_one(task.attempt, "Workflow Task")?;
+            check_task(task)?;
             at_least_one(epoch.attempt, "Local Activity")
         }
         Some(Kind::WorkflowActivity(activity) | Kind::StandaloneActivity(activity)) => {
@@ -212,7 +231,6 @@ pub fn check_required(producer: &Producer) -> StreamResult<()> {
             };
             at_least_one(epoch.attempt, "client")
         }
-        Some(Kind::Workflow(_)) => Ok(()),
         None => missing("kind"),
     }
 }
@@ -433,6 +451,45 @@ mod tests {
     fn a_workflow_producer_needs_its_run_id() {
         let workflow = producer(ProducerKind::Workflow, "wf:", "");
         assert!(refused(&workflow).contains("run id"));
+    }
+
+    /// A Workflow Producer with `epoch`.
+    fn workflow_with(epoch: WorkflowTaskEpoch) -> Producer {
+        Producer {
+            id: workflow_producer_id("r"),
+            kind: Some(Kind::Workflow(WorkflowProducer {
+                run_id: "r".to_string(),
+                epoch: Some(epoch),
+            })),
+        }
+    }
+
+    #[test]
+    fn a_workflow_epoch_passes_with_its_required_fields() {
+        let epoch = WorkflowTaskEpoch {
+            started_event_id: 3,
+            attempt: 1,
+            started_time: None,
+        };
+        check_required(&workflow_with(epoch)).unwrap();
+    }
+
+    #[test]
+    fn a_workflow_epoch_needs_its_started_event_id() {
+        let epoch = WorkflowTaskEpoch {
+            attempt: 1,
+            ..Default::default()
+        };
+        assert!(refused(&workflow_with(epoch)).contains("started event id"));
+    }
+
+    #[test]
+    fn a_workflow_epoch_attempt_is_1_or_more() {
+        let epoch = WorkflowTaskEpoch {
+            started_event_id: 3,
+            ..Default::default()
+        };
+        assert!(refused(&workflow_with(epoch)).contains("Workflow Task attempt"));
     }
 
     #[test]

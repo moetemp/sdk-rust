@@ -19,6 +19,16 @@ pub(crate) fn data_record(producer: &Producer, record: AppendRecord) -> Vec<u8> 
     .encode_to_vec()
 }
 
+/// Refuses a batch with a Record that has no body, before the Store.
+pub(crate) fn check_records(records: &[AppendRecord]) -> StreamResult<()> {
+    match records.iter().position(|record| record.body.is_none()) {
+        Some(at) => Err(StreamError::invalid(format!(
+            "Record {at} of the batch has no body"
+        ))),
+        None => Ok(()),
+    }
+}
+
 /// The stored Records of one batch from outside Workflow code. A batch over the Store's limits
 /// fails, since the crate doesn't split a batch it didn't build.
 pub(crate) fn data_records(
@@ -64,6 +74,17 @@ pub(crate) fn data_records(
 mod tests {
     use super::*;
     use temporalio_common::protos::temporal::api::common::v1::Payload;
+
+    #[test]
+    fn a_record_with_no_body_is_invalid() {
+        let body = AppendRecord {
+            body: Some(Payload::default()),
+        };
+        check_records(std::slice::from_ref(&body)).unwrap();
+        let error = check_records(&[body, AppendRecord::default()]).unwrap_err();
+        assert_eq!(error.reason, Reason::Invalid);
+        assert!(error.message.contains("Record 1"), "{}", error.message);
+    }
 
     #[test]
     fn a_batch_over_the_limits_fails() {

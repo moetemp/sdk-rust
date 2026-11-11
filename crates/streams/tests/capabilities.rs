@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
     MemoryStreamRuntime, StreamError, StreamResult, StreamRuntime,
     ids::client_producer_id,
@@ -93,6 +94,12 @@ fn case(without: Capabilities) -> Case {
     }
 }
 
+fn record() -> AppendRecord {
+    AppendRecord {
+        body: Some(Payload::default()),
+    }
+}
+
 fn client() -> Producer {
     Producer {
         id: client_producer_id("me", "p"),
@@ -150,7 +157,7 @@ async fn an_append_without_the_fence_is_refused_with_nothing_written() {
         r#ref: case.stream_ref(),
         producer: Some(client()),
         sequence: 1,
-        records: vec![AppendRecord::default()],
+        records: vec![record()],
         ..Default::default()
     };
     let error = case.call("AppendRecords", request).await.unwrap_err();
@@ -166,7 +173,7 @@ async fn an_append_with_no_sequence_without_the_capability_is_refused_with_nothi
         namespace: NAMESPACE.to_string(),
         r#ref: case.stream_ref(),
         producer: Some(client()),
-        records: vec![AppendRecord::default()],
+        records: vec![record()],
         ..Default::default()
     };
     let error = case

@@ -23,13 +23,13 @@ pub fn offset_to_wire(offset: i64) -> Vec<u8> {
 
 /// The offset of a wire value that [offset_to_wire] wrote. The empty string is "no offset", zero.
 ///
-/// A longer value than 8 bytes is corrupt Store data.
+/// A value longer than 8 bytes is a bad request, since no offset has more.
 pub fn offset_from_wire(bytes: &[u8]) -> StreamResult<i64> {
     if bytes.is_empty() {
         return Ok(0);
     }
     if bytes.len() > 8 {
-        return Err(StreamError::storage_corrupt(format!(
+        return Err(StreamError::invalid(format!(
             "A Stream offset has {} bytes, more than 8",
             bytes.len()
         )));
@@ -83,7 +83,7 @@ mod tests {
             offset_from_wire(&[0, 0, 0, 0, 0, 0, 0, 0, 0])
                 .unwrap_err()
                 .reason,
-            crate::Reason::StorageCorrupt
+            crate::Reason::Invalid
         );
     }
 

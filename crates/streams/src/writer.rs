@@ -13,6 +13,7 @@ use crate::{
     proto::{
         AppendRecord, AppendRecordsRequest, OpenWriterRequest, Producer, StreamRef, producer::Kind,
     },
+    record::check_records,
     service::StreamService,
     store::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES},
 };
@@ -347,6 +348,7 @@ impl Writers {
                 ));
             }
         }
+        check_records(&records)?;
         check_sizes(&writer.producer, &records)?;
         writer.write(records).await
     }

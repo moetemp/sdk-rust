@@ -609,6 +609,26 @@ async fn a_write_that_waits_behind_a_close_is_refused() {
     }
 }
 
+/// A write with a Record that has no body fails as invalid before the Store, and the writer goes
+/// on.
+async fn a_write_of_a_record_with_no_body_is_refused_and_the_writer_goes_on() {
+    for case in cases().await {
+        let writer = case.open(client(), |_| {}).await;
+        let written: Result<WriteRecordsResponse, _> = case
+            .call(
+                "WriteRecords",
+                WriteRecordsRequest {
+                    writer_id: writer,
+                    records: vec![AppendRecord::default()],
+                },
+            )
+            .await;
+        assert_eq!(reason(&written.unwrap_err()), "stream_invalid");
+        case.write(writer, &["ok"]).await.unwrap();
+        assert_eq!(case.visible().await, ["ok"]);
+    }
+}
+
 /// An open of a writer whose Producer lacks a required field fails as invalid.
 async fn a_writer_of_a_producer_with_a_missing_required_field_does_not_open() {
     for case in cases().await {
@@ -650,4 +670,5 @@ pub const CASES: &[super::Case] = &[
     case!(a_write_on_corrupt_store_data_fails_with_no_retry),
     case!(a_write_that_waits_behind_a_close_is_refused),
     case!(a_writer_of_a_producer_with_a_missing_required_field_does_not_open),
+    case!(a_write_of_a_record_with_no_body_is_refused_and_the_writer_goes_on),
 ];

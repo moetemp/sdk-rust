@@ -119,7 +119,11 @@ fn workflow(run: &str) -> Producer {
         id: crate::ids::workflow_producer_id(run),
         kind: Some(Kind::Workflow(WorkflowProducer {
             run_id: run.to_string(),
-            epoch: Some(WorkflowTaskEpoch::default()),
+            epoch: Some(WorkflowTaskEpoch {
+                started_event_id: 3,
+                attempt: 1,
+                started_time: None,
+            }),
         })),
     }
 }
@@ -409,9 +413,32 @@ async fn a_write_with_a_missing_required_field_is_invalid() {
         );
         let error = case.close(no_epoch).await.unwrap_err();
         assert_eq!(reason(&error), "stream_invalid");
+        // A Workflow Producer may close with no epoch, but one that it sends must order.
+        let mut no_task = workflow("r1");
+        let Some(Kind::Workflow(kind)) = no_task.kind.as_mut() else {
+            unreachable!()
+        };
+        kind.epoch = Some(WorkflowTaskEpoch::default());
+        let error = case.close(no_task).await.unwrap_err();
+        assert_eq!(reason(&error), "stream_invalid");
         let describe = case.describe().await.unwrap();
         assert_eq!(describe.status, StreamStatus::Open as i32);
         assert!(describe.last_offset.is_empty());
+    }
+}
+
+/// An append with a Record that has no body fails as invalid before the Store, so no Record of the
+/// batch is written.
+async fn an_append_with_a_record_that_has_no_body_is_invalid() {
+    for case in cases_for(Needs::CALLS).await {
+        case.create().await.unwrap();
+        let records = vec![record("a"), AppendRecord::default()];
+        let error = case.append(client(1), 1, records).await.unwrap_err();
+        assert_eq!(
+            (error.code(), reason(&error).as_str()),
+            (Code::InvalidArgument, "stream_invalid")
+        );
+        assert!(case.describe().await.unwrap().last_offset.is_empty());
     }
 }
 
@@ -438,7 +465,8 @@ async fn an_append_with_no_sequence_takes_the_next_one_of_its_epoch() {
 }
 
 /// A read is exclusive from its offset, a read from the end gives only new Records, an offset past
-/// the newest fails with `stream_offset_too_high`, and one that decodes below zero is invalid.
+/// the newest fails with `stream_offset_too_high`, and one that decodes below zero or has more than
+/// 8 bytes is invalid.
 async fn a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_records() {
     for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
@@ -491,6 +519,14 @@ async fn a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_recor
             .read(ReadRecordsRequest {
                 // An 8-byte value with the top bit set decodes to a negative offset.
                 position: Some(Position::FromOffset(vec![0x80, 0, 0, 0, 0, 0, 0, 0])),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "stream_invalid");
+        let error = case
+            .read(ReadRecordsRequest {
+                position: Some(Position::FromOffset(vec![0; 9])),
                 ..Default::default()
             })
             .await
@@ -883,6 +919,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_create_of_an_expired_stream_fails),
     case!(a_producer_must_match_its_kind_and_not_be_a_workflow),
     case!(a_write_with_a_missing_required_field_is_invalid),
+    case!(an_append_with_a_record_that_has_no_body_is_invalid),
     case!(an_append_with_no_sequence_takes_the_next_one_of_its_epoch),
     case!(a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_records),
     case!(a_read_of_an_uncreated_stream_fails_at_once),
