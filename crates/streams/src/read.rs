@@ -67,19 +67,20 @@ impl StreamRuntime {
                 format!("format {} is newer than {FORMAT_VERSION}", state.version),
             ));
         }
-        // An exclusive from_offset reads after that Record, so the inclusive start is one past it.
-        let from = match from_offset {
-            0 if at_end => state.newest + 1,
-            0 => 0,
-            offset => offset + 1,
-        };
-        if from > state.newest + 1 {
+        // Before the start is one past the offset, since the largest offset has no next one.
+        if from_offset > state.newest {
             return Err(StreamError::new(
                 Reason::OffsetTooHigh,
                 "The offset is past the newest Record. A failover may have lost the newest \
                  Records. Resume from the newest offset, or read again once newer Records pass it",
             ));
         }
+        // An exclusive from_offset reads after that Record, so the inclusive start is one past it.
+        let from = match from_offset {
+            0 if at_end => state.newest + 1,
+            0 => 0,
+            offset => offset + 1,
+        };
         loop {
             check_expiry(&state, from)?;
             if let Some(page) = self.page(&stream, &state, from, (max, max_bytes)).await? {

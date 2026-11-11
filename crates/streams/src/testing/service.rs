@@ -508,6 +508,15 @@ async fn a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_recor
             .await
             .unwrap_err();
         assert_eq!(reason(&error), "stream_invalid");
+        // The largest offset has no next one, and it is past the newest Record too.
+        let error = case
+            .read(ReadRecordsRequest {
+                position: Some(Position::FromOffset(wire(i64::MAX))),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "stream_offset_too_high");
     }
 }
 
