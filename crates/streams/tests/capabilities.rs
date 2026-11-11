@@ -96,7 +96,7 @@ struct Case {
 fn case(without: Capabilities) -> Case {
     let memory = Arc::new(MemoryStore::new(
         Duration::from_secs(3600),
-        Duration::from_secs(7200),
+        Some(Duration::from_secs(7200)),
     ));
     let store = Arc::new(Masked {
         inner: memory.clone(),

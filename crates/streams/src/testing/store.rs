@@ -297,17 +297,15 @@ async fn an_expired_stream_refuses_writes_and_its_create() {
     }
 }
 
-/// An open Stream's meta and log keep the safety TTL, so the log keeps its Records past the
-/// Retention. Its close gives both the Retention, and the meta the Tombstone after it.
-async fn the_ttl_is_the_safety_ttl_until_the_close() {
+/// With no last-write TTL, an open Stream's meta and log never expire, and the meta has no `exp`.
+/// Its close gives both the Retention, and the meta the Tombstone after it.
+async fn an_open_stream_with_no_last_write_ttl_never_expires_until_the_close() {
     for target in stores_for(Needs::RAW_KEYS).await {
         target.create().await;
         append(&target, &client(1), 1, &["a"]).await.unwrap();
         let week = Duration::from_secs(7 * 86_400).as_millis() as i64;
-        let safety = Duration::from_secs(80 * 86_400).as_millis() as i64;
-        let (ttl, meta) = target.ttls().await;
-        assert!(ttl > safety, "{ttl}");
-        assert!(meta > safety, "{meta}");
+        assert_eq!(target.ttls().await, (-1, -1));
+        assert_eq!(target.meta("exp").await, None);
         target.close(&client(1)).await.unwrap();
         let (ttl, meta) = target.ttls().await;
         assert!(0 < ttl && ttl <= week, "{ttl}");
@@ -343,8 +341,9 @@ async fn an_open_stream_keeps_its_records_past_its_retention() {
         assert_eq!(state.trimmed, 0);
         assert!(state.retained_from() <= old.offsets.unwrap().0);
         assert_eq!(records_of(&entries), ["old", "new"]);
+        // A backend with a last-write TTL gives the log that TTL, and one with none gives no TTL.
         let (ttl, _) = target.ttls().await;
-        assert!(ttl > retention.as_millis() as i64, "{ttl}");
+        assert!(ttl == -1 || ttl > retention.as_millis() as i64, "{ttl}");
     }
 }
 
@@ -710,7 +709,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_close_stops_appends_but_not_a_resend),
     case!(a_newer_format_refuses_every_write),
     case!(an_expired_stream_refuses_writes_and_its_create),
-    case!(the_ttl_is_the_safety_ttl_until_the_close),
+    case!(an_open_stream_with_no_last_write_ttl_never_expires_until_the_close),
     case!(an_open_stream_keeps_its_records_past_its_retention),
     case!(offsets_go_on_after_the_log_is_gone),
     case!(a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline),

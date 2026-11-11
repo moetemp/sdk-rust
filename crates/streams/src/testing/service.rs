@@ -703,6 +703,32 @@ async fn the_retention_counts_from_the_close() {
     }
 }
 
+/// With a last-write TTL in the backend config, an open Stream expires that long after its last
+/// write. Each write starts the TTL again.
+async fn an_open_stream_expires_its_last_write_ttl_after_its_last_write() {
+    let config = RuntimeConfig {
+        last_write_ttl: Some(Duration::from_millis(500)),
+        ..Default::default()
+    };
+    for case in cases_with(Needs::SHORT_TIMES, &config).await {
+        case.create().await.unwrap();
+        case.append(client(1), 1, vec![record("a")]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        case.append(client(1), 2, vec![record("b")]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let describe = case.describe().await.unwrap();
+        assert_eq!(describe.status, StreamStatus::Open as i32);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let describe = case.describe().await.unwrap();
+        assert_eq!(describe.status, StreamStatus::Expired as i32);
+        let error = case
+            .append(client(1), 3, vec![record("c")])
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "stream_expired");
+    }
+}
+
 /// A create answer names the configured backend, and the Store never reads it.
 async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
     for ext in super::support::named_runtimes("redis-a") {
@@ -868,6 +894,7 @@ pub const CASES: &[super::Case] = &[
     case!(an_unknown_method_is_unimplemented),
     case!(a_read_of_an_expired_closed_stream_fails_instead_of_waiting),
     case!(the_retention_counts_from_the_close),
+    case!(an_open_stream_expires_its_last_write_ttl_after_its_last_write),
     case!(a_create_answer_names_the_backend_and_the_store_never_reads_it),
     case!(a_read_of_a_closed_stream_with_no_item_left_answers_at_once),
     case!(a_waiting_read_wakes_with_done_on_a_close),

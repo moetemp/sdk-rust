@@ -16,8 +16,9 @@ import "temporal/api/stream/v1/message.proto";
 message MemoryStreamConfig {
     // The default Retention of a new Stream. Empty is 7 days.
     google.protobuf.Duration retention = 4;
-    // How long an open Workflow-owned Stream stays after its last write. Empty is 90 days.
-    google.protobuf.Duration safety_ttl = 5;
+    // How long an open Stream stays after its last write. Empty keeps an open Stream until its
+    // close.
+    google.protobuf.Duration last_write_ttl = 5;
     // The backend name that lang registered this runtime under. The runtime sets it on each
     // StreamRef that it builds, such as the one in a create response.
     string backend = 10;

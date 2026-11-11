@@ -12,9 +12,6 @@ use tokio::time::Instant;
 /// The Retention of a Stream whose create sets none, when a Store's options set no other.
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
-/// How long an open Stream stays after its last write, when a Store's options set no other.
-pub const DEFAULT_SAFETY_TTL: Duration = Duration::from_secs(90 * 24 * 60 * 60);
-
 /// The format version this crate writes. A Stream with a higher one refuses writes.
 pub const FORMAT_VERSION: u32 = 1;
 /// The maximum size of a stored Record, in bytes.
@@ -29,7 +26,7 @@ pub const MAX_SEQUENCE: i64 = (1 << 53) - 1;
 /// How long the meta key stays after the log key expires, so that a read can tell an expired Stream
 /// from a missing one.
 pub const TOMBSTONE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-/// The longest Retention or safety TTL, which is the largest proto Duration. Its ms plus the time
+/// The longest Retention or last-write TTL, which is the largest proto Duration. Its ms plus the time
 /// of a write stay exact in a Lua number.
 pub const MAX_TTL: Duration = Duration::from_secs(315_576_000_000);
 
@@ -127,7 +124,8 @@ pub struct StreamState {
     pub trimmed: i64,
     /// The Retention.
     pub retention: Duration,
-    /// When the Stream stops taking writes, in ms since 1970.
+    /// When the Stream stops taking writes, in ms since 1970. Zero for an open Stream with no
+    /// last-write TTL, which stays until its close.
     pub expires_ms: i64,
     /// The server time of the read, in ms since 1970.
     pub now_ms: i64,
@@ -136,7 +134,7 @@ pub struct StreamState {
 impl StreamState {
     /// The Stream is a Tombstone.
     pub fn expired(&self) -> bool {
-        self.exists && self.expires_ms <= self.now_ms
+        self.exists && self.expires_ms > 0 && self.expires_ms <= self.now_ms
     }
 
     /// The offset below which the log lost the Records. The Retention counts from the close, so

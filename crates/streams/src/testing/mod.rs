@@ -14,7 +14,7 @@ use crate::{
     MemoryStreamRuntime, StreamRuntime,
     memory::MemoryStore,
     proto::MemoryStreamConfig,
-    store::{DEFAULT_RETENTION, DEFAULT_SAFETY_TTL, Store},
+    store::{DEFAULT_RETENTION, Store},
 };
 use futures_util::{FutureExt, future::join_all};
 use prost::Message;
@@ -44,6 +44,8 @@ pub struct RuntimeConfig {
     pub backend: String,
     /// The Retention of each Stream that the runtime creates.
     pub retention: Option<Duration>,
+    /// How long an open Stream stays after its last write.
+    pub last_write_ttl: Option<Duration>,
 }
 
 /// A backend that the suites run on.
@@ -75,7 +77,7 @@ impl TestBackend for MemoryBackend {
     }
 
     async fn connect(&self) -> (Arc<dyn Store>, Arc<dyn RawKeys>) {
-        let store = Arc::new(MemoryStore::new(DEFAULT_RETENTION, DEFAULT_SAFETY_TTL));
+        let store = Arc::new(MemoryStore::new(DEFAULT_RETENTION, None));
         (store.clone(), store)
     }
 
@@ -84,7 +86,7 @@ impl TestBackend for MemoryBackend {
         let config = MemoryStreamConfig {
             backend: config.backend.clone(),
             retention: proto_duration(config.retention),
-            ..Default::default()
+            last_write_ttl: proto_duration(config.last_write_ttl),
         };
         MemoryStreamRuntime::from_config_bytes(&config.encode_to_vec(), None).unwrap()
     }

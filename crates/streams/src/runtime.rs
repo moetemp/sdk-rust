@@ -12,7 +12,7 @@ use crate::{
         ReadRecordsRequest, WriteRecordsRequest, WriteRecordsResponse,
     },
     service::StreamService,
-    store::{DEFAULT_RETENTION, DEFAULT_SAFETY_TTL, Store},
+    store::{DEFAULT_RETENTION, Store},
     writer::Writers,
 };
 use prost::Message;
@@ -221,7 +221,7 @@ impl MemoryStreamRuntime {
             .map_err(|error| StreamError::invalid(format!("The config is bad: {error}")))?;
         let memory = Arc::new(MemoryStore::new(
             duration(config.retention).unwrap_or(DEFAULT_RETENTION),
-            duration(config.safety_ttl).unwrap_or(DEFAULT_SAFETY_TTL),
+            duration(config.last_write_ttl),
         ));
         Ok(StreamRuntime::with_store(
             MEMORY_RUNTIME_NAME,

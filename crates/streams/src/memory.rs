@@ -47,7 +47,7 @@ struct Keys {
 pub struct MemoryStore {
     prefix: String,
     retention: Duration,
-    safety_ttl: Duration,
+    last_write_ttl: Option<Duration>,
     streams: Mutex<HashMap<String, Keys>>,
     appended: Notify,
 }
@@ -56,7 +56,7 @@ impl std::fmt::Debug for MemoryStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MemoryStore")
             .field("retention", &self.retention)
-            .field("safety_ttl", &self.safety_ttl)
+            .field("last_write_ttl", &self.last_write_ttl)
             .finish_non_exhaustive()
     }
 }
@@ -191,6 +191,10 @@ impl Keys {
         self.meta.insert(field.into(), value.into());
     }
 
+    fn remove(&mut self, field: impl AsRef<[u8]>) {
+        self.meta.remove(field.as_ref());
+    }
+
     /// The `check_live` step, which checks the create key, the format version and the expiry.
     fn check_live(&self, now: i64) -> StreamResult<()> {
         if self.get("v").is_none() {
@@ -213,13 +217,19 @@ impl Keys {
         Ok(())
     }
 
-    fn refresh(&mut self, now: i64, safety: i64, tombstone: i64) {
-        let retention = self.number("ret");
-        // An open Stream keeps the safety TTL after its last write. A closed one keeps the Retention.
+    fn refresh(&mut self, now: i64, last_write_ttl: Option<i64>, tombstone: i64) {
+        // An open Stream keeps the last-write TTL after its last write, and with none it stays
+        // until its close. A closed one keeps the Retention.
         let ttl = if self.get("closed").is_none() {
-            safety
+            last_write_ttl
         } else {
-            retention
+            Some(self.number("ret"))
+        };
+        let Some(ttl) = ttl else {
+            self.remove("exp");
+            self.meta_expires = 0;
+            self.log_expires = 0;
+            return;
         };
         let exp = now.saturating_add(ttl);
         self.set("exp", exp.to_string());
@@ -292,11 +302,11 @@ impl Keys {
 
 impl MemoryStore {
     /// An empty Store.
-    pub fn new(retention: Duration, safety_ttl: Duration) -> Self {
+    pub fn new(retention: Duration, last_write_ttl: Option<Duration>) -> Self {
         Self {
             prefix: crate::ids::DEFAULT_KEY_PREFIX.to_string(),
             retention,
-            safety_ttl,
+            last_write_ttl,
             streams: Mutex::default(),
             appended: Notify::new(),
         }
@@ -351,19 +361,21 @@ impl MemoryStore {
         })
     }
 
-    /// The ms left on the log and on the meta, -2 for a key that doesn't exist, as `PTTL`.
+    /// The ms left on the log and on the meta, -1 for a key with no expiry and -2 for a key that
+    /// doesn't exist, as `PTTL`.
     #[doc(hidden)]
     pub fn test_ttls(&self, namespace: &str, stream_id: &str) -> (i64, i64) {
         self.with(namespace, stream_id, |keys, now| {
+            let ttl = |expires: i64| if expires > 0 { expires - now } else { -1 };
             let log = if keys.log.is_some() {
-                keys.log_expires - now
+                ttl(keys.log_expires)
             } else {
                 -2
             };
             let meta = if keys.meta.is_empty() {
                 -2
             } else {
-                keys.meta_expires - now
+                ttl(keys.meta_expires)
             };
             (log, meta)
         })
@@ -426,7 +438,7 @@ impl Store for MemoryStore {
         let retention = create.retention.filter(|r| !r.is_zero());
         let retention = millis(retention.unwrap_or(self.retention));
         let request_id = create.request_id;
-        let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
+        let (last_write_ttl, tombstone) = (self.last_write_ttl.map(millis), millis(TOMBSTONE));
         let created = self.with(namespace, stream_id, |keys, now| {
             if keys.get("ret").is_none() {
                 keys.set("v", FORMAT_VERSION.to_string());
@@ -434,7 +446,7 @@ impl Store for MemoryStore {
                 if !request_id.is_empty() {
                     keys.set("rid", request_id);
                 }
-                keys.refresh(now, safety, tombstone);
+                keys.refresh(now, last_write_ttl, tombstone);
                 return Ok((CreateOutcome::Created, retention));
             }
             keys.check_live(now)?;
@@ -467,7 +479,7 @@ impl Store for MemoryStore {
         let producer = batch.producer;
         let kind = ProducerKind::try_from(producer)?;
         let epoch = epoch_key(producer.kind.as_ref());
-        let (safety, tombstone) = (millis(self.safety_ttl), millis(TOMBSTONE));
+        let (last_write_ttl, tombstone) = (self.last_write_ttl.map(millis), millis(TOMBSTONE));
         let field = format!("p|{}|{}", kind as i32, producer.id);
         let appended = self.with(namespace, stream_id, |keys, now| {
             // The format version comes first, since a newer format can change the Producer field.
@@ -555,7 +567,7 @@ impl Store for MemoryStore {
             if !last.is_empty() {
                 keys.set("newest", last.clone());
             }
-            keys.refresh(now, safety, tombstone);
+            keys.refresh(now, last_write_ttl, tombstone);
             Ok((false, first, last))
         });
         let (resend, first, last) = appended?;
@@ -596,7 +608,7 @@ impl Store for MemoryStore {
             // Store only ever closes with CLOSED.
             keys.set("closer", producer.encode_to_vec());
             keys.set("cstat", (StreamCloseStatus::Closed as i32).to_string());
-            keys.refresh(now, 0, tombstone);
+            keys.refresh(now, None, tombstone);
             Ok(false)
         });
         let already = closed?;

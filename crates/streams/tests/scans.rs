@@ -88,7 +88,7 @@ impl Store for Trimming {
 
 fn trimming() -> (Arc<Trimming>, Arc<StreamRuntime>) {
     let store = Arc::new(Trimming {
-        inner: MemoryStore::new(Duration::from_secs(3600), Duration::from_secs(7200)),
+        inner: MemoryStore::new(Duration::from_secs(3600), Some(Duration::from_secs(7200))),
         trim_next: AtomicBool::new(false),
         pulled: AtomicUsize::new(0),
     });
