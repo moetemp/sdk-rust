@@ -297,7 +297,8 @@ impl StreamWriter {
     /// batch again with the same `sequence`, so the dedupe key stops a second write.
     async fn send(&self, records: Vec<AppendRecord>, sequence: i64) -> StreamResult<(i64, i64)> {
         let request = self.append(records, sequence);
-        let until = Instant::now() + self.max_retry;
+        // A retry window too long for the clock has no end.
+        let until = Instant::now().checked_add(self.max_retry);
         let mut backoff = FIRST_BACKOFF;
         loop {
             match crate::runtime::append(&*self.store, &self.metrics, request.clone()).await {
@@ -309,7 +310,7 @@ impl StreamWriter {
                 }
                 Err(error)
                     if error.reason == Reason::StorageUnavailable
-                        && Instant::now() + backoff < until =>
+                        && until.is_none_or(|until| Instant::now() + backoff < until) =>
                 {
                     tokio::time::sleep(backoff).await;
                     backoff = (backoff * 2).min(Duration::from_secs(1));
@@ -345,10 +346,14 @@ mod tests {
     use super::*;
     use crate::{
         StreamRuntime,
-        ids::client_producer_id,
+        ids::{activity_producer_id, client_producer_id},
         memory::MemoryStore,
-        proto::{ClientEpoch, ClientProducer},
+        proto::{
+            ActivityEpoch, ActivityProducer, ClientEpoch, ClientProducer, CreateStreamRequest,
+        },
     };
+    use prost_types::Timestamp;
+    use temporalio_common::protos::temporal::api::common::v1::Payload;
 
     #[tokio::test]
     async fn an_append_of_a_writer_carries_the_namespace_of_its_open() {
@@ -370,5 +375,45 @@ mod tests {
         };
         let writer = runtime.open_writer(request).await.unwrap();
         assert_eq!(writer.append(vec![], 1).namespace, "ns-1");
+    }
+
+    // An open of a retry Producer sends its empty batch in the same retry window as a write.
+    #[tokio::test]
+    async fn a_retry_window_too_long_for_the_clock_has_no_end() {
+        let store = Arc::new(MemoryStore::new(Duration::from_secs(60), None));
+        let runtime = StreamRuntime::new("test", "", store, None);
+        let stream_ref = Some(StreamRef {
+            id: "s".into(),
+            ..Default::default()
+        });
+        let create = CreateStreamRequest {
+            stream_ref: stream_ref.clone(),
+            ..Default::default()
+        };
+        runtime.create_stream(create).await.unwrap();
+        let retry = Producer {
+            id: activity_producer_id("r", "a", "s"),
+            kind: Some(Kind::WorkflowActivity(ActivityProducer {
+                run_id: "r".into(),
+                epoch: Some(ActivityEpoch {
+                    attempt_scheduled_time: Some(Timestamp::default()),
+                    attempt: 2,
+                }),
+            })),
+        };
+        let request = OpenWriterRequest {
+            r#ref: stream_ref,
+            producer: Some(retry),
+            max_retry_duration: Some(prost_types::Duration {
+                seconds: i64::MAX,
+                nanos: 999_999_999,
+            }),
+            ..Default::default()
+        };
+        let writer = runtime.open_writer(request).await.unwrap();
+        let records = vec![AppendRecord {
+            body: Some(Payload::default()),
+        }];
+        writer.write(WriteRecordsRequest { records }).await.unwrap();
     }
 }

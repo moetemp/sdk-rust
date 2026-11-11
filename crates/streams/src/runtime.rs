@@ -294,6 +294,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_zero_or_negative_duration_is_unset_and_a_huge_one_stays() {
+        let proto = |seconds, nanos| Some(prost_types::Duration { seconds, nanos });
+        assert_eq!(duration(None), None);
+        assert_eq!(duration(proto(0, 0)), None);
+        assert_eq!(duration(proto(-5, 0)), None);
+        assert_eq!(duration(proto(0, -5)), None);
+        assert_eq!(
+            duration(proto(i64::MAX, 999_999_999)),
+            Some(Duration::new(i64::MAX as u64, 999_999_999))
+        );
+    }
+
+    #[test]
     fn a_bad_memory_config_is_invalid() {
         let error = MemoryStreamRuntime::from_config_bytes(&[0xff], None).unwrap_err();
         assert_eq!(error.reason, Reason::Invalid);
