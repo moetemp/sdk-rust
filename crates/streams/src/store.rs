@@ -257,7 +257,7 @@ pub trait Store: Send + Sync + 'static {
     async fn read(
         &self,
         namespace: &str,
-        stream_id: &str,
+        stream_ref: &StreamRef,
         from: i64,
         count: usize,
     ) -> StreamResult<(StreamState, Vec<Entry>)>;
@@ -268,7 +268,7 @@ pub trait Store: Send + Sync + 'static {
     async fn wait_after(
         &self,
         namespace: &str,
-        stream_id: &str,
+        stream_ref: &StreamRef,
         after: i64,
         deadline: Instant,
     ) -> StreamResult<bool>;

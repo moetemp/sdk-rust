@@ -257,7 +257,7 @@ impl Target {
     pub(crate) async fn entries(&self) -> Vec<Entry> {
         let (_, entries) = self
             .store
-            .read(&self.namespace, &self.stream, 0, 10_000)
+            .read(&self.namespace, &self.stream_ref(), 0, 10_000)
             .await
             .unwrap();
         entries

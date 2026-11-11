@@ -61,11 +61,11 @@ impl Store for Trimming {
     async fn read(
         &self,
         namespace: &str,
-        stream_id: &str,
+        stream_ref: &StreamRef,
         from: i64,
         count: usize,
     ) -> StreamResult<(StreamState, Vec<Entry>)> {
-        let (mut state, mut entries) = self.inner.read(namespace, stream_id, from, count).await?;
+        let (mut state, mut entries) = self.inner.read(namespace, stream_ref, from, count).await?;
         if count > 0 && !entries.is_empty() && self.trim_next.swap(false, Ordering::Relaxed) {
             state.trimmed = entries.remove(0).offset;
         }
@@ -76,12 +76,12 @@ impl Store for Trimming {
     async fn wait_after(
         &self,
         namespace: &str,
-        stream_id: &str,
+        stream_ref: &StreamRef,
         after: i64,
         deadline: Instant,
     ) -> StreamResult<bool> {
         self.inner
-            .wait_after(namespace, stream_id, after, deadline)
+            .wait_after(namespace, stream_ref, after, deadline)
             .await
     }
 }

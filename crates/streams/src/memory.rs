@@ -622,10 +622,11 @@ impl Store for MemoryStore {
     async fn read(
         &self,
         namespace: &str,
-        stream_id: &str,
+        stream_ref: &StreamRef,
         from: i64,
         count: usize,
     ) -> StreamResult<(StreamState, Vec<Entry>)> {
+        let stream_id = stream_ref.id.as_str();
         let start = if from > 0 {
             parse_id(&entry_id_of_offset(from)).unwrap_or((0, 0))
         } else {
@@ -664,10 +665,11 @@ impl Store for MemoryStore {
     async fn wait_after(
         &self,
         namespace: &str,
-        stream_id: &str,
+        stream_ref: &StreamRef,
         after: i64,
         deadline: Instant,
     ) -> StreamResult<bool> {
+        let stream_id = stream_ref.id.as_str();
         let after = if after > 0 {
             parse_id(&entry_id_of_offset(after)).unwrap_or((0, 0))
         } else {

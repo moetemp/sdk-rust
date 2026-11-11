@@ -335,7 +335,7 @@ async fn an_open_stream_keeps_its_records_past_its_retention() {
         append(&target, &client(1), 2, &["new"]).await.unwrap();
         let (state, entries) = target
             .store
-            .read(&target.namespace, &target.stream, 0, 10)
+            .read(&target.namespace, &target.stream_ref(), 0, 10)
             .await
             .unwrap();
         assert_eq!(state.trimmed, 0);
@@ -367,7 +367,7 @@ async fn offsets_go_on_after_the_log_is_gone() {
         assert!(new.offsets.unwrap().0 > ahead);
         let (state, _) = target
             .store
-            .read(&target.namespace, &target.stream, 0, 0)
+            .read(&target.namespace, &target.stream_ref(), 0, 0)
             .await
             .unwrap();
         assert_eq!(state.trimmed, ahead);
@@ -384,12 +384,12 @@ async fn a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline() {
         let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
         let woke = target
             .store
-            .wait_after(&target.namespace, &target.stream, newest, deadline)
+            .wait_after(&target.namespace, &target.stream_ref(), newest, deadline)
             .await
             .unwrap();
         assert!(!woke);
         let store = target.store.clone();
-        let (namespace, stream) = (target.namespace.clone(), target.stream.clone());
+        let (namespace, stream) = (target.namespace.clone(), target.stream_ref());
         let waiter = tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             store
@@ -410,7 +410,7 @@ async fn a_close_writes_no_entry_and_ends_a_wait() {
         let first = append(&target, &client(1), 1, &["a"]).await.unwrap();
         let newest = first.offsets.unwrap().1;
         let store = target.store.clone();
-        let (namespace, stream) = (target.namespace.clone(), target.stream.clone());
+        let (namespace, stream) = (target.namespace.clone(), target.stream_ref());
         let waiter = tokio::spawn(async move {
             let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
             store
@@ -424,13 +424,13 @@ async fn a_close_writes_no_entry_and_ends_a_wait() {
         let deadline = started + Duration::from_secs(5);
         let woke = target
             .store
-            .wait_after(&target.namespace, &target.stream, newest, deadline)
+            .wait_after(&target.namespace, &target.stream_ref(), newest, deadline)
             .await
             .unwrap();
         assert!(woke && started.elapsed() < Duration::from_secs(1));
         let (state, entries) = target
             .store
-            .read(&target.namespace, &target.stream, 0, 10)
+            .read(&target.namespace, &target.stream_ref(), 0, 10)
             .await
             .unwrap();
         assert!(state.closed);

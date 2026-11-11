@@ -494,22 +494,22 @@ impl Store for Flaky {
     async fn read(
         &self,
         namespace: &str,
-        stream_id: &str,
+        stream_ref: &StreamRef,
         from: i64,
         count: usize,
     ) -> StreamResult<(StreamState, Vec<Entry>)> {
-        self.inner.read(namespace, stream_id, from, count).await
+        self.inner.read(namespace, stream_ref, from, count).await
     }
 
     async fn wait_after(
         &self,
         namespace: &str,
-        stream_id: &str,
+        stream_ref: &StreamRef,
         after: i64,
         deadline: tokio::time::Instant,
     ) -> StreamResult<bool> {
         self.inner
-            .wait_after(namespace, stream_id, after, deadline)
+            .wait_after(namespace, stream_ref, after, deadline)
             .await
     }
 

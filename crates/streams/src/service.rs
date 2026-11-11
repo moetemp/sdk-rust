@@ -199,8 +199,9 @@ impl StreamService {
         &self,
         request: DescribeStreamRequest,
     ) -> StreamResult<DescribeStreamResponse> {
-        let id = stream_id(request.r#ref.as_ref())?;
-        let (state, _) = self.store.read(&request.namespace, id, 0, 0).await?;
+        stream_id(request.r#ref.as_ref())?;
+        let stream = request.r#ref.clone().unwrap_or_default();
+        let (state, _) = self.store.read(&request.namespace, &stream, 0, 0).await?;
         if !state.exists {
             return Err(StreamError::new(
                 Reason::NotFound,
@@ -228,7 +229,8 @@ impl StreamService {
         &self,
         request: ReadRecordsRequest,
     ) -> StreamResult<ReadRecordsResponse> {
-        let id = stream_id(request.r#ref.as_ref())?.to_string();
+        stream_id(request.r#ref.as_ref())?;
+        let stream = request.r#ref.clone().unwrap_or_default();
         let namespace = request.namespace.as_str();
         // The wire from_offset is exclusive, so a read starts after it. The empty value is a read
         // from the start.
@@ -258,7 +260,9 @@ impl StreamService {
             .min(MAX_WAIT);
         let deadline = started + wait;
 
-        let mut state = self.created(namespace, &id, started + create_wait).await?;
+        let mut state = self
+            .created(namespace, &stream, started + create_wait)
+            .await?;
         if state.version > FORMAT_VERSION {
             return Err(StreamError::new(
                 Reason::FormatTooNew,
@@ -281,7 +285,7 @@ impl StreamService {
         loop {
             check_expiry(&state, from)?;
             if let Some(page) = self
-                .page(namespace, &id, &state, from, (max, max_bytes))
+                .page(namespace, &stream, &state, from, (max, max_bytes))
                 .await?
             {
                 return Ok(page);
@@ -296,10 +300,13 @@ impl StreamService {
             }
             let after = (from - 1).max(state.newest);
             self.metrics.read_waits(true);
-            let woke = self.store.wait_after(namespace, &id, after, deadline).await;
+            let woke = self
+                .store
+                .wait_after(namespace, &stream, after, deadline)
+                .await;
             self.metrics.read_waits(false);
             woke?;
-            state = self.store.read(namespace, &id, 0, 0).await?.0;
+            state = self.store.read(namespace, &stream, 0, 0).await?.0;
         }
     }
 
@@ -307,11 +314,11 @@ impl StreamService {
     async fn created(
         &self,
         namespace: &str,
-        id: &str,
+        stream: &StreamRef,
         until: Instant,
     ) -> StreamResult<StreamState> {
         loop {
-            let (state, _) = self.store.read(namespace, id, 0, 0).await?;
+            let (state, _) = self.store.read(namespace, stream, 0, 0).await?;
             if state.exists {
                 return Ok(state);
             }
@@ -332,7 +339,7 @@ impl StreamService {
     async fn page(
         &self,
         namespace: &str,
-        id: &str,
+        stream: &StreamRef,
         state: &StreamState,
         from: i64,
         (max, max_bytes): (usize, usize),
@@ -354,7 +361,7 @@ impl StreamService {
         while records.len() < max && !full {
             let room = (max_bytes != usize::MAX).then(|| max_bytes.saturating_sub(bytes));
             let chunk = chunk_len(max - records.len(), room, pulled);
-            let (chunk_state, entries) = self.store.read(namespace, id, start, chunk).await?;
+            let (chunk_state, entries) = self.store.read(namespace, stream, start, chunk).await?;
             // Records that the log lost after the state read leave a gap before these entries.
             check_expiry(&chunk_state, if from > 0 { start } else { 0 })?;
             end = (chunk_state.closed, chunk_state.newest);
