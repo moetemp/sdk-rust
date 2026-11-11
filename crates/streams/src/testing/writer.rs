@@ -7,7 +7,7 @@ use super::{
     support::{Needs, item_offset, stores_for},
 };
 use crate::{
-    MemoryStreamRuntime, StreamError, StreamResult, StreamRuntime,
+    StreamError, StreamResult, StreamRuntime,
     ids::{activity_producer_id, client_producer_id, named_client_producer_id},
     proto::{
         ActivityEpoch, ActivityProducer, AppendRecord, ClientEpoch, ClientProducer,
@@ -507,7 +507,7 @@ async fn flaky_cases(lose_next: bool) -> Vec<(Arc<Flaky>, Case)> {
             ..Flaky::new(target.store)
         });
         let case = Case {
-            ext: MemoryStreamRuntime::with_store(store.clone(), None),
+            ext: StreamRuntime::new("flaky", "", store.clone(), None),
             namespace: format!("ns-{}", target.stream),
             stream: target.stream,
         };

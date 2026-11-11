@@ -8,7 +8,7 @@ use std::{
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
-    MemoryStreamRuntime, StreamError, StreamResult, StreamRuntime,
+    StreamError, StreamResult, StreamRuntime,
     ids::client_producer_id,
     memory::MemoryStore,
     proto::{
@@ -88,7 +88,7 @@ fn case(without: Capabilities) -> Case {
         .unwrap()
         .as_nanos();
     Case {
-        ext: MemoryStreamRuntime::with_store(store, None),
+        ext: StreamRuntime::new("test", "", store, None),
         memory,
         stream: format!("wf:run-{unique}"),
     }

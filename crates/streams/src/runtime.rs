@@ -1,203 +1,253 @@
-//! The Stream runtime, a plain object that lang's bridge builds per client and calls by name.
+//! The Stream runtime, a plain object that lang's bridge builds per client.
 
 use crate::{
     Reason, StreamError, StreamResult,
+    digest::batch_digest,
+    epoch::ProducerKind,
+    ids::{check_producer, check_required, check_stream_id},
     memory::MemoryStore,
     metrics::Metrics,
     offset::offset_to_wire,
     proto::{
-        AppendRecordsRequest, CloseStreamRequest, CloseWriterRequest, CloseWriterResponse,
-        CloseWritersRequest, CloseWritersResponse, DescribeStreamRequest, FreeWriterRequest,
-        FreeWriterResponse, MemoryStreamConfig, OpenWriterRequest, OpenWriterResponse,
-        ReadRecordsRequest, WriteRecordsRequest, WriteRecordsResponse,
+        AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
+        CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
+        MemoryStreamConfig, Producer, StreamIdConflictPolicy, StreamRef, StreamStatus,
     },
-    service::StreamService,
-    store::{DEFAULT_RETENTION, Store},
+    record::{check_records, data_records},
+    store::{
+        Batch, Capabilities, ConflictPolicy, Create, CreateOutcome, DEFAULT_RETENTION,
+        MAX_SEQUENCE, Store,
+    },
     writer::Writers,
 };
 use prost::Message;
 use std::{sync::Arc, time::Duration};
 use temporalio_common::telemetry::metrics::TemporalMeter;
-use tokio::sync::OnceCell;
 
-/// Connects the Store of a runtime.
-///
-/// The runtime connects on its first call that needs the Store. So a bridge can build the runtime
-/// with no async runtime, and a Workflow that never publishes never connects. A failed connect is
-/// tried again on the next call.
-#[async_trait::async_trait]
-pub trait StoreFactory: Send + Sync + 'static {
-    /// Connects a Store.
-    async fn connect(&self) -> StreamResult<Arc<dyn Store>>;
-}
-
-/// A Store that is already connected.
-struct Connected(Arc<dyn Store>);
-
-#[async_trait::async_trait]
-impl StoreFactory for Connected {
-    async fn connect(&self) -> StreamResult<Arc<dyn Store>> {
-        Ok(self.0.clone())
-    }
-}
-
-/// The state that the runtime's calls share.
-pub(crate) struct Shared {
-    name: &'static str,
-    backend: String,
-    metrics: Metrics,
-    factory: Arc<dyn StoreFactory>,
-    service: OnceCell<Arc<StreamService>>,
-    writers: Writers,
-}
-
-impl Shared {
-    /// The service, which connects its Store on its first use.
-    pub(crate) async fn service(&self) -> StreamResult<&Arc<StreamService>> {
-        self.service
-            .get_or_try_init(|| async {
-                let store = self.factory.connect().await?;
-                Ok(Arc::new(StreamService {
-                    store,
-                    metrics: self.metrics.clone(),
-                    backend: self.backend.clone(),
-                }))
-            })
-            .await
-    }
-}
-
-/// The Stream runtime on one Store.
+/// The Stream runtime on one Store. It serves the five Stream service operations and the writers.
+/// A Store has no namespaces, so the runtime ignores a request's `namespace`. The SDK sets it, and
+/// only the server's native Streams read it.
 ///
 /// A bridge builds one for each client with a Stream backend, and that client's Workers share it.
 /// A Store crate, such as `temporalio-streams-redis`, builds it with its own Store.
 pub struct StreamRuntime {
-    shared: Arc<Shared>,
+    name: &'static str,
+    /// The backend name for the refs the runtime builds.
+    backend: String,
+    pub(crate) store: Arc<dyn Store>,
+    pub(crate) metrics: Metrics,
+    pub(crate) writers: Writers,
 }
 
 impl std::fmt::Debug for StreamRuntime {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamRuntime")
-            .field("name", &self.shared.name)
-            .field("backend", &self.shared.backend)
+            .field("name", &self.name)
+            .field("backend", &self.backend)
             .finish_non_exhaustive()
     }
 }
 
-impl StreamRuntime {
-    /// Builds a runtime that connects its Store with `factory` on its first call that needs it.
-    /// `name` identifies the runtime in logs. `backend` is the name that lang registered the
-    /// runtime under, which the refs that the runtime builds carry. The runtime records metrics
-    /// on `meter`, lang's runtime meter, if set.
-    pub fn new(
-        name: &'static str,
-        backend: impl Into<String>,
-        factory: Arc<dyn StoreFactory>,
-        meter: Option<TemporalMeter>,
-    ) -> Arc<Self> {
-        let meter = meter.unwrap_or_else(TemporalMeter::no_op);
-        let shared = Arc::new(Shared {
-            name,
-            backend: backend.into(),
-            metrics: Metrics::new(&meter),
-            factory,
-            service: OnceCell::new(),
-            writers: Writers::default(),
-        });
-        Arc::new(Self { shared })
-    }
+pub(crate) fn duration(value: Option<prost_types::Duration>) -> Option<Duration> {
+    let value = value?;
+    let duration = Duration::new(value.seconds.max(0) as u64, value.nanos.max(0) as u32);
+    (!duration.is_zero()).then_some(duration)
+}
 
-    /// Builds a runtime on a Store that is already connected.
-    pub fn with_store(
+/// The conflict policy of a create. Unspecified is FAIL, as for a Workflow start.
+fn conflict_policy(value: i32) -> StreamResult<ConflictPolicy> {
+    match StreamIdConflictPolicy::try_from(value) {
+        Ok(StreamIdConflictPolicy::Unspecified | StreamIdConflictPolicy::Fail) => {
+            Ok(ConflictPolicy::Fail)
+        }
+        Ok(StreamIdConflictPolicy::UseExisting) => Ok(ConflictPolicy::UseExisting),
+        Err(_) => Err(StreamError::invalid(format!(
+            "The conflict policy {value} is unknown"
+        ))),
+    }
+}
+
+fn proto_duration(value: Duration) -> prost_types::Duration {
+    prost_types::Duration {
+        seconds: value.as_secs() as i64,
+        nanos: value.subsec_nanos() as i32,
+    }
+}
+
+pub(crate) fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
+    let id = stream_ref
+        .map(|stream_ref| stream_ref.id.as_str())
+        .unwrap_or_default();
+    check_stream_id(id)?;
+    Ok(id)
+}
+
+/// Checks a Producer that writes outside Workflow code.
+pub(crate) fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
+    let producer = producer.ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
+    check_producer(producer)?;
+    if ProducerKind::try_from(producer)? == ProducerKind::Workflow {
+        return Err(StreamError::invalid(
+            "A Workflow writes with the Producer of its Local Activity",
+        ));
+    }
+    check_required(producer)?;
+    Ok(producer)
+}
+
+/// Checks the Producer of a close.
+fn close_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
+    let producer = producer.ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
+    check_producer(producer)?;
+    check_required(producer)?;
+    Ok(producer)
+}
+
+/// Appends one batch. The runtime and each writer send their batches through it, so a writer needs
+/// no reference to the runtime.
+pub(crate) async fn append(
+    store: &dyn Store,
+    metrics: &Metrics,
+    request: AppendRecordsRequest,
+) -> StreamResult<AppendRecordsResponse> {
+    stream_id(request.r#ref.as_ref())?;
+    let stream = request.r#ref.clone().unwrap_or_default();
+    let producer = outside_producer(request.producer.as_ref())?;
+    if !(0..=MAX_SEQUENCE).contains(&request.sequence) {
+        return Err(StreamError::invalid(
+            "The sequence must be from 1 to 2^53 - 1, or zero for the next one",
+        ));
+    }
+    check_records(&request.records)?;
+    // Without the fence, a stale batch would reach Readers.
+    store.capabilities().require(Capabilities::PRODUCER_FENCE)?;
+    if request.sequence == 0 {
+        // A call with no writer state sends no sequence. Only the Store can number the batch in
+        // the same step as its dedupe check.
+        store.capabilities().require(Capabilities::NEXT_SEQUENCE)?;
+    }
+    let digest = batch_digest(&request.records);
+    let records = data_records(producer, request.records)?;
+    let batch = Batch {
+        producer,
+        sequence: request.sequence,
+        records: &records,
+        digest,
+    };
+    let appended = store.append(&stream, &batch).await;
+    if let Err(error) = &appended
+        && error.reason == Reason::Fenced
+    {
+        metrics.fenced();
+    }
+    // An empty batch has no offset, which is the empty wire value.
+    let (first_offset, last_offset) = appended?.offsets.unwrap_or_default();
+    Ok(AppendRecordsResponse {
+        first_offset: offset_to_wire(first_offset),
+        last_offset: offset_to_wire(last_offset),
+    })
+}
+
+impl StreamRuntime {
+    /// Builds a runtime on `store`. `name` identifies the runtime in logs. `backend` is the name
+    /// that lang registered the runtime under, which the refs that the runtime builds carry. The
+    /// runtime records metrics on `meter`, lang's runtime meter, if set. A Store that connects
+    /// later, such as a [crate::store::LazyStore], lets a bridge build the runtime with no async
+    /// runtime.
+    pub fn new(
         name: &'static str,
         backend: impl Into<String>,
         store: Arc<dyn Store>,
         meter: Option<TemporalMeter>,
     ) -> Arc<Self> {
-        Self::new(name, backend, Arc::new(Connected(store)), meter)
+        let meter = meter.unwrap_or_else(TemporalMeter::no_op);
+        Arc::new(Self {
+            name,
+            backend: backend.into(),
+            store,
+            metrics: Metrics::new(&meter),
+            writers: Writers::default(),
+        })
     }
 
     /// A name that identifies the runtime in logs.
     pub fn name(&self) -> &str {
-        self.shared.name
+        self.name
     }
 
-    /// Releases one reference to a writer with no wait, as the `FreeWriter` method does. A bridge
-    /// calls it from a finalizer, which has no async runtime to await on.
-    pub fn free_writer(&self, writer_id: u64) -> StreamResult<()> {
-        self.shared.writers.free(writer_id)
-    }
-
-    /// Runs one method on encoded input and returns the encoded output. The bridge raises an error
-    /// with [StreamError::code] and [StreamError::details].
-    pub async fn call(&self, method: &str, input: &[u8]) -> StreamResult<Vec<u8>> {
-        // `FreeWriter` needs no Store, so it works when the Store is down too.
-        if method == "FreeWriter" {
-            let request = decode::<FreeWriterRequest>(input)?;
-            self.free_writer(request.writer_id)?;
-            return Ok(FreeWriterResponse {}.encode_to_vec());
-        }
-        let service = self.shared.service().await?;
-        let output = match method {
-            "CreateStream" => service.create_stream(decode(input)?).await?.encode_to_vec(),
-            "AppendRecords" => service
-                .append_records(decode::<AppendRecordsRequest>(input)?)
-                .await?
-                .encode_to_vec(),
-            "CloseStream" => service
-                .close_stream(decode::<CloseStreamRequest>(input)?)
-                .await?
-                .encode_to_vec(),
-            "ReadRecords" => service
-                .read_records(decode::<ReadRecordsRequest>(input)?)
-                .await?
-                .encode_to_vec(),
-            "DescribeStream" => service
-                .describe_stream(decode::<DescribeStreamRequest>(input)?)
-                .await?
-                .encode_to_vec(),
-            "OpenWriter" => {
-                let request = decode::<OpenWriterRequest>(input)?;
-                let writer_id = self.shared.writers.open(service, request).await?;
-                OpenWriterResponse { writer_id }.encode_to_vec()
-            }
-            "WriteRecords" => {
-                let request = decode::<WriteRecordsRequest>(input)?;
-                let (first_offset, last_offset) = self
-                    .shared
-                    .writers
-                    .write(request.writer_id, request.records)
-                    .await?;
-                WriteRecordsResponse {
-                    first_offset: offset_to_wire(first_offset),
-                    last_offset: offset_to_wire(last_offset),
-                }
-                .encode_to_vec()
-            }
-            "CloseWriters" => {
-                decode::<CloseWritersRequest>(input)?;
-                let failed = self.shared.writers.close_all().await;
-                CloseWritersResponse {
-                    failed: failed as i32,
-                }
-                .encode_to_vec()
-            }
-            "CloseWriter" => {
-                let request = decode::<CloseWriterRequest>(input)?;
-                let last_offset = self.shared.writers.close(request.writer_id).await?;
-                CloseWriterResponse {
-                    last_offset: offset_to_wire(last_offset),
-                }
-                .encode_to_vec()
-            }
-            _ => {
-                return Err(StreamError::new(
-                    Reason::Unsupported,
-                    format!("Unknown method {method}"),
-                ));
-            }
+    /// Creates a Stream, or gets it with USE_EXISTING.
+    pub async fn create_stream(
+        &self,
+        request: CreateStreamRequest,
+    ) -> StreamResult<CreateStreamResponse> {
+        stream_id(request.stream_ref.as_ref())?;
+        let stream = request.stream_ref.clone().unwrap_or_default();
+        let conflict = conflict_policy(request.id_conflict_policy)?;
+        // The backend config holds the Retention, so a create takes the Store default.
+        let create = Create {
+            retention: None,
+            conflict,
+            request_id: &request.request_id,
         };
-        Ok(output)
+        let created = self.store.create(&stream, &create).await?;
+        Ok(CreateStreamResponse {
+            r#ref: Some(StreamRef {
+                id: stream.id,
+                backend: self.backend.clone(),
+            }),
+            created: created.outcome == CreateOutcome::Created,
+        })
+    }
+
+    /// Appends one batch as one Producer. A writer keeps a Producer's epoch and `sequence` order
+    /// for many batches.
+    pub async fn append_records(
+        &self,
+        request: AppendRecordsRequest,
+    ) -> StreamResult<AppendRecordsResponse> {
+        append(&*self.store, &self.metrics, request).await
+    }
+
+    /// Closes a Stream. Its readers drain what is left, and later appends fail.
+    pub async fn close_stream(
+        &self,
+        request: CloseStreamRequest,
+    ) -> StreamResult<CloseStreamResponse> {
+        stream_id(request.r#ref.as_ref())?;
+        let stream = request.r#ref.clone().unwrap_or_default();
+        let producer = close_producer(request.producer.as_ref())?;
+        self.store.capabilities().require(Capabilities::CLOSE)?;
+        self.store.close(&stream, producer).await?;
+        Ok(CloseStreamResponse {})
+    }
+
+    /// Gets the status, the newest offset and the Retention of a Stream.
+    pub async fn describe_stream(
+        &self,
+        request: DescribeStreamRequest,
+    ) -> StreamResult<DescribeStreamResponse> {
+        stream_id(request.r#ref.as_ref())?;
+        let stream = request.r#ref.clone().unwrap_or_default();
+        let (state, _) = self.store.read(&stream, 0, 0).await?;
+        if !state.exists {
+            return Err(StreamError::new(
+                Reason::NotFound,
+                "Nobody created the Stream",
+            ));
+        }
+        // A closed Stream that expired has lost its log, and every read fails.
+        let status = if state.expired() {
+            StreamStatus::Expired
+        } else if state.closed {
+            StreamStatus::Closed
+        } else {
+            StreamStatus::Open
+        };
+        Ok(DescribeStreamResponse {
+            status: status as i32,
+            last_offset: offset_to_wire(state.newest),
+            retention: Some(proto_duration(state.retention)),
+        })
     }
 }
 
@@ -223,69 +273,18 @@ impl MemoryStreamRuntime {
             duration(config.retention).unwrap_or(DEFAULT_RETENTION),
             duration(config.last_write_ttl),
         ));
-        Ok(StreamRuntime::with_store(
+        Ok(StreamRuntime::new(
             MEMORY_RUNTIME_NAME,
             config.backend,
             memory,
             meter,
         ))
     }
-
-    /// Builds a runtime on any Store, for tests of a Store that lacks some capabilities.
-    #[doc(hidden)]
-    pub fn with_store(store: Arc<dyn Store>, meter: Option<TemporalMeter>) -> Arc<StreamRuntime> {
-        StreamRuntime::with_store(MEMORY_RUNTIME_NAME, String::new(), store, meter)
-    }
-}
-
-fn duration(value: Option<prost_types::Duration>) -> Option<Duration> {
-    let value = value?;
-    let duration = Duration::new(value.seconds.max(0) as u64, value.nanos.max(0) as u32);
-    (!duration.is_zero()).then_some(duration)
-}
-
-pub(crate) fn decode<M: Message + Default>(input: &[u8]) -> StreamResult<M> {
-    M::decode(input).map_err(|error| StreamError::invalid(format!("The request is bad: {error}")))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const METHODS: [&str; 10] = [
-        "CreateStream",
-        "AppendRecords",
-        "CloseStream",
-        "ReadRecords",
-        "DescribeStream",
-        "OpenWriter",
-        "WriteRecords",
-        "CloseWriters",
-        "CloseWriter",
-        "FreeWriter",
-    ];
-
-    fn runtime() -> Arc<StreamRuntime> {
-        let config = MemoryStreamConfig::default().encode_to_vec();
-        MemoryStreamRuntime::from_config_bytes(&config, None).unwrap()
-    }
-
-    // A call connects the Store before it decodes its request, so the runtime is a memory one. A
-    // typo in a method name would make it unknown, which is unsupported, so the loop also checks
-    // the names that a bridge calls.
-    #[tokio::test]
-    async fn a_bad_request_is_invalid_and_an_unknown_method_is_unsupported() {
-        let runtime = runtime();
-        for method in METHODS {
-            let error = runtime.call(method, &[0xff]).await.unwrap_err();
-            assert_eq!(error.reason, Reason::Invalid, "{method}");
-        }
-        let error = runtime.call("Nope", &[]).await.unwrap_err();
-        assert_eq!(
-            (error.reason, error.message.as_str()),
-            (Reason::Unsupported, "Unknown method Nope")
-        );
-    }
 
     #[test]
     fn a_bad_memory_config_is_invalid() {

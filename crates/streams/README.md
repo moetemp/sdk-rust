@@ -1,8 +1,9 @@
 # temporalio-streams
 
 Experimental. The Stream runtime that the Temporal SDKs link into their bridges. A bridge builds
-the runtime per client, as a plain object, and calls it with a method name and proto bytes. A
-Workflow makes each Stream call from a Local Activity. Core has no Stream code.
+the runtime per client, as a plain object, and calls its typed methods, or its byte form with a
+method name and proto bytes. A Workflow makes each Stream call from a Local Activity. Core has no
+Stream code.
 
 ## Protos and shared vectors
 
@@ -22,12 +23,13 @@ re-exports them, so a value needs no conversion between the crates.
 
 ## The runtime
 
-`StreamRuntime` serves the Stream service on one Store. A Store crate builds it with
-`StreamRuntime::new` and a `StoreFactory`, which connects the Store on the runtime's first call
-that needs it. So a bridge can build the runtime with no async runtime, and a Workflow that never
-publishes never connects. `MemoryStreamRuntime` builds it on the memory Store, from a
-`MemoryStreamConfig`. That message has the field numbers of the same fields in the Redis config,
-so a bridge can send the memory runtime the config it builds for Redis.
+`StreamRuntime` serves the Stream service on one Store, with one typed method for each operation.
+`StreamRuntime::call` is the byte form of the same methods, for a bridge that decodes no proto. A
+Store crate builds the runtime with `StreamRuntime::new` and its Store. A `store::LazyStore`
+connects its inner Store on the first call that needs it. So a bridge can build the runtime with no
+async runtime, and a Workflow that never publishes never connects. `MemoryStreamRuntime` builds it
+on the memory Store, from a `MemoryStreamConfig`. That message has the field numbers of the same
+fields in the Redis config, so a bridge can send the memory runtime the config it builds for Redis.
 
 ## Stores and the shared suites
 

@@ -1,4 +1,4 @@
-//! The Stream service operations through the runtime's byte call, as lang sends them.
+//! The Stream service operations through the runtime's typed calls.
 //!
 //! Every Store runs the suite through its own runtime.
 
@@ -77,15 +77,6 @@ async fn cases_with(needs: Needs, config: &RuntimeConfig) -> Vec<Case> {
             }
         })
         .collect()
-}
-
-async fn call<Req: Message, Resp: Message + Default>(
-    ext: &StreamRuntime,
-    method: &str,
-    request: Req,
-) -> Result<Resp, StreamError> {
-    let bytes = ext.call(method, &request.encode_to_vec()).await?;
-    Ok(Resp::decode(bytes.as_slice()).unwrap())
 }
 
 fn reason(error: &StreamError) -> String {
@@ -175,7 +166,7 @@ impl Case {
             stream_ref: self.stream_ref(),
             ..request
         };
-        call(&self.ext, "CreateStream", request).await
+        self.ext.create_stream(request).await
     }
 
     async fn append(
@@ -184,58 +175,46 @@ impl Case {
         sequence: i64,
         records: Vec<AppendRecord>,
     ) -> Result<AppendRecordsResponse, StreamError> {
-        call(
-            &self.ext,
-            "AppendRecords",
-            AppendRecordsRequest {
+        self.ext
+            .append_records(AppendRecordsRequest {
                 namespace: self.namespace.clone(),
                 r#ref: self.stream_ref(),
                 producer: Some(producer),
                 sequence,
                 records,
                 ..Default::default()
-            },
-        )
-        .await
+            })
+            .await
     }
 
     async fn read(&self, request: ReadRecordsRequest) -> Result<ReadRecordsResponse, StreamError> {
-        call(
-            &self.ext,
-            "ReadRecords",
-            ReadRecordsRequest {
+        self.ext
+            .read_records(ReadRecordsRequest {
                 namespace: self.namespace.clone(),
                 r#ref: self.stream_ref(),
                 ..request
-            },
-        )
-        .await
+            })
+            .await
     }
 
     async fn describe(&self) -> Result<DescribeStreamResponse, StreamError> {
-        call(
-            &self.ext,
-            "DescribeStream",
-            DescribeStreamRequest {
+        self.ext
+            .describe_stream(DescribeStreamRequest {
                 namespace: self.namespace.clone(),
                 r#ref: self.stream_ref(),
-            },
-        )
-        .await
+            })
+            .await
     }
 
     async fn close(&self, producer: Producer) -> Result<CloseStreamResponse, StreamError> {
-        call(
-            &self.ext,
-            "CloseStream",
-            CloseStreamRequest {
+        self.ext
+            .close_stream(CloseStreamRequest {
                 namespace: self.namespace.clone(),
                 r#ref: self.stream_ref(),
                 producer: Some(producer),
                 ..Default::default()
-            },
-        )
-        .await
+            })
+            .await
     }
 }
 
@@ -290,9 +269,7 @@ async fn a_create_of_an_open_stream_fails_unless_it_uses_it_or_retries() {
                 stream_ref,
                 ..Default::default()
             };
-            let error = call::<_, CreateStreamResponse>(&case.ext, "CreateStream", request)
-                .await
-                .unwrap_err();
+            let error = case.ext.create_stream(request).await.unwrap_err();
             assert_eq!(reason(&error), "stream_invalid");
         }
     }
@@ -335,8 +312,7 @@ async fn a_close_writes_no_record_and_a_second_close_succeeds() {
             namespace: case.namespace.clone(),
             r#ref: case.stream_ref(),
         };
-        let described: DescribeStreamResponse =
-            call(&case.ext, "DescribeStream", describe).await.unwrap();
+        let described = case.ext.describe_stream(describe).await.unwrap();
         assert_eq!(described.status, StreamStatus::Closed as i32);
         assert_eq!(described.last_offset, written.last_offset);
     }
@@ -590,7 +566,7 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
                 records: vec![record("2")],
                 ..Default::default()
             };
-            call::<_, AppendRecordsResponse>(&ext, "AppendRecords", request).await
+            ext.append_records(request).await
         });
         let woke = case
             .read(ReadRecordsRequest {
@@ -655,14 +631,6 @@ async fn a_closed_read_ends_with_a_close_item() {
         };
         assert_eq!(close.status, StreamCloseStatus::Closed as i32);
         assert_eq!(close.producer, Some(client(1)));
-    }
-}
-
-/// An unknown method fails with UNIMPLEMENTED.
-async fn an_unknown_method_is_unimplemented() {
-    for case in cases_for(Needs::CALLS).await {
-        let error = case.ext.call("Nope", &[]).await.unwrap_err();
-        assert_eq!(error.code(), Code::Unimplemented);
     }
 }
 
@@ -791,14 +759,14 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
                 records: vec![record(&sequence.to_string())],
                 ..Default::default()
             };
-            let _: AppendRecordsResponse = call(&case.ext, "AppendRecords", request).await.unwrap();
+            case.ext.append_records(request).await.unwrap();
         }
         let read = ReadRecordsRequest {
             namespace: case.namespace.clone(),
             r#ref: named("other"),
             ..Default::default()
         };
-        let read: ReadRecordsResponse = call(&case.ext, "ReadRecords", read).await.unwrap();
+        let read = case.ext.read_records(read).await.unwrap();
         assert_eq!(texts(&read), ["1", "2", "3"]);
     }
     // With no backend in the config, the ref has none, and lang reads it as the default.
@@ -873,7 +841,7 @@ async fn a_waiting_read_wakes_with_done_on_a_close() {
         };
         let closer = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(150)).await;
-            call::<_, CloseStreamResponse>(&ext, "CloseStream", close).await
+            ext.close_stream(close).await
         });
         let started = Instant::now();
         let woke = case
@@ -926,7 +894,6 @@ pub const CASES: &[super::Case] = &[
     case!(a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append),
     case!(a_close_ends_every_read_with_done),
     case!(a_closed_read_ends_with_a_close_item),
-    case!(an_unknown_method_is_unimplemented),
     case!(a_read_of_an_expired_closed_stream_fails_instead_of_waiting),
     case!(the_retention_counts_from_the_close),
     case!(an_open_stream_expires_its_last_write_ttl_after_its_last_write),

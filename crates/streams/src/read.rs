@@ -1,28 +1,17 @@
-//! The five Stream service operations on the Store, for Activities, clients and the Local
-//! Activity that runs each Workflow call.
+//! The read of the runtime, a long poll that pages through the log.
 
 use crate::{
-    Reason, StreamError, StreamResult,
-    digest::batch_digest,
-    epoch::ProducerKind,
-    ids::{check_producer, check_required, check_stream_id},
-    metrics::Metrics,
+    Reason, StreamError, StreamResult, StreamRuntime,
     offset::{offset_from_wire, offset_to_wire},
     proto::{
-        AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
-        CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        Producer, ReadRecordsRequest, ReadRecordsResponse, StreamClose, StreamIdConflictPolicy,
-        StreamReadStart, StreamRecord, StreamRef, StreamStatus, read_records_request::Position,
-        stream_record::Item,
+        Producer, ReadRecordsRequest, ReadRecordsResponse, StreamClose, StreamReadStart,
+        StreamRecord, StreamRef, read_records_request::Position, stream_record::Item,
     },
-    record::{check_records, data_records},
-    store::{
-        Batch, Capabilities, ConflictPolicy, Create, CreateOutcome, FORMAT_VERSION, MAX_SEQUENCE,
-        Store, StreamState,
-    },
+    runtime::{duration, stream_id},
+    store::{FORMAT_VERSION, StreamState},
 };
 use prost::Message;
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 use tokio::time::Instant;
 
 /// The longest wait of one read for new Records.
@@ -30,189 +19,10 @@ pub const MAX_WAIT: Duration = Duration::from_secs(60);
 /// The maximum number of Records in one read.
 const MAX_RECORDS: usize = 1000;
 
-/// The Stream service on one Store. A Store has no namespaces, so the service ignores a request's
-/// `namespace`. The SDK sets it, and only the server's native Streams read it.
-pub(crate) struct StreamService {
-    pub(crate) store: Arc<dyn Store>,
-    pub(crate) metrics: Metrics,
-    /// The backend name for the refs the service builds.
-    pub(crate) backend: String,
-}
-
-fn duration(value: Option<prost_types::Duration>) -> Option<Duration> {
-    let value = value?;
-    let duration = Duration::new(value.seconds.max(0) as u64, value.nanos.max(0) as u32);
-    (!duration.is_zero()).then_some(duration)
-}
-
-/// The conflict policy of a create. Unspecified is FAIL, as for a Workflow start.
-fn conflict_policy(value: i32) -> StreamResult<ConflictPolicy> {
-    match StreamIdConflictPolicy::try_from(value) {
-        Ok(StreamIdConflictPolicy::Unspecified | StreamIdConflictPolicy::Fail) => {
-            Ok(ConflictPolicy::Fail)
-        }
-        Ok(StreamIdConflictPolicy::UseExisting) => Ok(ConflictPolicy::UseExisting),
-        Err(_) => Err(StreamError::invalid(format!(
-            "The conflict policy {value} is unknown"
-        ))),
-    }
-}
-
-fn proto_duration(value: Duration) -> prost_types::Duration {
-    prost_types::Duration {
-        seconds: value.as_secs() as i64,
-        nanos: value.subsec_nanos() as i32,
-    }
-}
-
-fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
-    let id = stream_ref
-        .map(|stream_ref| stream_ref.id.as_str())
-        .unwrap_or_default();
-    check_stream_id(id)?;
-    Ok(id)
-}
-
-/// Checks a Producer that writes outside Workflow code.
-fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
-    let producer = producer.ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
-    check_producer(producer)?;
-    if ProducerKind::try_from(producer)? == ProducerKind::Workflow {
-        return Err(StreamError::invalid(
-            "A Workflow writes with the Producer of its Local Activity",
-        ));
-    }
-    check_required(producer)?;
-    Ok(producer)
-}
-
-/// Checks the Producer of a close.
-fn close_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
-    let producer = producer.ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
-    check_producer(producer)?;
-    check_required(producer)?;
-    Ok(producer)
-}
-
-impl StreamService {
-    pub(crate) async fn create_stream(
-        &self,
-        request: CreateStreamRequest,
-    ) -> StreamResult<CreateStreamResponse> {
-        stream_id(request.stream_ref.as_ref())?;
-        let stream = request.stream_ref.clone().unwrap_or_default();
-        let conflict = conflict_policy(request.id_conflict_policy)?;
-        // The backend config holds the Retention, so a create takes the Store default.
-        let create = Create {
-            retention: None,
-            conflict,
-            request_id: &request.request_id,
-        };
-        let created = self.store.create(&stream, &create).await?;
-        Ok(CreateStreamResponse {
-            r#ref: Some(StreamRef {
-                id: stream.id,
-                backend: self.backend.clone(),
-            }),
-            created: created.outcome == CreateOutcome::Created,
-        })
-    }
-
-    pub(crate) async fn append_records(
-        &self,
-        request: AppendRecordsRequest,
-    ) -> StreamResult<AppendRecordsResponse> {
-        stream_id(request.r#ref.as_ref())?;
-        let stream = request.r#ref.clone().unwrap_or_default();
-        let producer = outside_producer(request.producer.as_ref())?;
-        if !(0..=MAX_SEQUENCE).contains(&request.sequence) {
-            return Err(StreamError::invalid(
-                "The sequence must be from 1 to 2^53 - 1, or zero for the next one",
-            ));
-        }
-        check_records(&request.records)?;
-        // Without the fence, a stale batch would reach Readers.
-        self.store
-            .capabilities()
-            .require(Capabilities::PRODUCER_FENCE)?;
-        if request.sequence == 0 {
-            // A call with no writer state sends no sequence. Only the Store can number the batch in
-            // the same step as its dedupe check.
-            self.store
-                .capabilities()
-                .require(Capabilities::NEXT_SEQUENCE)?;
-        }
-        let digest = batch_digest(&request.records);
-        let records = data_records(producer, request.records)?;
-        let batch = Batch {
-            producer,
-            sequence: request.sequence,
-            records: &records,
-            digest,
-        };
-        let appended = self.store.append(&stream, &batch).await;
-        let appended = self.count(appended)?;
-        // An empty batch has no offset, which is the empty wire value.
-        let (first_offset, last_offset) = appended.offsets.unwrap_or_default();
-        Ok(AppendRecordsResponse {
-            first_offset: offset_to_wire(first_offset),
-            last_offset: offset_to_wire(last_offset),
-        })
-    }
-
-    /// Counts a fence of an append on the metrics.
-    fn count<T>(&self, result: StreamResult<T>) -> StreamResult<T> {
-        if let Err(error) = &result
-            && error.reason == Reason::Fenced
-        {
-            self.metrics.fenced();
-        }
-        result
-    }
-
-    pub(crate) async fn close_stream(
-        &self,
-        request: CloseStreamRequest,
-    ) -> StreamResult<CloseStreamResponse> {
-        stream_id(request.r#ref.as_ref())?;
-        let stream = request.r#ref.clone().unwrap_or_default();
-        let producer = close_producer(request.producer.as_ref())?;
-        self.store.capabilities().require(Capabilities::CLOSE)?;
-        self.store.close(&stream, producer).await?;
-        Ok(CloseStreamResponse {})
-    }
-
-    pub(crate) async fn describe_stream(
-        &self,
-        request: DescribeStreamRequest,
-    ) -> StreamResult<DescribeStreamResponse> {
-        stream_id(request.r#ref.as_ref())?;
-        let stream = request.r#ref.clone().unwrap_or_default();
-        let (state, _) = self.store.read(&stream, 0, 0).await?;
-        if !state.exists {
-            return Err(StreamError::new(
-                Reason::NotFound,
-                "Nobody created the Stream",
-            ));
-        }
-        // A closed Stream that expired has lost its log, and every read fails.
-        let status = if state.expired() {
-            StreamStatus::Expired
-        } else if state.closed {
-            StreamStatus::Closed
-        } else {
-            StreamStatus::Open
-        };
-        Ok(DescribeStreamResponse {
-            status: status as i32,
-            last_offset: offset_to_wire(state.newest),
-            retention: Some(proto_duration(state.retention)),
-        })
-    }
-
+impl StreamRuntime {
     /// A long poll that returns the Records it found, or nothing after `wait`. On a closed Stream
     /// with no item left, it returns `done` at once.
-    pub(crate) async fn read_records(
+    pub async fn read_records(
         &self,
         request: ReadRecordsRequest,
     ) -> StreamResult<ReadRecordsResponse> {
@@ -344,7 +154,7 @@ impl StreamService {
                     start = entry.offset + 1;
                     continue;
                 };
-                let record = decode(&encoded, entry.offset)?;
+                let record = decode_record(&encoded, entry.offset)?;
                 // An entry over the caps is still returned alone, so that the read always makes
                 // progress. The next read starts at the entry that didn't fit.
                 let size = record.encoded_len();
@@ -408,7 +218,7 @@ fn chunk_len(left: usize, room: Option<usize>, (bytes, entries): (usize, usize))
     (room / average + 1).clamp(1, left.max(1))
 }
 
-fn decode(bytes: &[u8], offset: i64) -> StreamResult<StreamRecord> {
+fn decode_record(bytes: &[u8], offset: i64) -> StreamResult<StreamRecord> {
     let mut record = StreamRecord::decode(bytes).map_err(|error| {
         StreamError::storage_corrupt(format!("A stored Record is bad: {error}"))
     })?;

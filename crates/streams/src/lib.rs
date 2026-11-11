@@ -3,27 +3,28 @@
 //! The Stream runtime of Temporal SDKs. It is experimental.
 //!
 //! The crate serves the Stream service on a Stream Store. Lang's bridge builds the runtime per
-//! client and calls it with an operation name and proto bytes. Core has no hook for it. A Workflow
-//! makes each call from a Local Activity.
+//! client and calls its typed methods, or its byte form with an operation name and proto bytes.
+//! Core has no hook for it. A Workflow makes each call from a Local Activity.
 
 pub mod digest;
+mod dispatch;
 pub mod epoch;
 mod error;
 pub mod ids;
 pub mod memory;
 mod metrics;
 pub mod offset;
+mod read;
 mod record;
 mod runtime;
-mod service;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 mod writer;
 
 pub use error::{Reason, StreamError, StreamResult};
-pub use runtime::{MemoryStreamRuntime, StoreFactory, StreamRuntime};
-pub use service::MAX_WAIT;
+pub use read::MAX_WAIT;
+pub use runtime::{MemoryStreamRuntime, StreamRuntime};
 
 /// The protos that lang and the crate exchange. `temporalio-protos` generates them, so a value
 /// needs no conversion between the crates.

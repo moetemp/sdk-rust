@@ -9,13 +9,13 @@
 use crate::{
     Reason, StreamError, StreamResult,
     epoch::ProducerKind,
+    metrics::Metrics,
     offset::offset_from_wire,
     proto::{
         AppendRecord, AppendRecordsRequest, OpenWriterRequest, Producer, StreamRef, producer::Kind,
     },
     record::check_records,
-    service::StreamService,
-    store::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES},
+    store::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES, Store},
 };
 use parking_lot::Mutex;
 use prost::Message;
@@ -57,7 +57,8 @@ struct Writer {
     producer: Producer,
     max_batch: usize,
     max_retry: Duration,
-    service: Arc<StreamService>,
+    store: Arc<dyn Store>,
+    metrics: Metrics,
     state: Mutex<State>,
     /// Allows one write at a time, so that the batches of one epoch reach the Store in order.
     writing: tokio::sync::Mutex<()>,
@@ -145,7 +146,7 @@ impl Writer {
         let until = Instant::now() + self.max_retry;
         let mut backoff = FIRST_BACKOFF;
         loop {
-            match self.service.append_records(request.clone()).await {
+            match crate::runtime::append(&*self.store, &self.metrics, request.clone()).await {
                 Ok(response) => {
                     return Ok((
                         offset_from_wire(&response.first_offset)?,
@@ -234,7 +235,8 @@ impl Writers {
     /// open still succeeds, and the first write fails with the reason.
     pub(crate) async fn open(
         &self,
-        service: &Arc<StreamService>,
+        store: &Arc<dyn Store>,
+        metrics: &Metrics,
         request: OpenWriterRequest,
     ) -> StreamResult<u64> {
         let stream = request
@@ -276,7 +278,8 @@ impl Writers {
                 _ => MAX_BATCH_RECORDS,
             },
             max_retry: duration(request.max_retry_duration).unwrap_or(DEFAULT_RETRY),
-            service: service.clone(),
+            store: store.clone(),
+            metrics: metrics.clone(),
             state: Mutex::default(),
             writing: tokio::sync::Mutex::new(()),
         });
@@ -409,21 +412,17 @@ async fn end(writer: &Writer) -> StreamResult<i64> {
 mod tests {
     use super::*;
     use crate::{
+        StreamRuntime,
         ids::client_producer_id,
         memory::MemoryStore,
-        metrics::Metrics,
         proto::{ClientEpoch, ClientProducer},
     };
-    use temporalio_common::telemetry::metrics::TemporalMeter;
 
     #[tokio::test]
     async fn an_append_of_a_writer_carries_the_namespace_of_its_open() {
-        let service = Arc::new(StreamService {
-            store: Arc::new(MemoryStore::new(Duration::from_secs(60), None)),
-            metrics: Metrics::new(&TemporalMeter::no_op()),
-            backend: String::new(),
-        });
-        let writers = Writers::default();
+        let store = Arc::new(MemoryStore::new(Duration::from_secs(60), None));
+        let runtime = StreamRuntime::new("test", "", store, None);
+        let writers = &runtime.writers;
         let request = OpenWriterRequest {
             namespace: "ns-1".into(),
             r#ref: Some(StreamRef {
@@ -438,7 +437,10 @@ mod tests {
             }),
             ..Default::default()
         };
-        let id = writers.open(&service, request).await.unwrap();
+        let id = writers
+            .open(&runtime.store, &runtime.metrics, request)
+            .await
+            .unwrap();
         let append = writers.get(id).unwrap().append(vec![], 1);
         assert_eq!(append.namespace, "ns-1");
     }

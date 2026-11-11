@@ -10,7 +10,7 @@ use std::{
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
 use temporalio_streams::{
-    MemoryStreamRuntime, StreamError, StreamResult, StreamRuntime,
+    StreamError, StreamResult, StreamRuntime,
     ids::client_producer_id,
     memory::MemoryStore,
     proto::{
@@ -78,7 +78,7 @@ fn trimming() -> (Arc<Trimming>, Arc<StreamRuntime>) {
         trim_next: AtomicBool::new(false),
         pulled: AtomicUsize::new(0),
     });
-    let ext = MemoryStreamRuntime::with_store(store.clone(), None);
+    let ext = StreamRuntime::new("test", "", store.clone(), None);
     (store, ext)
 }
 
