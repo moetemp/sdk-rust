@@ -146,6 +146,7 @@ impl Case {
 
     async fn open(&self, producer: Producer, change: impl Fn(&mut OpenWriterRequest)) -> u64 {
         let mut request = OpenWriterRequest {
+            namespace: self.namespace.clone(),
             r#ref: Some(StreamRef {
                 id: self.stream.clone(),
                 ..Default::default()
@@ -612,6 +613,7 @@ async fn a_write_that_waits_behind_a_close_is_refused() {
 async fn a_writer_of_a_producer_with_a_missing_required_field_does_not_open() {
     for case in cases().await {
         let request = OpenWriterRequest {
+            namespace: case.namespace.clone(),
             r#ref: Some(StreamRef {
                 id: case.stream.clone(),
                 ..Default::default()

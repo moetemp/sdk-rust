@@ -31,7 +31,7 @@ pub const MAX_WAIT: Duration = Duration::from_secs(60);
 const MAX_RECORDS: usize = 1000;
 
 /// The Stream service on one Store. A Store has no namespaces, so the service ignores a request's
-/// `namespace`, which only the server's native Streams read.
+/// `namespace`. The SDK sets it, and only the server's native Streams read it.
 pub(crate) struct StreamService {
     pub(crate) store: Arc<dyn Store>,
     pub(crate) metrics: Metrics,

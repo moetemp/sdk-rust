@@ -49,6 +49,8 @@ struct State {
 }
 
 struct Writer {
+    /// The namespace of the open that made the writer, which each batch sends.
+    namespace: String,
     stream_ref: StreamRef,
     /// The open's Producer, with its epoch, which each batch sends.
     producer: Producer,
@@ -123,16 +125,22 @@ impl Writer {
         Ok((first, last))
     }
 
-    /// Appends one batch and returns its first and last offset. After a Store failure it sends the
-    /// batch again with the same `sequence`, so the dedupe key stops a second write.
-    async fn send(&self, records: Vec<AppendRecord>, sequence: i64) -> StreamResult<(i64, i64)> {
-        let request = AppendRecordsRequest {
+    /// The append of one batch.
+    fn append(&self, records: Vec<AppendRecord>, sequence: i64) -> AppendRecordsRequest {
+        AppendRecordsRequest {
+            namespace: self.namespace.clone(),
             r#ref: Some(self.stream_ref.clone()),
             producer: Some(self.producer.clone()),
             sequence,
             records,
             ..Default::default()
-        };
+        }
+    }
+
+    /// Appends one batch and returns its first and last offset. After a Store failure it sends the
+    /// batch again with the same `sequence`, so the dedupe key stops a second write.
+    async fn send(&self, records: Vec<AppendRecord>, sequence: i64) -> StreamResult<(i64, i64)> {
+        let request = self.append(records, sequence);
         let until = Instant::now() + self.max_retry;
         let mut backoff = FIRST_BACKOFF;
         loop {
@@ -258,6 +266,7 @@ impl Writers {
             _ => false,
         };
         let writer = Arc::new(Writer {
+            namespace: request.namespace,
             stream_ref: stream,
             producer,
             // The Store refuses a batch over its Record limit, so no batch can be larger.
@@ -391,5 +400,44 @@ async fn end(writer: &Writer) -> StreamResult<i64> {
     match &state.failed {
         Some(error) => Err(error.clone()),
         None => Ok(state.last_offset),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        ids::client_producer_id,
+        memory::MemoryStore,
+        metrics::Metrics,
+        proto::{ClientEpoch, ClientProducer},
+    };
+    use temporalio_common::telemetry::metrics::TemporalMeter;
+
+    #[tokio::test]
+    async fn an_append_of_a_writer_carries_the_namespace_of_its_open() {
+        let service = Arc::new(StreamService {
+            store: Arc::new(MemoryStore::new(Duration::from_secs(60), None)),
+            metrics: Metrics::new(&TemporalMeter::no_op()),
+            backend: String::new(),
+        });
+        let writers = Writers::default();
+        let request = OpenWriterRequest {
+            namespace: "ns-1".into(),
+            r#ref: Some(StreamRef {
+                id: "s".into(),
+                ..Default::default()
+            }),
+            producer: Some(Producer {
+                id: client_producer_id("me", "p"),
+                kind: Some(Kind::Client(ClientProducer {
+                    epoch: Some(ClientEpoch { attempt: 1 }),
+                })),
+            }),
+            ..Default::default()
+        };
+        let id = writers.open(&service, request).await.unwrap();
+        let append = writers.get(id).unwrap().append(vec![], 1);
+        assert_eq!(append.namespace, "ns-1");
     }
 }
