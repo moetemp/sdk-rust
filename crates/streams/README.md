@@ -24,12 +24,14 @@ re-exports them, so a value needs no conversion between the crates.
 ## The runtime
 
 `StreamRuntime` serves the Stream service on one Store, with one typed method for each operation.
-`StreamRuntime::call` is the byte form of the same methods, for a bridge that decodes no proto. A
-Store crate builds the runtime with `StreamRuntime::new` and its Store. A `store::LazyStore`
-connects its inner Store on the first call that needs it. So a bridge can build the runtime with no
-async runtime, and a Workflow that never publishes never connects. `MemoryStreamRuntime` builds it
-on the memory Store, from a `MemoryStreamConfig`. That message has the field numbers of the same
-fields in the Redis config, so a bridge can send the memory runtime the config it builds for Redis.
+`StreamRuntime::call` is the byte form of the same methods, for a bridge that decodes no proto.
+`StreamRuntime::open_writer` gives a `StreamWriter`, which the bridge holds, and dropping it
+releases the writer. A Store crate builds the runtime with `StreamRuntime::new` and its Store. A
+`store::LazyStore` connects its inner Store on the first call that needs it. So a bridge can build
+the runtime with no async runtime, and a Workflow that never publishes never connects.
+`MemoryStreamRuntime` builds it on the memory Store, from a `MemoryStreamConfig`. That message has
+the field numbers of the same fields in the Redis config, so a bridge can send the memory runtime
+the config it builds for Redis.
 
 ## Stores and the shared suites
 

@@ -1,14 +1,8 @@
-//! The byte form of the runtime's calls, for bridges. A bridge passes a method name and the
-//! encoded request, and gets the encoded response, so it decodes no proto.
+//! The byte form of the runtime's and the writer's calls, for bridges. A bridge passes the encoded
+//! request and gets the encoded response, so it decodes no proto.
 
 use crate::{
-    Reason, StreamError, StreamResult, StreamRuntime,
-    offset::offset_to_wire,
-    proto::{
-        CloseWriterRequest, CloseWriterResponse, CloseWritersRequest, CloseWritersResponse,
-        FreeWriterRequest, FreeWriterResponse, OpenWriterRequest, OpenWriterResponse,
-        WriteRecordsRequest, WriteRecordsResponse,
-    },
+    Reason, StreamError, StreamResult, StreamRuntime, StreamWriter, proto::WriteRecordsRequest,
 };
 use prost::Message;
 
@@ -17,8 +11,9 @@ pub(crate) fn decode<M: Message + Default>(input: &[u8]) -> StreamResult<M> {
 }
 
 impl StreamRuntime {
-    /// Runs one method on encoded input and returns the encoded output. The bridge raises an error
-    /// with [StreamError::code] and [StreamError::details].
+    /// Runs one of the five Stream service operations on encoded input, by its name, and returns
+    /// the encoded output. The bridge raises an error with [StreamError::code] and
+    /// [StreamError::details].
     pub async fn call(&self, method: &str, input: &[u8]) -> StreamResult<Vec<u8>> {
         let output = match method {
             "CreateStream" => self.create_stream(decode(input)?).await?.encode_to_vec(),
@@ -26,47 +21,6 @@ impl StreamRuntime {
             "CloseStream" => self.close_stream(decode(input)?).await?.encode_to_vec(),
             "ReadRecords" => self.read_records(decode(input)?).await?.encode_to_vec(),
             "DescribeStream" => self.describe_stream(decode(input)?).await?.encode_to_vec(),
-            "OpenWriter" => {
-                let request = decode::<OpenWriterRequest>(input)?;
-                let writer_id = self
-                    .writers
-                    .open(&self.store, &self.metrics, request)
-                    .await?;
-                OpenWriterResponse { writer_id }.encode_to_vec()
-            }
-            "WriteRecords" => {
-                let request = decode::<WriteRecordsRequest>(input)?;
-                let (first_offset, last_offset) = self
-                    .writers
-                    .write(request.writer_id, request.records)
-                    .await?;
-                WriteRecordsResponse {
-                    first_offset: offset_to_wire(first_offset),
-                    last_offset: offset_to_wire(last_offset),
-                }
-                .encode_to_vec()
-            }
-            "CloseWriters" => {
-                decode::<CloseWritersRequest>(input)?;
-                let failed = self.writers.close_all().await;
-                CloseWritersResponse {
-                    failed: failed as i32,
-                }
-                .encode_to_vec()
-            }
-            "CloseWriter" => {
-                let request = decode::<CloseWriterRequest>(input)?;
-                let last_offset = self.writers.close(request.writer_id).await?;
-                CloseWriterResponse {
-                    last_offset: offset_to_wire(last_offset),
-                }
-                .encode_to_vec()
-            }
-            "FreeWriter" => {
-                let request = decode::<FreeWriterRequest>(input)?;
-                self.free_writer(request.writer_id)?;
-                FreeWriterResponse {}.encode_to_vec()
-            }
             _ => {
                 return Err(StreamError::new(
                     Reason::Unsupported,
@@ -77,10 +31,22 @@ impl StreamRuntime {
         Ok(output)
     }
 
-    /// Releases one reference to a writer with no wait, as the `FreeWriter` method does. A bridge
-    /// calls it from a finalizer, which has no async runtime to await on.
-    pub fn free_writer(&self, writer_id: u64) -> StreamResult<()> {
-        self.writers.free(writer_id)
+    /// Opens a writer from an encoded `OpenWriterRequest`.
+    pub async fn open_writer_bytes(&self, input: &[u8]) -> StreamResult<StreamWriter> {
+        self.open_writer(decode(input)?).await
+    }
+}
+
+impl StreamWriter {
+    /// Writes an encoded `WriteRecordsRequest`, and returns the encoded `WriteRecordsResponse`.
+    pub async fn write_bytes(&self, input: &[u8]) -> StreamResult<Vec<u8>> {
+        let request = decode::<WriteRecordsRequest>(input)?;
+        Ok(self.write(request).await?.encode_to_vec())
+    }
+
+    /// Closes the writer, and returns the encoded `CloseWriterResponse`.
+    pub async fn close_bytes(&self) -> StreamResult<Vec<u8>> {
+        Ok(self.close().await?.encode_to_vec())
     }
 }
 
@@ -92,25 +58,21 @@ mod tests {
         ids::client_producer_id,
         proto::{
             AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientEpoch, ClientProducer,
-            CloseStreamRequest, CloseStreamResponse, CreateStreamRequest, CreateStreamResponse,
-            DescribeStreamRequest, DescribeStreamResponse, MemoryStreamConfig, Producer,
-            ReadRecordsRequest, ReadRecordsResponse, StreamRef, StreamStatus, producer::Kind,
+            CloseStreamRequest, CloseStreamResponse, CloseWriterResponse, CreateStreamRequest,
+            CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
+            MemoryStreamConfig, OpenWriterRequest, Producer, ReadRecordsRequest,
+            ReadRecordsResponse, StreamRef, StreamStatus, WriteRecordsResponse, producer::Kind,
         },
     };
     use std::sync::Arc;
     use temporalio_common::protos::temporal::api::common::v1::Payload;
 
-    const METHODS: [&str; 10] = [
+    const METHODS: [&str; 5] = [
         "CreateStream",
         "AppendRecords",
         "CloseStream",
         "ReadRecords",
         "DescribeStream",
-        "OpenWriter",
-        "WriteRecords",
-        "CloseWriters",
-        "CloseWriter",
-        "FreeWriter",
     ];
 
     fn runtime() -> Arc<StreamRuntime> {
@@ -155,15 +117,37 @@ mod tests {
         Resp::decode(bytes.as_slice()).unwrap()
     }
 
+    async fn create(runtime: &StreamRuntime) -> CreateStreamResponse {
+        let request = CreateStreamRequest {
+            stream_ref: stream_ref(),
+            ..Default::default()
+        };
+        call(runtime, "CreateStream", request).await
+    }
+
     // A typo in a method name would make it unknown, which is unsupported, so the loop also checks
     // the names that a bridge calls.
     #[tokio::test]
-    async fn a_bad_request_is_invalid_and_an_unknown_method_is_unsupported() {
+    async fn bad_bytes_are_invalid_and_an_unknown_method_is_unsupported() {
         let runtime = runtime();
         for method in METHODS {
             let error = runtime.call(method, &[0xff]).await.unwrap_err();
             assert_eq!(error.reason, Reason::Invalid, "{method}");
         }
+        let error = runtime.open_writer_bytes(&[0xff]).await.unwrap_err();
+        assert_eq!(error.reason, Reason::Invalid);
+        create(&runtime).await;
+        let request = OpenWriterRequest {
+            r#ref: stream_ref(),
+            producer: client(),
+            ..Default::default()
+        };
+        let writer = runtime
+            .open_writer_bytes(&request.encode_to_vec())
+            .await
+            .unwrap();
+        let error = writer.write_bytes(&[0xff]).await.unwrap_err();
+        assert_eq!(error.reason, Reason::Invalid);
         let error = runtime.call("Nope", &[]).await.unwrap_err();
         assert_eq!(
             (error.reason, error.message.as_str()),
@@ -174,16 +158,7 @@ mod tests {
     #[tokio::test]
     async fn each_stream_method_round_trips_its_bytes() {
         let runtime = runtime();
-        let created: CreateStreamResponse = call(
-            &runtime,
-            "CreateStream",
-            CreateStreamRequest {
-                stream_ref: stream_ref(),
-                ..Default::default()
-            },
-        )
-        .await;
-        assert_eq!(created.r#ref.unwrap().backend, "b");
+        assert_eq!(create(&runtime).await.r#ref.unwrap().backend, "b");
         let appended: AppendRecordsResponse = call(
             &runtime,
             "AppendRecords",
@@ -231,42 +206,21 @@ mod tests {
     #[tokio::test]
     async fn a_writer_round_trips_its_bytes() {
         let runtime = runtime();
-        let _: CreateStreamResponse = call(
-            &runtime,
-            "CreateStream",
-            CreateStreamRequest {
-                stream_ref: stream_ref(),
-                ..Default::default()
-            },
-        )
-        .await;
-        let opened: OpenWriterResponse = call(
-            &runtime,
-            "OpenWriter",
-            OpenWriterRequest {
-                r#ref: stream_ref(),
-                producer: client(),
-                ..Default::default()
-            },
-        )
-        .await;
-        let written: WriteRecordsResponse = call(
-            &runtime,
-            "WriteRecords",
-            WriteRecordsRequest {
-                writer_id: opened.writer_id,
-                records: records(),
-            },
-        )
-        .await;
-        let closed: CloseWriterResponse = call(
-            &runtime,
-            "CloseWriter",
-            CloseWriterRequest {
-                writer_id: opened.writer_id,
-            },
-        )
-        .await;
+        create(&runtime).await;
+        let request = OpenWriterRequest {
+            r#ref: stream_ref(),
+            producer: client(),
+            ..Default::default()
+        };
+        let writer = runtime
+            .open_writer_bytes(&request.encode_to_vec())
+            .await
+            .unwrap();
+        let write = WriteRecordsRequest { records: records() };
+        let written = writer.write_bytes(&write.encode_to_vec()).await.unwrap();
+        let written = WriteRecordsResponse::decode(written.as_slice()).unwrap();
+        let closed = writer.close_bytes().await.unwrap();
+        let closed = CloseWriterResponse::decode(closed.as_slice()).unwrap();
         assert_eq!(closed.last_offset, written.last_offset);
     }
 }

@@ -25,6 +25,7 @@ mod writer;
 pub use error::{Reason, StreamError, StreamResult};
 pub use read::MAX_WAIT;
 pub use runtime::{MemoryStreamRuntime, StreamRuntime};
+pub use writer::StreamWriter;
 
 /// The protos that lang and the crate exchange. `temporalio-protos` generates them, so a value
 /// needs no conversion between the crates.

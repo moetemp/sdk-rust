@@ -11,14 +11,15 @@ use crate::{
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        MemoryStreamConfig, Producer, StreamIdConflictPolicy, StreamRef, StreamStatus,
+        MemoryStreamConfig, OpenWriterRequest, Producer, StreamIdConflictPolicy, StreamRef,
+        StreamStatus,
     },
     record::{check_records, data_records},
     store::{
         Batch, Capabilities, ConflictPolicy, Create, CreateOutcome, DEFAULT_RETENTION,
         MAX_SEQUENCE, Store,
     },
-    writer::Writers,
+    writer::{Lanes, StreamWriter},
 };
 use prost::Message;
 use std::{sync::Arc, time::Duration};
@@ -36,7 +37,7 @@ pub struct StreamRuntime {
     backend: String,
     pub(crate) store: Arc<dyn Store>,
     pub(crate) metrics: Metrics,
-    pub(crate) writers: Writers,
+    lanes: Lanes,
 }
 
 impl std::fmt::Debug for StreamRuntime {
@@ -166,7 +167,7 @@ impl StreamRuntime {
             backend: backend.into(),
             store,
             metrics: Metrics::new(&meter),
-            writers: Writers::default(),
+            lanes: Lanes::default(),
         })
     }
 
@@ -248,6 +249,12 @@ impl StreamRuntime {
             last_offset: offset_to_wire(state.newest),
             retention: Some(proto_duration(state.retention)),
         })
+    }
+
+    /// Opens a writer for an Activity, a Local Activity or a client Producer. The bridge holds the
+    /// writer, and dropping it releases it.
+    pub async fn open_writer(&self, request: OpenWriterRequest) -> StreamResult<StreamWriter> {
+        StreamWriter::open(&self.store, &self.metrics, &self.lanes, request).await
     }
 }
 

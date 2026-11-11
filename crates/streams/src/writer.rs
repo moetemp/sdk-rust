@@ -3,18 +3,21 @@
 //! order, so that the Store writes a retried batch only once. Lang can buffer Records on its own
 //! and write each batch with one call.
 //!
-//! The opens of one Producer epoch on one Stream share one writer. Each open adds a reference, and
-//! each close or free releases one. The last release drops the writer.
+//! The bridge holds each writer as an object, and dropping it releases it. The writers of one
+//! Producer epoch on one Stream share a lane, which keeps their batches in `sequence` order.
 
 use crate::{
     Reason, StreamError, StreamResult,
-    epoch::ProducerKind,
+    epoch::{EPOCH_KEY_LEN, ProducerKind, epoch_key},
+    ids::{check_producer, check_required, check_stream_id},
     metrics::Metrics,
-    offset::offset_from_wire,
+    offset::{offset_from_wire, offset_to_wire},
     proto::{
-        AppendRecord, AppendRecordsRequest, OpenWriterRequest, Producer, StreamRef, producer::Kind,
+        AppendRecord, AppendRecordsRequest, CloseWriterResponse, OpenWriterRequest, Producer,
+        StreamRef, WriteRecordsRequest, WriteRecordsResponse, producer::Kind,
     },
     record::check_records,
+    runtime::duration,
     store::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES, Store},
 };
 use parking_lot::Mutex;
@@ -22,8 +25,8 @@ use prost::Message;
 use std::{
     collections::HashMap,
     sync::{
-        Arc,
-        atomic::{AtomicI64, AtomicU64, Ordering},
+        Arc, Weak,
+        atomic::{AtomicI64, Ordering},
     },
     time::Duration,
 };
@@ -40,6 +43,33 @@ fn next_sequence() -> i64 {
     LAST_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1
 }
 
+/// The ordering lock of one Producer epoch on one Stream. A write holds it from its first
+/// `sequence` to its last retry, so the batches of the epoch reach the Store in order.
+#[derive(Default)]
+pub(crate) struct Lane(tokio::sync::Mutex<()>);
+
+/// The Stream id, Producer id and epoch key of a lane.
+type LaneKey = (String, String, [u8; EPOCH_KEY_LEN]);
+
+/// The lanes of one runtime, while a writer holds them.
+#[derive(Default)]
+pub(crate) struct Lanes(Mutex<HashMap<LaneKey, Weak<Lane>>>);
+
+impl Lanes {
+    /// The lane of `key`, and whether it is new. It first drops the lanes that no writer holds, so
+    /// a writer's drop never reaches back into the runtime.
+    fn get(&self, key: LaneKey) -> (Arc<Lane>, bool) {
+        let mut lanes = self.0.lock();
+        lanes.retain(|_, lane| lane.strong_count() > 0);
+        if let Some(lane) = lanes.get(&key).and_then(Weak::upgrade) {
+            return (lane, false);
+        }
+        let lane = Arc::new(Lane::default());
+        lanes.insert(key, Arc::downgrade(&lane));
+        (lane, true)
+    }
+}
+
 #[derive(Default)]
 struct State {
     last_offset: i64,
@@ -49,8 +79,10 @@ struct State {
     closed: bool,
 }
 
-struct Writer {
-    /// The namespace of the open that made the writer, which each batch sends.
+/// A writer of one Producer epoch on one Stream, for an Activity, a Local Activity or a client.
+/// The bridge holds it, and dropping it releases it. A write in flight still completes.
+pub struct StreamWriter {
+    /// The namespace of the open, which each batch sends.
     namespace: String,
     stream_ref: StreamRef,
     /// The open's Producer, with its epoch, which each batch sends.
@@ -59,18 +91,132 @@ struct Writer {
     max_retry: Duration,
     store: Arc<dyn Store>,
     metrics: Metrics,
+    lane: Arc<Lane>,
     state: Mutex<State>,
-    /// Allows one write at a time, so that the batches of one epoch reach the Store in order.
-    writing: tokio::sync::Mutex<()>,
 }
 
-fn duration(value: Option<prost_types::Duration>) -> Option<Duration> {
-    let value = value?;
-    let duration = Duration::new(value.seconds.max(0) as u64, value.nanos.max(0) as u32);
-    (!duration.is_zero()).then_some(duration)
+impl std::fmt::Debug for StreamWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamWriter")
+            .field("stream", &self.stream_ref.id)
+            .field("producer", &self.producer.id)
+            .finish_non_exhaustive()
+    }
 }
 
-impl Writer {
+fn closed(message: &str) -> StreamError {
+    StreamError::new(Reason::Closed, message)
+}
+
+impl StreamWriter {
+    /// Opens a writer on the lane of its Producer epoch. A writer of a Local Activity, or of an
+    /// Activity attempt above 1, first sends an empty batch when its lane is new, so the new epoch
+    /// sets its fence even when it publishes nothing. On a closed or expired Stream the open still
+    /// succeeds, and the first write fails with the reason.
+    pub(crate) async fn open(
+        store: &Arc<dyn Store>,
+        metrics: &Metrics,
+        lanes: &Lanes,
+        request: OpenWriterRequest,
+    ) -> StreamResult<Self> {
+        let stream = request
+            .r#ref
+            .ok_or_else(|| StreamError::invalid("The writer has no Stream"))?;
+        check_stream_id(&stream.id)?;
+        let producer = request
+            .producer
+            .ok_or_else(|| StreamError::invalid("The writer has no Producer"))?;
+        check_producer(&producer)?;
+        check_required(&producer)?;
+        if ProducerKind::try_from(&producer)? == ProducerKind::Workflow {
+            return Err(StreamError::invalid("Workflow code doesn't open a writer"));
+        }
+        // A Local Activity that runs again in a later task has attempt 1 again, so its writer
+        // always sends the empty batch.
+        let retry = match producer.kind.as_ref() {
+            Some(Kind::LocalActivity(_)) => true,
+            Some(Kind::WorkflowActivity(activity) | Kind::StandaloneActivity(activity)) => {
+                activity.epoch.map_or(0, |e| e.attempt) > 1
+            }
+            _ => false,
+        };
+        let key = (
+            stream.id.clone(),
+            producer.id.clone(),
+            epoch_key(producer.kind.as_ref()),
+        );
+        let (lane, new) = lanes.get(key);
+        let writer = Self {
+            namespace: request.namespace,
+            stream_ref: stream,
+            producer,
+            // The Store refuses a batch over its Record limit, so no batch can be larger.
+            max_batch: match request.max_batch_size {
+                n if n > 0 => (n as usize).min(MAX_BATCH_RECORDS),
+                _ => MAX_BATCH_RECORDS,
+            },
+            max_retry: duration(request.max_retry_duration).unwrap_or(DEFAULT_RETRY),
+            store: store.clone(),
+            metrics: metrics.clone(),
+            lane,
+            state: Mutex::default(),
+        };
+        // A writer that shares a lane comes after the open that set the epoch's fence.
+        if retry && new {
+            let _lane = writer.lane.0.lock().await;
+            match writer.send(vec![], next_sequence()).await {
+                // A Stream with no key has no fence to set yet. A closed or expired one accepts
+                // no more Records, and a retry that only reads it must still run.
+                Ok(_) => {}
+                Err(error)
+                    if matches!(
+                        error.reason,
+                        Reason::NotFound | Reason::Closed | Reason::Expired
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(writer)
+    }
+
+    /// Appends Records at once and answers with the offsets of the first and the last one. Records
+    /// past the Store's batch limit go in more batches, in order. A Record that the Store would
+    /// refuse fails the write before the Store, and the writer goes on.
+    pub async fn write(&self, request: WriteRecordsRequest) -> StreamResult<WriteRecordsResponse> {
+        let records = request.records;
+        {
+            let state = self.state.lock();
+            if let Some(error) = &state.failed {
+                return Err(error.clone());
+            }
+            if state.closed {
+                return Err(closed("The writer is closed"));
+            }
+        }
+        check_records(&records)?;
+        check_sizes(&self.producer, &records)?;
+        let (first, last) = self.write_batches(records).await?;
+        Ok(WriteRecordsResponse {
+            first_offset: offset_to_wire(first),
+            last_offset: offset_to_wire(last),
+        })
+    }
+
+    /// Closes the writer. It waits for a write in flight, then answers with the offset of the
+    /// newest Record that the writer wrote, or fails with the writer's error. It doesn't close the
+    /// Stream, and a later write fails as closed.
+    pub async fn close(&self) -> StreamResult<CloseWriterResponse> {
+        self.state.lock().closed = true;
+        let _lane = self.lane.0.lock().await;
+        let state = self.state.lock();
+        match &state.failed {
+            Some(error) => Err(error.clone()),
+            None => Ok(CloseWriterResponse {
+                last_offset: offset_to_wire(state.last_offset),
+            }),
+        }
+    }
+
     /// The number of `records` in the next batch. The Store refuses a batch over its limit, so a
     /// batch ends at the count limit or the byte limit, whichever comes first.
     fn batch_len<'a>(&self, records: impl Iterator<Item = &'a AppendRecord>) -> usize {
@@ -87,16 +233,13 @@ impl Writer {
         count
     }
 
-    /// Appends `records` now and returns the offsets of the first and the last one. Records past
-    /// the Store's batch limit go in more batches, in order.
-    async fn write(&self, mut records: Vec<AppendRecord>) -> StreamResult<(i64, i64)> {
-        let _writing = self.writing.lock().await;
-        // A close that started while this write waited has ended the writer.
+    /// Appends `records` in batches on the writer's lane, and returns the offsets of the first and
+    /// the last one.
+    async fn write_batches(&self, mut records: Vec<AppendRecord>) -> StreamResult<(i64, i64)> {
+        let _lane = self.lane.0.lock().await;
+        // A close that started while this write waited has closed the writer.
         if self.state.lock().closed {
-            return Err(StreamError::new(
-                Reason::UnknownWriter,
-                "The writer closed while the write waited",
-            ));
+            return Err(closed("The writer closed while the write waited"));
         }
         let (mut first, mut last) = (0, 0);
         while !records.is_empty() {
@@ -186,228 +329,6 @@ fn check_sizes(producer: &Producer, records: &[AppendRecord]) -> StreamResult<()
     Ok(())
 }
 
-/// The Stream id, Producer id and epoch key of a writer.
-type WriterKey = (String, String, [u8; crate::epoch::EPOCH_KEY_LEN]);
-
-/// One open writer and the references to it.
-struct Open {
-    writer: Arc<Writer>,
-    key: WriterKey,
-    refs: usize,
-}
-
-#[derive(Default)]
-struct Table {
-    open: HashMap<u64, Open>,
-    /// The writer of each key, so a second open shares its sequence instead of reusing it.
-    by_producer: HashMap<WriterKey, u64>,
-}
-
-impl Table {
-    /// Releases one reference to a writer, or every reference with `all`. Returns the writer when
-    /// it has no reference left, so that the caller ends it.
-    fn release(&mut self, id: u64, all: bool) -> StreamResult<Option<Arc<Writer>>> {
-        let open = self
-            .open
-            .get_mut(&id)
-            .ok_or_else(|| StreamError::new(Reason::UnknownWriter, format!("No writer {id}")))?;
-        open.refs -= 1;
-        if open.refs > 0 && !all {
-            return Ok(None);
-        }
-        let open = self.open.remove(&id).expect("found above");
-        self.by_producer.remove(&open.key);
-        Ok(Some(open.writer))
-    }
-}
-
-/// The open writers of one runtime.
-#[derive(Default)]
-pub(crate) struct Writers {
-    next: AtomicU64,
-    table: Mutex<Table>,
-}
-
-impl Writers {
-    /// Opens a writer, or adds a reference to the one that this Producer epoch has on the Stream. A
-    /// writer of a Local Activity, or of an Activity attempt above 1, first sends an empty batch, so
-    /// the new epoch sets its fence even when it publishes nothing. On a closed or expired Stream the
-    /// open still succeeds, and the first write fails with the reason.
-    pub(crate) async fn open(
-        &self,
-        store: &Arc<dyn Store>,
-        metrics: &Metrics,
-        request: OpenWriterRequest,
-    ) -> StreamResult<u64> {
-        let stream = request
-            .r#ref
-            .ok_or_else(|| StreamError::invalid("The writer has no Stream"))?;
-        crate::ids::check_stream_id(&stream.id)?;
-        let producer = request
-            .producer
-            .ok_or_else(|| StreamError::invalid("The writer has no Producer"))?;
-        crate::ids::check_producer(&producer)?;
-        crate::ids::check_required(&producer)?;
-        if ProducerKind::try_from(&producer)? == ProducerKind::Workflow {
-            return Err(StreamError::invalid("Workflow code doesn't open a writer"));
-        }
-        let key = (
-            stream.id.clone(),
-            producer.id.clone(),
-            crate::epoch::epoch_key(producer.kind.as_ref()),
-        );
-        if let Some(id) = self.share(&key) {
-            return Ok(id);
-        }
-        // A Local Activity that runs again in a later task has attempt 1 again, so its writer
-        // always sends the empty batch.
-        let retry = match producer.kind.as_ref() {
-            Some(Kind::LocalActivity(_)) => true,
-            Some(Kind::WorkflowActivity(activity) | Kind::StandaloneActivity(activity)) => {
-                activity.epoch.map_or(0, |e| e.attempt) > 1
-            }
-            _ => false,
-        };
-        let writer = Arc::new(Writer {
-            namespace: request.namespace,
-            stream_ref: stream,
-            producer,
-            // The Store refuses a batch over its Record limit, so no batch can be larger.
-            max_batch: match request.max_batch_size {
-                n if n > 0 => (n as usize).min(MAX_BATCH_RECORDS),
-                _ => MAX_BATCH_RECORDS,
-            },
-            max_retry: duration(request.max_retry_duration).unwrap_or(DEFAULT_RETRY),
-            store: store.clone(),
-            metrics: metrics.clone(),
-            state: Mutex::default(),
-            writing: tokio::sync::Mutex::new(()),
-        });
-        if retry {
-            match writer.send(vec![], next_sequence()).await {
-                // A Stream with no key has no fence to set yet. A closed or expired one accepts
-                // no more Records, and a retry that only reads it must still run.
-                Ok(_) => {}
-                Err(error)
-                    if matches!(
-                        error.reason,
-                        Reason::NotFound | Reason::Closed | Reason::Expired
-                    ) => {}
-                Err(error) => return Err(error),
-            }
-        }
-        let mut table = self.table.lock();
-        if let Some(id) = table.by_producer.get(&key).copied() {
-            table.open.get_mut(&id).expect("indexed").refs += 1;
-            return Ok(id);
-        }
-        let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-        table.by_producer.insert(key.clone(), id);
-        table.open.insert(
-            id,
-            Open {
-                writer,
-                key,
-                refs: 1,
-            },
-        );
-        Ok(id)
-    }
-
-    /// Adds a reference to the open writer of `key`, if there is one.
-    fn share(&self, key: &WriterKey) -> Option<u64> {
-        let mut table = self.table.lock();
-        let id = table.by_producer.get(key).copied()?;
-        table.open.get_mut(&id).expect("indexed").refs += 1;
-        Some(id)
-    }
-
-    fn get(&self, id: u64) -> StreamResult<Arc<Writer>> {
-        self.table
-            .lock()
-            .open
-            .get(&id)
-            .map(|open| open.writer.clone())
-            .ok_or_else(|| StreamError::new(Reason::UnknownWriter, format!("No writer {id}")))
-    }
-
-    /// Appends Records at once and returns the first and the last offset. A retry after a Store
-    /// failure resends the same batch, so that the Store writes it once.
-    pub(crate) async fn write(
-        &self,
-        id: u64,
-        records: Vec<AppendRecord>,
-    ) -> StreamResult<(i64, i64)> {
-        let writer = self.get(id)?;
-        {
-            let state = writer.state.lock();
-            if let Some(error) = &state.failed {
-                return Err(error.clone());
-            }
-            if state.closed {
-                return Err(StreamError::new(
-                    Reason::UnknownWriter,
-                    format!("Writer {id} is closed"),
-                ));
-            }
-        }
-        check_records(&records)?;
-        check_sizes(&writer.producer, &records)?;
-        writer.write(records).await
-    }
-
-    /// Closes every open writer, whatever its references. Returns how many had failed.
-    pub(crate) async fn close_all(&self) -> usize {
-        let ids: Vec<u64> = self.table.lock().open.keys().copied().collect();
-        let mut failed = 0;
-        for id in ids {
-            let released = self.table.lock().release(id, true);
-            let Ok(Some(writer)) = released else {
-                continue;
-            };
-            if end(&writer).await.is_err() {
-                failed += 1;
-            }
-        }
-        failed
-    }
-
-    /// Releases one reference. The last one waits for a write in flight, then drops the writer.
-    /// Returns its last offset, or the error it failed with.
-    pub(crate) async fn close(&self, id: u64) -> StreamResult<i64> {
-        let writer = self.get(id)?;
-        if self.table.lock().release(id, false)?.is_none() {
-            let state = writer.state.lock();
-            return match &state.failed {
-                Some(error) => Err(error.clone()),
-                None => Ok(state.last_offset),
-            };
-        }
-        end(&writer).await
-    }
-
-    /// Releases one reference with no wait, for a reference that lang drops. A write in flight
-    /// still completes, and a write that waits behind it is refused once no reference is left.
-    pub(crate) fn free(&self, id: u64) -> StreamResult<()> {
-        if let Some(writer) = self.table.lock().release(id, false)? {
-            writer.state.lock().closed = true;
-        }
-        Ok(())
-    }
-}
-
-/// Ends a writer that no reference uses. It waits for a write in flight, then returns its last
-/// offset or the error it failed with.
-async fn end(writer: &Writer) -> StreamResult<i64> {
-    writer.state.lock().closed = true;
-    let _writing = writer.writing.lock().await;
-    let state = writer.state.lock();
-    match &state.failed {
-        Some(error) => Err(error.clone()),
-        None => Ok(state.last_offset),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -422,7 +343,6 @@ mod tests {
     async fn an_append_of_a_writer_carries_the_namespace_of_its_open() {
         let store = Arc::new(MemoryStore::new(Duration::from_secs(60), None));
         let runtime = StreamRuntime::new("test", "", store, None);
-        let writers = &runtime.writers;
         let request = OpenWriterRequest {
             namespace: "ns-1".into(),
             r#ref: Some(StreamRef {
@@ -437,11 +357,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let id = writers
-            .open(&runtime.store, &runtime.metrics, request)
-            .await
-            .unwrap();
-        let append = writers.get(id).unwrap().append(vec![], 1);
-        assert_eq!(append.namespace, "ns-1");
+        let writer = runtime.open_writer(request).await.unwrap();
+        assert_eq!(writer.append(vec![], 1).namespace, "ns-1");
     }
 }
