@@ -390,6 +390,31 @@ async fn a_producer_must_match_its_kind_and_not_be_a_workflow() {
     }
 }
 
+/// An append and a close of a Producer that lacks a required field fail as invalid before the
+/// Store, so the Stream gets no Record and stays open.
+async fn a_write_with_a_missing_required_field_is_invalid() {
+    for case in cases_for(Needs::CALLS).await {
+        case.create().await.unwrap();
+        let no_epoch = Producer {
+            kind: Some(Kind::Client(ClientProducer::default())),
+            ..client(1)
+        };
+        let error = case
+            .append(no_epoch.clone(), 1, vec![record("x")])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (error.code(), reason(&error).as_str()),
+            (Code::InvalidArgument, "stream_invalid")
+        );
+        let error = case.close(no_epoch).await.unwrap_err();
+        assert_eq!(reason(&error), "stream_invalid");
+        let describe = case.describe().await.unwrap();
+        assert_eq!(describe.status, StreamStatus::Open as i32);
+        assert!(describe.last_offset.is_empty());
+    }
+}
+
 /// An append with no sequence takes the next one of its Producer's epoch, as a call with no writer
 /// state sends it. Nothing dedupes it, so its retry writes the batch again. A negative sequence
 /// fails.
@@ -857,6 +882,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_close_writes_no_record_and_a_second_close_succeeds),
     case!(a_create_of_an_expired_stream_fails),
     case!(a_producer_must_match_its_kind_and_not_be_a_workflow),
+    case!(a_write_with_a_missing_required_field_is_invalid),
     case!(an_append_with_no_sequence_takes_the_next_one_of_its_epoch),
     case!(a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_records),
     case!(a_read_of_an_uncreated_stream_fails_at_once),

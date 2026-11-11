@@ -608,6 +608,28 @@ async fn a_write_that_waits_behind_a_close_is_refused() {
     }
 }
 
+/// An open of a writer whose Producer lacks a required field fails as invalid.
+async fn a_writer_of_a_producer_with_a_missing_required_field_does_not_open() {
+    for case in cases().await {
+        let request = OpenWriterRequest {
+            r#ref: Some(StreamRef {
+                id: case.stream.clone(),
+                ..Default::default()
+            }),
+            producer: Some(Producer {
+                kind: Some(Kind::Client(ClientProducer::default())),
+                ..client()
+            }),
+            ..Default::default()
+        };
+        let error = case
+            .call::<_, OpenWriterResponse>("OpenWriter", request)
+            .await
+            .unwrap_err();
+        assert_eq!(reason(&error), "stream_invalid");
+    }
+}
+
 /// The cases of the suite, in file order.
 pub const CASES: &[super::Case] = &[
     case!(a_write_is_in_the_store_when_it_answers_its_offsets),
@@ -625,4 +647,5 @@ pub const CASES: &[super::Case] = &[
     case!(a_writer_writes_again_after_a_store_outage),
     case!(a_write_on_corrupt_store_data_fails_with_no_retry),
     case!(a_write_that_waits_behind_a_close_is_refused),
+    case!(a_writer_of_a_producer_with_a_missing_required_field_does_not_open),
 ];

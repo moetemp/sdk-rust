@@ -4,8 +4,8 @@
 use crate::{
     Reason, StreamError, StreamResult,
     digest::batch_digest,
-    epoch::{ProducerKind, task_of},
-    ids::{check_producer, check_stream_id},
+    epoch::ProducerKind,
+    ids::{check_producer, check_required, check_stream_id},
     metrics::Metrics,
     offset::{offset_from_wire, offset_to_wire},
     proto::{
@@ -77,19 +77,12 @@ fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
 fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
     let producer = producer.ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
     check_producer(producer)?;
-    let kind = ProducerKind::try_from(producer)?;
-    if kind == ProducerKind::Workflow {
+    if ProducerKind::try_from(producer)? == ProducerKind::Workflow {
         return Err(StreamError::invalid(
             "A Workflow writes with the Producer of its Local Activity",
         ));
     }
-    // Without its task, a re-dispatch in a later task has the same epoch as the first dispatch.
-    let task = task_of(producer.kind.as_ref()).started_event_id;
-    if kind == ProducerKind::LocalActivity && task <= 0 {
-        return Err(StreamError::invalid(
-            "A Local Activity Producer's epoch must name the Workflow Task that dispatched it",
-        ));
-    }
+    check_required(producer)?;
     Ok(producer)
 }
 
@@ -97,6 +90,7 @@ fn outside_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
 fn close_producer(producer: Option<&Producer>) -> StreamResult<&Producer> {
     let producer = producer.ok_or_else(|| StreamError::invalid("The request has no Producer"))?;
     check_producer(producer)?;
+    check_required(producer)?;
     Ok(producer)
 }
 

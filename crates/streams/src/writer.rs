@@ -236,6 +236,7 @@ impl Writers {
             .producer
             .ok_or_else(|| StreamError::invalid("The writer has no Producer"))?;
         crate::ids::check_producer(&producer)?;
+        crate::ids::check_required(&producer)?;
         if ProducerKind::try_from(&producer)? == ProducerKind::Workflow {
             return Err(StreamError::invalid("Workflow code doesn't open a writer"));
         }

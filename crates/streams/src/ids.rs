@@ -14,7 +14,7 @@
 use crate::{
     StreamError, StreamResult,
     epoch::{ProducerKind, producer_run_id},
-    proto::Producer,
+    proto::{Producer, producer::Kind},
 };
 
 /// The longest Stream id, in bytes.
@@ -168,6 +168,55 @@ pub fn check_producer(producer: &Producer) -> StreamResult<()> {
     Ok(())
 }
 
+/// Refuses a Producer that lacks a field the API requires. A Workflow Producer only closes a
+/// Stream, so it may send no epoch. A Workflow Task's started time stays optional, since Core
+/// leaves it empty when the server gave the task none.
+pub fn check_required(producer: &Producer) -> StreamResult<()> {
+    let missing = |what: &str| Err(StreamError::invalid(format!("The Producer has no {what}")));
+    let at_least_one = |attempt: i32, of: &str| {
+        if attempt < 1 {
+            return Err(StreamError::invalid(format!(
+                "The {of} attempt is {attempt}, and it must be 1 or more"
+            )));
+        }
+        Ok(())
+    };
+    match producer.kind.as_ref() {
+        Some(Kind::Workflow(workflow)) if workflow.run_id.is_empty() => missing("run id"),
+        Some(Kind::LocalActivity(local)) => {
+            if local.run_id.is_empty() {
+                return missing("run id");
+            }
+            let Some(epoch) = local.epoch.as_ref() else {
+                return missing("epoch");
+            };
+            // Without its task, a re-dispatch in a later task has the epoch of the first dispatch.
+            let Some(task) = epoch.task.filter(|task| task.started_event_id > 0) else {
+                return missing("Workflow Task that dispatched it");
+            };
+            at_least_one(task.attempt, "Workflow Task")?;
+            at_least_one(epoch.attempt, "Local Activity")
+        }
+        Some(Kind::WorkflowActivity(activity) | Kind::StandaloneActivity(activity)) => {
+            let Some(epoch) = activity.epoch.as_ref() else {
+                return missing("epoch");
+            };
+            if epoch.attempt_scheduled_time.is_none() {
+                return missing("attempt scheduled time");
+            }
+            at_least_one(epoch.attempt, "Activity")
+        }
+        Some(Kind::Client(client)) => {
+            let Some(epoch) = client.epoch.as_ref() else {
+                return missing("epoch");
+            };
+            at_least_one(epoch.attempt, "client")
+        }
+        Some(Kind::Workflow(_)) => Ok(()),
+        None => missing("kind"),
+    }
+}
+
 /// The keys of one Stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamKeys {
@@ -203,8 +252,10 @@ impl StreamKeys {
 mod tests {
     use super::*;
     use crate::proto::{
-        ActivityProducer, ClientProducer, LocalActivityProducer, WorkflowProducer, producer::Kind,
+        ActivityEpoch, ActivityProducer, ClientEpoch, ClientProducer, LocalActivityEpoch,
+        LocalActivityProducer, WorkflowProducer, WorkflowTaskEpoch,
     };
+    use prost_types::Timestamp;
 
     fn producer(kind: ProducerKind, id: &str, run_id: &str) -> Producer {
         let run_id = run_id.to_string();
@@ -297,5 +348,186 @@ mod tests {
         check_stream_id(&"a".repeat(MAX_STREAM_ID_BYTES)).unwrap();
         assert!(check_stream_id("").is_err());
         assert!(check_stream_id(&"a".repeat(MAX_STREAM_ID_BYTES + 1)).is_err());
+    }
+
+    /// A Local Activity Producer with every field the API requires.
+    fn local_activity() -> Producer {
+        Producer {
+            id: local_activity_producer_id("r", "k"),
+            kind: Some(Kind::LocalActivity(LocalActivityProducer {
+                run_id: "r".to_string(),
+                epoch: Some(LocalActivityEpoch {
+                    task: Some(WorkflowTaskEpoch {
+                        started_event_id: 3,
+                        attempt: 1,
+                        started_time: None,
+                    }),
+                    attempt: 1,
+                }),
+            })),
+        }
+    }
+
+    /// An Activity Producer with every field the API requires.
+    fn activity() -> Producer {
+        Producer {
+            id: activity_producer_id("r", "a", "s"),
+            kind: Some(Kind::WorkflowActivity(ActivityProducer {
+                run_id: "r".to_string(),
+                epoch: Some(ActivityEpoch {
+                    attempt_scheduled_time: Some(Timestamp::default()),
+                    attempt: 1,
+                }),
+            })),
+        }
+    }
+
+    /// A client Producer with every field the API requires.
+    fn client() -> Producer {
+        Producer {
+            id: named_client_producer_id("n"),
+            kind: Some(Kind::Client(ClientProducer {
+                epoch: Some(ClientEpoch { attempt: 1 }),
+            })),
+        }
+    }
+
+    fn local_epoch(producer: &mut Producer) -> &mut LocalActivityEpoch {
+        let Some(Kind::LocalActivity(local)) = producer.kind.as_mut() else {
+            unreachable!()
+        };
+        local.epoch.as_mut().unwrap()
+    }
+
+    fn activity_epoch(producer: &mut Producer) -> &mut ActivityEpoch {
+        let Some(Kind::WorkflowActivity(activity)) = producer.kind.as_mut() else {
+            unreachable!()
+        };
+        activity.epoch.as_mut().unwrap()
+    }
+
+    fn refused(producer: &Producer) -> String {
+        let error = check_required(producer).unwrap_err();
+        assert_eq!(error.reason, crate::Reason::Invalid);
+        error.message
+    }
+
+    #[test]
+    fn a_producer_with_its_required_fields_passes() {
+        // A Workflow Producer only closes, with no epoch, and a standalone Activity has no run.
+        let workflow = producer(ProducerKind::Workflow, &workflow_producer_id("r"), "r");
+        let mut standalone = activity();
+        let Some(Kind::WorkflowActivity(kind)) = standalone.kind.take() else {
+            unreachable!()
+        };
+        standalone.kind = Some(Kind::StandaloneActivity(ActivityProducer {
+            run_id: String::new(),
+            ..kind
+        }));
+        for producer in [workflow, local_activity(), activity(), standalone, client()] {
+            check_required(&producer).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_workflow_producer_needs_its_run_id() {
+        let workflow = producer(ProducerKind::Workflow, "wf:", "");
+        assert!(refused(&workflow).contains("run id"));
+    }
+
+    #[test]
+    fn a_local_activity_producer_needs_its_run_id() {
+        let mut local = local_activity();
+        let Some(Kind::LocalActivity(kind)) = local.kind.as_mut() else {
+            unreachable!()
+        };
+        kind.run_id.clear();
+        assert!(refused(&local).contains("run id"));
+    }
+
+    #[test]
+    fn a_local_activity_producer_needs_its_epoch() {
+        let mut local = local_activity();
+        let Some(Kind::LocalActivity(kind)) = local.kind.as_mut() else {
+            unreachable!()
+        };
+        kind.epoch = None;
+        assert!(refused(&local).contains("epoch"));
+    }
+
+    #[test]
+    fn a_local_activity_epoch_needs_its_workflow_task() {
+        let mut local = local_activity();
+        local_epoch(&mut local).task = None;
+        assert!(refused(&local).contains("Workflow Task"));
+    }
+
+    #[test]
+    fn a_local_activity_task_needs_its_started_event_id() {
+        let mut local = local_activity();
+        local_epoch(&mut local)
+            .task
+            .as_mut()
+            .unwrap()
+            .started_event_id = 0;
+        assert!(refused(&local).contains("Workflow Task"));
+    }
+
+    #[test]
+    fn a_local_activity_task_attempt_is_1_or_more() {
+        let mut local = local_activity();
+        local_epoch(&mut local).task.as_mut().unwrap().attempt = 0;
+        assert!(refused(&local).contains("Workflow Task attempt"));
+    }
+
+    #[test]
+    fn a_local_activity_attempt_is_1_or_more() {
+        let mut local = local_activity();
+        local_epoch(&mut local).attempt = 0;
+        assert!(refused(&local).contains("Local Activity attempt"));
+    }
+
+    #[test]
+    fn an_activity_producer_needs_its_epoch() {
+        let mut act = activity();
+        let Some(Kind::WorkflowActivity(kind)) = act.kind.as_mut() else {
+            unreachable!()
+        };
+        kind.epoch = None;
+        assert!(refused(&act).contains("epoch"));
+    }
+
+    #[test]
+    fn an_activity_epoch_needs_its_scheduled_time() {
+        let mut act = activity();
+        activity_epoch(&mut act).attempt_scheduled_time = None;
+        assert!(refused(&act).contains("scheduled time"));
+    }
+
+    #[test]
+    fn an_activity_attempt_is_1_or_more() {
+        let mut act = activity();
+        activity_epoch(&mut act).attempt = 0;
+        assert!(refused(&act).contains("Activity attempt"));
+    }
+
+    #[test]
+    fn a_client_producer_needs_its_epoch() {
+        let client = Producer {
+            kind: Some(Kind::Client(ClientProducer::default())),
+            ..client()
+        };
+        assert!(refused(&client).contains("epoch"));
+    }
+
+    #[test]
+    fn a_client_attempt_is_1_or_more() {
+        let client = Producer {
+            kind: Some(Kind::Client(ClientProducer {
+                epoch: Some(ClientEpoch { attempt: 0 }),
+            })),
+            ..client()
+        };
+        assert!(refused(&client).contains("client attempt"));
     }
 }
