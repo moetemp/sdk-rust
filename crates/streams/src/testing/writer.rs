@@ -26,11 +26,12 @@ use prost_types::Timestamp;
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use temporalio_common::protos::temporal::api::common::v1::Payload;
+use tokio::sync::Notify;
 use tonic::Code;
 
 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -376,12 +377,19 @@ async fn a_named_client_with_a_higher_epoch_fences_its_earlier_self() {
 
 /// A Store over another one, whose appends fail. It can write an append and lose its answer, as on
 /// a dropped connection, and it refuses every append while it is down. It can also refuse the next
-/// append as corrupt Store data.
+/// append as corrupt Store data. It can hold the next append until a release, and it counts the
+/// appends that reach the inner Store.
 struct Flaky {
     inner: Arc<dyn Store>,
     lose_next: AtomicBool,
     down: AtomicBool,
     corrupt_next: AtomicBool,
+    hold_next: AtomicBool,
+    /// Notified when the held append arrives.
+    held: Notify,
+    /// Lets the held append go on.
+    release: Notify,
+    appends: AtomicUsize,
 }
 
 impl Flaky {
@@ -392,6 +400,10 @@ impl Flaky {
             lose_next: AtomicBool::new(false),
             down: AtomicBool::new(false),
             corrupt_next: AtomicBool::new(false),
+            hold_next: AtomicBool::new(false),
+            held: Notify::new(),
+            release: Notify::new(),
+            appends: AtomicUsize::new(0),
         }
     }
 }
@@ -407,12 +419,17 @@ impl Store for Flaky {
     }
 
     async fn append(&self, stream_ref: &StreamRef, batch: &Batch<'_>) -> StreamResult<Appended> {
+        if self.hold_next.swap(false, Ordering::SeqCst) {
+            self.held.notify_one();
+            self.release.notified().await;
+        }
         if self.down.load(Ordering::SeqCst) {
             return Err(StreamError::storage_unavailable("the Store is down"));
         }
         if self.corrupt_next.swap(false, Ordering::SeqCst) {
             return Err(StreamError::storage_corrupt("a stored field is bad"));
         }
+        self.appends.fetch_add(1, Ordering::SeqCst);
         let appended = self.inner.append(stream_ref, batch).await?;
         if self.lose_next.swap(false, Ordering::SeqCst) {
             return Err(StreamError::storage_unavailable("the answer was lost"));
@@ -550,6 +567,60 @@ async fn a_write_that_waits_behind_a_close_is_refused() {
     }
 }
 
+/// The first open of a retry epoch sends the empty batch that fences the earlier epoch, and a
+/// second open of the same epoch sends none.
+async fn a_retry_epoch_sends_its_empty_batch_once() {
+    for (store, case) in flaky_cases(false).await {
+        let _first = case.open(activity(2), |_| {}).await;
+        assert_eq!(store.appends.load(Ordering::SeqCst), 1);
+        let _second = case.open(activity(2), |_| {}).await;
+        assert_eq!(store.appends.load(Ordering::SeqCst), 1);
+    }
+}
+
+/// An open whose empty batch fails, or whose future is dropped while it sends, leaves the epoch
+/// unfenced. So an open of the same epoch that waited on the lane sends the empty batch itself.
+async fn an_open_after_a_failed_or_cancelled_fence_sends_it() {
+    for (store, case) in flaky_cases(false).await {
+        store.down.store(true, Ordering::SeqCst);
+        let failed = case.ext.open_writer(OpenWriterRequest {
+            max_retry_duration: millis(100),
+            ..case.open_request(activity(2))
+        });
+        let waited = async {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            case.ext.open_writer(case.open_request(activity(2))).await
+        };
+        let back = async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            store.down.store(false, Ordering::SeqCst);
+        };
+        let (failed, waited, ()) = tokio::join!(failed, waited, back);
+        assert_eq!(reason(&failed.unwrap_err()), "stream_storage_unavailable");
+        let _waited = waited.unwrap();
+        assert_eq!(store.appends.load(Ordering::SeqCst), 1);
+        let earlier = case.open(activity(1), |_| {}).await;
+        let error = write(&earlier, &["late"]).await.unwrap_err();
+        assert_eq!(reason(&error), "stream_fenced");
+    }
+    for (store, case) in flaky_cases(false).await {
+        store.hold_next.store(true, Ordering::SeqCst);
+        let held = case.ext.open_writer(case.open_request(activity(2)));
+        let cancelled = tokio::time::timeout(Duration::from_millis(100), held);
+        let waited = async {
+            store.held.notified().await;
+            case.ext.open_writer(case.open_request(activity(2))).await
+        };
+        let (cancelled, waited) = tokio::join!(cancelled, waited);
+        assert!(cancelled.is_err());
+        let _waited = waited.unwrap();
+        assert_eq!(store.appends.load(Ordering::SeqCst), 1);
+        let earlier = case.open(activity(1), |_| {}).await;
+        let error = write(&earlier, &["late"]).await.unwrap_err();
+        assert_eq!(reason(&error), "stream_fenced");
+    }
+}
+
 /// An open of a writer whose Producer lacks a required field fails as invalid.
 async fn a_writer_of_a_producer_with_a_missing_required_field_does_not_open() {
     for case in cases().await {
@@ -595,4 +666,6 @@ pub const CASES: &[super::Case] = &[
     case!(a_write_that_waits_behind_a_close_is_refused),
     case!(a_writer_of_a_producer_with_a_missing_required_field_does_not_open),
     case!(a_write_of_a_record_with_no_body_is_refused_and_the_writer_goes_on),
+    case!(a_retry_epoch_sends_its_empty_batch_once),
+    case!(an_open_after_a_failed_or_cancelled_fence_sends_it),
 ];

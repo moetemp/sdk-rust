@@ -43,10 +43,18 @@ fn next_sequence() -> i64 {
     LAST_SEQUENCE.fetch_add(1, Ordering::Relaxed) + 1
 }
 
-/// The ordering lock of one Producer epoch on one Stream. A write holds it from its first
-/// `sequence` to its last retry, so the batches of the epoch reach the Store in order.
+/// What the writers of one epoch share beyond the order of their batches.
 #[derive(Default)]
-pub(crate) struct Lane(tokio::sync::Mutex<()>);
+struct LaneState {
+    /// The epoch's empty batch reached the Store, or the Stream takes no more Records.
+    fenced: bool,
+}
+
+/// The ordering lock of one Producer epoch on one Stream. A write holds it from its first
+/// `sequence` to its last retry, so the batches of the epoch reach the Store in order. An open
+/// holds it while it sends the epoch's empty batch, so the writers of the epoch see one result.
+#[derive(Default)]
+pub(crate) struct Lane(tokio::sync::Mutex<LaneState>);
 
 /// The Stream id, Producer id and epoch key of a lane.
 type LaneKey = (String, String, [u8; EPOCH_KEY_LEN]);
@@ -56,17 +64,17 @@ type LaneKey = (String, String, [u8; EPOCH_KEY_LEN]);
 pub(crate) struct Lanes(Mutex<HashMap<LaneKey, Weak<Lane>>>);
 
 impl Lanes {
-    /// The lane of `key`, and whether it is new. It first drops the lanes that no writer holds, so
-    /// a writer's drop never reaches back into the runtime.
-    fn get(&self, key: LaneKey) -> (Arc<Lane>, bool) {
+    /// The lane of `key`. It first drops the lanes that no writer holds, so a writer's drop never
+    /// reaches back into the runtime.
+    fn get(&self, key: LaneKey) -> Arc<Lane> {
         let mut lanes = self.0.lock();
         lanes.retain(|_, lane| lane.strong_count() > 0);
         if let Some(lane) = lanes.get(&key).and_then(Weak::upgrade) {
-            return (lane, false);
+            return lane;
         }
         let lane = Arc::new(Lane::default());
         lanes.insert(key, Arc::downgrade(&lane));
-        (lane, true)
+        lane
     }
 }
 
@@ -110,9 +118,9 @@ fn closed(message: &str) -> StreamError {
 
 impl StreamWriter {
     /// Opens a writer on the lane of its Producer epoch. A writer of a Local Activity, or of an
-    /// Activity attempt above 1, first sends an empty batch when its lane is new, so the new epoch
-    /// sets its fence even when it publishes nothing. On a closed or expired Stream the open still
-    /// succeeds, and the first write fails with the reason.
+    /// Activity attempt above 1, first sends an empty batch unless an open of its epoch already
+    /// did, so the new epoch sets its fence even when it publishes nothing. On a closed or expired
+    /// Stream the open still succeeds, and the first write fails with the reason.
     pub(crate) async fn open(
         store: &Arc<dyn Store>,
         metrics: &Metrics,
@@ -145,7 +153,7 @@ impl StreamWriter {
             producer.id.clone(),
             epoch_key(producer.kind.as_ref()),
         );
-        let (lane, new) = lanes.get(key);
+        let lane = lanes.get(key);
         let writer = Self {
             namespace: request.namespace,
             stream_ref: stream,
@@ -161,19 +169,22 @@ impl StreamWriter {
             lane,
             state: Mutex::default(),
         };
-        // A writer that shares a lane comes after the open that set the epoch's fence.
-        if retry && new {
-            let _lane = writer.lane.0.lock().await;
-            match writer.send(vec![], next_sequence()).await {
-                // A Stream with no key has no fence to set yet. A closed or expired one accepts
-                // no more Records, and a retry that only reads it must still run.
-                Ok(_) => {}
-                Err(error)
-                    if matches!(
-                        error.reason,
-                        Reason::NotFound | Reason::Closed | Reason::Expired
-                    ) => {}
-                Err(error) => return Err(error),
+        if retry {
+            // The flag changes only after the Store answers, so a failed or cancelled open leaves
+            // the fence to the next open of the epoch.
+            let mut lane = writer.lane.0.lock().await;
+            if !lane.fenced {
+                match writer.send(vec![], next_sequence()).await {
+                    Ok(_) => lane.fenced = true,
+                    // A closed or expired Stream accepts no more Records, and a retry that only
+                    // reads it must still run.
+                    Err(error) if matches!(error.reason, Reason::Closed | Reason::Expired) => {
+                        lane.fenced = true;
+                    }
+                    // A Stream with no key has no fence to set yet, so a later open tries again.
+                    Err(error) if error.reason == Reason::NotFound => {}
+                    Err(error) => return Err(error),
+                }
             }
         }
         Ok(writer)
