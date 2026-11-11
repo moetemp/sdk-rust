@@ -25,7 +25,7 @@ use prost::Message;
 use std::{sync::Arc, time::Duration};
 use tokio::time::Instant;
 
-/// The longest wait of one read, for new Records and for the create.
+/// The longest wait of one read for new Records.
 pub const MAX_WAIT: Duration = Duration::from_secs(60);
 /// The maximum number of Records in one read.
 const MAX_RECORDS: usize = 1000;
