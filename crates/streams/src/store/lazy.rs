@@ -13,18 +13,19 @@ type Connect<S> =
 
 /// A Store that connects its inner Store on the first call, so a bridge can build the runtime with
 /// no async runtime, and a Workflow that never publishes never connects. A failed connect is tried
-/// again on the next call.
+/// again on the next call. An inner Store that lacks a declared capability is refused once, and
+/// every later call fails with that refusal.
 pub struct LazyStore<S: Store> {
     capabilities: Capabilities,
     connect: Connect<S>,
-    store: OnceCell<S>,
+    store: OnceCell<StreamResult<S>>,
 }
 
 impl<S: Store> std::fmt::Debug for LazyStore<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LazyStore")
             .field("capabilities", &self.capabilities)
-            .field("connected", &self.store.initialized())
+            .field("connected", &matches!(self.store.get(), Some(Ok(_))))
             .finish_non_exhaustive()
     }
 }
@@ -50,13 +51,20 @@ impl<S: Store> LazyStore<S> {
     }
 
     async fn store(&self) -> StreamResult<&S> {
-        self.store
+        let connected = self
+            .store
             .get_or_try_init(|| async {
                 let store = (self.connect)().await?;
-                store.capabilities().require(self.capabilities)?;
-                Ok(store)
+                // The same Store lacks the capability on the next connect too.
+                Ok::<_, StreamError>(
+                    store
+                        .capabilities()
+                        .require(self.capabilities)
+                        .map(|()| store),
+                )
             })
-            .await
+            .await?;
+        connected.as_ref().map_err(Clone::clone)
     }
 }
 
@@ -147,19 +155,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_connect_refuses_a_store_that_lacks_a_declared_capability() {
-        let lazy = LazyStore::new(Capabilities::ALL, || async {
-            let fewer = LazyStore::new(Capabilities::CLOSE, || async {
-                Ok::<_, StreamError>(memory())
-            });
-            Ok::<_, StreamError>(fewer)
+    async fn a_connect_refuses_a_store_that_lacks_a_declared_capability_once() {
+        let connects = Arc::new(AtomicUsize::new(0));
+        let counted = connects.clone();
+        let lazy = LazyStore::new(Capabilities::ALL, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            async {
+                let fewer = LazyStore::new(Capabilities::CLOSE, || async {
+                    Ok::<_, StreamError>(memory())
+                });
+                Ok::<_, StreamError>(fewer)
+            }
         });
-        let error = lazy.read(&stream(), 0, 0).await.unwrap_err();
-        assert_eq!(error.reason, Reason::Unsupported);
-        assert!(
-            error.message.contains("producer_fence"),
-            "{}",
-            error.message
-        );
+        for _ in 0..2 {
+            let error = lazy.read(&stream(), 0, 0).await.unwrap_err();
+            assert_eq!(error.reason, Reason::Unsupported);
+            assert!(
+                error.message.contains("producer_fence"),
+                "{}",
+                error.message
+            );
+        }
+        assert_eq!(connects.load(Ordering::SeqCst), 1);
     }
 }
