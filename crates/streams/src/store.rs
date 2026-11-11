@@ -9,6 +9,10 @@ use crate::{
 use std::time::Duration;
 use tokio::time::Instant;
 
+mod lazy;
+
+pub use lazy::LazyStore;
+
 /// The Retention of a Stream whose create sets none, when a Store's options set no other.
 pub const DEFAULT_RETENTION: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
