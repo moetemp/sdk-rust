@@ -567,6 +567,29 @@ async fn a_write_that_waits_behind_a_close_is_refused() {
     }
 }
 
+/// The writers of one epoch send their batches in call order. A write waits on the lane while an
+/// earlier write of the epoch is in the Store, so its higher `sequence` never arrives first.
+async fn the_writers_of_one_epoch_send_their_batches_in_call_order() {
+    for (store, case) in flaky_cases(false).await {
+        let a = case.open(client(), |_| {}).await;
+        let b = case.open(client(), |_| {}).await;
+        store.hold_next.store(true, Ordering::SeqCst);
+        let first = write(&a, &["first"]);
+        let second = async {
+            store.held.notified().await;
+            write(&b, &["second"]).await
+        };
+        let release = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            store.release.notify_one();
+        };
+        let (first, second, ()) = tokio::join!(first, second, release);
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert!(first.1 < second.0, "{first:?} {second:?}");
+        assert_eq!(case.visible().await, ["first", "second"]);
+    }
+}
+
 /// The first open of a retry epoch sends the empty batch that fences the earlier epoch, and a
 /// second open of the same epoch sends none.
 async fn a_retry_epoch_sends_its_empty_batch_once() {
@@ -666,6 +689,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_write_that_waits_behind_a_close_is_refused),
     case!(a_writer_of_a_producer_with_a_missing_required_field_does_not_open),
     case!(a_write_of_a_record_with_no_body_is_refused_and_the_writer_goes_on),
+    case!(the_writers_of_one_epoch_send_their_batches_in_call_order),
     case!(a_retry_epoch_sends_its_empty_batch_once),
     case!(an_open_after_a_failed_or_cancelled_fence_sends_it),
 ];
