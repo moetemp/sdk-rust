@@ -582,7 +582,7 @@ impl Store for MemoryStore {
                 ));
             }
             keys.set("closed", "1");
-            // A read builds the final StreamClose item from the closer and the status. A Brook
+            // A read builds the final StreamClose item from the closer and the status. An SDK
             // Store only ever closes with CLOSED.
             keys.set("closer", producer.encode_to_vec());
             keys.set("cstat", (StreamCloseStatus::Closed as i32).to_string());

@@ -32,8 +32,8 @@ impl<S: Store> std::fmt::Debug for LazyStore<S> {
 
 impl<S: Store> LazyStore<S> {
     /// A Store that `connect` connects on its first call. The runtime asks for the capabilities
-    /// before any call connects, so the Store declares `capabilities` now, and a connect fails if
-    /// the inner Store lacks one of them.
+    /// before any call connects, so the Store declares `capabilities` when it is built, and a
+    /// connect fails if the inner Store lacks one of them.
     pub fn new<F, Fut, E>(capabilities: Capabilities, connect: F) -> Self
     where
         F: Fn() -> Fut + Send + Sync + 'static,

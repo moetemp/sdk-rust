@@ -119,7 +119,7 @@ pub struct StreamState {
     /// The encoded [Producer] that closed the Stream, `None` when it is open. A read builds the
     /// final `StreamClose` item from it.
     pub closer: Option<Vec<u8>>,
-    /// Why the Stream closed, as a `StreamCloseStatus`, zero when it is open. A Brook Store only
+    /// Why the Stream closed, as a `StreamCloseStatus`, zero when it is open. An SDK Store only
     /// sets CLOSED.
     pub close_status: i32,
     /// The offset of the newest entry written, zero if none.
