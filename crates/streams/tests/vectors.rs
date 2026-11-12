@@ -12,9 +12,8 @@ use temporalio_streams::{
     ids::{self, StreamKeys},
     offset::{entry_id_of_offset, offset_of_entry_id},
     proto::{
-        ActivityEpoch, ActivityProducer, AppendRecord, ClientEpoch, ClientProducer,
-        LocalActivityEpoch, LocalActivityProducer, WorkflowProducer, WorkflowTaskEpoch,
-        producer::Kind,
+        ActivityEpoch, ActivityProducer, AppendRecord, ClientProducer, LocalActivityEpoch,
+        LocalActivityProducer, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
     },
 };
 
@@ -70,9 +69,7 @@ fn kind_of(kind: &str, value: &Value, run_id: &str) -> Option<Kind> {
         })),
         "activity" => Some(Kind::WorkflowActivity(activity)),
         "standalone_activity" => Some(Kind::StandaloneActivity(activity)),
-        "client" => Some(Kind::Client(ClientProducer {
-            epoch: Some(ClientEpoch { attempt }),
-        })),
+        "client" => Some(Kind::Client(ClientProducer {})),
         "empty" => None,
         other => panic!("unknown kind {other}"),
     }
@@ -129,10 +126,6 @@ fn producer_ids_match() {
     assert_eq!(
         ids::client_producer_id(field("client", "identity"), field("client", "process_key")),
         id("client")
-    );
-    assert_eq!(
-        ids::named_client_producer_id(field("named_client", "name")),
-        id("named_client")
     );
 }
 

@@ -57,7 +57,7 @@ mod tests {
         MemoryStreamRuntime,
         ids::client_producer_id,
         proto::{
-            AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientEpoch, ClientProducer,
+            AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientProducer,
             CloseStreamRequest, CloseStreamResponse, CloseWriterResponse, CreateStreamRequest,
             CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
             MemoryStreamConfig, OpenWriterRequest, Producer, ReadRecordsRequest,
@@ -94,9 +94,7 @@ mod tests {
     fn client() -> Option<Producer> {
         Some(Producer {
             id: client_producer_id("me", "p"),
-            kind: Some(Kind::Client(ClientProducer {
-                epoch: Some(ClientEpoch { attempt: 1 }),
-            })),
+            kind: Some(Kind::Client(ClientProducer {})),
         })
     }
 

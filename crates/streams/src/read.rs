@@ -3,10 +3,7 @@
 use crate::{
     Reason, StreamError, StreamResult, StreamRuntime,
     offset::{offset_from_wire, offset_to_wire},
-    proto::{
-        Producer, ReadRecordsRequest, ReadRecordsResponse, StreamClose, StreamReadStart,
-        StreamRecord, StreamRef, read_records_request::Position, stream_record::Item,
-    },
+    proto::{ReadRecordsRequest, ReadRecordsResponse, StreamRecord, StreamRef},
     runtime::{duration, stream_id},
     store::{FORMAT_VERSION, StreamState},
 };
@@ -21,7 +18,7 @@ const MAX_RECORDS: usize = 1000;
 
 impl StreamRuntime {
     /// A long poll that returns the Records it found, or nothing after `wait`. On a closed Stream
-    /// with no item left, it returns `done` at once.
+    /// with no Record left, it returns `done` at once.
     pub async fn read_records(
         &self,
         request: ReadRecordsRequest,
@@ -30,21 +27,11 @@ impl StreamRuntime {
         let stream = request.r#ref.clone().unwrap_or_default();
         // The wire from_offset is exclusive, so a read starts after it. The empty value is a read
         // from the start.
-        let (from_offset, at_end) = match &request.position {
-            Some(Position::FromOffset(offset)) => (offset_from_wire(offset)?, false),
-            Some(Position::Start(start)) => (0, *start == StreamReadStart::End as i32),
-            None => (0, false),
-        };
+        let from_offset = offset_from_wire(&request.from_offset)?;
         if from_offset < 0 {
             return Err(StreamError::invalid("The offset is below zero"));
         }
         let max_bytes = max_bytes(request.max_bytes)?;
-        if request.wake_only || !request.to_offset.is_empty() {
-            return Err(StreamError::new(
-                Reason::Unsupported,
-                "The Store reads no to_offset or wake_only, which the native backend serves",
-            ));
-        }
         let max = match request.max_records {
             n if n <= 0 => MAX_RECORDS,
             n => (n as usize).min(MAX_RECORDS),
@@ -77,7 +64,6 @@ impl StreamRuntime {
         }
         // An exclusive from_offset reads after that Record, so the inclusive start is one past it.
         let from = match from_offset {
-            0 if at_end => state.newest + 1,
             0 => 0,
             offset => offset + 1,
         };
@@ -104,8 +90,8 @@ impl StreamRuntime {
     }
 
     /// The Records from `from`, or `None` when there is none yet and the Stream is open. A page
-    /// of a closed Stream that gives its last item is done, also with no item. `(max, max_bytes)`
-    /// caps the items and their bytes.
+    /// of a closed Stream that gives its last Record is done, also with no Record. The pair
+    /// `(max, max_bytes)` caps the Records and their bytes.
     async fn page(
         &self,
         stream: &StreamRef,
@@ -124,9 +110,6 @@ impl StreamRuntime {
         let mut pulled = (0, 0);
         // Whether the Stream was closed, and its newest offset, at the newest Store read.
         let mut end = (state.closed, state.newest);
-        // The closer and the status at the newest Store read, for the final close item.
-        let mut closer = state.closer.clone();
-        let mut close_status = state.close_status;
         while records.len() < max && !full {
             let room = (max_bytes != usize::MAX).then(|| max_bytes.saturating_sub(bytes));
             let chunk = chunk_len(max - records.len(), room, pulled);
@@ -134,8 +117,6 @@ impl StreamRuntime {
             // Records that the log lost after the state read leave a gap before these entries.
             check_expiry(&chunk_state, if from > 0 { start } else { 0 })?;
             end = (chunk_state.closed, chunk_state.newest);
-            close_status = chunk_state.close_status;
-            closer = chunk_state.closer;
             if entries.is_empty() {
                 // Only an expired log has no entry at an offset up to `newest`.
                 if from > 0 && start == from && from <= chunk_state.newest {
@@ -173,34 +154,16 @@ impl StreamRuntime {
                 }
             }
         }
-        // A closed Stream takes no more appends, so no item is left past its newest offset.
+        // A closed Stream takes no more appends, so no Record is left past its newest offset.
         let done = end.0 && start > end.1;
         if records.is_empty() && !done {
             return Ok(None);
-        }
-        // The read that reaches the end of a closed Stream ends with its close item, at the offset
-        // after the newest Record. A read that starts past the newest Record already saw it, so it
-        // doesn't repeat it.
-        if done && from <= end.1 {
-            let producer = closer
-                .as_deref()
-                .map(Producer::decode)
-                .transpose()
-                .map_err(|error| StreamError::storage_corrupt(error.to_string()))?;
-            records.push(StreamRecord {
-                item: Some(Item::Close(StreamClose {
-                    producer,
-                    status: close_status,
-                    offset: offset_to_wire(end.1 + 1),
-                })),
-            });
         }
         // The resume is after the last Record returned, which is one before the inclusive start.
         let page = ReadRecordsResponse {
             records,
             last_offset: offset_to_wire(start - 1),
             done,
-            ..Default::default()
         };
         Ok(Some(page))
     }
@@ -223,13 +186,7 @@ fn decode_record(bytes: &[u8], offset: i64) -> StreamResult<StreamRecord> {
     let mut record = StreamRecord::decode(bytes).map_err(|error| {
         StreamError::storage_corrupt(format!("A stored Record is bad: {error}"))
     })?;
-    match record.item.as_mut() {
-        Some(Item::Data(data)) => data.offset = offset_to_wire(offset),
-        Some(Item::Close(close)) => close.offset = offset_to_wire(offset),
-        None => {
-            return Err(StreamError::storage_corrupt("A stored Record has no item"));
-        }
-    }
+    record.offset = offset_to_wire(offset);
     Ok(record)
 }
 

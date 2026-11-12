@@ -2,7 +2,7 @@
 
 use crate::{
     Reason, StreamError, StreamResult,
-    proto::{AppendRecord, Producer, StreamData, StreamRecord, stream_record::Item},
+    proto::{AppendRecord, Producer, StreamRecord},
     store::{MAX_BATCH_BYTES, MAX_BATCH_RECORDS, MAX_RECORD_BYTES},
 };
 use prost::Message;
@@ -10,11 +10,9 @@ use prost::Message;
 /// One stored data Record. It has no offset, since the Store gives the entry its offset.
 pub(crate) fn data_record(producer: &Producer, record: AppendRecord) -> Vec<u8> {
     StreamRecord {
-        item: Some(Item::Data(StreamData {
-            producer: Some(producer.clone()),
-            body: record.body,
-            ..Default::default()
-        })),
+        producer: Some(producer.clone()),
+        body: record.body,
+        ..Default::default()
     }
     .encode_to_vec()
 }

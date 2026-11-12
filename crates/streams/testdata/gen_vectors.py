@@ -94,7 +94,6 @@ def ids():
             "process_key": "p-1",
             "id": "client:" + join("1@host", "p-1"),
         },
-        "named_client": {"name": "ingest:eu/1", "id": "client:" + join("ingest:eu/1")},
     }
     return {"streams": cases, "producers": producers}
 
@@ -116,7 +115,7 @@ def epochs():
                                               "attempt": 3}},
         {"kind": "activity", "epoch": {"attempt_scheduled_time": [1760000001, 999999999],
                                         "attempt": 2}},
-        {"kind": "client", "epoch": {"attempt": 1}},
+        {"kind": "client", "epoch": {}},
         {"kind": "empty", "epoch": {}},
     ]
     for case in cases:

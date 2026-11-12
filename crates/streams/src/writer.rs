@@ -293,7 +293,6 @@ impl StreamWriter {
             producer: Some(self.producer.clone()),
             sequence,
             records,
-            ..Default::default()
         }
     }
 
@@ -352,9 +351,7 @@ mod tests {
         StreamRuntime,
         ids::{activity_producer_id, client_producer_id},
         memory::MemoryStore,
-        proto::{
-            ActivityEpoch, ActivityProducer, ClientEpoch, ClientProducer, CreateStreamRequest,
-        },
+        proto::{ActivityEpoch, ActivityProducer, ClientProducer, CreateStreamRequest},
     };
     use prost_types::Timestamp;
     use temporalio_common::protos::temporal::api::common::v1::Payload;
@@ -371,9 +368,7 @@ mod tests {
             }),
             producer: Some(Producer {
                 id: client_producer_id("me", "p"),
-                kind: Some(Kind::Client(ClientProducer {
-                    epoch: Some(ClientEpoch { attempt: 1 }),
-                })),
+                kind: Some(Kind::Client(ClientProducer {})),
             }),
             ..Default::default()
         };

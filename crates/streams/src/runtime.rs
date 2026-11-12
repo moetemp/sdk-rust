@@ -68,13 +68,6 @@ fn conflict_policy(value: i32) -> StreamResult<ConflictPolicy> {
     }
 }
 
-fn proto_duration(value: Duration) -> prost_types::Duration {
-    prost_types::Duration {
-        seconds: value.as_secs() as i64,
-        nanos: value.subsec_nanos() as i32,
-    }
-}
-
 pub(crate) fn stream_id(stream_ref: Option<&StreamRef>) -> StreamResult<&str> {
     let id = stream_ref
         .map(|stream_ref| stream_ref.id.as_str())
@@ -222,7 +215,7 @@ impl StreamRuntime {
         Ok(CloseStreamResponse {})
     }
 
-    /// Gets the status, the newest offset and the Retention of a Stream.
+    /// Gets the status and the newest offset of a Stream.
     pub async fn describe_stream(
         &self,
         request: DescribeStreamRequest,
@@ -247,7 +240,6 @@ impl StreamRuntime {
         Ok(DescribeStreamResponse {
             status: status as i32,
             last_offset: offset_to_wire(state.newest),
-            retention: Some(proto_duration(state.retention)),
         })
     }
 

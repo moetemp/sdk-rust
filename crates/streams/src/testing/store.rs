@@ -9,12 +9,10 @@ use super::{
 use crate::{
     Reason, StreamResult,
     epoch::{ProducerKind, epoch_key},
-    ids::{activity_producer_id, client_producer_id, named_client_producer_id},
+    ids::{activity_producer_id, client_producer_id},
     memory::{EntryId, ProducerField},
     offset::{entry_id_of_offset, offset_of_entry_id},
-    proto::{
-        ActivityEpoch, ActivityProducer, ClientEpoch, ClientProducer, Producer, producer::Kind,
-    },
+    proto::{ActivityEpoch, ActivityProducer, ClientProducer, Producer, producer::Kind},
     store::{Batch, ConflictPolicy, Create, CreateOutcome, Created},
 };
 use futures_util::future::join_all;
@@ -37,20 +35,18 @@ fn activity(run: &str, attempt: i32, scheduled: i64) -> Producer {
     }
 }
 
-fn client(attempt: i32) -> Producer {
+fn client() -> Producer {
     Producer {
         id: client_producer_id("me", "p1"),
-        kind: Some(Kind::Client(ClientProducer {
-            epoch: Some(ClientEpoch { attempt }),
-        })),
+        kind: Some(Kind::Client(ClientProducer {})),
     }
 }
 
 /// A second client Producer, which every backend accepts as sent.
 fn other_client() -> Producer {
     Producer {
-        id: named_client_producer_id("other"),
-        ..client(1)
+        id: client_producer_id("other", "p2"),
+        ..client()
     }
 }
 
@@ -88,7 +84,7 @@ fn use_existing() -> Create<'static> {
 async fn a_create_writes_the_key_once_and_keeps_its_retention() {
     for target in stores_for(Needs::STORE_ANSWERS).await {
         assert_eq!(
-            append(&target, &client(1), 1, &["x"])
+            append(&target, &client(), 1, &["x"])
                 .await
                 .unwrap_err()
                 .reason,
@@ -170,7 +166,7 @@ async fn closed_and_expired_come_before_already_exists() {
         };
         target.create_with(&first).await.unwrap();
         let reason = |created: StreamResult<Created>| created.unwrap_err().reason;
-        target.close(&client(1)).await.unwrap();
+        target.close(&client()).await.unwrap();
         for create in [&first, &Create::default()] {
             assert_eq!(reason(target.create_with(create).await), Reason::Closed);
         }
@@ -184,7 +180,7 @@ async fn closed_and_expired_come_before_already_exists() {
 async fn a_resend_gets_its_first_positions_and_a_lower_sequence_is_refused() {
     for target in stores_for(Needs::CALLS).await {
         target.create().await;
-        let p = client(1);
+        let p = client();
         let first = append(&target, &p, 1, &["p1", "p2"]).await.unwrap();
         // Another Producer writes between the batch and its resend.
         append(&target, &other_client(), 1, &["q1"]).await.unwrap();
@@ -207,7 +203,7 @@ async fn a_resend_gets_its_first_positions_and_a_lower_sequence_is_refused() {
 async fn a_resend_with_other_content_fails_as_divergent() {
     for target in stores_for(Needs::CALLS).await {
         target.create().await;
-        let p = client(1);
+        let p = client();
         append(&target, &p, 1, &["p1"]).await.unwrap();
         let divergent = append(&target, &p, 1, &["other"]).await.unwrap_err();
         assert_eq!(divergent.reason, Reason::SeqDivergent);
@@ -215,7 +211,8 @@ async fn a_resend_with_other_content_fails_as_divergent() {
     }
 }
 
-/// A lower epoch is fenced for each Producer kind.
+/// A lower epoch is fenced for each Producer kind that has an epoch. A client has none, so two
+/// writes of one client Producer are never fenced.
 async fn a_lower_epoch_is_fenced_for_each_producer_kind() {
     for target in stores_for(Needs::UNCHECKED).await {
         target.create().await;
@@ -231,10 +228,9 @@ async fn a_lower_epoch_is_fenced_for_each_producer_kind() {
             .unwrap();
         let stale = append(&target, &activity("r1", 3, 15), 1, &["a3"]).await;
         assert_eq!(stale.unwrap_err().reason, Reason::Fenced);
-        append(&target, &client(2), 1, &["c2"]).await.unwrap();
-        let stale = append(&target, &client(1), 1, &["c1"]).await;
-        assert_eq!(stale.unwrap_err().reason, Reason::Fenced);
-        assert_eq!(target.texts().await, ["la2", "a2", "c2"]);
+        append(&target, &client(), 1, &["c1"]).await.unwrap();
+        append(&target, &client(), 2, &["c2"]).await.unwrap();
+        assert_eq!(target.texts().await, ["la2", "a2", "c1", "c2"]);
     }
 }
 
@@ -243,7 +239,7 @@ async fn a_lower_epoch_is_fenced_for_each_producer_kind() {
 async fn a_close_stops_appends_but_not_a_resend() {
     for target in stores_for(Needs::CALLS).await {
         target.create().await;
-        let p = client(1);
+        let p = client();
         let first = append(&target, &p, 1, &["a"]).await.unwrap();
         let closed = target.close(&p).await.unwrap();
         assert_eq!(
@@ -268,7 +264,7 @@ async fn a_close_stops_appends_but_not_a_resend() {
 async fn a_newer_format_refuses_every_write() {
     for target in stores_for(Needs::RAW_KEYS).await {
         target.create().await;
-        let p = client(1);
+        let p = client();
         append(&target, &p, 1, &["a"]).await.unwrap();
         target.set_meta(fields::VERSION, "2").await;
         let field = fields::producer(ProducerKind::Client as i32, &p.id);
@@ -289,7 +285,7 @@ async fn an_expired_stream_refuses_writes_and_its_create() {
     for target in stores_for(Needs::RAW_KEYS).await {
         target.create().await;
         target.set_meta("exp", "1").await;
-        let error = append(&target, &client(1), 1, &["a"]).await.unwrap_err();
+        let error = append(&target, &client(), 1, &["a"]).await.unwrap_err();
         assert_eq!(error.reason, Reason::Expired);
         let created = target.create_with(&use_existing()).await;
         assert_eq!(created.unwrap_err().reason, Reason::Expired);
@@ -301,11 +297,11 @@ async fn an_expired_stream_refuses_writes_and_its_create() {
 async fn an_open_stream_with_no_last_write_ttl_never_expires_until_the_close() {
     for target in stores_for(Needs::RAW_KEYS).await {
         target.create().await;
-        append(&target, &client(1), 1, &["a"]).await.unwrap();
+        append(&target, &client(), 1, &["a"]).await.unwrap();
         let week = Duration::from_secs(7 * 86_400).as_millis() as i64;
         assert_eq!(target.ttls().await, (-1, -1));
         assert_eq!(target.meta("exp").await, None);
-        target.close(&client(1)).await.unwrap();
+        target.close(&client()).await.unwrap();
         let (ttl, meta) = target.ttls().await;
         assert!(0 < ttl && ttl <= week, "{ttl}");
         assert!(
@@ -328,10 +324,10 @@ async fn an_open_stream_keeps_its_records_past_its_retention() {
             })
             .await
             .unwrap();
-        let old = append(&target, &client(1), 1, &["old"]).await.unwrap();
+        let old = append(&target, &client(), 1, &["old"]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(target.texts().await, ["old"]);
-        append(&target, &client(1), 2, &["new"]).await.unwrap();
+        append(&target, &client(), 2, &["new"]).await.unwrap();
         let (state, entries) = target
             .store
             .read(&target.stream_ref(), 0, 10)
@@ -351,7 +347,7 @@ async fn an_open_stream_keeps_its_records_past_its_retention() {
 async fn offsets_go_on_after_the_log_is_gone() {
     for target in stores_for(Needs::RAW_KEYS).await {
         target.create().await;
-        append(&target, &client(1), 1, &["old"]).await.unwrap();
+        append(&target, &client(), 1, &["old"]).await.unwrap();
         // A newest id one minute ahead, as after the clock steps back.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -361,7 +357,7 @@ async fn offsets_go_on_after_the_log_is_gone() {
         target.set_meta("newest", &ahead).await;
         target.drop_log().await;
         assert_eq!(target.ttls().await.0, -2);
-        let new = append(&target, &client(1), 2, &["new"]).await.unwrap();
+        let new = append(&target, &client(), 2, &["new"]).await.unwrap();
         let ahead = offset_of_entry_id(&ahead).unwrap();
         assert!(new.offsets.unwrap().0 > ahead);
         let (state, _) = target.store.read(&target.stream_ref(), 0, 0).await.unwrap();
@@ -374,7 +370,7 @@ async fn offsets_go_on_after_the_log_is_gone() {
 async fn a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline() {
     for target in stores_for(Needs::RAW_KEYS).await {
         target.create().await;
-        let first = append(&target, &client(1), 1, &["a"]).await.unwrap();
+        let first = append(&target, &client(), 1, &["a"]).await.unwrap();
         let newest = first.offsets.unwrap().1;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(200);
         let woke = target
@@ -390,7 +386,7 @@ async fn a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline() {
             store.wait_after(&stream, newest, deadline).await
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
-        append(&target, &client(1), 2, &["b"]).await.unwrap();
+        append(&target, &client(), 2, &["b"]).await.unwrap();
         assert!(waiter.await.unwrap().unwrap());
     }
 }
@@ -400,7 +396,7 @@ async fn a_blocked_read_wakes_on_an_append_and_ends_at_its_deadline() {
 async fn a_close_writes_no_entry_and_ends_a_wait() {
     for target in stores_for(Needs::RAW_KEYS).await {
         target.create().await;
-        let first = append(&target, &client(1), 1, &["a"]).await.unwrap();
+        let first = append(&target, &client(), 1, &["a"]).await.unwrap();
         let newest = first.offsets.unwrap().1;
         let store = target.store.clone();
         let stream = target.stream_ref();
@@ -409,7 +405,7 @@ async fn a_close_writes_no_entry_and_ends_a_wait() {
             store.wait_after(&stream, newest, deadline).await
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
-        target.close(&client(1)).await.unwrap();
+        target.close(&client()).await.unwrap();
         assert!(waiter.await.unwrap().unwrap());
         let started = tokio::time::Instant::now();
         let deadline = started + Duration::from_secs(5);
@@ -434,11 +430,11 @@ async fn a_close_writes_no_entry_and_ends_a_wait() {
 async fn a_batch_gets_consecutive_offsets_that_end_at_its_last_offset() {
     for target in stores_for(Needs::RAW_KEYS).await {
         target.create().await;
-        append(&target, &client(1), 1, &["before"]).await.unwrap();
+        append(&target, &client(), 1, &["before"]).await.unwrap();
         // Enough Records that `XADD *` on Redis 7.0 would cross a millisecond.
         let texts: Vec<String> = (0..1000).map(|i| i.to_string()).collect();
         let texts: Vec<&str> = texts.iter().map(String::as_str).collect();
-        let appended = append(&target, &client(1), 2, &texts).await.unwrap();
+        let appended = append(&target, &client(), 2, &texts).await.unwrap();
         let offsets: Vec<i64> = target.entries().await[1..]
             .iter()
             .map(|entry| entry.offset)
@@ -459,7 +455,7 @@ async fn a_batch_gets_consecutive_offsets_that_end_at_its_last_offset() {
 async fn a_negative_sequence_is_refused() {
     for target in stores_for(Needs::CALLS).await {
         target.create().await;
-        let error = append(&target, &client(1), -1, &["x"]).await.unwrap_err();
+        let error = append(&target, &client(), -1, &["x"]).await.unwrap_err();
         assert_eq!(error.reason, Reason::Invalid);
         assert!(target.texts().await.is_empty());
     }
@@ -469,9 +465,9 @@ async fn a_negative_sequence_is_refused() {
 /// at one. Such a batch has no dedupe, so its retry writes it again. A batch that sends the taken
 /// number is a resend.
 async fn a_batch_with_no_sequence_takes_the_next_one_of_its_epoch() {
-    for target in stores_for(Needs::CALLS).await {
+    for target in stores_for(Needs::UNCHECKED).await {
         target.create().await;
-        let p = client(1);
+        let p = activity("r1", 1, 10);
         append(&target, &p, 0, &["a"]).await.unwrap();
         let retry = append(&target, &p, 0, &["a"]).await.unwrap();
         let resend = append(&target, &p, 2, &["a"]).await.unwrap();
@@ -482,7 +478,7 @@ async fn a_batch_with_no_sequence_takes_the_next_one_of_its_epoch() {
         let next = append(&target, &p, 0, &["c"]).await.unwrap();
         let resend = append(&target, &p, 8, &["c"]).await.unwrap();
         assert_eq!(resend.offsets, next.offsets);
-        let newer = client(2);
+        let newer = activity("r1", 2, 10);
         let first = append(&target, &newer, 0, &["d"]).await.unwrap();
         let resend = append(&target, &newer, 1, &["d"]).await.unwrap();
         assert_eq!(resend.offsets, first.offsets);
@@ -495,7 +491,7 @@ async fn a_batch_with_no_sequence_takes_the_next_one_of_its_epoch() {
 async fn batches_with_no_sequence_at_once_each_take_their_own_number() {
     for target in stores_for(Needs::CALLS).await {
         target.create().await;
-        let p = client(1);
+        let p = client();
         let texts = ["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8"];
         let appends = texts
             .iter()
@@ -517,7 +513,7 @@ async fn batches_with_no_sequence_at_once_each_take_their_own_number() {
 async fn a_large_sequence_dedupes_and_one_past_2_53_is_refused() {
     for target in stores_for(Needs::CALLS).await {
         target.create().await;
-        let p = client(1);
+        let p = client();
         let large = 100_000_000_000_000;
         let first = append(&target, &p, large, &["x"]).await.unwrap();
         let resend = append(&target, &p, large, &["x"]).await.unwrap();
@@ -546,7 +542,7 @@ async fn a_silent_producer_resends_its_last_batch_once_past_the_retention() {
             })
             .await
             .unwrap();
-        let p = client(1);
+        let p = client();
         let first = append(&target, &p, 1, &["old"]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
         // A Store that dropped a silent Producer's state would do it on another Producer's append.
@@ -563,7 +559,7 @@ async fn a_silent_producer_resends_its_last_batch_once_past_the_retention() {
 /// An open Stream keeps a Producer's fence past the Retention, so a lower epoch of a Producer with
 /// no append for longer than the Retention is still fenced.
 async fn a_silent_producer_stays_fenced_past_the_retention() {
-    for target in stores_for(Needs::SHORT_TIMES).await {
+    for target in stores_for(Needs::SHORT_TIMES.and(Needs::UNCHECKED)).await {
         target
             .create_with(&Create {
                 retention: Some(Duration::from_millis(300)),
@@ -571,12 +567,14 @@ async fn a_silent_producer_stays_fenced_past_the_retention() {
             })
             .await
             .unwrap();
-        append(&target, &client(2), 1, &["new"]).await.unwrap();
+        append(&target, &activity("r1", 2, 10), 1, &["new"])
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
         append(&target, &other_client(), 1, &["other"])
             .await
             .unwrap();
-        let stale = append(&target, &client(1), 1, &["stale"]).await;
+        let stale = append(&target, &activity("r1", 1, 10), 1, &["stale"]).await;
         assert_eq!(stale.unwrap_err().reason, Reason::Fenced);
         assert_eq!(target.texts().await, ["new", "other"]);
     }
@@ -584,14 +582,20 @@ async fn a_silent_producer_stays_fenced_past_the_retention() {
 
 /// A Producer with a lower epoch can't close the Stream.
 async fn a_stale_producer_cant_close_the_stream() {
-    for target in stores_for(Needs::CALLS).await {
+    for target in stores_for(Needs::UNCHECKED).await {
         target.create().await;
-        append(&target, &client(2), 1, &["a"]).await.unwrap();
+        append(&target, &activity("r1", 2, 10), 1, &["a"])
+            .await
+            .unwrap();
         assert_eq!(
-            target.close(&client(1)).await.unwrap_err().reason,
+            target
+                .close(&activity("r1", 1, 10))
+                .await
+                .unwrap_err()
+                .reason,
             Reason::Fenced
         );
-        target.close(&client(2)).await.unwrap();
+        target.close(&activity("r1", 2, 10)).await.unwrap();
     }
 }
 
@@ -602,7 +606,7 @@ async fn a_producer_with_no_epoch_case_is_refused() {
         target.create().await;
         let producer = Producer {
             kind: None,
-            ..client(1)
+            ..client()
         };
         let error = append(&target, &producer, 1, &["a"]).await.unwrap_err();
         assert_eq!(error.reason, Reason::Invalid);
@@ -623,9 +627,7 @@ async fn an_append_whose_ids_would_not_fit_an_offset_is_refused_before_it_writes
             .as_millis()
             + 60_000;
         target.add_raw_entry(&format!("{ahead}-1048570")).await;
-        let error = append(&target, &client(1), 1, &["a"; 10])
-            .await
-            .unwrap_err();
+        let error = append(&target, &client(), 1, &["a"; 10]).await.unwrap_err();
         assert_eq!(error.reason, Reason::StorageUnavailable);
         assert_eq!(target.log_len().await, 1);
     }
@@ -673,7 +675,7 @@ async fn a_producer_field_has_the_shared_layout() {
 async fn a_producer_field_of_another_format_is_refused() {
     for target in stores_for(Needs::RAW_KEYS).await {
         target.create().await;
-        let p = client(1);
+        let p = client();
         append(&target, &p, 1, &["a"]).await.unwrap();
         let field = fields::producer(ProducerKind::Client as i32, &p.id);
         let value = target.meta(&field).await.unwrap();

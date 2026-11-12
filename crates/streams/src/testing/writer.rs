@@ -4,16 +4,15 @@
 
 use super::{
     RuntimeConfig, case,
-    support::{Needs, item_offset, stores_for},
+    support::{Needs, stores_for},
 };
 use crate::{
     StreamError, StreamResult, StreamRuntime, StreamWriter,
-    ids::{activity_producer_id, client_producer_id, named_client_producer_id},
+    ids::{activity_producer_id, client_producer_id},
     proto::{
-        ActivityEpoch, ActivityProducer, AppendRecord, ClientEpoch, ClientProducer,
-        CloseStreamRequest, CreateStreamRequest, OpenWriterRequest, Producer, ReadRecordsRequest,
-        ReadRecordsResponse, StreamErrorDetails, StreamRef, WriteRecordsRequest, producer::Kind,
-        stream_record::Item,
+        ActivityEpoch, ActivityProducer, AppendRecord, ClientProducer, CloseStreamRequest,
+        CreateStreamRequest, OpenWriterRequest, Producer, ReadRecordsRequest, ReadRecordsResponse,
+        StreamErrorDetails, StreamRef, WriteRecordsRequest, producer::Kind,
     },
     store::{
         Appended, Batch, Capabilities, Closed, Create, Created, Entry, MAX_BATCH_RECORDS, Store,
@@ -69,9 +68,7 @@ async fn cases_with(config: &RuntimeConfig) -> Vec<Case> {
 fn client() -> Producer {
     Producer {
         id: client_producer_id("me", "p"),
-        kind: Some(Kind::Client(ClientProducer {
-            epoch: Some(ClientEpoch { attempt: 1 }),
-        })),
+        kind: Some(Kind::Client(ClientProducer {})),
     }
 }
 
@@ -177,7 +174,6 @@ impl Case {
             namespace: self.namespace.clone(),
             r#ref: self.stream_ref(),
             producer: Some(client()),
-            ..Default::default()
         };
         self.ext.close_stream(request).await.unwrap();
     }
@@ -197,10 +193,7 @@ impl Case {
             .await
             .records
             .into_iter()
-            .filter_map(|record| match record.item {
-                Some(Item::Data(data)) => Some(String::from_utf8(data.body.unwrap().data).unwrap()),
-                _ => None,
-            })
+            .map(|record| String::from_utf8(record.body.unwrap().data).unwrap())
             .collect()
     }
 }
@@ -211,7 +204,7 @@ async fn a_write_is_in_the_store_when_it_answers_its_offsets() {
         let (first, last) = write(&writer, &["a", "b"]).await.unwrap();
         assert!(0 < first && first < last);
         let read = case.read(0).await;
-        let offsets: Vec<i64> = read.records.iter().map(|r| off(item_offset(r))).collect();
+        let offsets: Vec<i64> = read.records.iter().map(|r| off(&r.offset)).collect();
         assert_eq!(offsets, [first, last]);
         let (one, same) = write(&writer, &["c"]).await.unwrap();
         assert_eq!(one, same);
@@ -229,8 +222,8 @@ async fn writes_split_at_the_batch_size_and_keep_one_sequence() {
         write(&writer, &["4", "5"]).await.unwrap();
         let read = case.read(0).await;
         assert_eq!(case.visible().await, ["1", "2", "3", "4", "5"]);
-        assert_eq!(off(item_offset(&read.records[0])), first);
-        assert_eq!(off(item_offset(&read.records[2])), last);
+        assert_eq!(off(&read.records[0].offset), first);
+        assert_eq!(off(&read.records[2].offset), last);
     }
 }
 
@@ -356,22 +349,16 @@ async fn the_writers_of_one_producer_epoch_share_a_lane() {
     }
 }
 
-async fn a_named_client_with_a_higher_epoch_fences_its_earlier_self() {
+/// A client Producer has one epoch for its whole life, so a later open of it never fences an
+/// earlier writer.
+async fn a_client_producer_is_never_fenced() {
     for case in cases().await {
-        let named = |attempt| Producer {
-            id: named_client_producer_id("ingest-1"),
-            kind: Some(Kind::Client(ClientProducer {
-                epoch: Some(ClientEpoch { attempt }),
-            })),
-        };
-        let old = case.open(named(1), |_| {}).await;
+        let old = case.open(client(), |_| {}).await;
         write(&old, &["old"]).await.unwrap();
-        let new = case.open(named(2), |_| {}).await;
+        let new = case.open(client(), |_| {}).await;
         write(&new, &["new"]).await.unwrap();
-        let error = write(&old, &["late"]).await.unwrap_err();
-        assert_eq!(reason(&error), "stream_fenced");
-        // A fence blocks the old epoch's later writes but keeps its earlier Records.
-        assert_eq!(case.visible().await, ["old", "new"]);
+        write(&old, &["late"]).await.unwrap();
+        assert_eq!(case.visible().await, ["old", "new", "late"]);
     }
 }
 
@@ -487,10 +474,7 @@ async fn a_write_whose_answer_is_lost_goes_in_once() {
         let read = case.read(0).await;
         assert_eq!(case.visible().await, ["a", "b"]);
         assert_eq!(
-            (
-                off(item_offset(&read.records[0])),
-                off(item_offset(&read.records[1]))
-            ),
+            (off(&read.records[0].offset), off(&read.records[1].offset)),
             (first, last)
         );
         write(&writer, &["c"]).await.unwrap();
@@ -594,14 +578,8 @@ async fn the_writers_of_one_epoch_send_their_batches_in_call_order() {
 /// writer's error.
 async fn a_closed_writer_refuses_writes_as_closed_after_a_failure() {
     for case in cases().await {
-        let named = |attempt| Producer {
-            id: named_client_producer_id("ingest-2"),
-            kind: Some(Kind::Client(ClientProducer {
-                epoch: Some(ClientEpoch { attempt }),
-            })),
-        };
-        let old = case.open(named(1), |_| {}).await;
-        let new = case.open(named(2), |_| {}).await;
+        let old = case.open(activity(1), |_| {}).await;
+        let new = case.open(activity(2), |_| {}).await;
         write(&new, &["new"]).await.unwrap();
         assert_eq!(
             reason(&write(&old, &["late"]).await.unwrap_err()),
@@ -695,8 +673,11 @@ async fn an_open_after_a_failed_or_cancelled_fence_sends_it() {
 async fn a_writer_of_a_producer_with_a_missing_required_field_does_not_open() {
     for case in cases().await {
         let request = case.open_request(Producer {
-            kind: Some(Kind::Client(ClientProducer::default())),
-            ..client()
+            kind: Some(Kind::WorkflowActivity(ActivityProducer {
+                run_id: "r1".to_string(),
+                epoch: None,
+            })),
+            ..activity(1)
         });
         let error = case.ext.open_writer(request).await.unwrap_err();
         assert_eq!(reason(&error), "stream_invalid");
@@ -729,7 +710,7 @@ pub const CASES: &[super::Case] = &[
     case!(a_write_splits_big_records_by_bytes_and_refuses_an_oversize_one),
     case!(a_reopen_of_a_closed_writer_goes_on_with_its_sequence),
     case!(the_writers_of_one_producer_epoch_share_a_lane),
-    case!(a_named_client_with_a_higher_epoch_fences_its_earlier_self),
+    case!(a_client_producer_is_never_fenced),
     case!(a_write_whose_answer_is_lost_goes_in_once),
     case!(a_writer_writes_again_after_a_store_outage),
     case!(a_write_on_corrupt_store_data_fails_with_no_retry),

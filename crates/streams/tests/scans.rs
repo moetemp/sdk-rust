@@ -14,10 +14,9 @@ use temporalio_streams::{
     ids::client_producer_id,
     memory::MemoryStore,
     proto::{
-        AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientEpoch, ClientProducer,
+        AppendRecord, AppendRecordsRequest, AppendRecordsResponse, ClientProducer,
         CreateStreamRequest, CreateStreamResponse, Producer, ReadRecordsRequest,
         ReadRecordsResponse, StreamErrorDetails, StreamErrorReason, StreamRef, producer::Kind,
-        read_records_request::Position,
     },
     store::{Appended, Batch, Capabilities, Create, Created, Entry, Store, StreamState},
 };
@@ -115,9 +114,7 @@ async fn create(ext: &StreamRuntime) {
 fn client() -> Producer {
     Producer {
         id: client_producer_id("me", "p"),
-        kind: Some(Kind::Client(ClientProducer {
-            epoch: Some(ClientEpoch { attempt: 1 }),
-        })),
+        kind: Some(Kind::Client(ClientProducer {})),
     }
 }
 
@@ -156,7 +153,6 @@ async fn append_sized(
             producer: Some(client()),
             sequence,
             records,
-            ..Default::default()
         },
     )
     .await
@@ -172,7 +168,7 @@ async fn a_trim_under_a_read_from_an_offset_fails_it_as_expired() {
     let read = |from_offset| ReadRecordsRequest {
         namespace: NAMESPACE.to_string(),
         r#ref: stream_ref(),
-        position: Some(Position::FromOffset(from_offset)),
+        from_offset,
         ..Default::default()
     };
     store.trim_next.store(true, Ordering::Relaxed);

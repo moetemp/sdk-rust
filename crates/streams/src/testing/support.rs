@@ -9,8 +9,8 @@ use crate::{
     digest::batch_digest,
     ids::local_activity_producer_id,
     proto::{
-        AppendRecord, LocalActivityEpoch, LocalActivityProducer, Producer, StreamData,
-        StreamRecord, StreamRef, WorkflowTaskEpoch, producer::Kind, stream_record::Item,
+        AppendRecord, LocalActivityEpoch, LocalActivityProducer, Producer, StreamRecord, StreamRef,
+        WorkflowTaskEpoch, producer::Kind,
     },
     store::{Appended, Batch, Closed, Create, Created, Entry, Store},
 };
@@ -38,7 +38,7 @@ impl Needs {
     /// Store's log calls `read` and `wait_after`.
     pub const RAW_KEYS: Self = Self(1 << 1);
     /// Producers, owners and runs as sent. The server checks them against its executions, so a
-    /// case with made-up runs, or an Activity with no task token, can't run there.
+    /// case with made-up runs can't run there.
     pub const UNCHECKED: Self = Self(1 << 2);
     /// A Retention of a few hundred ms.
     pub const SHORT_TIMES: Self = Self(1 << 3);
@@ -138,27 +138,16 @@ impl Run {
     }
 }
 
-/// The offset of a read item, which each item kind carries.
-pub(crate) fn item_offset(record: &StreamRecord) -> &[u8] {
-    match &record.item {
-        Some(Item::Data(data)) => &data.offset,
-        Some(Item::Close(close)) => &close.offset,
-        None => &[],
-    }
-}
-
 pub(crate) fn record(producer: &Producer, text: &str) -> Vec<u8> {
     StreamRecord {
-        item: Some(Item::Data(StreamData {
-            producer: Some(producer.clone()),
-            body: Some(
-                temporalio_common::protos::temporal::api::common::v1::Payload {
-                    data: text.as_bytes().to_vec(),
-                    ..Default::default()
-                },
-            ),
-            ..Default::default()
-        })),
+        producer: Some(producer.clone()),
+        body: Some(
+            temporalio_common::protos::temporal::api::common::v1::Payload {
+                data: text.as_bytes().to_vec(),
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
     }
     .encode_to_vec()
 }
@@ -193,10 +182,7 @@ pub(crate) fn records_of(entries: &[Entry]) -> Vec<String> {
         .iter()
         .filter_map(|entry| entry.record.as_ref())
         .map(|bytes| StreamRecord::decode(bytes.as_slice()).unwrap())
-        .filter_map(|record| match record.item {
-            Some(Item::Data(data)) => Some(String::from_utf8(data.body.unwrap().data).unwrap()),
-            _ => None,
-        })
+        .map(|record| String::from_utf8(record.body.unwrap().data).unwrap())
         .collect()
 }
 

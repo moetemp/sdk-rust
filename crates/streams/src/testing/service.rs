@@ -2,22 +2,18 @@
 //!
 //! Every Store runs the suite through its own runtime.
 
-use super::{
-    RuntimeConfig, case,
-    support::{Needs, item_offset},
-};
+use super::{RuntimeConfig, case, support::Needs};
 
 use crate::{
     StreamError, StreamRuntime,
     ids::client_producer_id,
     proto::{
         ActivityEpoch, ActivityProducer, AppendRecord, AppendRecordsRequest, AppendRecordsResponse,
-        ClientEpoch, ClientProducer, CloseStreamRequest, CloseStreamResponse, CreateStreamRequest,
+        ClientProducer, CloseStreamRequest, CloseStreamResponse, CreateStreamRequest,
         CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse, LocalActivityEpoch,
         LocalActivityProducer, Producer, ReadRecordsRequest, ReadRecordsResponse,
-        StreamCloseStatus, StreamErrorDetails, StreamIdConflictPolicy, StreamReadStart, StreamRef,
-        StreamStatus, WorkflowProducer, WorkflowTaskEpoch, producer::Kind,
-        read_records_request::Position, stream_record::Item,
+        StreamErrorDetails, StreamIdConflictPolicy, StreamRef, StreamStatus, WorkflowProducer,
+        WorkflowTaskEpoch, producer::Kind,
     },
 };
 use prost::Message;
@@ -95,12 +91,10 @@ fn wire(offset: i64) -> Vec<u8> {
     crate::offset::offset_to_wire(offset)
 }
 
-fn client(attempt: i32) -> Producer {
+fn client() -> Producer {
     Producer {
         id: client_producer_id("me", "p"),
-        kind: Some(Kind::Client(ClientProducer {
-            epoch: Some(ClientEpoch { attempt }),
-        })),
+        kind: Some(Kind::Client(ClientProducer {})),
     }
 }
 
@@ -182,7 +176,6 @@ impl Case {
                 producer: Some(producer),
                 sequence,
                 records,
-                ..Default::default()
             })
             .await
     }
@@ -212,7 +205,6 @@ impl Case {
                 namespace: self.namespace.clone(),
                 r#ref: self.stream_ref(),
                 producer: Some(producer),
-                ..Default::default()
             })
             .await
     }
@@ -222,11 +214,7 @@ fn texts(response: &ReadRecordsResponse) -> Vec<String> {
     response
         .records
         .iter()
-        .map(|record| match &record.item {
-            Some(Item::Data(data)) => String::from_utf8(data.body.clone().unwrap().data).unwrap(),
-            Some(Item::Close(_)) => "<close>".to_string(),
-            None => "?".to_string(),
-        })
+        .map(|record| String::from_utf8(record.body.clone().unwrap().data).unwrap())
         .collect()
 }
 
@@ -284,7 +272,7 @@ async fn a_create_of_a_closed_stream_fails() {
             ..Default::default()
         };
         case.create_with(first.clone()).await.unwrap();
-        case.close(client(1)).await.unwrap();
+        case.close(client()).await.unwrap();
         for request in [first, CreateStreamRequest::default()] {
             let error = case.create_with(request).await.unwrap_err();
             assert_eq!(
@@ -300,11 +288,11 @@ async fn a_create_of_a_closed_stream_fails() {
 async fn a_close_writes_no_record_and_a_second_close_succeeds() {
     for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
-        let written = case.append(client(1), 1, vec![record("a")]).await.unwrap();
-        case.close(client(1)).await.unwrap();
-        case.close(client(1)).await.unwrap();
+        let written = case.append(client(), 1, vec![record("a")]).await.unwrap();
+        case.close(client()).await.unwrap();
+        case.close(client()).await.unwrap();
         let error = case
-            .append(client(1), 2, vec![record("b")])
+            .append(client(), 2, vec![record("b")])
             .await
             .unwrap_err();
         assert_eq!(reason(&error), "stream_closed");
@@ -323,7 +311,7 @@ async fn a_close_writes_no_record_and_a_second_close_succeeds() {
 async fn a_create_of_an_expired_stream_fails() {
     for case in short_cases().await {
         case.create().await.unwrap();
-        case.close(client(1)).await.unwrap();
+        case.close(client()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
         let error = case.create().await.unwrap_err();
         assert_eq!(
@@ -343,7 +331,7 @@ async fn a_producer_must_match_its_kind_and_not_be_a_workflow() {
             epoch: Some(ActivityEpoch::default()),
         });
         for kind in [Some(activity), None] {
-            let wrong = Producer { kind, ..client(1) };
+            let wrong = Producer { kind, ..client() };
             let error = case.append(wrong, 1, vec![record("x")]).await.unwrap_err();
             assert_eq!(
                 (error.code(), reason(&error).as_str()),
@@ -376,8 +364,11 @@ async fn a_write_with_a_missing_required_field_is_invalid() {
     for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
         let no_epoch = Producer {
-            kind: Some(Kind::Client(ClientProducer::default())),
-            ..client(1)
+            id: crate::ids::local_activity_producer_id("r1", "call-1"),
+            kind: Some(Kind::LocalActivity(LocalActivityProducer {
+                run_id: "r1".to_string(),
+                epoch: None,
+            })),
         };
         let error = case
             .append(no_epoch.clone(), 1, vec![record("x")])
@@ -409,7 +400,7 @@ async fn an_append_with_a_record_that_has_no_body_is_invalid() {
     for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
         let records = vec![record("a"), AppendRecord::default()];
-        let error = case.append(client(1), 1, records).await.unwrap_err();
+        let error = case.append(client(), 1, records).await.unwrap_err();
         assert_eq!(
             (error.code(), reason(&error).as_str()),
             (Code::InvalidArgument, "stream_invalid")
@@ -424,39 +415,40 @@ async fn an_append_with_a_record_that_has_no_body_is_invalid() {
 async fn an_append_with_no_sequence_takes_the_next_one_of_its_epoch() {
     for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
-        let first = case.append(client(1), 0, vec![record("a")]).await.unwrap();
-        let retry = case.append(client(1), 0, vec![record("a")]).await.unwrap();
+        let first = case.append(client(), 0, vec![record("a")]).await.unwrap();
+        let retry = case.append(client(), 0, vec![record("a")]).await.unwrap();
         assert!(
             retry.first_offset > first.last_offset,
             "{first:?} {retry:?}"
         );
-        let resend = case.append(client(1), 2, vec![record("a")]).await.unwrap();
+        let resend = case.append(client(), 2, vec![record("a")]).await.unwrap();
         assert_eq!(resend, retry);
         let error = case
-            .append(client(1), -1, vec![record("b")])
+            .append(client(), -1, vec![record("b")])
             .await
             .unwrap_err();
         assert_eq!(reason(&error), "stream_invalid");
     }
 }
 
-/// A read is exclusive from its offset, a read from the end gives only new Records, an offset past
-/// the newest fails with `stream_offset_too_high`, and one that decodes below zero or has more than
-/// 8 bytes is invalid.
+/// A read with no offset starts at the beginning, and a read is exclusive from its offset. A read
+/// after the newest offset gives no Record, so a describe and a read give only new Records. An
+/// offset past the newest fails with `stream_offset_too_high`, and one that decodes below zero or
+/// has more than 8 bytes is invalid.
 async fn a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_records() {
     for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
         let first = case
-            .append(client(1), 1, vec![record("1"), record("2")])
+            .append(client(), 1, vec![record("1"), record("2")])
             .await
             .unwrap();
         let all = case.read(ReadRecordsRequest::default()).await.unwrap();
         assert_eq!(texts(&all), ["1", "2"]);
-        assert_eq!(item_offset(&all.records[0]), first.first_offset);
+        assert_eq!(all.records[0].offset, first.first_offset);
         assert_eq!(all.last_offset, first.last_offset);
         let from = case
             .read(ReadRecordsRequest {
-                position: Some(Position::FromOffset(first.first_offset.clone())),
+                from_offset: first.first_offset.clone(),
                 ..Default::default()
             })
             .await
@@ -465,24 +457,16 @@ async fn a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_recor
         let newest = case.describe().await.unwrap().last_offset;
         let none = case
             .read(ReadRecordsRequest {
-                position: Some(Position::FromOffset(newest.clone())),
+                from_offset: newest.clone(),
                 ..Default::default()
             })
             .await
             .unwrap();
         assert!(none.records.is_empty());
         assert_eq!(none.last_offset, newest);
-        let end = case
-            .read(ReadRecordsRequest {
-                position: Some(Position::Start(StreamReadStart::End as i32)),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        assert_eq!(end.last_offset, newest);
         let error = case
             .read(ReadRecordsRequest {
-                position: Some(Position::FromOffset(wire(off(&newest) + 1))),
+                from_offset: wire(off(&newest) + 1),
                 ..Default::default()
             })
             .await
@@ -494,7 +478,7 @@ async fn a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_recor
         let error = case
             .read(ReadRecordsRequest {
                 // An 8-byte value with the top bit set decodes to a negative offset.
-                position: Some(Position::FromOffset(vec![0x80, 0, 0, 0, 0, 0, 0, 0])),
+                from_offset: vec![0x80, 0, 0, 0, 0, 0, 0, 0],
                 ..Default::default()
             })
             .await
@@ -502,7 +486,7 @@ async fn a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_recor
         assert_eq!(reason(&error), "stream_invalid");
         let error = case
             .read(ReadRecordsRequest {
-                position: Some(Position::FromOffset(vec![0; 9])),
+                from_offset: vec![0; 9],
                 ..Default::default()
             })
             .await
@@ -511,7 +495,7 @@ async fn a_read_is_exclusive_from_its_offset_and_get_offset_reads_only_new_recor
         // The largest offset has no next one, and it is past the newest Record too.
         let error = case
             .read(ReadRecordsRequest {
-                position: Some(Position::FromOffset(wire(i64::MAX))),
+                from_offset: wire(i64::MAX),
                 ..Default::default()
             })
             .await
@@ -544,12 +528,12 @@ async fn a_read_of_an_uncreated_stream_fails_at_once() {
 async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append() {
     for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
-        let first = case.append(client(1), 1, vec![record("1")]).await.unwrap();
+        let first = case.append(client(), 1, vec![record("1")]).await.unwrap();
         let from = first.last_offset;
         let started = Instant::now();
         let quiet = case
             .read(ReadRecordsRequest {
-                position: Some(Position::FromOffset(from.clone())),
+                from_offset: from.clone(),
                 wait: millis(200),
                 ..Default::default()
             })
@@ -570,16 +554,15 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
                     id: stream,
                     ..Default::default()
                 }),
-                producer: Some(client(1)),
+                producer: Some(client()),
                 sequence: 2,
                 records: vec![record("2")],
-                ..Default::default()
             };
             ext.append_records(request).await
         });
         let woke = case
             .read(ReadRecordsRequest {
-                position: Some(Position::FromOffset(from)),
+                from_offset: from,
                 wait: millis(5000),
                 ..Default::default()
             })
@@ -590,19 +573,19 @@ async fn a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append(
     }
 }
 
-/// A read that gives the last item of a closed Stream is done, and so is every later read, which
-/// gives no item. A close refuses later appends.
+/// A read that gives the last Record of a closed Stream is done, and so is every later read, which
+/// gives no Record. A close refuses later appends.
 async fn a_close_ends_every_read_with_done() {
     for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
-        case.append(client(1), 1, vec![record("1")]).await.unwrap();
-        case.close(client(1)).await.unwrap();
+        case.append(client(), 1, vec![record("1")]).await.unwrap();
+        case.close(client()).await.unwrap();
         let read = case.read(ReadRecordsRequest::default()).await.unwrap();
-        assert_eq!(texts(&read), ["1", "<close>"]);
+        assert_eq!(texts(&read), ["1"]);
         assert!(read.done);
         let again = case
             .read(ReadRecordsRequest {
-                position: Some(Position::FromOffset(read.last_offset.clone())),
+                from_offset: read.last_offset.clone(),
                 ..Default::default()
             })
             .await
@@ -614,7 +597,7 @@ async fn a_close_ends_every_read_with_done() {
             StreamStatus::Closed as i32
         );
         let error = case
-            .append(client(1), 2, vec![record("2")])
+            .append(client(), 2, vec![record("2")])
             .await
             .unwrap_err();
         assert_eq!(
@@ -624,43 +607,24 @@ async fn a_close_ends_every_read_with_done() {
     }
 }
 
-/// A read of a closed Stream ends with a StreamClose item, at the offset after the newest Record.
-/// Its status is CLOSED, and its Producer is the one that closed the Stream.
-async fn a_closed_read_ends_with_a_close_item() {
-    for case in cases_for(Needs::CALLS).await {
-        case.create().await.unwrap();
-        let written = case.append(client(1), 1, vec![record("1")]).await.unwrap();
-        case.close(client(1)).await.unwrap();
-        let read = case.read(ReadRecordsRequest::default()).await.unwrap();
-        assert!(read.done);
-        let last = read.records.last().expect("a close item");
-        assert_eq!(off(item_offset(last)), off(&written.last_offset) + 1);
-        let Some(Item::Close(close)) = &last.item else {
-            panic!("not a close item: {:?}", last.item);
-        };
-        assert_eq!(close.status, StreamCloseStatus::Closed as i32);
-        assert_eq!(close.producer, Some(client(1)));
-    }
-}
-
 /// A read of a closed Stream whose Retention passed fails as expired, from any offset, instead
 /// of waiting out its wait.
 async fn a_read_of_an_expired_closed_stream_fails_instead_of_waiting() {
     for case in short_cases().await {
         case.create().await.unwrap();
-        let first = case.append(client(1), 1, vec![record("1")]).await.unwrap();
-        case.close(client(1)).await.unwrap();
+        let first = case.append(client(), 1, vec![record("1")]).await.unwrap();
+        case.close(client()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(500)).await;
         let describe = case.describe().await.unwrap();
         assert_eq!(describe.status, StreamStatus::Expired as i32);
         for request in [
             ReadRecordsRequest::default(),
             ReadRecordsRequest {
-                position: Some(Position::FromOffset(first.first_offset)),
+                from_offset: first.first_offset,
                 ..Default::default()
             },
             ReadRecordsRequest {
-                position: Some(Position::FromOffset(describe.last_offset)),
+                from_offset: describe.last_offset,
                 ..Default::default()
             },
         ] {
@@ -679,32 +643,28 @@ async fn a_read_of_an_expired_closed_stream_fails_instead_of_waiting() {
 }
 
 /// An open Stream keeps its Records past its Retention, which counts from the close. So a read
-/// gets every Record and the close item until one Retention after the close, and then the Stream
-/// is expired. The Retention is the backend's, since a create takes none.
+/// gets every Record until one Retention after the close, and then the Stream is expired. The
+/// Retention is the backend's, since a create takes none.
 async fn the_retention_counts_from_the_close() {
     for case in short_cases().await {
         case.create().await.unwrap();
         let first = case
-            .append(client(1), 1, vec![record("a"), record("b")])
+            .append(client(), 1, vec![record("a"), record("b")])
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
         let after_first = ReadRecordsRequest {
-            position: Some(Position::FromOffset(first.first_offset.clone())),
+            from_offset: first.first_offset.clone(),
             ..Default::default()
         };
         let read = case.read(after_first.clone()).await.unwrap();
         assert_eq!(texts(&read), ["b"]);
-        case.append(client(1), 2, vec![record("c")]).await.unwrap();
-        case.close(client(1)).await.unwrap();
+        case.append(client(), 2, vec![record("c")]).await.unwrap();
+        case.close(client()).await.unwrap();
         let read = case.read(ReadRecordsRequest::default()).await.unwrap();
-        assert_eq!(texts(&read), ["a", "b", "c", "<close>"]);
+        assert_eq!(texts(&read), ["a", "b", "c"]);
         let describe = case.describe().await.unwrap();
         assert_eq!(describe.status, StreamStatus::Closed as i32);
-        assert_eq!(
-            describe.retention,
-            millis(SHORT_RETENTION.as_millis() as u64)
-        );
         tokio::time::sleep(Duration::from_millis(400)).await;
         let describe = case.describe().await.unwrap();
         assert_eq!(describe.status, StreamStatus::Expired as i32);
@@ -722,9 +682,9 @@ async fn an_open_stream_expires_its_last_write_ttl_after_its_last_write() {
     };
     for case in cases_with(Needs::SHORT_TIMES, &config).await {
         case.create().await.unwrap();
-        case.append(client(1), 1, vec![record("a")]).await.unwrap();
+        case.append(client(), 1, vec![record("a")]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
-        case.append(client(1), 2, vec![record("b")]).await.unwrap();
+        case.append(client(), 2, vec![record("b")]).await.unwrap();
         tokio::time::sleep(Duration::from_millis(300)).await;
         let describe = case.describe().await.unwrap();
         assert_eq!(describe.status, StreamStatus::Open as i32);
@@ -732,7 +692,7 @@ async fn an_open_stream_expires_its_last_write_ttl_after_its_last_write() {
         let describe = case.describe().await.unwrap();
         assert_eq!(describe.status, StreamStatus::Expired as i32);
         let error = case
-            .append(client(1), 3, vec![record("c")])
+            .append(client(), 3, vec![record("c")])
             .await
             .unwrap_err();
         assert_eq!(reason(&error), "stream_expired");
@@ -763,10 +723,9 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
             let request = AppendRecordsRequest {
                 namespace: case.namespace.clone(),
                 r#ref: stream,
-                producer: Some(client(1)),
+                producer: Some(client()),
                 sequence,
                 records: vec![record(&sequence.to_string())],
-                ..Default::default()
             };
             case.ext.append_records(request).await.unwrap();
         }
@@ -785,14 +744,14 @@ async fn a_create_answer_names_the_backend_and_the_store_never_reads_it() {
     }
 }
 
-/// A read of a closed Stream gives `done` only with its last item. With no item left, a read
+/// A read of a closed Stream gives `done` only with its last Record. With no Record left, a read
 /// answers at once with `done`, even with a long wait.
-async fn a_read_of_a_closed_stream_with_no_item_left_answers_at_once() {
+async fn a_read_of_a_closed_stream_with_no_record_left_answers_at_once() {
     for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
         let records = vec![record("1"), record("2")];
-        let written = case.append(client(1), 1, records).await.unwrap();
-        case.close(client(1)).await.unwrap();
+        let written = case.append(client(), 1, records).await.unwrap();
+        case.close(client()).await.unwrap();
         let first = case
             .read(ReadRecordsRequest {
                 max_records: 1,
@@ -804,35 +763,25 @@ async fn a_read_of_a_closed_stream_with_no_item_left_answers_at_once() {
         assert!(!first.done);
         let rest = case
             .read(ReadRecordsRequest {
-                position: Some(Position::FromOffset(first.last_offset)),
+                from_offset: first.last_offset,
                 ..Default::default()
             })
             .await
             .unwrap();
-        assert_eq!(texts(&rest), ["2", "<close>"]);
+        assert_eq!(texts(&rest), ["2"]);
         assert!(rest.done);
-        for request in [
-            ReadRecordsRequest {
-                position: Some(Position::FromOffset(written.last_offset.clone())),
+        let started = Instant::now();
+        let read = case
+            .read(ReadRecordsRequest {
+                from_offset: written.last_offset.clone(),
+                wait: millis(5000),
                 ..Default::default()
-            },
-            ReadRecordsRequest {
-                position: Some(Position::Start(StreamReadStart::End as i32)),
-                ..Default::default()
-            },
-        ] {
-            let started = Instant::now();
-            let read = case
-                .read(ReadRecordsRequest {
-                    wait: millis(5000),
-                    ..request
-                })
-                .await
-                .unwrap();
-            assert!(started.elapsed() < Duration::from_secs(2));
-            assert!(read.records.is_empty() && read.done);
-            assert_eq!(read.last_offset, written.last_offset);
-        }
+            })
+            .await
+            .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(read.records.is_empty() && read.done);
+        assert_eq!(read.last_offset, written.last_offset);
     }
 }
 
@@ -840,13 +789,12 @@ async fn a_read_of_a_closed_stream_with_no_item_left_answers_at_once() {
 async fn a_waiting_read_wakes_with_done_on_a_close() {
     for case in cases_for(Needs::CALLS).await {
         case.create().await.unwrap();
-        let written = case.append(client(1), 1, vec![record("1")]).await.unwrap();
+        let written = case.append(client(), 1, vec![record("1")]).await.unwrap();
         let ext = case.ext.clone();
         let close = CloseStreamRequest {
             namespace: case.namespace.clone(),
             r#ref: case.stream_ref(),
-            producer: Some(client(1)),
-            ..Default::default()
+            producer: Some(client()),
         };
         let closer = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -855,7 +803,7 @@ async fn a_waiting_read_wakes_with_done_on_a_close() {
         let started = Instant::now();
         let woke = case
             .read(ReadRecordsRequest {
-                position: Some(Position::FromOffset(written.last_offset)),
+                from_offset: written.last_offset,
                 wait: millis(5000),
                 ..Default::default()
             })
@@ -873,9 +821,9 @@ async fn a_page_keeps_under_max_bytes_and_a_larger_record_comes_alone() {
         case.create().await.unwrap();
         let big = "x".repeat(1000);
         let records = vec![record("a"), record("b"), record(&big), record("c")];
-        case.append(client(1), 1, records).await.unwrap();
+        case.append(client(), 1, records).await.unwrap();
         let capped = |from_offset| ReadRecordsRequest {
-            position: Some(Position::FromOffset(from_offset)),
+            from_offset,
             max_bytes: 200,
             ..Default::default()
         };
@@ -902,12 +850,11 @@ pub const CASES: &[super::Case] = &[
     case!(a_read_of_an_uncreated_stream_fails_at_once),
     case!(a_quiet_read_ends_empty_after_its_wait_and_a_long_poll_wakes_on_append),
     case!(a_close_ends_every_read_with_done),
-    case!(a_closed_read_ends_with_a_close_item),
     case!(a_read_of_an_expired_closed_stream_fails_instead_of_waiting),
     case!(the_retention_counts_from_the_close),
     case!(an_open_stream_expires_its_last_write_ttl_after_its_last_write),
     case!(a_create_answer_names_the_backend_and_the_store_never_reads_it),
-    case!(a_read_of_a_closed_stream_with_no_item_left_answers_at_once),
+    case!(a_read_of_a_closed_stream_with_no_record_left_answers_at_once),
     case!(a_waiting_read_wakes_with_done_on_a_close),
     case!(a_page_keeps_under_max_bytes_and_a_larger_record_comes_alone),
 ];

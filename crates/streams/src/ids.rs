@@ -105,12 +105,6 @@ pub fn client_producer_id(identity: &str, process_key: &str) -> String {
     format!("client:{}", join(&[identity, process_key]))
 }
 
-/// The Producer id that a client names itself, `client:<name>`. The caller keeps the name across
-/// restarts and raises the epoch on each one, so that a new incarnation fences the earlier one.
-pub fn named_client_producer_id(name: &str) -> String {
-    format!("client:{}", join(&[name]))
-}
-
 /// The id prefix of a Producer kind.
 pub(crate) fn kind_prefix(kind: ProducerKind) -> &'static str {
     match kind {
@@ -137,10 +131,7 @@ pub fn check_producer(producer: &Producer) -> StreamResult<()> {
     let parts: Vec<_> = rest.split(':').collect();
     let expected = match kind {
         ProducerKind::Workflow => 1,
-        ProducerKind::LocalActivity | ProducerKind::StandaloneActivity => 2,
-        // A named client id has one part. A process client id has two.
-        ProducerKind::Client if parts.len() == 1 => 1,
-        ProducerKind::Client => 2,
+        ProducerKind::LocalActivity | ProducerKind::StandaloneActivity | ProducerKind::Client => 2,
         ProducerKind::Activity => 3,
     };
     // The meta field names use `|` as a separator, so a part must be in the form of `encode_part`.
@@ -225,12 +216,7 @@ pub fn check_required(producer: &Producer) -> StreamResult<()> {
             }
             at_least_one(epoch.attempt, "Activity")
         }
-        Some(Kind::Client(client)) => {
-            let Some(epoch) = client.epoch.as_ref() else {
-                return missing("epoch");
-            };
-            at_least_one(epoch.attempt, "client")
-        }
+        Some(Kind::Client(_)) => Ok(()),
         None => missing("kind"),
     }
 }
@@ -270,8 +256,8 @@ impl StreamKeys {
 mod tests {
     use super::*;
     use crate::proto::{
-        ActivityEpoch, ActivityProducer, ClientEpoch, ClientProducer, LocalActivityEpoch,
-        LocalActivityProducer, WorkflowProducer, WorkflowTaskEpoch,
+        ActivityEpoch, ActivityProducer, ClientProducer, LocalActivityEpoch, LocalActivityProducer,
+        WorkflowProducer, WorkflowTaskEpoch,
     };
     use prost_types::Timestamp;
 
@@ -350,6 +336,7 @@ mod tests {
             },
             producer(ProducerKind::Client, "client:a|b", ""),
             producer(ProducerKind::Client, "client:run%3a1", ""),
+            producer(ProducerKind::Client, "client:name", ""),
         ];
         for producer in &bad {
             assert_eq!(
@@ -403,10 +390,8 @@ mod tests {
     /// A client Producer with every field the API requires.
     fn client() -> Producer {
         Producer {
-            id: named_client_producer_id("n"),
-            kind: Some(Kind::Client(ClientProducer {
-                epoch: Some(ClientEpoch { attempt: 1 }),
-            })),
+            id: client_producer_id("n", "p"),
+            kind: Some(Kind::Client(ClientProducer {})),
         }
     }
 
@@ -566,25 +551,5 @@ mod tests {
         let mut act = activity();
         activity_epoch(&mut act).attempt = 0;
         assert!(refused(&act).contains("Activity attempt"));
-    }
-
-    #[test]
-    fn a_client_producer_needs_its_epoch() {
-        let client = Producer {
-            kind: Some(Kind::Client(ClientProducer::default())),
-            ..client()
-        };
-        assert!(refused(&client).contains("epoch"));
-    }
-
-    #[test]
-    fn a_client_attempt_is_1_or_more() {
-        let client = Producer {
-            kind: Some(Kind::Client(ClientProducer {
-                epoch: Some(ClientEpoch { attempt: 0 }),
-            })),
-            ..client()
-        };
-        assert!(refused(&client).contains("client attempt"));
     }
 }

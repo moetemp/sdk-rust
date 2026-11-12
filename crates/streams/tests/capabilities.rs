@@ -12,7 +12,7 @@ use temporalio_streams::{
     ids::client_producer_id,
     memory::MemoryStore,
     proto::{
-        AppendRecord, AppendRecordsRequest, ClientEpoch, ClientProducer, CloseStreamRequest,
+        AppendRecord, AppendRecordsRequest, ClientProducer, CloseStreamRequest,
         CreateStreamRequest, DescribeStreamRequest, DescribeStreamResponse, Producer,
         StreamErrorDetails, StreamErrorReason, StreamRef, StreamStatus, producer::Kind,
     },
@@ -103,9 +103,7 @@ fn record() -> AppendRecord {
 fn client() -> Producer {
     Producer {
         id: client_producer_id("me", "p"),
-        kind: Some(Kind::Client(ClientProducer {
-            epoch: Some(ClientEpoch { attempt: 1 }),
-        })),
+        kind: Some(Kind::Client(ClientProducer {})),
     }
 }
 
@@ -158,7 +156,6 @@ async fn an_append_without_the_fence_is_refused_with_nothing_written() {
         producer: Some(client()),
         sequence: 1,
         records: vec![record()],
-        ..Default::default()
     };
     let error = case.call("AppendRecords", request).await.unwrap_err();
     assert_eq!(refused_capability(&error), "producer_fence");
@@ -199,7 +196,6 @@ async fn a_close_without_the_capability_is_refused_and_the_stream_stays_open() {
         namespace: NAMESPACE.to_string(),
         r#ref: case.stream_ref(),
         producer: Some(client()),
-        ..Default::default()
     };
     let error = case.call("CloseStream", request).await.unwrap_err();
     assert_eq!(refused_capability(&error), "close");

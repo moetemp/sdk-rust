@@ -107,7 +107,8 @@ pub fn epoch_key(kind: Option<&Kind>) -> [u8; EPOCH_KEY_LEN] {
                 epoch.map_or(0, |e| e.attempt),
             )
         }
-        Some(Kind::Client(client)) => (None, client.epoch.map_or(0, |e| e.attempt)),
+        // A client has one epoch for its whole life, so nothing fences it.
+        Some(Kind::Client(_)) => (None, 0),
         Some(Kind::Workflow(_)) | None => (None, 0),
     };
     let (seconds, nanos) = time_fields(scheduled.as_ref());
@@ -137,13 +138,17 @@ pub fn compare_epochs(a: Option<&Kind>, b: Option<&Kind>) -> Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::proto::{ClientEpoch, ClientProducer, producer::Kind};
+    use crate::proto::{LocalActivityEpoch, LocalActivityProducer, producer::Kind};
 
     // Without the clamp, the bytes of a negative field would outrank every real epoch.
     #[test]
     fn a_negative_field_compares_as_zero() {
-        let negative = Kind::Client(ClientProducer {
-            epoch: Some(ClientEpoch { attempt: -1 }),
+        let negative = Kind::LocalActivity(LocalActivityProducer {
+            epoch: Some(LocalActivityEpoch {
+                task: None,
+                attempt: -1,
+            }),
+            ..Default::default()
         });
         assert_eq!(compare_epochs(Some(&negative), None), Ordering::Equal);
     }
