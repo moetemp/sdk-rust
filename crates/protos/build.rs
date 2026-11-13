@@ -57,7 +57,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:descriptor_path={}", descriptor_file.display());
     let protos = &[
         "./protos/local/temporal/sdk/core/core_interface.proto",
-        "./protos/local/temporal/sdk/core/streams/streams.proto",
         "./protos/api_upstream/temporal/api/sdk/v1/external_storage.proto",
         "./protos/api_upstream/temporal/api/sdk/v1/workflow_metadata.proto",
         "./protos/api_upstream/temporal/api/workflowservice/v1/service.proto",

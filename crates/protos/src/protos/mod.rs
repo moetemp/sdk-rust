@@ -1384,9 +1384,6 @@ pub mod coresdk {
     pub mod child_workflow {
         tonic::include_proto!("coresdk.child_workflow");
     }
-    pub mod streams {
-        tonic::include_proto!("coresdk.streams");
-    }
     pub mod nexus {
         tonic::include_proto!("coresdk.nexus");
         pub use self::sdk_helpers::*;
