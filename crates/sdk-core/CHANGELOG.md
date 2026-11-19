@@ -45,6 +45,10 @@ relevant information.
   for new workflows only. The mode is recorded on the first successful task completion and defaults to off.
   Core handles tasks with no activation jobs internally, without polling workflow routines; see
   [Disabling chunking](../../arch_docs/workflow_task_chunking.md#disabling-chunking).
+* [lang-internal] Added the experimental `temporalio-streams` crate. Its `StreamRuntime` checks each
+  Stream call and its answer for a `StreamStore`, which a lang SDK implements for a Store in its
+  own language. An SDK gives the runtime the limits of a batch as a `StoreLimits`, and checks an
+  append of client code against them with `StoreLimits::check_append`.
 
 ### Fixed
 * Nexus operations cancelled or timed out before starting retain their cancellation or timeout
