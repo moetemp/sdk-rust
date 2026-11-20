@@ -4574,6 +4574,7 @@ dependencies = [
  "temporalio-common",
  "temporalio-macros",
  "temporalio-sdk",
+ "temporalio-streams",
  "temporalio-workflow",
  "thiserror 2.0.21",
  "tokio",
@@ -4622,6 +4623,7 @@ dependencies = [
 name = "temporalio-streams"
 version = "0.1.0"
 dependencies = [
+ "backon",
  "enum-iterator",
  "futures-util",
  "parking_lot",

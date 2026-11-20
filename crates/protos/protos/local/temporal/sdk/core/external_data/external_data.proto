@@ -5,6 +5,8 @@ option ruby_package = "Temporalio::Internal::Bridge::Api::ExternalData";
 
 import "google/protobuf/duration.proto";
 import "google/protobuf/timestamp.proto";
+import "temporal/api/failure/v1/message.proto";
+import "temporal/api/stream/v1/message.proto";
 
 // This file defines data that Core might write externally. The first motivating case being
 // storing data in markers in event history. Defining such data as protos provides an easy way
@@ -39,4 +41,42 @@ message PatchedMarkerData {
   string id = 1;
   // Whether or not the patch is marked deprecated.
   bool deprecated = 2;
+}
+
+// The data of a `core_stream` marker, in its `data` detail as `binary/protobuf`. Core records one
+// in each Workflow Task in which Workflow code got a Stream result or asked for a close.
+message StreamMarkerData {
+  // Each Stream that the entries refer to, once. An entry refers to a Stream by its index here.
+  repeated temporal.api.stream.v1.StreamRef streams = 1;
+  repeated StreamCloseIntent close_intents = 2;
+  repeated StreamAppendResult appends = 3;
+  repeated StreamCloseResult closes = 4;
+}
+
+message StreamCloseIntent {
+  uint32 seq = 1;
+  uint32 stream = 2;
+}
+
+message StreamAppendResult {
+  uint32 seq = 1;
+  uint32 stream = 2;
+  // The index of the activation, within its Workflow Task, in which Workflow code got the result.
+  uint64 activation = 3;
+  oneof result {
+    StreamAppendOffsets appended = 4;
+    temporal.api.failure.v1.Failure failure = 5;
+  }
+}
+
+message StreamAppendOffsets {
+  bytes first_offset = 1;
+  bytes last_offset = 2;
+}
+
+message StreamCloseResult {
+  uint32 seq = 1;
+  uint64 activation = 2;
+  // Unset if the Stream is closed.
+  temporal.api.failure.v1.Failure failure = 3;
 }

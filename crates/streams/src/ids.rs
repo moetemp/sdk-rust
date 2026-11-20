@@ -1,5 +1,6 @@
-//! Size limits for Stream ids and offsets, and the checks for ids, offsets and Producers. Callers
-//! choose the ids and Stores choose the offsets, so this crate treats both as opaque.
+//! Size limits for Stream ids, Store names and offsets, and the checks for ids, offsets and
+//! Producers. Callers choose the ids and Stores choose the offsets, so this crate treats both as
+//! opaque.
 
 use crate::{
     AnyError, AnyReason,
@@ -18,6 +19,10 @@ pub const MAX_STREAM_ID_BYTES: usize = 4096;
 /// every Store, since offsets end up in Workflow History and a reader keeps them.
 pub const MAX_OFFSET_BYTES: usize = 1024;
 
+/// The maximum length of a Store name in a Workflow call, in bytes. A marker records the Store of
+/// each call, so Core fails the Workflow Task of a call with a longer name.
+pub const MAX_STORE_NAME_BYTES: usize = 4096;
+
 pub(crate) fn check_stream_id(id: &str) -> Result<(), AnyError> {
     if id.is_empty() {
         return Err(AnyError::invalid_argument("The Stream id is empty"));
@@ -26,6 +31,17 @@ pub(crate) fn check_stream_id(id: &str) -> Result<(), AnyError> {
         return Err(AnyError::invalid_argument(format!(
             "The Stream id has {} bytes, more than {MAX_STREAM_ID_BYTES}",
             id.len()
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "workflow")]
+pub(crate) fn check_store_name(store: &str) -> Result<(), AnyError> {
+    if store.len() > MAX_STORE_NAME_BYTES {
+        return Err(AnyError::invalid_argument(format!(
+            "The Store name has {} bytes, more than {MAX_STORE_NAME_BYTES}",
+            store.len()
         )));
     }
     Ok(())
