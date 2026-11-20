@@ -13,7 +13,13 @@ categories = ["development-tools"]
 
 [features]
 # The Stream calls of Workflow code, which Core runs.
-workflow = ["dep:backon", "dep:parking_lot", "dep:rand", "dep:tokio"]
+workflow = [
+  "dep:backon",
+  "dep:parking_lot",
+  "dep:rand",
+  "dep:sha2",
+  "dep:tokio",
+]
 
 [dependencies]
 backon = { version = "1.6", default-features = false, optional = true }
@@ -23,6 +29,7 @@ parking_lot = { version = "0.12", optional = true }
 prost = { workspace = true }
 prost-types = { workspace = true }
 rand = { version = "0.10", optional = true }
+sha2 = { version = "0.11", optional = true }
 tokio = { version = "1.47", default-features = false, features = [
   "rt",
   "sync",
