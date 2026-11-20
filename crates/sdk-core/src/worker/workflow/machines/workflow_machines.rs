@@ -38,7 +38,9 @@ use crate::{
                 upsert_search_attributes_state_machine::upsert_search_attrs_internal,
             },
             nondeterminism,
-            streams::{Phase, StreamCalls, is_stream_marker, peeked_marker},
+            streams::{
+                Phase, ReplayReads, StreamCalls, StreamMarker, is_stream_marker, peeked_marker,
+            },
         },
     },
 };
@@ -60,7 +62,6 @@ use temporalio_common::{
         VERSION_SEARCH_ATTR_KEY,
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
-            external_data::StreamMarkerData,
             workflow_activation::{
                 self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
@@ -395,6 +396,11 @@ impl WorkflowMachines {
         Ok(())
     }
 
+    /// Adds the Records of the next Stream markers of the history from the server.
+    pub(crate) fn add_stream_reads(&mut self, reads: ReplayReads) {
+        self.last_history_from_server.add_stream_reads(reads);
+    }
+
     /// Let this workflow know that something we've been waiting locally on has resolved, like a
     /// local activity or side effect
     ///
@@ -461,6 +467,25 @@ impl WorkflowMachines {
     /// Returns true once the Stream marker of the task has no room for a result that waits.
     pub(crate) fn stream_must_complete(&self) -> bool {
         (self.stream_calls).must_complete(self.local_activity_data.current_activation_index())
+    }
+
+    /// Returns true if only Stream reads hold the Workflow Task open.
+    pub(crate) fn holds_only_stream_reads(&self) -> bool {
+        self.outstanding_local_activity_count() == 0 && self.stream_calls.holds_only_reads()
+    }
+
+    /// Returns true if only Stream reads hold the task while it has a command, a message or a
+    /// close intent for the server, which must not wait for a read.
+    pub(crate) fn must_complete_before_stream_reads(&self) -> bool {
+        if !self.holds_only_stream_reads() {
+            return false;
+        }
+        // A marker asks the server for nothing.
+        let has_command = (self.commands.iter()).any(|c| {
+            !self.machine(c.machine).is_final_state()
+                && c.command.command_type() != CommandType::RecordMarker
+        });
+        has_command || !self.message_outbox.is_empty() || self.stream_calls.has_intents()
     }
 
     /// Returns start info for the workflow if it has started
@@ -950,7 +975,7 @@ impl WorkflowMachines {
         enum DelayedAction {
             LocalActivityMarker(Box<CompleteLocalActivityData>),
             ProtocolMessage(IncomingProtocolMessage),
-            StreamMarker(StreamMarkerData),
+            StreamMarker(i64, StreamMarker),
         }
         let mut delayed_actions = vec![];
         // Scan through to the next WFT, searching for any patch / la markers, so that we can
@@ -986,8 +1011,8 @@ impl WorkflowMachines {
                 } else {
                     return Err(fatal!("Local activity marker was unparsable: {e:?}"));
                 }
-            } else if let Some(data) = peeked_marker(e) {
-                delayed_actions.push(DelayedAction::StreamMarker(data?));
+            } else if let Some(marker) = peeked_marker(e) {
+                delayed_actions.push(DelayedAction::StreamMarker(e.event_id, marker?));
             } else if let Some(
                 history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(ref atts),
             ) = e.attributes
@@ -1024,7 +1049,10 @@ impl WorkflowMachines {
                 DelayedAction::ProtocolMessage(pm) => {
                     self.handle_protocol_message(pm)?;
                 }
-                DelayedAction::StreamMarker(data) => self.stream_calls.peeked(data)?,
+                DelayedAction::StreamMarker(event_id, marker) => {
+                    let records = self.last_history_from_server.take_stream_reads(event_id);
+                    self.stream_calls.peeked(marker, records)?;
+                }
             }
         }
         self.release_held_local_activity_resolutions_if_idle()?;
@@ -1790,6 +1818,10 @@ impl WorkflowMachines {
                 }
                 WFCommandVariant::AppendToStream(attrs) => self.stream_calls.append(attrs)?,
                 WFCommandVariant::CloseStream(attrs) => self.stream_calls.close(attrs)?,
+                WFCommandVariant::ReadStream(attrs) => self.stream_calls.read(attrs)?,
+                WFCommandVariant::RequestCancelStreamRead(attrs) => {
+                    self.stream_calls.cancel_read(attrs)?
+                }
             }
         }
         Ok(())
@@ -1835,12 +1867,12 @@ impl WorkflowMachines {
 
     /// Adds the Stream marker of the task to its commands, before a terminal command.
     fn seal_stream_marker(&mut self) {
-        let Some(data) = self.stream_calls.take_marker() else {
+        let Some(marker) = self.stream_calls.take_marker() else {
             return;
         };
         // The task's last `prepare_commands` ran before its completion. One more would also send
         // the marker of a Local Activity whose result lang doesn't have yet.
-        let marker = self.add_new_command_machine(stream_marker(&data), Default::default());
+        let marker = self.add_new_command_machine(stream_marker(marker), Default::default());
         self.machine_is_core_created.insert(marker.machine, ());
         let responses = self
             .machine_mut(marker.machine)

@@ -50,10 +50,10 @@ import "temporal/sdk/core/nexus/nexus.proto";
 //  this to ensure the LA resolution happens after that cancel (or whatever else it may be) as it
 //  normally would have when executing.
 // * The results of Stream calls go after the local activity resolutions, since a replay scans
-//  ahead for their marker too. The appends come first and then the closes, each kind by `seq`. A
-//  replay that gives the results of several activations in one keeps the order of those
-//  activations among the results of Stream calls, and gives them after each local activity
-//  resolution.
+//  ahead for their marker too. The appends come first, then the closes, and then the reads, each
+//  kind by `seq`. A replay that gives the results of several activations in one keeps the order
+//  of those activations among the results of Stream calls, and gives them after each local
+//  activity resolution.
 // * Queries always go last (and, in fact, always come in their own activation)
 // * Evictions also always come in their own activation
 //
@@ -149,6 +149,8 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // A read of a Stream finished.
+        ResolveStreamRead resolve_stream_read = 17;
         // An append to a Stream finished.
         ResolveStreamAppend resolve_stream_append = 18;
         // A close of a Stream finished.
@@ -437,6 +439,33 @@ message RemoveFromCache {
         WORKFLOW_EXECUTION_ENDING = 10;
     }
     EvictionReason reason = 2;
+}
+
+// The result of a `ReadStream`. A read gets at most one, and a read that lang cancelled gets one
+// too. It gets none only in the four cases that `ReadStream` lists. What `ResolveStreamAppend`
+// says of its activation holds for it.
+message ResolveStreamRead {
+    // The `seq` of the `ReadStream`.
+    uint32 seq = 1;
+    oneof status {
+        StreamPage page = 2;
+        // The failure of the read. It has the parts of the `failed` of a `ResolveStreamAppend`.
+        temporal.api.failure.v1.Failure failed = 3;
+        // Core got a `RequestCancelStreamRead` for the read before lang got a job for it. The job
+        // comes in the next activation after the cancel, or in the next Workflow Task if the task
+        // in hand completes first. `RequestCancelStreamRead` says when a replay gives it.
+        google.protobuf.Empty cancelled = 4;
+    }
+}
+
+message StreamPage {
+    // The Records of the page, in the order of the Stream. It's empty if no Record came within the
+    // `wait` of the read, or if the Stream is closed and has no Record after the `from_offset` of
+    // the read.
+    repeated temporal.api.stream.v1.StreamRecord records = 1;
+    // True if the Stream is closed and has no Record after this page. It's false if the page has
+    // no Record because none came within the `wait` of the read.
+    bool done = 2;
 }
 
 // The result of an `AppendToStream`. Core gives each result in the next activation after it comes,

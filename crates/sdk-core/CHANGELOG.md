@@ -57,6 +57,17 @@ relevant information.
   If a call is waiting to try again at the task's heartbeat, because a try failed with
   `StoreUnavailable`, got no answer within `try_deadline` or panicked in the code of the Store,
   the task fails, and the message of its failure starts with `StreamStoreUnavailable:`.
+* [lang-internal] Workflow code can read a Stream with the experimental `ReadStream` command. It
+  reads one page, of at most the `max_records` and the `max_bytes` of the command, and gets one
+  `ResolveStreamRead` job with the page, a failure or a cancel. `RequestCancelStreamRead` cancels
+  a read, whose job is then `cancelled` unless lang already got it. A task gives at most 16 MiB
+  of Records. Its marker has an entry for each read, with a digest of the Records of its page, or
+  the Records with `records_in_history`. A replay reads digested Records again, a part of at most
+  16 MiB at a time by their recorded size, and tries each Store in an outage for at most
+  `replay_retry_bound`, 3 s by default. If the Store doesn't have the same Records, the task
+  fails. With the new `WorkflowErrorType::StreamReplay` variant in `workflow_failure_errors`, the
+  Workflow fails in its place, on the first attempt of the task. A command, a message or a close
+  intent completes a task while its reads wait, and so does a graceful shutdown.
 
 ### Fixed
 * Nexus operations cancelled or timed out before starting retain their cancellation or timeout

@@ -166,13 +166,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "coresdk.external_data.LocalActivityMarkerData.backoff",
             "#[serde(with = \"sdk_helpers::opt_duration\")]",
         )
-        // A person reads a Stream marker's JSON in the web UI, so an offset is hex.
+        // A person reads a Stream marker's JSON in the web UI, so an offset or a digest is hex.
         .field_attribute(
             "coresdk.external_data.StreamAppendOffsets.first_offset",
             "#[serde(with = \"sdk_helpers::hex_bytes\")]",
         )
         .field_attribute(
             "coresdk.external_data.StreamAppendOffsets.last_offset",
+            "#[serde(with = \"sdk_helpers::hex_bytes\")]",
+        )
+        .field_attribute(
+            "coresdk.external_data.StreamReadResult.from_offset",
+            "#[serde(with = \"sdk_helpers::hex_bytes\")]",
+        )
+        .field_attribute(
+            "coresdk.external_data.StreamReadPage.digest",
             "#[serde(with = \"sdk_helpers::hex_bytes\")]",
         )
         .skip_debug(["temporal.api.common.v1.Payload"]);
@@ -182,10 +190,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     // The JSON of a Stream marker has a `oneof` under the name of its field. A serde attribute
     // ahead of the serde derive is a compiler warning, and `SERDE_ATTR` adds that derive here.
-    builder = builder.type_attribute(
-        "coresdk.external_data.StreamAppendResult.result",
-        "#[serde(rename_all = \"snake_case\")]",
-    );
+    builder = builder
+        .type_attribute(
+            "coresdk.external_data.StreamAppendResult.result",
+            "#[serde(rename_all = \"snake_case\")]",
+        )
+        .type_attribute(
+            "coresdk.external_data.StreamReadResult.result",
+            "#[serde(rename_all = \"snake_case\")]",
+        );
 
     #[cfg(feature = "vendored-protox")]
     {

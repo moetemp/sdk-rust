@@ -8,11 +8,10 @@ use super::{
 };
 use crate::worker::workflow::{
     nondeterminism,
-    streams::{is_stream_marker, marker_details},
+    streams::{StreamMarker, is_stream_marker, marker_details},
 };
 use temporalio_common::protos::{
     constants::STREAM_MARKER_NAME,
-    coresdk::external_data::StreamMarkerData,
     temporal::api::{command::v1::RecordMarkerCommandAttributes, enums::v1::CommandType},
 };
 
@@ -50,11 +49,11 @@ impl From<CommandSent> for Recorded {
     }
 }
 
-/// Creates the marker command that records `data`, with its machine.
-pub(super) fn stream_marker(data: &StreamMarkerData) -> NewMachineWithCommand {
+/// Creates the marker command that records `marker`, with its machine.
+pub(super) fn stream_marker(marker: StreamMarker) -> NewMachineWithCommand {
     let command = RecordMarkerCommandAttributes {
         marker_name: STREAM_MARKER_NAME.to_string(),
-        details: marker_details(data),
+        details: marker_details(marker),
         header: None,
         failure: None,
     };
