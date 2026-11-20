@@ -1,6 +1,9 @@
 //! Runs the Stream calls of a Worker's runs, one task for each call.
 
-use super::{StreamRuntimes, StreamSettings};
+use super::{
+    StreamRuntimes, StreamSettings,
+    reader::{self, Page, ReadCall},
+};
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
 use parking_lot::Mutex;
 use std::{
@@ -55,6 +58,7 @@ pub(crate) struct Call {
 pub(crate) enum Op {
     Append(AppendRecordsRequest),
     Close(CloseStreamRequest),
+    Read(ReadCall),
 }
 
 /// The result of a call, for its run.
@@ -70,6 +74,8 @@ pub(crate) enum Outcome {
     Append(resolve_stream_append::Status),
     /// `None` if the Stream is closed.
     Close(Option<Failure>),
+    /// The next page of a read, which a read gives before it ends.
+    Page(Page),
 }
 
 type Sink = Arc<dyn Fn(String, StreamResolution) + Send + Sync>;
@@ -177,6 +183,7 @@ impl StreamManager {
         let stream_id = match &op {
             Op::Append(request) => &request.stream_id,
             Op::Close(request) => &request.stream_id,
+            Op::Read(read) => &read.request.stream_id,
         };
         let runtime = (self.runtimes.get(&store).cloned())
             .expect("The run starts no call on a Store with no runtime");
@@ -190,6 +197,7 @@ impl StreamManager {
                 match op {
                     Op::Append(_) => "append",
                     Op::Close(_) => "close",
+                    Op::Read(_) => "read",
                 },
                 stream_id,
                 store
@@ -197,8 +205,19 @@ impl StreamManager {
         };
         let sink = self.sink.clone();
         let task = self.handle.spawn(async move {
-            let outcome = run(&runtime, op, settings, &note).await;
-            if note.end() {
+            let give = |page| {
+                let outcome = Outcome::Page(page);
+                let resolution = StreamResolution {
+                    call_id,
+                    seq,
+                    outcome,
+                };
+                sink(note.run_id.clone(), resolution);
+            };
+            let outcome = run(&runtime, op, settings, &note, give).await;
+            if note.end()
+                && let Some(outcome) = outcome
+            {
                 sink(
                     note.run_id,
                     StreamResolution {
@@ -223,21 +242,33 @@ impl Drop for StreamManager {
     }
 }
 
-async fn run(runtime: &StreamRuntime, op: Op, settings: StreamSettings, note: &Note) -> Outcome {
+/// Runs a call, and returns the outcome of an append or a close. A read gives each of its pages to
+/// `give` while it runs, and has no outcome.
+async fn run(
+    runtime: &StreamRuntime,
+    op: Op,
+    settings: StreamSettings,
+    note: &Note,
+    give: impl Fn(Page),
+) -> Option<Outcome> {
     match op {
         Op::Append(request) => {
             let answer = tries(settings, note, || runtime.append_records(request.clone())).await;
-            Outcome::Append(match answer {
+            Some(Outcome::Append(match answer {
                 Ok(appended) => resolve_stream_append::Status::Appended(StreamAppended {
                     first_offset: appended.first_offset,
                     last_offset: appended.last_offset,
                 }),
                 Err(error) => resolve_stream_append::Status::Failed(failure(&error)),
-            })
+            }))
         }
         Op::Close(request) => {
             let answer = tries(settings, note, || runtime.close_stream(request.clone())).await;
-            Outcome::Close(answer.err().map(|error| failure(&error)))
+            Some(Outcome::Close(answer.err().map(|error| failure(&error))))
+        }
+        Op::Read(read) => {
+            reader::read(runtime, read, settings, note, give).await;
+            None
         }
     }
 }
@@ -274,7 +305,7 @@ where
 
 /// Returns the waits between the tries of a call, which double from `retry_initial_interval` up to
 /// `retry_max_interval`.
-fn retry_waits(settings: &StreamSettings) -> ExponentialBackoff {
+pub(super) fn retry_waits(settings: &StreamSettings) -> ExponentialBackoff {
     ExponentialBuilder::new()
         .with_min_delay(settings.retry_initial_interval)
         .with_factor(2.0)
@@ -286,14 +317,14 @@ fn retry_waits(settings: &StreamSettings) -> ExponentialBackoff {
 /// Returns the next wait of `waits`, made longer or shorter at random by up to
 /// [`RETRY_RANDOMIZATION`] of its length, so that the calls of many runs don't all try again at
 /// the same moment.
-fn next_wait(waits: &mut ExponentialBackoff) -> Duration {
+pub(super) fn next_wait(waits: &mut ExponentialBackoff) -> Duration {
     let wait = waits.next().unwrap_or_default();
     let jitter = 1.0 + RETRY_RANDOMIZATION * (2.0 * rand::random::<f64>() - 1.0);
     Duration::try_from_secs_f64(wait.as_secs_f64() * jitter).unwrap_or(wait)
 }
 
 /// The handle of one call to its entry in the manager.
-struct Note {
+pub(super) struct Note {
     tasks: Tasks,
     run_id: String,
     call_id: u64,
@@ -301,7 +332,8 @@ struct Note {
 }
 
 impl Note {
-    fn set(&self, error: Option<&dyn fmt::Display>) {
+    /// Notes the failure of the last try, or clears it with `None`.
+    pub(super) fn set(&self, error: Option<&dyn fmt::Display>) {
         let mut tasks = self.tasks.lock();
         let task = tasks
             .get_mut(&self.run_id)
@@ -369,7 +401,7 @@ pub(crate) fn failure<R: Copy + Into<StreamErrorReason>>(error: &StreamError<R>)
 
 /// Cuts `text` on a character boundary to at most [`MAX_FAILURE_MESSAGE_BYTES`], with `...` at the
 /// end.
-fn cut(text: String) -> String {
+pub(super) fn cut(text: String) -> String {
     if text.len() <= MAX_FAILURE_MESSAGE_BYTES {
         return text;
     }

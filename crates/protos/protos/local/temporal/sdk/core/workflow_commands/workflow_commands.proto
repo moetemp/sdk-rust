@@ -56,6 +56,8 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        StartStreamRead start_stream_read = 23;
+        CloseStreamRead close_stream_read = 24;
         AppendToStream append_to_stream = 25;
         CloseStream close_stream = 26;
     }
@@ -482,4 +484,52 @@ message CloseStream {
     // Lang's incremental sequence number for closes, starting at 1.
     uint32 seq = 1;
     temporal.api.stream.v1.StreamRef stream = 2;
+}
+
+// Reads a Stream. The Records come in `ResolveStreamRead` jobs, one page in each job, until the
+// job that has `end`.
+//
+// What a read costs:
+// * A read holds its Workflow Task open while it waits for Records, as a Local Activity does. A
+//   Signal, a timer or an Activity result reaches Workflow code in the next task. The task in hand
+//   completes once Workflow code sends a command for the server while only reads hold the task,
+//   and at the latest at its heartbeat.
+// * A read that gets no Record adds the three events of a forced Workflow Task at each heartbeat,
+//   until its `idle_timeout`.
+// * One Workflow Task gives at most 16 MiB of Records, and its marker holds at most 1 MiB of them
+//   for a read with `records_in_history`, so a fast read takes several tasks.
+// * Without `records_in_history`, History has the count and a digest of the Records of each task.
+//   A replay reads them from the Store again, within the timeout of its Workflow Task. A query of
+//   a run that isn't cached replays too. Once the Store no longer has the same Records, each
+//   replay fails, also the one for a query of a closed Workflow.
+//
+// A read stops with no job at a `CloseStreamRead`, at the Workflow's last command, at a failed
+// Workflow Task, at an eviction and at the shutdown of the Worker. After the last three the
+// Workflow replays. The replay gives the pages that History has, and the read goes on after their
+// last Record.
+//
+// Core fails the Workflow Task in the cases that `AppendToStream` lists, and when `from_offset`
+// is longer than 1024 bytes or `idle_timeout` is negative or has its nanoseconds out of range. In
+// a replay, Core compares the `seq`, the `stream` and the `from_offset` of the command with
+// History.
+message StartStreamRead {
+    // Lang's incremental sequence number for reads, starting at 1.
+    uint32 seq = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // The read starts after this offset. If it's empty, the read starts at the beginning of the
+    // Stream.
+    bytes from_offset = 3;
+    // The read ends once no Record comes for this long, which is 1 minute by default. With zero,
+    // the read returns what the Stream has and then ends.
+    google.protobuf.Duration idle_timeout = 4;
+    // If set, each task's marker holds the Records of the read, so a replay doesn't read the
+    // Store.
+    bool records_in_history = 5;
+}
+
+// Stops a read. Lang gets no job for the close and no later page of the read. Core ignores the
+// close of a read that ended or that never started.
+message CloseStreamRead {
+    // The `seq` of the `StartStreamRead` to stop.
+    uint32 seq = 1;
 }

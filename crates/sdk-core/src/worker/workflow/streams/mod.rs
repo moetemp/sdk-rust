@@ -2,14 +2,18 @@
 //! takes the attempt of a Workflow Task.
 
 mod calls;
+mod digest;
 mod manager;
 mod marker;
+mod reader;
+mod replay;
 #[cfg(test)]
 mod test_store;
 
 pub(crate) use calls::{Phase, StreamCalls};
 pub(crate) use manager::{StreamManager, StreamResolution};
 pub(crate) use marker::{is_stream_marker, marker_details, peeked_marker};
+pub(crate) use replay::{MarkerReads, ReplayReader, ReplayReads};
 
 use crate::{
     WorkerConfig,
@@ -21,7 +25,10 @@ use crate::{
 use futures_util::future::{AbortRegistration, Abortable};
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 use temporalio_common::protos::temporal::api::stream::v1::WorkflowTaskAttempt;
@@ -35,6 +42,16 @@ use tracing::Span;
 /// The maximum size of the entries of one marker. The server rejects a marker over its blob size
 /// limit, which is 2 MiB by default.
 const MAX_MARKER_ENTRY_BYTES: usize = 256 * 1024;
+
+/// The maximum size of the Records that one Workflow Task gives Workflow code from all of its
+/// reads. A replay reads digested Records again in parts of this size by the bytes that History
+/// recorded. One marker over it still makes a separate part.
+const MAX_TASK_RECORD_BYTES: usize = 16 * 1024 * 1024;
+
+/// The maximum size of the Records that one marker holds for reads with `records_in_history`. One
+/// larger Record still fits as the marker's first. The server rejects a marker over its blob size
+/// limit, which is 2 MiB by default.
+const MAX_MARKER_RECORD_BYTES: usize = 1024 * 1024;
 
 /// The Stream runtimes of a Worker, keyed by the name of the Store that each one serves, with the
 /// settings of its Stream calls.
@@ -58,12 +75,17 @@ impl StreamRuntimes {
     pub(crate) fn get(&self, store: &str) -> Option<&Arc<StreamRuntime>> {
         self.runtimes.get(store)
     }
+
+    /// Returns true if there's no runtime, so Workflow code on this Worker can't call a Store.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.runtimes.is_empty()
+    }
 }
 
 /// The settings of a Worker's Stream calls. A try that fails with
 /// [`AnyReason::StoreUnavailable`](temporalio_streams::AnyReason::StoreUnavailable), or gets no
-/// answer within its deadline, counts as an outage, and the call then tries again with no limit
-/// in time.
+/// answer within its deadline, counts as an outage. A live call then tries again with no limit in
+/// time, and a replay read stops at `replay_retry_bound`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StreamSettings {
     /// The wait after the first failed try, 100 ms by default. Each later wait doubles, and the
@@ -72,8 +94,29 @@ pub struct StreamSettings {
     pub retry_initial_interval: Duration,
     /// The maximum wait between two tries before its random part, 2 s by default.
     pub retry_max_interval: Duration,
-    /// How long one try waits for the Store, 5 s by default. It must be more than 0.
+    /// How long one try waits for the Store, 5 s by default. A read's try also waits as long as the
+    /// read asks the Store to wait. It must be more than 0.
     pub try_deadline: Duration,
+    /// The maximum size of the Records in one page of a read, which is all that waits in Core for
+    /// the next activation, 4 MiB by default. It must be more than 0.
+    pub read_ahead_bytes: usize,
+    /// The maximum number of Records in one page of a read, 256 by default. It must be 1 or more.
+    pub read_page_records: usize,
+    /// The maximum time that one read asks the Store to wait for a Record, 60 s by default. It must
+    /// be more than 0. The read asks again after that, so a Store that stops answering counts as an
+    /// outage within this wait and `try_deadline`.
+    pub read_max_wait: Duration,
+    /// The minimum time between two pages of a read, so that Records which come one at a time reach
+    /// Workflow code in fewer activations. It's zero by default, which is no gap.
+    pub read_min_gap: Duration,
+    /// How long a replay goes on trying a Store after its first try of that Store fails, each time
+    /// it reads a part of the Records of History, 3 s by default. No try or wait goes past that
+    /// time, and zero is one try. The first try can take `try_deadline` to fail, so the two
+    /// together must stay under the Workflow Task timeout.
+    pub replay_retry_bound: Duration,
+    /// The maximum number of read entries whose Records a replay reads at the same time, 8 by
+    /// default. It must be 1 or more.
+    pub replay_concurrency: usize,
     /// The bounds that a test sets in place of the constants.
     #[cfg(test)]
     pub(crate) bounds: TestBounds,
@@ -85,6 +128,12 @@ impl Default for StreamSettings {
             retry_initial_interval: Duration::from_millis(100),
             retry_max_interval: Duration::from_secs(2),
             try_deadline: Duration::from_secs(5),
+            read_ahead_bytes: 4 * 1024 * 1024,
+            read_page_records: 256,
+            read_max_wait: Duration::from_secs(60),
+            read_min_gap: Duration::ZERO,
+            replay_retry_bound: Duration::from_secs(3),
+            replay_concurrency: 8,
             #[cfg(test)]
             bounds: TestBounds::default(),
         }
@@ -102,7 +151,13 @@ impl StreamSettings {
                     .to_string(),
             );
         }
-        let zeros = [("try_deadline", self.try_deadline.is_zero())];
+        let zeros = [
+            ("try_deadline", self.try_deadline.is_zero()),
+            ("read_ahead_bytes", self.read_ahead_bytes == 0),
+            ("read_page_records", self.read_page_records == 0),
+            ("read_max_wait", self.read_max_wait.is_zero()),
+            ("replay_concurrency", self.replay_concurrency == 0),
+        ];
         if let Some((setting, _)) = zeros.iter().find(|(_, zero)| *zero) {
             return Err(format!(
                 "The Stream setting `{setting}` must be more than 0"
@@ -119,6 +174,24 @@ impl StreamSettings {
         let max = MAX_MARKER_ENTRY_BYTES;
         max
     }
+
+    /// Returns [`MAX_TASK_RECORD_BYTES`], or the bound that a test set.
+    pub(crate) fn max_task_record_bytes(&self) -> usize {
+        #[cfg(test)]
+        let max = self.bounds.max_task_record_bytes;
+        #[cfg(not(test))]
+        let max = MAX_TASK_RECORD_BYTES;
+        max
+    }
+
+    /// Returns [`MAX_MARKER_RECORD_BYTES`], or the bound that a test set.
+    pub(crate) fn max_marker_record_bytes(&self) -> usize {
+        #[cfg(test)]
+        let max = self.bounds.max_marker_record_bytes;
+        #[cfg(not(test))]
+        let max = MAX_MARKER_RECORD_BYTES;
+        max
+    }
 }
 
 /// The bounds of the Stream calls that a test sets in place of the constants.
@@ -126,6 +199,8 @@ impl StreamSettings {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct TestBounds {
     pub(crate) max_marker_entry_bytes: usize,
+    pub(crate) max_task_record_bytes: usize,
+    pub(crate) max_marker_record_bytes: usize,
 }
 
 #[cfg(test)]
@@ -133,6 +208,8 @@ impl Default for TestBounds {
     fn default() -> Self {
         Self {
             max_marker_entry_bytes: MAX_MARKER_ENTRY_BYTES,
+            max_task_record_bytes: MAX_TASK_RECORD_BYTES,
+            max_marker_record_bytes: MAX_MARKER_RECORD_BYTES,
         }
     }
 }
@@ -172,6 +249,33 @@ impl RunGate {
             TaskState::Open(attempt) | TaskState::Completing(attempt) => Some(attempt),
             TaskState::NoTask => None,
         }
+    }
+
+    /// Returns a receiver for a reader, which wakes it each time the task state changes.
+    fn subscribe(&self) -> watch::Receiver<TaskState> {
+        self.0.subscribe()
+    }
+}
+
+/// The bytes of Records that the task in hand can still give Workflow code, and that its marker
+/// can still hold for reads with `records_in_history`. The run is its one writer, and its readers
+/// only read it.
+#[derive(Debug, Default)]
+pub(crate) struct TaskRoom {
+    task: AtomicUsize,
+    marker: AtomicUsize,
+}
+
+impl TaskRoom {
+    fn set(&self, (task, marker): (usize, usize)) {
+        self.task.store(task, Ordering::Release);
+        self.marker.store(marker, Ordering::Release);
+    }
+
+    /// Returns the bytes of Records that the task, and then its marker, can still take.
+    fn get(&self) -> (usize, usize) {
+        let task = self.task.load(Ordering::Acquire);
+        (task, self.marker.load(Ordering::Acquire))
     }
 }
 

@@ -1,3 +1,4 @@
+use super::streams::ReplayReads;
 use crate::{
     abstractions::OwnedMeteredSemPermit,
     protosext::ValidPollWFTQResponse,
@@ -28,7 +29,7 @@ pub(super) enum WFTExtractorOutput {
     ),
     NextPage {
         paginator: HistoryPaginator,
-        update: HistoryUpdate,
+        update: FetchedPage,
         span: Span,
         rc: Arc<HistfetchRC>,
     },
@@ -52,6 +53,46 @@ pub(super) enum HistoryFetchReq {
     Full(Box<CacheMissFetchReq>, Arc<HistfetchRC>),
     NextPage(Box<NextPageReq>, Arc<HistfetchRC>),
 }
+/// A read of the Records that a replay needs for the Stream markers of its History. The task slot
+/// of its run bounds these reads, since each one is for a task that holds a slot.
+#[derive(Debug)]
+pub(super) enum StreamRecordsReq {
+    /// The first part, for the task of a run new to the cache, before the run replays.
+    NewRun(Box<PermittedWFT>, Arc<HistfetchRC>),
+    /// The next part, for a completion of the run that waits for it.
+    NextPart(Box<NextPageReq>, Arc<HistfetchRC>),
+}
+impl StreamRecordsReq {
+    /// Reads the Records. Each read entry gets its own result, so the read never fails as a whole.
+    async fn read(self) -> WFTExtractorOutput {
+        match self {
+            StreamRecordsReq::NewRun(mut pwft, rc) => {
+                let PermittedWFT {
+                    work, paginator, ..
+                } = pwft.as_mut();
+                paginator.read_stream_records(&mut work.update).await;
+                WFTExtractorOutput::FetchResult(*pwft, rc)
+            }
+            StreamRecordsReq::NextPart(mut req, rc) => {
+                let reads = req.paginator.read_next_stream_records().await;
+                WFTExtractorOutput::NextPage {
+                    paginator: req.paginator,
+                    update: FetchedPage::StreamRecords(reads),
+                    span: req.span,
+                    rc,
+                }
+            }
+        }
+    }
+}
+/// What a completion that waits for a fetch gets.
+#[derive(derive_more::Debug)]
+pub(super) enum FetchedPage {
+    History(HistoryUpdate),
+    /// The Records of the next Stream markers of the History that the run has.
+    #[debug("StreamRecords")]
+    StreamRecords(ReplayReads),
+}
 /// Used inside of `Arc`s to ensure we don't shutdown while there are outstanding fetches.
 #[derive(Debug)]
 pub(super) struct HistfetchRC {}
@@ -62,6 +103,7 @@ impl WFTExtractor {
         max_fetch_concurrency: usize,
         wft_stream: impl Stream<Item = WFTStreamIn> + Send + 'static,
         fetch_stream: impl Stream<Item = HistoryFetchReq> + Send + 'static,
+        records_stream: impl Stream<Item = StreamRecordsReq> + Send + 'static,
     ) -> impl Stream<Item = Result<WFTExtractorOutput, tonic::Status>> + Send + 'static {
         let fetch_client = client.clone();
         let wft_stream = wft_stream
@@ -106,7 +148,7 @@ impl WFTExtractor {
             .right_future()
             .left_future()]));
 
-        stream::select_with_strategy(
+        let fetched = stream::select_with_strategy(
             wft_stream,
             fetch_stream.map(move |fetchreq: HistoryFetchReq| {
                 let client = fetch_client.clone();
@@ -132,10 +174,11 @@ impl WFTExtractor {
                             }
                         }
                         HistoryFetchReq::NextPage(mut req, rc) => {
-                            match req.paginator.extract_next_update().await {
+                            let page = req.paginator.extract_next_update().await;
+                            match page.map(|page| req.paginator.queue_stream_markers(page)) {
                                 Ok(update) => WFTExtractorOutput::NextPage {
                                     paginator: req.paginator,
-                                    update,
+                                    update: FetchedPage::History(update),
                                     span: req.span,
                                     rc,
                                 },
@@ -153,6 +196,12 @@ impl WFTExtractor {
             // Priority always goes to the fetching stream
             |_: &mut ()| PollNext::Right,
         )
-        .buffer_unordered(max_fetch_concurrency)
+        .buffer_unordered(max_fetch_concurrency);
+        // A Store that gives no answer must not keep the polls of other Workflows out of the
+        // fetch stage, so the reads of Records run in a separate stage.
+        let records = records_stream
+            .map(|request| request.read().map(Ok))
+            .buffer_unordered(usize::MAX);
+        stream::select(fetched, records)
     }
 }
