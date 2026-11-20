@@ -172,14 +172,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.type_attribute(*prefix, SERDE_ATTR);
     }
     // A person reads the JSON of a Stream marker in the web UI. So the case of a `oneof` has the
-    // name of its field, and an offset is hex.
-    builder = builder.type_attribute(
-        "coresdk.external_data.StreamAppendResult.result",
-        "#[serde(rename_all = \"snake_case\")]",
-    );
-    for field in ["first_offset", "last_offset"] {
+    // name of its field, and an offset or a digest is hex.
+    for result in ["StreamAppendResult.result", "StreamReadResult.result"] {
+        builder = builder.type_attribute(
+            format!("coresdk.external_data.{result}"),
+            "#[serde(rename_all = \"snake_case\")]",
+        );
+    }
+    for field in [
+        "StreamAppendOffsets.first_offset",
+        "StreamAppendOffsets.last_offset",
+        "StreamReadResult.from_offset",
+        "StreamReadPage.digest",
+    ] {
         builder = builder.field_attribute(
-            format!("coresdk.external_data.StreamAppendOffsets.{field}"),
+            format!("coresdk.external_data.{field}"),
             "#[serde(with = \"sdk_helpers::hex_bytes\")]",
         );
     }
