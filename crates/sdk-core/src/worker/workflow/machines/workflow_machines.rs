@@ -38,12 +38,13 @@ use crate::{
                 upsert_search_attributes_state_machine::upsert_search_attrs_internal,
             },
             nondeterminism,
-            streams::{Phase, StreamCalls, has_ledger, peeked_ledger},
+            streams::{
+                Ledger, Phase, ReplayReads, StreamCalls, encode_ledger, has_ledger, peeked_ledger,
+            },
         },
     },
 };
 use anyhow::Context;
-use prost::Message;
 use siphasher::sip::SipHasher13;
 use slotmap::{SlotMap, SparseSecondaryMap};
 use std::{
@@ -61,7 +62,6 @@ use temporalio_common::{
         VERSION_SEARCH_ATTR_KEY,
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
-            external_data::StreamLedger,
             workflow_activation::{
                 self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
@@ -70,7 +70,7 @@ use temporalio_common::{
         temporal::api::{
             command::v1::{Command as ProtoCommand, command::Attributes as ProtoCmdAttrs},
             common::v1::SearchAttributes,
-            enums::v1::EventType,
+            enums::v1::{CommandType, EventType},
             history::v1::{HistoryEvent, history_event},
             protocol::v1::{Message as ProtocolMessage, message::SequencingId},
             sdk::v1::WorkflowTaskCompletedMetadata,
@@ -400,6 +400,11 @@ impl WorkflowMachines {
         Ok(())
     }
 
+    /// Adds the Records of the next ledgers of the history from the server.
+    pub(crate) fn add_stream_reads(&mut self, reads: ReplayReads) {
+        reads.add_to(&mut self.last_history_from_server);
+    }
+
     /// Let this workflow know that something we've been waiting locally on has resolved, like a
     /// local activity or side effect
     ///
@@ -466,6 +471,25 @@ impl WorkflowMachines {
     /// Returns true once the ledger of the task has no room for a result that waits.
     pub(crate) fn stream_must_complete(&self) -> bool {
         (self.stream_calls).must_complete(self.local_activity_data.current_activation_index())
+    }
+
+    /// Returns true if only Stream reads hold the Workflow Task open.
+    pub(crate) fn holds_only_stream_reads(&self) -> bool {
+        self.outstanding_local_activity_count() == 0 && self.stream_calls.holds_only_reads()
+    }
+
+    /// Returns true if only Stream reads hold the task while it has a command, a message or a
+    /// close intent for the server, which must not wait for a read.
+    pub(crate) fn must_complete_before_stream_reads(&self) -> bool {
+        if !self.holds_only_stream_reads() {
+            return false;
+        }
+        // A marker asks the server for nothing.
+        let has_command = (self.commands.iter()).any(|c| {
+            !self.machine(c.machine).is_final_state()
+                && c.command.command_type() != CommandType::RecordMarker
+        });
+        has_command || !self.message_outbox.is_empty() || self.stream_calls.has_intents()
     }
 
     /// Returns start info for the workflow if it has started
@@ -688,7 +712,7 @@ impl WorkflowMachines {
         }
         let mut metadata = flags.gather_for_wft_complete();
         if let Some(ledger) = self.stream_calls.take_ledger() {
-            metadata.core_stream_calls = ledger.encode_to_vec();
+            metadata.core_stream_calls = encode_ledger(ledger);
         }
         metadata
     }
@@ -971,7 +995,7 @@ impl WorkflowMachines {
         enum DelayedAction {
             LocalActivityMarker(Box<CompleteLocalActivityData>),
             ProtocolMessage(IncomingProtocolMessage),
-            StreamLedger(StreamLedger),
+            StreamLedger(i64, Ledger),
         }
         let mut delayed_actions = vec![];
         // Scan through to the next WFT, searching for any patch / la markers, so that we can
@@ -994,9 +1018,9 @@ impl WorkflowMachines {
             .peek_next_wft_sequence(last_handled_wft_started_id)
         {
             if !e.is_command_event()
-                && let Some(data) = ledger.take()
+                && let Some((event_id, data)) = ledger.take()
             {
-                delayed_actions.push(DelayedAction::StreamLedger(data));
+                delayed_actions.push(DelayedAction::StreamLedger(event_id, data));
             }
             if let Some((patch_id, _)) = e.get_patch_marker_details() {
                 self.encountered_patch_markers.insert(
@@ -1017,7 +1041,7 @@ impl WorkflowMachines {
                     return Err(fatal!("Local activity marker was unparsable: {e:?}"));
                 }
             } else if let Some(data) = peeked_ledger(e) {
-                ledger = Some(data?);
+                ledger = Some((e.event_id, data?));
             } else if let Some(
                 history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(ref atts),
             ) = e.attributes
@@ -1035,7 +1059,8 @@ impl WorkflowMachines {
                 ));
             }
         }
-        delayed_actions.extend(ledger.map(DelayedAction::StreamLedger));
+        delayed_actions
+            .extend(ledger.map(|(event_id, data)| DelayedAction::StreamLedger(event_id, data)));
         for action in delayed_actions {
             match action {
                 DelayedAction::LocalActivityMarker(la_dat) => {
@@ -1055,7 +1080,11 @@ impl WorkflowMachines {
                 DelayedAction::ProtocolMessage(pm) => {
                     self.handle_protocol_message(pm)?;
                 }
-                DelayedAction::StreamLedger(data) => self.stream_calls.peeked(data)?,
+                DelayedAction::StreamLedger(event_id, data) => {
+                    let update = &mut self.last_history_from_server;
+                    let records = ReplayReads::take_from(update, event_id);
+                    self.stream_calls.peeked(data, records)?;
+                }
             }
         }
         self.release_held_local_activity_resolutions_if_idle()?;
@@ -1825,6 +1854,10 @@ impl WorkflowMachines {
                 }
                 WFCommandVariant::AppendToStream(attrs) => self.stream_calls.append(attrs)?,
                 WFCommandVariant::CloseStream(attrs) => self.stream_calls.close(attrs)?,
+                WFCommandVariant::ReadStream(attrs) => self.stream_calls.read(attrs)?,
+                WFCommandVariant::RequestCancelStreamRead(attrs) => {
+                    self.stream_calls.cancel_read(attrs)?
+                }
             }
         }
         Ok(())

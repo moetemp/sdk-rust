@@ -4,7 +4,9 @@ package coresdk.external_data;
 option ruby_package = "Temporalio::Internal::Bridge::Api::ExternalData";
 
 import "google/protobuf/duration.proto";
+import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
+import "temporal/api/stream/v1/message.proto";
 
 // This file defines data that Core might write externally. The first motivating case being
 // storing data in markers in event history. Defining such data as protos provides an easy way
@@ -55,6 +57,10 @@ message StreamLedger {
   repeated StreamCloseIntent close_intents = 1;
   repeated StreamAppendResult appends = 2;
   repeated StreamCloseResult closes = 3;
+  repeated StreamReadResult reads = 4;
+  // The Records of the reads with `records_in_history`, in the order of `reads`, and those of one
+  // read in the order of its Stream.
+  repeated temporal.api.stream.v1.StreamRecord records = 5;
 }
 
 message StreamCloseIntent {
@@ -97,4 +103,37 @@ message StreamCloseResult {
   uint64 activation_index = 2;
   // Unset if the Stream is closed.
   StreamFailure failure = 3;
+}
+
+message StreamReadResult {
+  uint32 seq = 1;
+  string stream_id = 2;
+  // The Store name of the Stream's ref.
+  string store = 3;
+  // The index of the activation, within its Workflow Task, in which Workflow code got the result.
+  uint64 activation_index = 4;
+  // The `from_offset` of the read. A replay reads the Records of a page after it.
+  bytes from_offset = 5;
+  oneof result {
+    StreamReadPage page = 6;
+    StreamFailure failure = 7;
+    // Workflow code cancelled the read before it got the job of the read.
+    google.protobuf.Empty cancelled = 8;
+  }
+}
+
+// A page that a read gave Workflow code.
+message StreamReadPage {
+  // The number of Records in the page.
+  uint32 record_count = 1;
+  // True if the Stream was closed and had no Record after this page.
+  bool done = 2;
+  // The first 16 bytes of the SHA-256 of the Records. It's empty for a read with
+  // `records_in_history`, whose Records are in the ledger, or if the page has no
+  // Record.
+  bytes digest = 3;
+  // The bytes of the Records, each as a page of a read encodes it, with the tag and the length of
+  // its field. That is the measure of the `max_bytes` of a read. It's set when `digest` is, so a
+  // replay knows how much it reads.
+  uint64 record_bytes = 4;
 }
