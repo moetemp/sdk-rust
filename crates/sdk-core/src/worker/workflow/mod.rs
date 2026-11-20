@@ -385,6 +385,7 @@ impl Workflows {
                         messages,
                         query_responses,
                         force_new_wft,
+                        leaves_worker,
                         sdk_metadata,
                         mut versioning_behavior,
                         attempt,
@@ -429,7 +430,7 @@ impl Workflows {
                         .workflow_task_completion_size_limit(),
                     resource_id: format!("workflow:{workflow_id}"),
                 };
-                let sticky_attrs = self.sticky_attrs.clone();
+                let sticky_attrs = self.sticky_attrs.clone().filter(|_| !leaves_worker);
                 // Do not return new WFT if we would not cache, because returned new WFTs are
                 // always partial.
                 if sticky_attrs.is_none() {
@@ -1203,6 +1204,9 @@ pub(crate) enum ActivationAction {
         messages: Vec<ProtocolMessage>,
         query_responses: Vec<QueryResult>,
         force_new_wft: bool,
+        /// True if a shutdown stopped the reads of the run, so the next task goes to the normal
+        /// task queue instead of the sticky one, for another Worker.
+        leaves_worker: bool,
         sdk_metadata: WorkflowTaskCompletedMetadata,
         versioning_behavior: VersioningBehavior,
         attempt: u32,
@@ -1630,6 +1634,8 @@ enum WFCommandVariant {
     UpdateResponse(UpdateResponse),
     ScheduleNexusOperation(ScheduleNexusOperation),
     RequestCancelNexusOperation(RequestCancelNexusOperation),
+    StartStreamRead(StartStreamRead),
+    CloseStreamRead(CloseStreamRead),
     AppendToStream(AppendToStream),
     CloseStream(CloseStream),
 }
@@ -1693,6 +1699,8 @@ impl TryFrom<WorkflowCommand> for WFCommand {
             workflow_command::Variant::RequestCancelNexusOperation(s) => {
                 WFCommandVariant::RequestCancelNexusOperation(s)
             }
+            workflow_command::Variant::StartStreamRead(s) => WFCommandVariant::StartStreamRead(s),
+            workflow_command::Variant::CloseStreamRead(s) => WFCommandVariant::CloseStreamRead(s),
             workflow_command::Variant::AppendToStream(s) => WFCommandVariant::AppendToStream(s),
             workflow_command::Variant::CloseStream(s) => WFCommandVariant::CloseStream(s),
         };
@@ -1774,7 +1782,14 @@ pub(crate) enum WFMachinesError {
     /// Lang gets the message as it is, so that of an outage starts with `StreamStoreUnavailable:`.
     #[error("{0}")]
     Stream(String),
+    /// A replay whose Store no longer has the Records of a read as the first run read them.
+    #[error("{0}")]
+    StreamReplay(String),
 }
+
+/// The type of the failure of a [`WFMachinesError::StreamReplay`], which can fail the Workflow.
+/// It's a fact of the format of that failure, which History keeps.
+const STREAM_REPLAY_ERROR_TYPE: &str = "StreamReplayError";
 
 /// Helper macro to create Nondeterminism errors
 ///
@@ -1808,12 +1823,14 @@ impl WFMachinesError {
     fn evict_reason(&self) -> EvictionReason {
         match self {
             WFMachinesError::Nondeterminism(_) => EvictionReason::Nondeterminism,
-            WFMachinesError::Fatal(_) | WFMachinesError::Stream(_) => EvictionReason::Fatal,
+            WFMachinesError::Fatal(_)
+            | WFMachinesError::Stream(_)
+            | WFMachinesError::StreamReplay(_) => EvictionReason::Fatal,
         }
     }
 
     fn as_failure(&self) -> Failure {
-        Failure {
+        let mut failure = Failure {
             failure: Some(
                 temporalio_common::protos::temporal::api::failure::v1::Failure::application_failure(
                     self.to_string(),
@@ -1821,8 +1838,22 @@ impl WFMachinesError {
                 ),
             ),
             force_cause: WorkflowTaskFailedCause::from(self.evict_reason()) as i32,
+        };
+        if let WFMachinesError::StreamReplay(_) = self
+            && let Some(FailureInfo::ApplicationFailureInfo(info)) =
+                (failure.failure.as_mut()).and_then(|failure| failure.failure_info.as_mut())
+        {
+            info.r#type = STREAM_REPLAY_ERROR_TYPE.to_string();
         }
+        failure
     }
+}
+
+/// Returns true for the failure of a [`WFMachinesError::StreamReplay`].
+fn is_stream_replay_failure(failure: &Failure) -> bool {
+    let info = (failure.failure.as_ref()).and_then(|failure| failure.failure_info.as_ref());
+    matches!(info, Some(FailureInfo::ApplicationFailureInfo(info))
+        if info.r#type == STREAM_REPLAY_ERROR_TYPE)
 }
 
 impl From<MachineError<WFMachinesError>> for WFMachinesError {
@@ -1927,7 +1958,8 @@ fn prepare_to_ship_activation(wfa: &mut WorkflowActivation) {
                 workflow_activation_job::Variant::DoUpdate(_) => 3,
                 workflow_activation_job::Variant::ResolveActivity(ra) if ra.is_local => 5,
                 workflow_activation_job::Variant::ResolveStreamAppend(_)
-                | workflow_activation_job::Variant::ResolveStreamClose(_) => 5,
+                | workflow_activation_job::Variant::ResolveStreamClose(_)
+                | workflow_activation_job::Variant::ResolveStreamRead(_) => 5,
                 // In principle we should never actually need to sort these with the others, since
                 // queries always get their own activation, but, maintaining the semantic is
                 // reasonable.

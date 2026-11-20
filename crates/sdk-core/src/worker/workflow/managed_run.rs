@@ -14,6 +14,7 @@ use crate::{
             WFCommand, WFCommandVariant, WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION,
             WFTReportStatus, WftFailureKind, WorkflowTaskInfo,
             history_update::HistoryPaginator,
+            is_stream_replay_failure,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
             streams::{Streams, task_attempt},
         },
@@ -523,26 +524,34 @@ impl ManagedRun {
             // applying the completion to machines. If we can't, return early indicating we need
             // to fetch a page.
             if !self.wfm.ready_to_apply_next_wft() {
-                return if let Some(paginator) = self.paginator.take() {
-                    debug!("Need to fetch a history page before next WFT can be applied");
-                    self.completion_waiting_on_page_fetch = Some(rac);
-                    Err(Box::new(NextPageReq {
-                        paginator,
-                        span: Span::current(),
-                    }))
-                } else {
-                    Ok(self.update_to_acts(Err(RunUpdateErr {
-                        source: WFMachinesError::Fatal(
-                            "Run's paginator was absent when attempting to fetch next history \
-                                page. This is a Core SDK bug."
-                                .to_string(),
-                        ),
-                        complete_resp_chan: rac.resp_chan,
-                    })))
-                };
+                return self.wait_for_page(rac);
             }
 
-            Ok(self.process_completion(rac))
+            self.process_completion(rac)
+        }
+    }
+
+    /// Makes `rac` wait for the next page of History, and returns the request for that page.
+    fn wait_for_page(
+        &mut self,
+        rac: RunActivationCompletion,
+    ) -> Result<RunUpdateAct, Box<NextPageReq>> {
+        if let Some(paginator) = self.paginator.take() {
+            debug!("Need to fetch a history page before next WFT can be applied");
+            self.completion_waiting_on_page_fetch = Some(rac);
+            Err(Box::new(NextPageReq {
+                paginator,
+                span: Span::current(),
+            }))
+        } else {
+            Ok(self.update_to_acts(Err(RunUpdateErr {
+                source: WFMachinesError::Fatal(
+                    "Run's paginator was absent when attempting to fetch next history \
+                        page. This is a Core SDK bug."
+                        .to_string(),
+                ),
+                complete_resp_chan: rac.resp_chan,
+            })))
         }
     }
 
@@ -586,9 +595,9 @@ impl ManagedRun {
         &mut self,
         update: HistoryUpdate,
         paginator: HistoryPaginator,
-    ) -> RunUpdateAct {
+    ) -> Result<RunUpdateAct, Box<NextPageReq>> {
         let res = self._fetched_page_completion(update, paginator);
-        self.update_to_acts(res.map(Into::into))
+        self.finish_completion(res)
     }
     fn _fetched_page_completion(
         &mut self,
@@ -621,7 +630,7 @@ impl ManagedRun {
         failure: workflow_completion::Failure,
         is_auto_fail: bool,
         resp_chan: Option<oneshot::Sender<ActivationCompleteResult>>,
-    ) -> RunUpdateAct {
+    ) -> Result<RunUpdateAct, Box<NextPageReq>> {
         let (tt, attempt) = if let Some(t) = self.wft.as_ref() {
             (t.info.task_token.clone(), t.info.attempt)
         } else {
@@ -630,7 +639,7 @@ impl ManagedRun {
                 self.run_id()
             );
             self.reply_to_complete(ActivationCompleteOutcome::DoNothing, resp_chan);
-            return None;
+            return Ok(None);
         };
 
         let message = format!("Workflow activation completion failed: {:?}", failure);
@@ -663,37 +672,46 @@ impl ManagedRun {
             WftFailureKind::LegacyQuery
         };
 
+        // A lang failure of the type of a Stream replay error doesn't count as one.
+        let error_type = if matches!(cause, WorkflowTaskFailedCause::NonDeterministicError) {
+            Some(WorkflowErrorType::Nondeterminism)
+        } else if is_auto_fail && is_stream_replay_failure(&failure) {
+            Some(WorkflowErrorType::StreamReplay)
+        } else {
+            None
+        };
         // Check if we should fail the workflow instead of the WFT because of user's preferences.
         // Only done on the first attempt: if that attempt's completion didn't reach the server,
         // later attempts fall through to the normal task failure path, which won't re-report.
         if kind == WftFailureKind::Task
             && attempt <= 1
-            && matches!(cause, WorkflowTaskFailedCause::NonDeterministicError)
-            && self.config.should_fail_workflow(
-                &self.wfm.machines.workflow_type,
-                &WorkflowErrorType::Nondeterminism,
-            )
+            && let Some(error_type) = error_type
+            && self
+                .config
+                .should_fail_workflow(&self.wfm.machines.workflow_type, &error_type)
         {
-            warn!(failure=?failure, "Failing workflow due to nondeterminism error");
+            match error_type {
+                WorkflowErrorType::Nondeterminism => {
+                    warn!(failure=?failure, "Failing workflow due to nondeterminism error")
+                }
+                WorkflowErrorType::StreamReplay => {
+                    warn!(failure=?failure, "Failing workflow due to a Stream replay error")
+                }
+            }
             // The command that fails the Workflow drops each Stream call, so the outage of one
             // must not fail the task in its place.
             self.streams.manager.cancel_run(self.run_id());
-            return self
-                .successful_completion(
-                    vec![WFCommand::new(WFCommandVariant::FailWorkflow(
-                        FailWorkflowExecution {
-                            failure: failure.failure,
-                        },
-                    ))],
-                    vec![],
-                    VersioningBehavior::Unspecified, // Doesn't matter since we're failing wf
-                    resp_chan,
-                    true,
-                )
-                .unwrap_or_else(|e| {
-                    dbg_panic!("Got next page request when auto-failing workflow: {e:?}");
-                    None
-                });
+            return self.successful_completion(
+                vec![WFCommand::new(WFCommandVariant::FailWorkflow(
+                    FailWorkflowExecution {
+                        failure: failure.failure,
+                    },
+                ))],
+                vec![],
+                VersioningBehavior::Unspecified, // Doesn't matter since we're failing wf
+                resp_chan,
+                true,
+            );
         }
 
         // History gets no marker from a failed task, so none of its Stream results may reach
@@ -713,7 +731,7 @@ impl ManagedRun {
             ))),
             resp_chan,
         );
-        rur
+        Ok(rur)
     }
 
     /// Must be called after the processing of the activation completion and WFT reporting.
@@ -757,9 +775,26 @@ impl ManagedRun {
         self.update_to_acts(res.map(Into::into))
     }
 
-    fn process_completion(&mut self, completion: RunActivationCompletion) -> RunUpdateAct {
+    fn process_completion(
+        &mut self,
+        completion: RunActivationCompletion,
+    ) -> Result<RunUpdateAct, Box<NextPageReq>> {
         let res = self._process_completion(completion, None);
-        self.update_to_acts(res.map(Into::into))
+        self.finish_completion(res)
+    }
+
+    fn finish_completion(
+        &mut self,
+        res: Result<Option<FulfillableActivationComplete>, RunUpdateErr>,
+    ) -> Result<RunUpdateAct, Box<NextPageReq>> {
+        let acts = match self.completion_waiting_on_page_fetch {
+            None => self.update_to_acts(res.map(Into::into)),
+            Some(_) => None,
+        };
+        match self.completion_waiting_on_page_fetch.take() {
+            Some(rac) => self.wait_for_page(rac),
+            None => Ok(acts),
+        }
     }
 
     fn _process_completion(
@@ -795,6 +830,7 @@ impl ManagedRun {
             )));
         }
 
+        let mut waits_for_page = false;
         let outcome = (|| {
             // A forced task for a call that waits on a dead Store would only add events, so the
             // task fails at its heartbeat and the server tries it again.
@@ -807,12 +843,17 @@ impl ManagedRun {
             // another activation and mark it if so
             self.wfm.push_commands_and_iterate(completion.commands)?;
             if let Some(update) = update_from_new_page {
-                self.wfm.feed_history_from_new_page(update)?;
+                self.wfm.feed_history_from_new_page(update);
             }
             // Don't bother applying the next task if we're evicting at the end of this activation
             // or are otherwise broken.
             if !completion.activation_was_eviction && !self.am_broken {
                 self.wfm.apply_next_task_if_ready()?;
+                waits_for_page =
+                    !self.wfm.machines.activation_needed() && !self.wfm.ready_to_apply_next_wft();
+                if waits_for_page {
+                    return Ok(None);
+                }
             }
             let mut new_local_acts = self.wfm.drain_queued_local_activities();
             self.stamp_dispatching_task(&mut new_local_acts);
@@ -837,6 +878,22 @@ impl ManagedRun {
             }
         })();
 
+        if waits_for_page {
+            self.completion_waiting_on_page_fetch = Some(RunActivationCompletion {
+                task_token: data.task_token,
+                start_time: completion.start_time,
+                commands: vec![],
+                activation_was_eviction: false,
+                has_pending_query: data.has_pending_query,
+                query_responses: data.query_responses,
+                used_flags: vec![],
+                is_forced_failure: data.is_forced_failure,
+                resp_chan: completion.resp_chan,
+                versioning_behavior: data.versioning_behavior,
+            });
+            return Ok(None);
+        }
+
         match outcome {
             Ok(None) => {
                 if let Some(waiting) = self.waiting_on_la.take() {
@@ -852,8 +909,14 @@ impl ManagedRun {
                 if let Some(wola) = self.waiting_on_la.as_mut() {
                     wola.hb_timeout_handle.abort();
                 }
-                let must_complete = self.wfm.machines.stream_must_complete();
-                if completing_la_heartbeat || !data.query_responses.is_empty() || must_complete {
+                let early = (self.wfm.machines.stream_must_complete())
+                    .then_some(EarlyCompletion::MarkerFull)
+                    .or((self.wfm.machines.must_complete_before_stream_reads())
+                        .then_some(EarlyCompletion::ForServer));
+                if early.is_some() {
+                    self.complete_stream_task();
+                }
+                if completing_la_heartbeat || !data.query_responses.is_empty() || early.is_some() {
                     // Reporting a query while an LA is still running must request another WFT;
                     // otherwise the LA could resolve without a task on which to deliver its job.
                     let hb_timeout_handle = sink_heartbeat_timeout_start(
@@ -872,7 +935,8 @@ impl ManagedRun {
                         // needs to be honored after those jobs are processed.
                         completion_pending: completion_pending
                             .or(completing_heartbeat_autocomplete
-                                .then_some(EarlyCompletion::Heartbeat)),
+                                .then_some(EarlyCompletion::Heartbeat))
+                            .or(early),
                     });
                     Ok(Some(self.prepare_complete_resp(
                         completion.resp_chan,
@@ -1028,6 +1092,26 @@ impl ManagedRun {
             || (after_other_tasks && has_stream_work)
     }
 
+    /// Completes a Workflow Task that only Stream reads hold open, at a graceful shutdown, which
+    /// would wait for them otherwise. The reads stop with no end, and another Worker goes on with
+    /// each from History.
+    pub(super) fn end_reads_for_shutdown(&mut self) -> RunUpdateAct {
+        if self.activation.is_some()
+            || self.wft.is_none()
+            || self.trying_to_evict.is_some()
+            || !self.wfm.machines.holds_only_stream_reads()
+        {
+            return None;
+        }
+        if let Some(waiting) = self.waiting_on_la.take() {
+            waiting.hb_timeout_handle.abort();
+        }
+        self.wfm.machines.stream_calls.park_reads();
+        self.dispatch_stream_calls();
+        let run_id = self.run_id().to_string();
+        self.update_to_acts(Ok(Some(ActivationOrAuto::Autocomplete { run_id }).into()))
+    }
+
     /// Stops the Stream calls of the run, and evicts it. The run that replaces it takes `work`,
     /// and replays from History what the other attempt or Worker recorded.
     pub(super) fn evict_for_foreign_task(&mut self, work: PermittedWFT) -> RunUpdateAct {
@@ -1059,7 +1143,7 @@ impl ManagedRun {
                 true,
                 c.resp_chan,
             );
-            return EvictionRequestResult::EvictionRequested(run_upd);
+            return EvictionRequestResult::EvictionRequested(run_upd.unwrap_or_default());
         }
 
         if !self.activation_is_eviction() && self.trying_to_evict.is_none() {
@@ -1236,6 +1320,7 @@ impl ManagedRun {
                     } else {
                         WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
                     };
+                    // `finish_completion` needs the paginator to fetch a parked failure's page.
                     self.failed_completion(
                         fail_cause,
                         fail.source.evict_reason(),
@@ -1243,6 +1328,10 @@ impl ManagedRun {
                         true,
                         Some(resp_chan),
                     )
+                    .unwrap_or_else(|npr| {
+                        self.paginator = Some(npr.paginator);
+                        None
+                    })
                 } else {
                     warn!(error=?fail.source, "Error while updating workflow");
                     Some(ActivationOrAuto::AutoFail {
@@ -1292,6 +1381,8 @@ impl ManagedRun {
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
         // An evicted run with an open Stream call completes its task, and doesn't let it time out.
         let stream_calls_open = self.wfm.machines.stream_calls.needs_next_task();
+        // A task whose reads a shutdown stopped skips the sticky queue, for another Worker.
+        let leaves_worker = self.wfm.machines.stream_calls.has_parked_reads();
         let has_stream_marker = self.wfm.machines.stream_calls.has_marker();
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
         let eviction_has_output = can_report_eviction
@@ -1346,6 +1437,7 @@ impl ManagedRun {
                 workflow_id,
                 action: ActivationAction::WftComplete {
                     force_new_wft,
+                    leaves_worker,
                     commands,
                     messages,
                     query_responses,
@@ -1612,8 +1704,11 @@ struct WaitingOnLAs {
 enum EarlyCompletion {
     /// The heartbeat of the task fired.
     Heartbeat,
-    /// The Stream marker of the task has no room for the next result.
+    /// The Stream marker of the task, or its room for Records, has no space for the next result.
     MarkerFull,
+    /// Only Stream reads hold the task, and it has a command, a message or a close intent for the
+    /// server, which must not wait for a read.
+    ForServer,
 }
 #[derive(Debug)]
 struct CompletionDataForWFT {
@@ -1670,8 +1765,9 @@ impl WorkflowManager {
     }
 
     /// Update the machines with some events from fetching another page of history. Does *not*
-    /// attempt to pull the next activation, unlike [Self::new_work_from_server].
-    fn feed_history_from_new_page(&mut self, update: HistoryUpdate) -> Result<()> {
+    /// attempt to pull the next activation, unlike [Self::new_work_from_server]. The caller
+    /// applies the next WFT once the current one needs no more activations.
+    fn feed_history_from_new_page(&mut self, update: HistoryUpdate) {
         self.machines.new_history_from_server(update)
     }
 
@@ -1719,6 +1815,9 @@ impl WorkflowManager {
             {
                 // Keep applying tasks while there are events, we are still replaying, and no
                 // activation is needed
+                break;
+            }
+            if !self.machines.ready_to_apply_next_wft() {
                 break;
             }
         }

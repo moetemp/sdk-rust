@@ -50,8 +50,8 @@ import "temporal/sdk/core/nexus/nexus.proto";
 //  this to ensure the LA resolution happens after that cancel (or whatever else it may be) as it
 //  normally would have when executing.
 // * The results of Stream calls go after the local activity resolutions for the same reason, the
-//  appends by `seq` and then the closes by `seq`. A replay that gives the results of several
-//  activations in one keeps the order of those activations.
+//  appends by `seq`, then the closes by `seq`, and then the pages of reads by `seq`. A replay that
+//  gives the results of several activations in one keeps the order of those activations.
 // * Queries always go last (and, in fact, always come in their own activation)
 // * Evictions also always come in their own activation
 //
@@ -147,6 +147,8 @@ message WorkflowActivationJob {
         ResolveNexusOperationStart resolve_nexus_operation_start = 15;
         // A nexus operation resolved.
         ResolveNexusOperation resolve_nexus_operation = 16;
+        // A read of a Stream returned Records, ended, or both.
+        ResolveStreamRead resolve_stream_read = 17;
         // An append to a Stream finished.
         ResolveStreamAppend resolve_stream_append = 18;
         // A close of a Stream finished.
@@ -435,6 +437,23 @@ message RemoveFromCache {
         WORKFLOW_EXECUTION_ENDING = 10;
     }
     EvictionReason reason = 2;
+}
+
+message ResolveStreamRead {
+    // The `seq` of the `StartStreamRead`.
+    uint32 seq = 1;
+    // The Records in Stream order. It's empty in a job that only ends the read.
+    repeated temporal.api.stream.v1.StreamRecord records = 2;
+    // Set in the last job of the read.
+    StreamReadEnd end = 3;
+}
+
+message StreamReadEnd {
+    // True if the Stream is closed and the read returned its last Record. False if the read ended
+    // because no Record came within its idle timeout.
+    bool done = 1;
+    // Set if the read failed. It has the parts of the `failed` of a `ResolveStreamAppend`.
+    temporal.api.failure.v1.Failure failed = 2;
 }
 
 // The result of an `AppendToStream`. Core gives each result in the next activation after it comes,

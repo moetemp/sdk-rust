@@ -1,6 +1,8 @@
 //! The Stream calls of Workflow code, through a Worker on a mock server. The mock server writes the
 //! History of each completion, so a replay Worker can replay it.
 
+mod reads;
+
 use super::stream_store::{MemoryStore, Op, Request};
 use crate::{
     StreamRuntimes, StreamSettings, Worker, WorkerConfig, WorkflowErrorType, init_replay_worker,
@@ -10,7 +12,7 @@ use crate::{
         MockPollCfg, MocksHolder, NAMESPACE, PollWFTRespExt, ResponseType, WorkerExt,
         build_mock_pollers, hist_to_poll_resp, mock_worker, test_worker_cfg,
     },
-    worker::client::{WorkflowTaskCompletion, mocks::mock_worker_client},
+    worker::client::{MockWorkerClient, WorkflowTaskCompletion, mocks::mock_worker_client},
 };
 use futures_util::{StreamExt, stream};
 use parking_lot::Mutex;
@@ -28,7 +30,7 @@ use temporalio_common::protos::{
     coresdk::{
         external_data::{
             StreamAppendOffsets, StreamAppendResult, StreamCloseIntent, StreamCloseResult,
-            StreamMarkerData, stream_append_result,
+            StreamMarkerData, StreamReadEntry, stream_append_result,
         },
         workflow_activation::{
             ResolveStreamAppend, ResolveStreamClose, StreamAppended, WorkflowActivation,
@@ -38,8 +40,8 @@ use temporalio_common::protos::{
         workflow_commands::{
             AppendToStream, CancelWorkflowExecution, CloseStream, CompleteWorkflowExecution,
             ContinueAsNewWorkflowExecution, FailWorkflowExecution, QueryResult, QuerySuccess,
-            ScheduleLocalActivity, StartTimer, UpdateResponse, query_result, update_response,
-            workflow_command::Variant as Command,
+            ScheduleLocalActivity, StartStreamRead, StartTimer, UpdateResponse, query_result,
+            update_response, workflow_command::Variant as Command,
         },
         workflow_completion::WorkflowActivationCompletion,
     },
@@ -48,10 +50,14 @@ use temporalio_common::protos::{
         common::v1::Payload,
         enums::v1::{CommandType, WorkflowTaskFailedCause},
         failure::v1::Failure,
-        history::v1::MarkerRecordedEventAttributes,
+        history::v1::{
+            History, HistoryEvent, MarkerRecordedEventAttributes,
+            UpsertWorkflowSearchAttributesEventAttributes, history_event,
+        },
         query::v1::WorkflowQuery,
         workflowservice::v1::{
-            PollWorkflowTaskQueueResponse, RespondWorkflowTaskCompletedResponse,
+            GetWorkflowExecutionHistoryResponse, PollWorkflowTaskQueueResponse,
+            RespondWorkflowTaskCompletedResponse,
         },
     },
 };
@@ -60,8 +66,9 @@ use temporalio_streams::{
     StreamError, StreamRuntime, StreamStore,
     attempt::producer_key,
     proto::{
-        AppendRecord, AppendRecordsRequest, CreateStreamRequest, Producer, StreamRef,
-        WorkflowProducer, WorkflowTaskAttempt, producer::Kind as ProducerKind,
+        AppendRecord, AppendRecordsRequest, ClientProducer, CreateStreamRequest, Producer,
+        StreamRecord, StreamRef, WorkflowProducer, WorkflowTaskAttempt,
+        producer::Kind as ProducerKind,
     },
     record::StoreLimits,
     workflow::marker_details,
@@ -142,7 +149,11 @@ struct StartOpts {
     refuse: Option<usize>,
     /// The failed Workflow Tasks that the server gets.
     fails: usize,
-    configure: fn(&mut WorkerConfig),
+    /// The pages of History that the client fetches, in order.
+    pages: Vec<GetWorkflowExecutionHistoryResponse>,
+    configure: Box<dyn FnOnce(&mut WorkerConfig)>,
+    /// The generated input that the run comes from, for the message of a failed task.
+    label: String,
 }
 
 impl StartOpts {
@@ -157,7 +168,9 @@ impl StartOpts {
             replay: false,
             refuse: None,
             fails: 0,
-            configure: |_| {},
+            pages: vec![],
+            configure: Box::new(|_| {}),
+            label: String::new(),
         }
     }
 }
@@ -186,7 +199,9 @@ fn start(t: TestHistoryBuilder, opts: StartOpts) -> Run {
         replay,
         refuse,
         fails,
+        pages,
         configure,
+        label,
     } = opts;
     let sent = Arc::new(Mutex::new(vec![]));
     let failed = Arc::new(Mutex::new(vec![]));
@@ -249,7 +264,7 @@ fn start(t: TestHistoryBuilder, opts: StartOpts) -> Run {
         let message = failure.as_ref().map(|f| f.message.clone());
         let mut failed = kept.lock();
         failed.push((*cause, message.unwrap_or_default()));
-        assert!(failed.len() <= fails, "A task failed: {failed:?}");
+        assert!(failed.len() <= fails, "A task failed: {failed:?} {label}");
     };
     let from_channel = tasks.is_some();
     let mut mock = match tasks {
@@ -258,6 +273,7 @@ fn start(t: TestHistoryBuilder, opts: StartOpts) -> Run {
             cfg.make_poll_stream_interminable = true;
             cfg.num_expected_completions = Some((0..).into());
             cfg.num_expected_fails = fails;
+            expect_pages(&mut cfg.mock_client, pages);
             cfg.completion_mock_fn = Some(Box::new(complete));
             cfg.expect_fail_wft_matcher = Box::new(move |_, cause, failure| {
                 fail(cause, failure);
@@ -280,6 +296,7 @@ fn start(t: TestHistoryBuilder, opts: StartOpts) -> Run {
                     Ok(Default::default())
                 },
             );
+            expect_pages(&mut client, pages);
             MocksHolder::from_wft_stream(client, input)
         }
     };
@@ -299,6 +316,24 @@ fn start(t: TestHistoryBuilder, opts: StartOpts) -> Run {
         failed,
         history,
         all_taken: all_taken.filter(|_| from_channel),
+    }
+}
+
+/// Returns the one page of a History with `events`.
+fn page(events: &[HistoryEvent]) -> GetWorkflowExecutionHistoryResponse {
+    GetWorkflowExecutionHistoryResponse {
+        history: Some(History {
+            events: events.to_vec(),
+        }),
+        ..Default::default()
+    }
+}
+
+fn expect_pages(client: &mut MockWorkerClient, pages: Vec<GetWorkflowExecutionHistoryResponse>) {
+    for page in pages {
+        (client.expect_get_workflow_execution_history())
+            .times(1)
+            .returning(move |_, _, _| Ok(page.clone()));
     }
 }
 
@@ -338,7 +373,16 @@ fn close_intent(stream_id: &str) -> StreamMarkerData {
 /// Adds the events of a completion that the server took to `history`.
 fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) {
     history.add_workflow_task_completed();
+    // A replay decides some commands by the flags that the completion used, such as a patch's
+    // search attribute.
+    let event = history.last_event().map(|event| event.attributes.as_mut());
+    if let Some(Some(history_event::Attributes::WorkflowTaskCompletedEventAttributes(attrs))) =
+        event
+    {
+        attrs.sdk_metadata = Some(completion.sdk_metadata.clone());
+    }
     let completed = history.current_event_id();
+    let mut accepted = HashMap::new();
     for command in &completion.commands {
         match command.attributes.as_ref() {
             Some(Attributes::RecordMarkerCommandAttributes(marker)) => {
@@ -352,6 +396,12 @@ fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) 
             Some(Attributes::StartTimerCommandAttributes(timer)) => {
                 history.add_timer_started(timer.timer_id.clone());
             }
+            Some(Attributes::UpsertWorkflowSearchAttributesCommandAttributes(upsert)) => {
+                history.add(UpsertWorkflowSearchAttributesEventAttributes {
+                    workflow_task_completed_event_id: completed,
+                    search_attributes: upsert.search_attributes.clone(),
+                });
+            }
             Some(Attributes::CompleteWorkflowExecutionCommandAttributes(_)) => {
                 history.add_workflow_execution_completed();
             }
@@ -364,8 +414,22 @@ fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) 
             Some(Attributes::ContinueAsNewWorkflowExecutionCommandAttributes(_)) => {
                 history.add_continued_as_new();
             }
-            // No test replays an Update.
-            Some(Attributes::ProtocolMessageCommandAttributes(_)) => {}
+            // A rejected Update leaves no event.
+            Some(Attributes::ProtocolMessageCommandAttributes(command)) => {
+                let message = (completion.messages.iter())
+                    .find(|message| message.id == command.message_id)
+                    .expect("A protocol command has its message");
+                let id = &message.protocol_instance_id;
+                match message.body.as_ref().map(|body| body.type_url.as_str()) {
+                    Some("type.googleapis.com/temporal.api.update.v1.Acceptance") => {
+                        accepted.insert(id, history.add_update_accepted(id, "update_fn"));
+                    }
+                    Some("type.googleapis.com/temporal.api.update.v1.Response") => {
+                        history.add_update_completed(accepted[id]);
+                    }
+                    _ => {}
+                }
+            }
             other => panic!("The mock server can't write {other:?}"),
         }
     }
@@ -653,6 +717,12 @@ impl EndingCall {
         match self.op {
             Op::Append => append(self.seq, &self.stream),
             Op::Close => close(self.seq, &self.stream),
+            Op::Read => StartStreamRead {
+                seq: self.seq,
+                stream: Some(stream(&self.stream)),
+                ..Default::default()
+            }
+            .into(),
         }
     }
 
@@ -714,6 +784,9 @@ impl Ending {
             let state = [Taken, Answered, Runs][rng.random_range(0..3)];
             add(&mut calls, Op::Append, state);
         }
+        for _ in 0..rng.random_range(0..=2) {
+            add(&mut calls, Op::Read, Runs);
+        }
         // With no result to take, the Signal's activation is the last one.
         if calls.iter().all(|call| call.state != Taken) {
             for call in &mut calls[in_history..] {
@@ -721,7 +794,7 @@ impl Ending {
             }
         }
         for _ in 0..rng.random_range(0..=2) {
-            let op = [Op::Append, Op::Close][rng.random_range(0..2)];
+            let op = [Op::Append, Op::Close, Op::Read][rng.random_range(0..3)];
             add(&mut calls, op, WithTheCommand);
         }
         // A failed completion has no command.
@@ -831,9 +904,9 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
         }
         let mut opts = StartOpts::new(&store);
         opts.served = None;
-        opts.configure = |wc| {
+        opts.configure = Box::new(|wc| {
             wc.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
-        };
+        });
         let run = start(ending.history(), opts);
         let worker = &run.worker;
         let mut live = vec![];
@@ -928,6 +1001,7 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
             .map(|request| match request {
                 Request::Append(append) => (Op::Append, append.stream_id),
                 Request::Close(close) => (Op::Close, close.stream_id),
+                Request::Read(read) => (Op::Read, read.stream_id),
             })
             .collect();
         requests.sort();
@@ -951,12 +1025,13 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
             .await;
         assert_eq!(replayed, live, "seed {seed}: {ending:?}");
     }
-    // The seeds reach each state of a call, for an append and for a close.
+    // The seeds reach each state of a call, for each kind of call.
     let states = [Taken, Answered, Runs, WithTheCommand];
     let mut expected: HashSet<(Op, u8)> = (states.iter())
         .flat_map(|state| [(Op::Append, *state as u8), (Op::Close, *state as u8)])
         .collect();
     expected.extend([(Op::Close, Waits as u8), (Op::Close, Asked as u8)]);
+    expected.extend([(Op::Read, Runs as u8), (Op::Read, WithTheCommand as u8)]);
     assert_eq!(seen, expected);
 }
 
@@ -965,6 +1040,7 @@ fn written(store: &MemoryStore, call: &EndingCall) -> bool {
     match call.op {
         Op::Append => !store.records(&call.stream).is_empty(),
         Op::Close => store.is_closed(&call.stream),
+        Op::Read => false,
     }
 }
 
@@ -1005,13 +1081,14 @@ async fn a_call_in_an_outage_fails_its_task_at_the_heartbeat(#[case] outage: Out
     }
     let mut opts = StartOpts::new(&store);
     opts.fails = 1;
-    opts.configure = match outage {
+    let configure: fn(&mut WorkerConfig) = match outage {
         Outage::AppendFailsWithNoLocalActivityManager => |wc| {
             fast_tries(wc);
             wc.task_types = WorkerTaskTypes::workflow_only();
         },
         _ => fast_tries,
     };
+    opts.configure = Box::new(configure);
     let t = history(Duration::from_millis(200));
     let mut attempts = 1;
     if let Outage::AppendFailsOnALaterAttempt = outage {
@@ -1156,7 +1233,7 @@ async fn a_batch_is_written_once_while_the_store_remembers_its_request_id() {
         let store = store(&ids).await;
         store.window.store(window, Ordering::Relaxed);
         let mut opts = StartOpts::new(&store);
-        opts.configure = fast_tries;
+        opts.configure = Box::new(fast_tries);
         let run = start(history(Duration::from_secs(10)), opts);
         // The model of each Stream, as the seqs of its batches in the order that they're written.
         let mut model: HashMap<&str, Vec<u32>> = HashMap::new();
@@ -1210,7 +1287,7 @@ async fn a_batch_is_written_once_while_the_store_remembers_its_request_id() {
                             (append.records[0].body.as_ref().unwrap().data[0] == seq)
                                 .then_some(append.request_id)
                         }
-                        Request::Close(_) => None,
+                        Request::Close(_) | Request::Read(_) => None,
                     });
                     store.write_late(&late.unwrap());
                 }
@@ -1302,7 +1379,7 @@ async fn a_call_in_an_outage_goes_on_when_a_full_marker_completes_its_task() {
     );
     store.hold(Op::Append);
     let mut opts = StartOpts::new(&store);
-    opts.configure = fast_tries;
+    opts.configure = Box::new(fast_tries);
     // Task 2 has a Signal, so that Workflow code gets an activation in it.
     opts.served = Some(Box::new(|number, t| {
         if number == 1 {
@@ -1925,7 +2002,7 @@ async fn a_cached_run_with_no_call_replays_the_marker_of_another_worker() {
     let closes: Vec<_> = (store.requests().into_iter())
         .filter_map(|request| match request {
             Request::Close(close) => Some(writer(close.producer)),
-            Request::Append(_) => None,
+            _ => None,
         })
         .collect();
     let id = producer_key(&producer(&run_id, Default::default())).unwrap();
@@ -2034,15 +2111,17 @@ struct Got {
     after: Option<u32>,
 }
 
-/// The results of task 2, by the seq of their calls. Workflow code asks for the closes in task 1.
-/// It schedules a Local Activity or sends an append at the Signal that starts task 2, which has no
-/// other job, or at the result of a call of the other kind.
+/// The results of task 2, by the seq of their calls. Workflow code asks for the closes in task 1,
+/// and starts the reads at the Signal that starts task 2, which has no other job. It schedules a
+/// Local Activity or sends an append at that Signal, or at the result of a call of the other kind.
 #[derive(Debug)]
 struct Held {
     locals: Vec<Got>,
     appends: Vec<Got>,
     /// The activation in which the first run got the result of each close.
     closes: Vec<u64>,
+    /// The activations of the pages of each read, each with one Record.
+    reads: Vec<Vec<u64>>,
     /// Whether History leaves chunking on, which batches the Local Activity results of a task.
     chunking: bool,
 }
@@ -2055,6 +2134,11 @@ impl Held {
         };
         // A result of a call that Workflow code made at the Signal comes after it.
         let (locals, appends, closes) = (at(3, 1), at(3, 1), at(2, 0));
+        // A read gives at most one page in an activation.
+        let reads = (0..rng.random_range(0..=2))
+            .map(|_| (1..=6).filter(|_| rng.random_bool(0.3)).collect())
+            .filter(|pages: &Vec<u64>| !pages.is_empty())
+            .collect();
         let signal = |activations: &Vec<u64>| -> Vec<Got> {
             let got = |activation| Got {
                 activation,
@@ -2066,6 +2150,7 @@ impl Held {
             locals: signal(&locals),
             appends: signal(&appends),
             closes,
+            reads,
             chunking: false,
         };
         // A call that a result starts gets its own result in a later activation. The calls of a
@@ -2091,7 +2176,8 @@ impl Held {
     }
 
     fn count(&self) -> usize {
-        self.locals.len() + self.appends.len() + self.closes.len()
+        let pages: usize = self.reads.iter().map(Vec::len).sum();
+        self.locals.len() + self.appends.len() + self.closes.len() + pages
     }
 
     /// Returns the History of the first run.
@@ -2139,9 +2225,30 @@ impl Held {
             first_offset: vec![1],
             last_offset: vec![1],
         };
+        let reads = (1..).zip(&self.reads);
+        let read = |(seq, pages): (u32, &Vec<u64>)| StreamReadEntry {
+            seq,
+            stream: self.appends.len() as u32 + seq - 1,
+            page_records: vec![1; pages.len()],
+            page_activations: pages.clone(),
+            records: (1..=pages.len() as u8)
+                .map(|offset| StreamRecord {
+                    producer: Some(Producer {
+                        kind: Some(ProducerKind::Client(ClientProducer {
+                            namespace: NAMESPACE.to_string(),
+                            id: "test".to_string(),
+                        })),
+                    }),
+                    body: Some(Payload::default()),
+                    offset: vec![offset],
+                })
+                .collect(),
+            ..Default::default()
+        };
         let data = StreamMarkerData {
-            streams: seqs(&appends)
-                .map(|(seq, _)| stream(&format!("a{seq}")))
+            streams: (seqs(&appends).map(|(seq, _)| format!("a{seq}")))
+                .chain((1..=self.reads.len()).map(|seq| format!("r{seq}")))
+                .map(|id| stream(&id))
                 .collect(),
             appends: seqs(&appends)
                 .map(|(seq, activation)| StreamAppendResult {
@@ -2158,9 +2265,10 @@ impl Held {
                     failure: None,
                 })
                 .collect(),
+            reads: reads.map(read).collect(),
             ..Default::default()
         };
-        if !data.appends.is_empty() || !data.closes.is_empty() {
+        if !data.appends.is_empty() || !data.closes.is_empty() || !data.reads.is_empty() {
             t.add(MarkerRecordedEventAttributes {
                 marker_name: STREAM_MARKER_NAME.to_string(),
                 details: marker_details(&data),
@@ -2181,9 +2289,13 @@ impl Held {
         let activations = |got: &Vec<Got>| got.iter().map(|got| got.activation).collect();
         let mut task: BTreeMap<u64, Vec<String>> = BTreeMap::new();
         task.entry(0).or_default().push("signal".to_string());
+        let pages = (1..).zip(&self.reads).flat_map(|(seq, pages)| {
+            (pages.iter()).map(move |activation| (*activation, format!("read {seq}")))
+        });
         let results = (named("local activity", activations(&self.locals)))
             .chain(named("append", activations(&self.appends)))
-            .chain(named("close", self.closes.clone()));
+            .chain(named("close", self.closes.clone()))
+            .chain(pages);
         for (activation, name) in results {
             task.entry(activation).or_default().push(name);
         }
@@ -2202,6 +2314,7 @@ fn job_name(job: &Job) -> String {
         Job::ResolveActivity(result) => format!("local activity {}", result.seq),
         Job::ResolveStreamAppend(result) => format!("append {}", result.seq),
         Job::ResolveStreamClose(result) => format!("close {}", result.seq),
+        Job::ResolveStreamRead(page) => format!("read {}", page.seq),
         other => format!("{other:?}"),
     }
 }
@@ -2225,6 +2338,7 @@ async fn a_replay_gives_each_held_result_in_its_activation() {
                 locals: vec![signal(5)],
                 appends: vec![signal(3)],
                 closes: vec![],
+                reads: vec![],
                 chunking: false,
             },
             // The same calls with chunking on, and a second Local Activity result at 2.
@@ -2239,6 +2353,7 @@ async fn a_replay_gives_each_held_result_in_its_activation() {
                     locals: vec![signal(2), signal(5)],
                     appends: vec![signal(3)],
                     closes: vec![],
+                    reads: vec![],
                     chunking: true,
                 }
             }
@@ -2257,6 +2372,16 @@ async fn a_replay_gives_each_held_result_in_its_activation() {
                 .collect()
         };
         let append = |seq| append(seq, &format!("a{seq}"));
+        let read = |seq| {
+            let stream = Some(stream(&format!("r{seq}")));
+            let read = StartStreamRead {
+                seq,
+                stream,
+                records_in_history: true,
+                ..Default::default()
+            };
+            Command::from(read)
+        };
         let mut left = held.count();
         let jobs = replay
             .drive(|activation| {
@@ -2271,6 +2396,7 @@ async fn a_replay_gives_each_held_result_in_its_activation() {
                         Some(Job::SignalWorkflow(_)) => {
                             locals.extend(started(&held.locals, None));
                             appends.extend(started(&held.appends, None));
+                            commands.extend((1..=held.reads.len() as u32).map(read));
                         }
                         Some(Job::ResolveStreamAppend(result)) => {
                             locals.extend(started(&held.locals, Some(result.seq)));

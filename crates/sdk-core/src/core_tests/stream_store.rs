@@ -6,6 +6,7 @@ use parking_lot::Mutex;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
 };
 use temporalio_streams::{
     AnyError, AnyReason, AppendError, AppendReason, CloseError, CloseReason, CreateError,
@@ -19,18 +20,20 @@ use temporalio_streams::{
 };
 use tokio::sync::watch;
 
-/// A write of the Store, which a fault can hit.
+/// A call of the Store, which a fault can hit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(super) enum Op {
     Append,
     Close,
+    Read,
 }
 
-/// A write that the Store got, in the order that it came.
+/// A call that the Store got, in the order that it came.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum Request {
     Append(AppendRecordsRequest),
     Close(CloseStreamRequest),
+    Read(ReadRecordsRequest),
 }
 
 /// A batch that the Store remembers, with the key of its attempt.
@@ -69,10 +72,13 @@ struct State {
 }
 
 /// A Store in memory. It fences an earlier attempt of a Producer, and writes nothing for a resend
-/// of one of the last `window` batches of a Producer of a Stream.
+/// of one of the last `window` batches of a Producer of a Stream. A read with no Record to give
+/// waits for one, or for a close, up to its `wait`.
 pub(super) struct MemoryStore {
     state: Mutex<State>,
     released: watch::Sender<u64>,
+    /// Counts the writes, so that a read that waits wakes at each one.
+    written: watch::Sender<u64>,
     /// The number of the last batches of each Producer of a Stream that the Store remembers.
     pub(super) window: AtomicUsize,
 }
@@ -82,6 +88,7 @@ impl Default for MemoryStore {
         Self {
             state: Mutex::default(),
             released: watch::Sender::default(),
+            written: watch::Sender::default(),
             window: AtomicUsize::new(4),
         }
     }
@@ -99,12 +106,12 @@ impl MemoryStore {
         self.released.send_modify(|count| *count += 1);
     }
 
-    /// Makes each write to the Stream `id` wait for [`Self::release_stream`].
+    /// Makes each append, close and read of the Stream `id` wait for [`Self::release_stream`].
     pub(super) fn hold_stream(&self, id: &str) {
         self.state.lock().held_streams.insert(id.to_string());
     }
 
-    /// Lets each held write to the Stream `id` go on.
+    /// Lets each held call of the Stream `id` go on.
     pub(super) fn release_stream(&self, id: &str) {
         self.state.lock().held_streams.remove(id);
         self.released.send_modify(|count| *count += 1);
@@ -132,6 +139,7 @@ impl MemoryStore {
         let at = (state.late.iter()).position(|request| request.request_id == request_id);
         let request = state.late.remove(at.expect("The append was delayed"));
         let _ = state.append(request, self.window.load(Ordering::Relaxed));
+        self.written.send_modify(|count| *count += 1);
     }
 
     pub(super) fn requests(&self) -> Vec<Request> {
@@ -153,11 +161,27 @@ impl MemoryStore {
         state.streams.get(id).is_some_and(|stream| stream.closed)
     }
 
+    /// Removes the Stream `id`, as its Retention does, so that a replay finds its Records gone.
+    pub(super) fn forget(&self, id: &str) {
+        self.state.lock().streams.remove(id);
+    }
+
+    /// Returns the reads that the Store got.
+    pub(super) fn reads(&self) -> Vec<ReadRecordsRequest> {
+        (self.requests().into_iter())
+            .filter_map(|request| match request {
+                Request::Read(read) => Some(read),
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Takes the request, and then holds or fails it as the faults say.
     async fn arrive(&self, op: Op, request: Request) -> Result<(), AnyError> {
         let id = match &request {
             Request::Append(append) => append.stream_id.clone(),
             Request::Close(close) => close.stream_id.clone(),
+            Request::Read(read) => read.stream_id.clone(),
         };
         let mut released = self.released.subscribe();
         let held = {
@@ -322,6 +346,7 @@ impl StreamStore for MemoryStore {
             }
             let window = self.window.load(Ordering::Relaxed);
             let appended = self.state.lock().append(request, window);
+            self.written.send_modify(|count| *count += 1);
             self.answer(Op::Append, appended)
         })
     }
@@ -331,24 +356,39 @@ impl StreamStore for MemoryStore {
         request: ReadRecordsRequest,
     ) -> BoxFuture<'_, Result<ReadRecordsResponse, ReadError>> {
         Box::pin(async move {
-            let state = self.state.lock();
-            let stream = state.streams.get(&request.stream_id);
-            let stream =
-                stream.ok_or_else(|| ReadError::operation(ReadReason::NotFound, NOT_CREATED))?;
-            let after: Vec<&StreamRecord> = (stream.records.iter())
-                .filter(|record| record.offset > request.from_offset)
-                .collect();
-            let records: Vec<StreamRecord> = (after.iter())
-                .take(request.max_records.max(1) as usize)
-                .map(|record| (*record).clone())
-                .collect();
-            Ok(ReadRecordsResponse {
-                done: stream.closed && records.len() == after.len(),
-                last_offset: records
-                    .last()
-                    .map_or(request.from_offset, |r| r.offset.clone()),
-                records,
-            })
+            self.arrive(Op::Read, Request::Read(request.clone()))
+                .await?;
+            let wait = (request.wait).map_or(Duration::ZERO, |wait| wait.try_into().unwrap());
+            let until = tokio::time::Instant::now() + wait;
+            let mut written = self.written.subscribe();
+            loop {
+                let page = {
+                    let state = self.state.lock();
+                    let stream = state.streams.get(&request.stream_id);
+                    let reason = ReadReason::NotFound;
+                    let stream = stream.ok_or_else(|| ReadError::operation(reason, NOT_CREATED))?;
+                    let after: Vec<&StreamRecord> = (stream.records.iter())
+                        .filter(|record| record.offset > request.from_offset)
+                        .collect();
+                    let records: Vec<StreamRecord> = (after.iter())
+                        .take(request.max_records.max(1) as usize)
+                        .map(|record| (*record).clone())
+                        .collect();
+                    ReadRecordsResponse {
+                        done: stream.closed && records.len() == after.len(),
+                        last_offset: (records.last())
+                            .map_or(request.from_offset.clone(), |r| r.offset.clone()),
+                        records,
+                    }
+                };
+                if !page.records.is_empty() || page.done {
+                    return Ok(page);
+                }
+                let changed = tokio::time::timeout_at(until, written.changed()).await;
+                if changed.is_err() {
+                    return Ok(page);
+                }
+            }
         })
     }
 
@@ -360,6 +400,7 @@ impl StreamStore for MemoryStore {
             self.arrive(Op::Close, Request::Close(request.clone()))
                 .await?;
             let closed = self.state.lock().close(&request);
+            self.written.send_modify(|count| *count += 1);
             self.answer(Op::Close, closed)
         })
     }

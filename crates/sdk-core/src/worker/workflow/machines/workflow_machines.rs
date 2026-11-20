@@ -381,18 +381,18 @@ impl WorkflowMachines {
         self.protocol_msgs = protocol_messages;
         self.preparing_legacy_query = preparing_legacy_query;
         self.update_only_task = false;
-        self.new_history_from_server(update)?;
+        self.new_history_from_server(update);
+        self.apply_next_wft_from_history()?;
         Ok(())
     }
 
-    pub(crate) fn new_history_from_server(&mut self, mut update: HistoryUpdate) -> Result<()> {
+    /// Replaces the history from the server with `update`, without applying its next WFT.
+    pub(crate) fn new_history_from_server(&mut self, mut update: HistoryUpdate) {
         self.note_wft_events(update.get_events());
         update.chunking_disabled |= self.last_history_from_server.chunking_disabled;
         self.last_history_from_server = update;
         self.replaying = self.preparing_legacy_query
             || self.last_history_from_server.previous_wft_started_id > 0;
-        self.apply_next_wft_from_history()?;
-        Ok(())
     }
 
     /// Let this workflow know that something we've been waiting locally on has resolved, like a
@@ -461,6 +461,23 @@ impl WorkflowMachines {
     /// Returns true once the Stream marker of the task has no room for a result that waits.
     pub(crate) fn stream_must_complete(&self) -> bool {
         (self.stream_calls).must_complete(self.local_activity_data.current_activation_index())
+    }
+
+    /// Returns true if only Stream reads hold the Workflow Task open.
+    pub(crate) fn holds_only_stream_reads(&self) -> bool {
+        self.outstanding_local_activity_count() == 0 && self.stream_calls.holds_only_reads()
+    }
+
+    /// Returns true if only Stream reads hold the task while it has a command, a message or a
+    /// close intent for the server, which must not wait for a read.
+    pub(crate) fn must_complete_before_stream_reads(&self) -> bool {
+        // A marker asks the server for nothing.
+        let has_command = (self.commands.iter()).any(|c| {
+            !self.machine(c.machine).is_final_state()
+                && c.command.command_type() != CommandType::RecordMarker
+        });
+        self.holds_only_stream_reads()
+            && (has_command || !self.message_outbox.is_empty() || self.stream_calls.has_intents())
     }
 
     /// Returns start info for the workflow if it has started
@@ -950,7 +967,7 @@ impl WorkflowMachines {
         enum DelayedAction {
             LocalActivityMarker(Box<CompleteLocalActivityData>),
             ProtocolMessage(IncomingProtocolMessage),
-            StreamMarker(StreamMarkerData),
+            StreamMarker(i64, StreamMarkerData),
         }
         let mut delayed_actions = vec![];
         // Scan through to the next WFT, searching for any patch / la markers, so that we can
@@ -987,7 +1004,7 @@ impl WorkflowMachines {
                     return Err(fatal!("Local activity marker was unparsable: {e:?}"));
                 }
             } else if let Some(data) = peeked_marker(e) {
-                delayed_actions.push(DelayedAction::StreamMarker(data?));
+                delayed_actions.push(DelayedAction::StreamMarker(e.event_id, data?));
             } else if let Some(
                 history_event::Attributes::WorkflowExecutionUpdateAcceptedEventAttributes(ref atts),
             ) = e.attributes
@@ -1024,7 +1041,10 @@ impl WorkflowMachines {
                 DelayedAction::ProtocolMessage(pm) => {
                     self.handle_protocol_message(pm)?;
                 }
-                DelayedAction::StreamMarker(data) => self.stream_calls.peeked(data)?,
+                DelayedAction::StreamMarker(event_id, data) => {
+                    let records = self.last_history_from_server.take_stream_reads(event_id);
+                    self.stream_calls.peeked(data, records)?;
+                }
             }
         }
         self.release_held_local_activity_resolutions_if_idle()?;
@@ -1790,6 +1810,8 @@ impl WorkflowMachines {
                 }
                 WFCommandVariant::AppendToStream(attrs) => self.stream_calls.append(attrs)?,
                 WFCommandVariant::CloseStream(attrs) => self.stream_calls.close(attrs)?,
+                WFCommandVariant::StartStreamRead(attrs) => self.stream_calls.start_read(attrs)?,
+                WFCommandVariant::CloseStreamRead(attrs) => self.stream_calls.close_read(attrs)?,
             }
         }
         Ok(())

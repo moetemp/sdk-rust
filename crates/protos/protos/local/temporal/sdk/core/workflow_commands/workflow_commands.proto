@@ -56,6 +56,8 @@ message WorkflowCommand {
         UpdateResponse update_response = 20;
         ScheduleNexusOperation schedule_nexus_operation = 21;
         RequestCancelNexusOperation request_cancel_nexus_operation = 22;
+        StartStreamRead start_stream_read = 23;
+        CloseStreamRead close_stream_read = 24;
         AppendToStream append_to_stream = 25;
         CloseStream close_stream = 26;
     }
@@ -469,4 +471,33 @@ message CloseStream {
     // Lang's incremental sequence number for closes, starting at 1.
     uint32 seq = 1;
     temporal.api.stream.v1.StreamRef stream = 2;
+}
+
+// Reads a Stream. The Records come in `ResolveStreamRead` jobs. One Workflow Task gives at most
+// 16 MiB of Records, and its marker holds at most 1 MiB of them for a read with
+// `records_in_history`, so a fast read spans several tasks.
+//
+// Core stops a read that has no end when the Workflow's last command comes, and lang gets no job
+// for it. Core fails the Workflow Task in the cases that `AppendToStream` lists, and when
+// `from_offset` is longer than 1024 bytes or `idle_timeout` is negative or has its nanoseconds out
+// of range.
+message StartStreamRead {
+    // Lang's incremental sequence number for reads, starting at 1.
+    uint32 seq = 1;
+    temporal.api.stream.v1.StreamRef stream = 2;
+    // The read starts after this offset. If it's empty, the read starts at the beginning of the
+    // Stream.
+    bytes from_offset = 3;
+    // The read ends once no Record comes for this long, which is 1 minute by default. With zero,
+    // the read returns what the Stream has and then ends.
+    google.protobuf.Duration idle_timeout = 4;
+    // If set, each task's marker holds the Records of the read, so a replay doesn't read the
+    // Store.
+    bool records_in_history = 5;
+}
+
+// Stops a read. Lang gets no job for it.
+message CloseStreamRead {
+    // The `seq` of the `StartStreamRead` to stop.
+    uint32 seq = 1;
 }
