@@ -150,6 +150,18 @@ impl LocalActivityData {
         }
     }
 
+    /// Returns the activation index of the next peeked resolution, if its marker has one.
+    pub(super) fn next_resolution_activation(&self) -> Option<u64> {
+        self.preresolutions
+            .front()
+            .and_then(|item| item.activation_index)
+    }
+
+    /// Advances to `activation_index`, for a Stream result that History has at that index.
+    pub(super) fn advance_to_activation(&mut self, activation_index: u64) {
+        self.activation_index = self.activation_index.max(activation_index);
+    }
+
     pub(super) fn current_activation_index(&self) -> u64 {
         self.activation_index
     }
