@@ -1,7 +1,9 @@
+use super::streams::{MarkerReads, ReplayReader, ReplayReads, is_stream_marker};
 use crate::{
     internal_flags::CoreInternalFlags,
     protosext::ValidPollWFTQResponse,
     worker::{
+        WorkerConfig,
         client::WorkerClient,
         workflow::{CacheMissFetchReq, PermittedWFT, PreparedWFT},
     },
@@ -50,6 +52,9 @@ pub(crate) struct HistoryUpdate {
     has_last_wft: bool,
     wft_count: usize,
     pub(super) chunking_disabled: bool,
+    /// The Records that a run new to the cache read for the Stream markers of these events, and
+    /// that the machines haven't peeked yet. It's `None` for a cached run, which reads none.
+    stream_reads: Option<ReplayReads>,
 }
 
 impl Debug for HistoryUpdate {
@@ -73,6 +78,43 @@ impl Debug for HistoryUpdate {
 impl HistoryUpdate {
     pub(crate) fn get_events(&self) -> &[HistoryEvent] {
         self.events.as_slice()
+    }
+
+    /// Returns true if a run new to the cache must read the Records of the Stream markers in these
+    /// events before it replays them.
+    pub(crate) fn needs_stream_records(&self) -> bool {
+        self.stream_reads.is_none() && self.get_events().iter().any(is_stream_marker)
+    }
+
+    /// Takes the Records that were read for the Stream marker event `event_id`.
+    pub(crate) fn take_stream_reads(&mut self, event_id: i64) -> MarkerReads {
+        (self.stream_reads.as_mut()).map_or_else(Vec::new, |reads| reads.take(event_id))
+    }
+
+    /// Adds the Records of the next Stream markers, which a completion waited for.
+    pub(crate) fn add_stream_reads(&mut self, part: ReplayReads) {
+        if let Some(reads) = &mut self.stream_reads {
+            reads.extend(part);
+        }
+    }
+
+    /// Returns true if the WFT sequence after the one that ends at the index `end` of the events
+    /// ends at or after the first Stream marker with no Records yet. The machines peek that
+    /// sequence when they take the one before it, and give its markers their Records.
+    fn peeks_unread_stream_records(&self, end: usize) -> bool {
+        let unread = self.stream_reads.as_ref().and_then(ReplayReads::unread);
+        let (Some(unread), Some(taken)) = (unread, self.get_events().get(end)) else {
+            return false;
+        };
+        let after = &self.get_events()[end + 1..];
+        let peeked_end = find_end_index_of_next_wft_seq(
+            after,
+            taken.event_id,
+            self.has_last_wft || self.ends_at_known_boundary(),
+            self.chunking_disabled,
+        )
+        .index();
+        (after.get(peeked_end)).is_some_and(|last| last.event_id >= unread)
     }
 }
 
@@ -99,6 +141,9 @@ pub(crate) struct HistoryPaginator {
     /// during cache misses, where we got a partial task but need to fetch history from the start.
     final_events: Vec<HistoryEvent>,
     chunking_disabled: bool,
+    /// Set for a run new to the cache, which reads the Records of the Stream markers of its
+    /// History a part at a time.
+    stream_reader: Option<ReplayReader>,
 }
 
 #[derive(Clone, Debug)]
@@ -191,6 +236,7 @@ impl HistoryPaginator {
             next_page_token: NextPageToken::FetchFromStart,
             final_events: req.original_wft.work.update.events.collect(),
             chunking_disabled: false,
+            stream_reader: None,
         };
         let first_update = paginator.extract_next_update().await?;
         req.original_wft.work.update = first_update;
@@ -225,7 +271,44 @@ impl HistoryPaginator {
             wft_started_event_id,
             id_of_last_event_in_last_extracted_update: None,
             chunking_disabled: false,
+            stream_reader: None,
         }
+    }
+
+    /// Makes the paginator read the Records of the Stream markers of its History, for a run new
+    /// to the cache.
+    pub(super) fn read_stream_records_with(&mut self, config: &WorkerConfig) {
+        let runtimes = config.stream_runtimes.clone();
+        self.stream_reader = Some(ReplayReader::new(runtimes));
+    }
+
+    /// Reads the first part of the Records of the Stream markers of `update`, which has the whole
+    /// History, and keeps the markers after it for [`Self::read_next_stream_records`].
+    pub(super) async fn read_stream_records(&mut self, update: &mut HistoryUpdate) {
+        if let Some(reader) = &mut self.stream_reader {
+            reader.queue(update.get_events().iter());
+            update.stream_reads = Some(reader.read_next().await);
+        }
+    }
+
+    /// Reads the next part of the Records, for a completion that waits for them.
+    pub(super) async fn read_next_stream_records(&mut self) -> ReplayReads {
+        match &mut self.stream_reader {
+            Some(reader) => reader.read_next().await,
+            None => ReplayReads::default(),
+        }
+    }
+
+    /// Returns true while a Stream marker of the History has no Records yet.
+    pub(super) fn has_unread_stream_records(&self) -> bool {
+        (self.stream_reader.as_ref()).is_some_and(ReplayReader::has_unread)
+    }
+
+    /// Drops the reader and the Records of `update`. A cached run needs neither, since it gave
+    /// Workflow code each Record of its markers.
+    pub(super) fn forget_stream_records(&mut self, update: &mut HistoryUpdate) {
+        self.stream_reader = None;
+        update.stream_reads = None;
     }
 
     /// Return at least the next two WFT sequences (as determined by the passed-in ID) as a
@@ -453,6 +536,7 @@ impl HistoryUpdate {
             has_last_wft: false,
             wft_count: 0,
             chunking_disabled: false,
+            stream_reads: None,
         }
     }
 
@@ -513,6 +597,7 @@ impl HistoryUpdate {
                         has_last_wft,
                         wft_count: 1,
                         chunking_disabled,
+                        stream_reads: None,
                     },
                     vec![],
                 )
@@ -525,6 +610,7 @@ impl HistoryUpdate {
                         has_last_wft,
                         wft_count: 0,
                         chunking_disabled,
+                        stream_reads: None,
                     },
                     all_events,
                 )
@@ -564,6 +650,7 @@ impl HistoryUpdate {
                 has_last_wft,
                 wft_count,
                 chunking_disabled,
+                stream_reads: None,
             },
             remaining_events,
         )
@@ -666,7 +753,7 @@ impl HistoryUpdate {
         {
             return false;
         }
-        true
+        !self.peeks_unread_stream_records(next_wft_ix.index())
     }
 
     /// Returns the next WFT completed event attributes, if any, starting at (inclusive) the
@@ -889,6 +976,7 @@ fn disables_chunking(event: &HistoryEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::streams::marker_details;
     use super::*;
     use crate::{
         replay::{HistoryInfo, TestHistoryBuilder, canned_histories},
@@ -896,10 +984,19 @@ mod tests {
         worker::client::mocks::mock_worker_client,
     };
     use futures_util::TryStreamExt;
-    use temporalio_common::protos::temporal::api::{
-        common::v1::WorkflowExecution, enums::v1::WorkflowTaskFailedCause,
-        workflowservice::v1::GetWorkflowExecutionHistoryResponse,
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+    use temporalio_common::protos::{
+        constants::STREAM_MARKER_NAME,
+        coresdk::external_data::{
+            StreamMarkerData, StreamReadPage, StreamReadResult, stream_read_result,
+        },
+        temporal::api::{
+            common::v1::WorkflowExecution, enums::v1::WorkflowTaskFailedCause,
+            history::v1::MarkerRecordedEventAttributes,
+            workflowservice::v1::GetWorkflowExecutionHistoryResponse,
+        },
     };
+    use temporalio_streams::proto::StreamRef;
 
     impl From<HistoryInfo> for HistoryUpdate {
         fn from(v: HistoryInfo) -> Self {
@@ -1915,5 +2012,103 @@ mod tests {
         assert_eq!(seq.len(), 3);
         let seq = next_check_peek(&mut update, 3);
         assert_eq!(seq.len(), 3);
+    }
+
+    /// Returns a Stream marker of the completion `completed`, with a read whose Records aren't in
+    /// History.
+    fn stream_marker(completed: i64) -> MarkerRecordedEventAttributes {
+        let stream = StreamRef {
+            id: "s".to_string(),
+            store: "mem".to_string(),
+        };
+        let page = StreamReadPage {
+            record_count: 1,
+            digest: vec![0; 16],
+            record_bytes: 1,
+            ..Default::default()
+        };
+        let read = StreamReadResult {
+            seq: 1,
+            result: Some(stream_read_result::Result::Page(page)),
+            ..Default::default()
+        };
+        let data = StreamMarkerData {
+            streams: vec![stream],
+            reads: vec![read],
+            ..Default::default()
+        };
+        MarkerRecordedEventAttributes {
+            marker_name: STREAM_MARKER_NAME.to_string(),
+            details: marker_details(&data),
+            workflow_task_completed_event_id: completed,
+            ..Default::default()
+        }
+    }
+
+    // The machines take a WFT sequence and peek the one after it, whose Stream markers then get
+    // their Records. So an update gives a sequence only once it has the Records of the next one.
+    #[test]
+    fn an_update_waits_for_the_records_of_the_sequence_that_the_machines_peek() {
+        let (mut waited, mut went_on_before_an_unread_marker) = (0, 0);
+        for seed in 0..500 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let chunking_disabled = rng.random_bool(0.5);
+            let mut t = TestHistoryBuilder::default();
+            t.add_by_type(EventType::WorkflowExecutionStarted);
+            t.add_workflow_task_scheduled_and_started();
+            let mut markers = vec![];
+            for task in 0..rng.random_range(3..12) {
+                match rng.random_range(0..8) {
+                    0 => t.add_workflow_task_failed_with_failure(
+                        WorkflowTaskFailedCause::Unspecified,
+                        Default::default(),
+                    ),
+                    1 => t.add_workflow_task_timed_out(),
+                    kind => {
+                        t.add_workflow_task_completed();
+                        let completed = t.current_event_id();
+                        match kind {
+                            // A task with no command, before a heartbeat or a Signal.
+                            2 => {}
+                            3 => t.add_we_signaled("go", vec![]),
+                            4 => {
+                                t.add_update_accepted(format!("u{task}"), "update");
+                            }
+                            _ => {
+                                markers.push(t.add(stream_marker(completed)));
+                                t.add_timer_started(task.to_string());
+                            }
+                        }
+                    }
+                }
+                t.add_workflow_task_scheduled_and_started();
+            }
+            let events = t.get_full_history_info().unwrap().into_events();
+            let last = events.last().unwrap().event_id;
+            let update =
+                || HistoryUpdate::from_events(events.clone(), 0, last, true, chunking_disabled).0;
+            // The replay read the Records of the markers before a random one.
+            let unread = markers.get(rng.random_range(0..=markers.len())).copied();
+            let is_unread = |event: &&HistoryEvent| unread.is_some_and(|id| event.event_id >= id);
+            let mut reader = ReplayReader::new(Default::default());
+            reader.queue(events.iter().filter(is_unread));
+            let mut gated = update();
+            gated.stream_reads = Some(reader.waiting());
+            let mut machines = update();
+            let mut from = 0;
+            loop {
+                let can_take = gated.can_take_next_wft_sequence(from);
+                let NextWFT::WFT(taken, _) = machines.take_next_wft_sequence(from) else {
+                    break;
+                };
+                let peeked = machines.peek_next_wft_sequence(from);
+                let peeks_unread = peeked.iter().any(|event| is_unread(&event));
+                assert_eq!(can_take, !peeks_unread, "seed {seed}: from {from}");
+                waited += usize::from(peeks_unread);
+                went_on_before_an_unread_marker += usize::from(can_take && unread.is_some());
+                from = taken.last().unwrap().event_id;
+            }
+        }
+        assert!(waited > 0 && went_on_before_an_unread_marker > 0);
     }
 }
