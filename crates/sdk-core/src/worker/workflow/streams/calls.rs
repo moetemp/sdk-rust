@@ -1280,7 +1280,10 @@ fn stop_call(requests: &mut Vec<Request>, call_id: u64) {
 mod tests {
     use super::super::{StreamManager, StreamSettings, digest::digest, manager::recorded};
     use super::*;
-    use crate::test_help::stream_store::{MemoryStore, Request as StoreRequest};
+    use crate::{
+        telemetry::metrics::MetricsContext,
+        test_help::stream_store::{MemoryStore, Request as StoreRequest},
+    };
     use prost::Message;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use std::sync::Arc;
@@ -3485,7 +3488,7 @@ mod tests {
             assert!(keeps_ledgers || sent.is_empty(), "seed {seed}");
             // Each Store gets only the calls whose ref has its name.
             let manager = StreamManager::new(runtimes, Handle::current(), |_, _| {});
-            manager.dispatch("r", sent);
+            manager.dispatch("r", sent, |_| MetricsContext::no_op());
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             for (name, store) in &served {
                 for request in store.requests() {
