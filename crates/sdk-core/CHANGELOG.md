@@ -68,6 +68,12 @@ relevant information.
   fails. With the new `WorkflowErrorType::StreamReplay` variant in `workflow_failure_errors`, the
   Workflow fails in its place, on the first attempt of the task. A command, a message or a close
   intent completes a task while its reads wait, and so does a graceful shutdown.
+* [lang-internal] The Worker's metrics count the Stream calls of Workflow code, each with the
+  attribute `stream_store`. An append has `stream_append_total`,
+  `stream_append_execution_failed` and `stream_append_execution_latency`, and a close has the same
+  three with `close`. A read has `stream_read_total`, `stream_read_execution_failed` and
+  `stream_read_records`, which counts the Records of its page. The Store read of a replay has
+  `stream_replay_read_execution_latency`.
 
 ### Fixed
 * Nexus operations cancelled or timed out before starting retain their cancellation or timeout

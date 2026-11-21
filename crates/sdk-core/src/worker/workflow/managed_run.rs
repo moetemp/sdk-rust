@@ -3,6 +3,7 @@ use crate::{
     abstractions::dbg_panic,
     internal_flags::CoreInternalFlags,
     protosext::{WorkflowActivationExt, protocol_messages::IncomingProtocolMessage},
+    telemetry::metrics::stream_store,
     worker::{
         LEGACY_QUERY_ID, LocalActRequest, WorkflowErrorType,
         workflow::{
@@ -23,7 +24,7 @@ use crate::{
 };
 use futures_util::future::AbortHandle;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     mem,
     ops::{Add, Sub},
     rc::Rc,
@@ -76,6 +77,8 @@ pub(super) struct ManagedRun {
     /// This field is `None` when `WorkerTaskTypes.enable_local_activities` is false.
     local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
     streams: Arc<Streams>,
+    /// The metrics of each Store that the run called, by its name.
+    stream_metrics: HashMap<String, MetricsContext>,
     /// Set if the run is currently waiting on the execution of some local activities.
     waiting_on_la: Option<WaitingOnLAs>,
     /// Is set to true if the machines encounter an error and the only subsequent thing we should
@@ -120,6 +123,7 @@ impl ManagedRun {
             wfm,
             local_activity_request_sink,
             streams,
+            stream_metrics: HashMap::new(),
             waiting_on_la: None,
             am_broken: false,
             wft: None,
@@ -1495,7 +1499,16 @@ impl ManagedRun {
     fn dispatch_stream_calls(&mut self) {
         let requests = self.wfm.machines.stream_calls.take_requests();
         if !requests.is_empty() {
-            self.streams.manager.dispatch(self.run_id(), requests);
+            let (of_run, of_stores) = (&self.metrics, &mut self.stream_metrics);
+            let metrics = |store: &str| {
+                let new = || of_run.with_new_attrs([stream_store(store.to_string())]);
+                of_stores
+                    .entry(store.to_string())
+                    .or_insert_with(new)
+                    .clone()
+            };
+            let run_id = &self.wfm.machines.run_id;
+            self.streams.manager.dispatch(run_id, requests, metrics);
         }
     }
 

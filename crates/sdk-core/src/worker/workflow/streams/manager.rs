@@ -1,6 +1,7 @@
 //! Runs the Stream calls of a Worker's runs, one task for each call.
 
 use super::{StreamRuntimes, StreamSettings, marker::ReadDone};
+use crate::telemetry::metrics::MetricsContext;
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
 use parking_lot::Mutex;
 use std::{
@@ -130,15 +131,21 @@ impl StreamManager {
         self.call_ids.clone()
     }
 
-    /// Starts and stops calls of the run `run_id`.
-    pub(crate) fn dispatch(&self, run_id: &str, requests: Vec<Request>) {
+    /// Starts and stops calls of the run `run_id`. `metrics` gives the metrics of a Store.
+    pub(crate) fn dispatch(
+        &self,
+        run_id: &str,
+        requests: Vec<Request>,
+        mut metrics: impl FnMut(&str) -> MetricsContext,
+    ) {
         // The lock is held across each spawn, so a call that ends immediately finds its task.
         let mut tasks = self.tasks.lock();
         for request in requests {
             match request {
                 Request::Run(call) => {
                     let call_id = call.call_id;
-                    let abort = self.spawn(run_id, call);
+                    let metrics = metrics(&call.store);
+                    let abort = self.spawn(run_id, call, metrics);
                     let run = tasks.entry(run_id.to_string()).or_default();
                     run.insert(
                         call_id,
@@ -182,7 +189,7 @@ impl StreamManager {
             .map(|(_, outage)| outage.clone())
     }
 
-    fn spawn(&self, run_id: &str, call: Call) -> AbortHandle {
+    fn spawn(&self, run_id: &str, call: Call, metrics: MetricsContext) -> AbortHandle {
         let Call {
             call_id,
             seq,
@@ -214,7 +221,7 @@ impl StreamManager {
         };
         let sink = self.sink.clone();
         let task = self.handle.spawn(async move {
-            let outcome = run(&runtime, seq, &store, op, settings, &note).await;
+            let outcome = run(&runtime, seq, &store, op, settings, &note, &metrics).await;
             if note.end() {
                 sink(
                     note.run_id,
@@ -248,29 +255,46 @@ async fn run(
     op: Op,
     settings: StreamSettings,
     note: &Note,
+    metrics: &MetricsContext,
 ) -> Outcome {
+    let started = Instant::now();
     match op {
         Op::Append(request) => {
+            metrics.stream_append_executed();
             let answer = tries(settings, note, || runtime.append_records(request.clone())).await;
+            metrics.stream_append_exec_latency(started.elapsed());
             Outcome::Append(match answer {
                 Ok(appended) => stream_append_result::Result::Appended(StreamAppendOffsets {
                     first_offset: appended.first_offset,
                     last_offset: appended.last_offset,
                 }),
-                Err(error) => stream_append_result::Result::Failure(recorded(&error)),
+                Err(error) => {
+                    metrics.stream_append_execution_failed();
+                    stream_append_result::Result::Failure(recorded(&error))
+                }
             })
         }
         Op::Close(request) => {
+            metrics.stream_close_executed();
             let answer = tries(settings, note, || runtime.close_stream(request.clone())).await;
+            metrics.stream_close_exec_latency(started.elapsed());
+            if answer.is_err() {
+                metrics.stream_close_execution_failed();
+            }
             Outcome::Close(answer.err().map(|error| recorded(&error)))
         }
         Op::Read(read) => {
+            metrics.stream_read_executed();
             let stream = StreamRef {
                 id: read.request.stream_id.clone(),
                 store: store.to_string(),
             };
             let from_offset = read.request.from_offset.clone();
             let page = read_page(runtime, read.request, read.wait, settings, note).await;
+            match &page {
+                Ok(page) => metrics.stream_read_records(page.records.len() as u64),
+                Err(_) => metrics.stream_read_execution_failed(),
+            }
             let page = page.map_err(|error| recorded(&error));
             let in_history = read.records_in_history;
             Outcome::Read(ReadDone::new(&stream, seq, from_offset, page, in_history))
@@ -535,6 +559,10 @@ mod tests {
         (store, manager, rx)
     }
 
+    fn no_metrics(_: &str) -> MetricsContext {
+        MetricsContext::no_op()
+    }
+
     fn producer() -> Option<Producer> {
         Some(Producer {
             kind: Some(Kind::Workflow(WorkflowProducer {
@@ -582,7 +610,7 @@ mod tests {
     async fn a_try_with_no_answer_by_its_deadline_is_an_outage() {
         let (store, manager, mut results) = manager().await;
         store.hold(StoreOp::Append);
-        manager.dispatch("r", vec![append(1)]);
+        manager.dispatch("r", vec![append(1)], no_metrics);
         tokio::time::sleep(Duration::from_millis(5010)).await;
         assert_eq!(
             manager.outage("r").as_deref(),
@@ -610,11 +638,11 @@ mod tests {
         let down = || AnyError::store_unavailable("The Store is down");
         store.fail(StoreOp::Append, down(), usize::MAX);
         store.fail(StoreOp::Close, down(), usize::MAX);
-        manager.dispatch("a", vec![append(1), close(2), append(3)]);
-        manager.dispatch("b", vec![close(4)]);
+        manager.dispatch("a", vec![append(1), close(2), append(3)], no_metrics);
+        manager.dispatch("b", vec![close(4)], no_metrics);
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(manager.outage("a").is_some());
-        manager.dispatch("a", vec![Request::Stop(3)]);
+        manager.dispatch("a", vec![Request::Stop(3)], no_metrics);
         manager.cancel_run("a");
         assert_eq!(manager.outage("a"), None);
         assert!(manager.outage("b").is_some());
@@ -788,7 +816,7 @@ mod tests {
                     store: stream.store.clone(),
                     op: Op::Read(read),
                 };
-                manager.dispatch("r", vec![Request::Run(call)]);
+                manager.dispatch("r", vec![Request::Run(call)], no_metrics);
                 let resolution = loop {
                     let look = Duration::from_millis(rng.random_range(1..40));
                     tokio::select! {

@@ -8,6 +8,7 @@ use super::{
     manager::{cut, is_outage, next_wait, retry_waits},
     marker::{StreamMarker, peeked_marker},
 };
+use crate::telemetry::metrics::{MetricsContext, stream_store};
 use futures_util::{
     StreamExt,
     future::{self, Either},
@@ -117,17 +118,26 @@ struct UnreadEntry {
 
 /// A reader of the Records of read entries, for the replay of one run. It keeps the markers of
 /// History that it hasn't read yet, and reads them a part at a time.
-#[derive(Debug)]
+#[derive(derive_more::Debug)]
 pub(crate) struct ReplayReader {
     runtimes: StreamRuntimes,
     unread: VecDeque<UnreadMarker>,
+    #[debug(skip)]
+    metrics: MetricsContext,
+    /// The metrics of each Store that the reader read, by its name.
+    #[debug(skip)]
+    store_metrics: HashMap<String, MetricsContext>,
 }
 
 impl ReplayReader {
-    /// Creates a reader with the Stream runtimes of a Worker.
-    pub(crate) fn new(runtimes: StreamRuntimes) -> Self {
-        let unread = VecDeque::new();
-        Self { runtimes, unread }
+    /// Creates a reader with the Stream runtimes and the metrics of a Worker.
+    pub(crate) fn new(runtimes: StreamRuntimes, metrics: MetricsContext) -> Self {
+        Self {
+            runtimes,
+            unread: VecDeque::new(),
+            metrics,
+            store_metrics: HashMap::new(),
+        }
     }
 
     /// Queues each Stream marker in `events` that has a read entry with no Records in History.
@@ -190,15 +200,19 @@ impl ReplayReader {
         let deadlines: HashMap<String, Deadline> = (entries.iter())
             .map(|(_, entry)| (entry.stream.store.clone(), Deadline::default()))
             .collect();
+        for store in deadlines.keys() {
+            let new = || self.metrics.with_new_attrs([stream_store(store.clone())]);
+            (self.store_metrics.entry(store.clone())).or_insert_with(new);
+        }
         let (reader, deadlines) = (&*self, &deadlines);
         let mut read = stream::iter(entries)
             .map(|(event_id, entry)| async move {
                 let deadline = &deadlines[&entry.stream.store];
-                (
-                    event_id,
-                    entry.index,
-                    reader.read_entry(&entry, deadline).await,
-                )
+                let started = Instant::now();
+                let result = reader.read_entry(&entry, deadline).await;
+                let metrics = &reader.store_metrics[&entry.stream.store];
+                metrics.stream_replay_read_exec_latency(started.elapsed());
+                (event_id, entry.index, result)
             })
             .buffer_unordered(self.runtimes.settings.replay_concurrency);
         while let Some((event_id, index, result)) = read.next().await {
@@ -682,7 +696,7 @@ mod tests {
             let recorded: usize = needing.iter().map(|(_, bytes)| bytes).sum();
             runtimes.settings.bounds.max_task_record_bytes = rng.random_range(1..=2 * recorded + 1);
             let max_bytes = runtimes.settings.bounds.max_task_record_bytes;
-            let mut reader = ReplayReader::new(runtimes);
+            let mut reader = ReplayReader::new(runtimes, MetricsContext::no_op());
             reader.queue(events.iter());
             // The reader gives each marker in one part, in the order of History.
             let mut results = HashMap::<i64, MarkerReads>::new();
@@ -882,7 +896,7 @@ mod tests {
         let runtime = StreamRuntime::new(Arc::new(model), limits);
         let mut runtimes = StreamRuntimes::new([(stream.store, Arc::new(runtime))]);
         runtimes.settings = settings;
-        let mut reader = ReplayReader::new(runtimes);
+        let mut reader = ReplayReader::new(runtimes, MetricsContext::no_op());
         reader.queue([event].iter());
         (given, reader.read_next().await.take(1))
     }
