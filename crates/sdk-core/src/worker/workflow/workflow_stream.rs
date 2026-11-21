@@ -315,7 +315,8 @@ impl WFStream {
         // A run new to the cache replays its History, so it first reads the Records of its
         // Stream markers.
         if !self.runs.has_run(&run_id) && pwft.work.update.needs_stream_records() {
-            pwft.paginator.read_stream_records_with(&self.worker_config);
+            let (config, metrics) = (&self.worker_config, &self.metrics);
+            pwft.paginator.read_stream_records_with(config, metrics);
             let rc = self.history_fetch_refcounter.clone();
             (self.stream_records_reads).push_back(StreamRecordsReq::NewRun(Box::new(pwft), rc));
             return Ok(None);
