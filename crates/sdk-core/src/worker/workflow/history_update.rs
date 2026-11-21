@@ -1,5 +1,6 @@
 use super::streams::{MarkerReads, ReplayReader, ReplayReads, is_stream_marker};
 use crate::{
+    MetricsContext,
     internal_flags::CoreInternalFlags,
     protosext::ValidPollWFTQResponse,
     worker::{
@@ -277,9 +278,13 @@ impl HistoryPaginator {
 
     /// Makes the paginator read the Records of the Stream markers of its History, for a run new
     /// to the cache.
-    pub(super) fn read_stream_records_with(&mut self, config: &WorkerConfig) {
+    pub(super) fn read_stream_records_with(
+        &mut self,
+        config: &WorkerConfig,
+        metrics: &MetricsContext,
+    ) {
         let runtimes = config.stream_runtimes.clone();
-        self.stream_reader = Some(ReplayReader::new(runtimes));
+        self.stream_reader = Some(ReplayReader::new(runtimes, metrics.clone()));
     }
 
     /// Reads the first part of the Records of the Stream markers of `update`, which has the whole
