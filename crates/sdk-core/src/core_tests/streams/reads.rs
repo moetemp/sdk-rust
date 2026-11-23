@@ -1402,6 +1402,56 @@ async fn a_replay_gives_the_jobs_of_the_first_run_in_both_chunking_modes() {
     assert!(chunked_after_no_command > 0);
 }
 
+// The server gives a long History in pages. The poll has the first page and Core fetches the
+// others, or Core fetches all of them from the start when the run isn't in the cache. A ledger in
+// a later page has only its count and its digest too, so the replay must read its Records.
+#[tokio::test]
+async fn a_replay_reads_the_records_of_a_ledger_in_a_later_page_of_history() {
+    let store = store(&["s"]).await;
+    fill(&store, "s", 6).await;
+    // Each task reads one Record, so each ledger has the count and the digest of one page.
+    let (live, t, whole) = first_run_with_a_timer_at_each_page(&store, 1).await;
+    let first_run = [live, vec![vec![Job::FireTimer(FireTimer { seq: 1 })]]].concat();
+    let events = whole.history.clone().unwrap().events;
+    let ledgers = recorded_ledgers(&events).len();
+    // A page ends before the completion of task 2 or task 4. The server writes a completion in a
+    // batch after the one of the task's started event, and a page holds whole batches.
+    let completions: Vec<usize> = (events.iter().enumerate())
+        .filter(|(_, event)| event.event_type() == EventType::WorkflowTaskCompleted)
+        .map(|(at, _)| at)
+        .collect();
+    let (at, later) = (completions[1], completions[3]);
+    assert!(recorded_ledgers(&events[later..]).len() >= 2);
+    let continued = |events: &[HistoryEvent]| GetWorkflowExecutionHistoryResponse {
+        next_page_token: vec![1],
+        ..page(events)
+    };
+    let mut polled = whole.clone();
+    polled.history = Some(History {
+        events: events[..at].to_vec(),
+    });
+    polled.next_page_token = vec![1];
+    let (sticky, one_page) = poll_for_last_task(&t, whole, Path::CacheMiss);
+    let fetched_from_the_start = vec![continued(&events[..later]), page(&events[later..])];
+    let fetched_after_the_poll = vec![continued(&events[at..later]), page(&events[later..])];
+    let layouts = [
+        ("one page", sticky.clone(), one_page),
+        ("two pages", sticky, fetched_from_the_start),
+        ("three pages", polled, fetched_after_the_poll),
+    ];
+    let workflow = read_with_a_timer_at_each_page(1);
+    for (label, task, pages) in layouts {
+        let before = store.reads().len();
+        let poll = (task, pages);
+        let replayed =
+            replay_with_bound(&store, &t, &poll, usize::MAX, label.to_string(), workflow).await;
+        assert_eq!(replayed.jobs, job_names(&first_run), "{label}");
+        assert_eq!(replayed.reads, read_jobs(&first_run), "{label}");
+        // The replay read the Records of each ledger from the Store once.
+        assert_eq!(store.reads().len() - before, ledgers, "{label}");
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum NoJob {
     Upsert,
