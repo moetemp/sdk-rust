@@ -6,11 +6,14 @@ use super::{
     cancel_workflow_state_machine::cancel_workflow,
     complete_workflow_state_machine::complete_workflow,
     continue_as_new_workflow_state_machine::continue_as_new,
-    fail_workflow_state_machine::fail_workflow, local_activity_state_machine::new_local_activity,
-    patch_state_machine::has_change, signal_external_state_machine::new_external_signal,
-    stream_marker_state_machine::stream_marker, timer_state_machine::new_timer,
+    fail_workflow_state_machine::fail_workflow,
+    local_activity_state_machine::new_local_activity,
+    patch_state_machine::has_change,
+    signal_external_state_machine::new_external_signal,
+    stream_marker_state_machine::stream_marker,
+    timer_state_machine::new_timer,
     upsert_search_attributes_state_machine::upsert_search_attrs,
-    workflow_machines::local_acts::LocalActivityData,
+    workflow_machines::local_acts::{LocalActivityData, NextPeeked},
     workflow_task_state_machine::WorkflowTaskMachine,
 };
 use crate::{
@@ -602,8 +605,7 @@ impl WorkflowMachines {
         let jobs = if self.activation_needed() {
             let mut jobs = self.drive_me.drain_jobs();
             let activation = self.local_activity_data.current_activation_index();
-            let marker = self.local_activity_data.next_resolution_activation();
-            let results = self.stream_calls.take_jobs(activation, marker);
+            let results = self.stream_calls.take_jobs(activation);
             jobs.extend(results.into_iter().map(OutgoingJob::from));
             jobs
         } else {
@@ -666,10 +668,7 @@ impl WorkflowMachines {
                     job.variant,
                     workflow_activation_job::Variant::NotifyHasPatch(_)
                 )
-        }) || self.stream_calls.has_jobs(
-            self.local_activity_data.current_activation_index(),
-            self.local_activity_data.next_resolution_activation(),
-        )
+        }) || (self.stream_calls).has_jobs(self.local_activity_data.current_activation_index())
     }
 
     fn has_non_update_jobs(jobs: &[OutgoingJob]) -> bool {
@@ -1056,7 +1055,9 @@ impl WorkflowMachines {
                 DelayedAction::StreamMarker(event_id, marker) => {
                     let update = &mut self.last_history_from_server;
                     let records = ReplayReads::take_from(update, event_id);
-                    self.stream_calls.peeked(marker, records)?;
+                    let results = self.stream_calls.peeked(marker, records)?;
+                    (self.local_activity_data).insert_peeked_stream_results(results);
+                    self.apply_local_activity_peeked_resolutions(false)?;
                 }
             }
         }
@@ -1978,23 +1979,20 @@ impl WorkflowMachines {
             if self.last_history_from_server.chunking_disabled {
                 // Advance to the next marker's activation index without sending an empty activation.
                 // Stop there so resolutions recorded in later activations remain separate.
-                if let Some(seq) = self.local_activity_data.peek_preresolution_seq(true)
-                    && self.get_machine_key(CommandID::LocalActivity(seq)).is_ok()
-                {
+                let can_give = match self.local_activity_data.peek_preresolution(true) {
+                    Some(NextPeeked::LocalActivity(seq)) => {
+                        self.get_machine_key(CommandID::LocalActivity(seq)).is_ok()
+                    }
+                    Some(NextPeeked::Stream(at)) => self.stream_calls.is_ready(at),
+                    None => false,
+                };
+                if can_give {
                     self.local_activity_data
-                        .advance_to_next_held_activation(self.stream_calls.next_ready_activation());
+                        .advance_to_next_resolution_activation();
                     self.apply_local_activity_peeked_resolutions(false)?;
-                }
-                // With no Local Activity result to give, the next Stream result comes.
-                if !self.activation_needed()
-                    && let Some(stream) = self.stream_calls.next_ready_activation()
-                {
-                    self.local_activity_data.advance_to_activation(stream);
                 }
             } else {
                 self.apply_local_activity_peeked_resolutions(true)?;
-                // The Stream results of History come as these Local Activity results do.
-                self.stream_calls.release_ready();
             }
         }
         Ok(())
@@ -2005,17 +2003,20 @@ impl WorkflowMachines {
     /// activation in this WFT. Older markers lack grouping information and retain the historical
     /// batching behavior.
     fn apply_local_activity_peeked_resolutions(&mut self, include_held: bool) -> Result<()> {
-        while let Some(seq) = self
-            .local_activity_data
-            .peek_preresolution_seq(include_held)
-        {
-            // A Stream result that the first run gave in an earlier activation comes first.
-            let marker = self.local_activity_data.next_resolution_activation();
-            if let Some(stream) = self.stream_calls.first_result_activation()
-                && marker.is_some_and(|marker| stream < marker)
-            {
-                break;
-            }
+        while let Some(next) = self.local_activity_data.peek_preresolution(include_held) {
+            let seq = match next {
+                NextPeeked::Stream(at) => {
+                    if !self.stream_calls.release(at) {
+                        break;
+                    }
+                    self.local_activity_data.take_stream_preresolution();
+                    continue;
+                }
+                // The first run gave a Local Activity result after a Stream result only in a later
+                // activation.
+                NextPeeked::LocalActivity(_) if self.stream_calls.has_released() => break,
+                NextPeeked::LocalActivity(seq) => seq,
+            };
             let Ok(mk) = self.get_machine_key(CommandID::LocalActivity(seq)) else {
                 break;
             };

@@ -89,7 +89,7 @@ pub(crate) enum Phase {
 
 /// A call by its kind and seq. The results of one activation come in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-enum CallKey {
+pub(crate) enum CallKey {
     Append(u32),
     Close(u32),
     Read(u32),
@@ -171,19 +171,6 @@ struct Held {
     reads: HashMap<u32, HeldRead>,
 }
 
-impl Held {
-    /// Returns the activation and the call of the first result, in the order of the first run.
-    fn first_result(&self) -> Option<(u64, CallKey)> {
-        let appends =
-            (self.appends.iter()).map(|(seq, a)| (a.activation_index, CallKey::Append(*seq)));
-        let closes =
-            (self.closes.iter()).map(|(seq, c)| (c.activation_index, CallKey::Close(*seq)));
-        let reads = (self.reads.iter())
-            .map(|(seq, read)| (read.entry.activation_index, CallKey::Read(*seq)));
-        appends.chain(closes).chain(reads).min()
-    }
-}
-
 /// A read result of History, with the Records that the replay has for its page.
 struct HeldRead {
     entry: StreamReadResult,
@@ -209,10 +196,10 @@ pub(crate) struct StreamCalls {
     /// The live calls whose result waits for an activation.
     done: BTreeSet<CallKey>,
     held: Held,
-    /// History's results whose calls Workflow code issued, by the activation that gets them.
+    /// History's results whose calls Workflow code issued, by their place in the first run.
     ready: BTreeMap<(u64, CallKey), workflow_activation_job::Variant>,
-    /// The last result of `ready` that a release gave to the next activation.
-    released: Option<(u64, CallKey)>,
+    /// The results of `ready` that the run released for its next activation.
+    released: Vec<((u64, CallKey), workflow_activation_job::Variant)>,
     marker: MarkerBuilder,
     requests: Vec<Request>,
 }
@@ -248,7 +235,7 @@ impl StreamCalls {
             done: BTreeSet::new(),
             held: Held::default(),
             ready: BTreeMap::new(),
-            released: None,
+            released: vec![],
             marker,
             requests: vec![],
         }
@@ -457,32 +444,22 @@ impl StreamCalls {
         self.leave_queue(&queue, call);
     }
 
-    /// Returns true if the activation at index `activation` of the task gets a result. A result
-    /// from History waits for the Local Activity result of the next marker, at index `marker`, if
-    /// the first run gave that one before it or with it.
-    pub(crate) fn has_jobs(&self, activation: u64, marker: Option<u64>) -> bool {
+    /// Returns true if the activation at index `activation` of the task gets a result, which is
+    /// a result from History that the run released, or a live one.
+    pub(crate) fn has_jobs(&self, activation: u64) -> bool {
         // A run that stopped its calls gives no result, even one that History has.
         self.phase != Phase::Stopped
-            && ((self.ready.keys().next()).is_some_and(|key| self.is_due(key, activation, marker))
-                || self.next_result_fits(activation) == Some(true))
+            && (self.has_released() || self.next_result_fits(activation) == Some(true))
     }
 
     /// Returns the results for the activation at index `activation` of the task, as
     /// [`Self::has_jobs`] decides them. The marker records each live result with that index.
-    pub(crate) fn take_jobs(
-        &mut self,
-        activation: u64,
-        marker: Option<u64>,
-    ) -> Vec<workflow_activation_job::Variant> {
+    pub(crate) fn take_jobs(&mut self, activation: u64) -> Vec<workflow_activation_job::Variant> {
         let mut jobs = vec![];
-        while let Some(key) = self.ready.keys().next().copied()
-            && self.is_due(&key, activation, marker)
-        {
-            let job = self.ready.remove(&key).expect("The key was just read");
-            self.leave(key.1);
+        for ((_, call), job) in mem::take(&mut self.released) {
+            self.leave(call);
             jobs.push(job);
         }
-        self.released = None;
         if !self.task.is_open() {
             return jobs;
         }
@@ -498,18 +475,25 @@ impl StreamCalls {
     }
 
     /// Holds the entries of a marker from History, each for its call, with the Records that the
-    /// replay read for its read entries.
+    /// replay read for its read entries. It returns the results of the marker in the order of the
+    /// first run, each with its activation.
     pub(crate) fn peeked(
         &mut self,
         marker: StreamMarker,
         mut replayed: MarkerReads,
-    ) -> Result<(), WFMachinesError> {
+    ) -> Result<Vec<(u64, CallKey)>, WFMachinesError> {
         let StreamMarkerData {
             close_intents,
             appends,
             closes,
             reads,
         } = marker.data;
+        let mut results: Vec<(u64, CallKey)> = (appends.iter())
+            .map(|a| (a.activation_index, CallKey::Append(a.seq)))
+            .chain((closes.iter()).map(|c| (c.activation_index, CallKey::Close(c.seq))))
+            .chain((reads.iter()).map(|r| (r.activation_index, CallKey::Read(r.seq))))
+            .collect();
+        results.sort_unstable();
         for intent in close_intents {
             let seq = intent.seq;
             if self.held.intents.insert(seq, intent).is_some() {
@@ -550,7 +534,25 @@ impl StreamCalls {
             }
             self.match_read(seq)?;
         }
-        Ok(())
+        Ok(results)
+    }
+
+    /// Releases the result of History at `at` for the next activation. It returns false if
+    /// Workflow code hasn't issued the call of that result.
+    pub(crate) fn release(&mut self, at: (u64, CallKey)) -> bool {
+        let job = self.ready.remove(&at);
+        self.released.extend(job.map(|job| (at, job)));
+        self.released.last().is_some_and(|(last, _)| *last == at)
+    }
+
+    /// Returns true if Workflow code issued the call of the result of History at `at`.
+    pub(crate) fn is_ready(&self, at: (u64, CallKey)) -> bool {
+        self.ready.contains_key(&at)
+    }
+
+    /// Returns true while a released result waits for its activation.
+    pub(crate) fn has_released(&self) -> bool {
+        !self.released.is_empty()
     }
 
     /// Handles the event of a marker. Each entry of the marker must have reached its call by now,
@@ -573,7 +575,8 @@ impl StreamCalls {
         if let Some(seq) = self.held.reads.keys().min() {
             return Err(never("a result", CallKey::Read(*seq)));
         }
-        if let Some((_, call)) = self.ready.keys().next() {
+        let waits = (self.released.first().map(|(at, _)| at)).or(self.ready.keys().next());
+        if let Some((_, call)) = waits {
             return Err(WFMachinesError::Nondeterminism(format!(
                 "History has a result of Stream {call} that Workflow code never got"
             )));
@@ -732,32 +735,6 @@ impl StreamCalls {
         (self.reads.values()).any(|read| matches!(read.state, ReadState::Parked))
     }
 
-    /// Returns the activation of the first result from History whose call Workflow code issued.
-    pub(crate) fn next_ready_activation(&self) -> Option<u64> {
-        self.ready.keys().next().map(|(at, _)| *at)
-    }
-
-    /// Returns the activation of the first result from History that Workflow code doesn't have.
-    pub(crate) fn first_result_activation(&self) -> Option<u64> {
-        let held = self.held.first_result().map(|(at, _)| at);
-        self.next_ready_activation().into_iter().chain(held).min()
-    }
-
-    /// Releases the results from History for the next activation, whatever their index. It takes
-    /// them in the order of the first run, up to the first one whose call Workflow code hasn't
-    /// issued. A replay with chunking on that has no job to give does the same for the results of
-    /// Local Activities.
-    pub(crate) fn release_ready(&mut self) {
-        let held = self.held.first_result();
-        let comes = |key: &&(u64, CallKey)| held.is_none_or(|held| **key < held);
-        self.released = self.ready.keys().take_while(comes).last().copied();
-    }
-
-    fn is_due(&self, key: &(u64, CallKey), activation: u64, marker: Option<u64>) -> bool {
-        (key.0 <= activation || self.released.is_some_and(|released| *key <= released))
-            && marker.is_none_or(|marker| key.0 < marker)
-    }
-
     /// Returns the marker of the task as it completes, with the intent of each close that fits.
     pub(crate) fn take_marker(&mut self) -> Option<StreamMarker> {
         if matches!(self.phase, Phase::Replaying | Phase::ReplayOnly) {
@@ -794,7 +771,7 @@ impl StreamCalls {
         self.task = TaskState::NoTask;
         self.held = Held::default();
         self.ready.clear();
-        self.released = None;
+        self.released.clear();
         self.marker = MarkerBuilder::new(self.runtimes.settings);
         self.requests.clear();
     }
@@ -1434,9 +1411,30 @@ mod tests {
         });
     }
 
+    /// Releases the results of History up to `activation`, as a run with no Local Activity does.
+    fn release_up_to(calls: &mut StreamCalls, activation: u64) {
+        while let Some(at) = calls.ready.keys().next().copied()
+            && at.0 <= activation
+        {
+            calls.release(at);
+        }
+    }
+
+    /// Returns true if the activation at `activation` gets a result, after the release up to it.
+    fn has_jobs(calls: &mut StreamCalls, activation: u64) -> bool {
+        release_up_to(calls, activation);
+        calls.has_jobs(activation)
+    }
+
+    /// Returns the activation of the first result from History whose call Workflow code issued.
+    fn next_ready_activation(calls: &StreamCalls) -> Option<u64> {
+        calls.ready.keys().next().map(|(at, _)| *at)
+    }
+
     /// Returns the results of the activation at `activation`, as `append 1` or `close 2: <text>`.
     fn jobs(calls: &mut StreamCalls, activation: u64) -> Vec<String> {
-        (calls.take_jobs(activation, None).into_iter())
+        release_up_to(calls, activation);
+        (calls.take_jobs(activation).into_iter())
             .map(|job| match job {
                 Variant::ResolveStreamAppend(ResolveStreamAppend {
                     seq,
@@ -1527,11 +1525,11 @@ mod tests {
         finish(&mut live, CallKey::Append(2), None);
         finish(&mut live, CallKey::Append(1), None);
         live.set_task(TaskState::Completing(task_attempt(3)));
-        assert!(!live.has_jobs(4, None));
+        assert!(!has_jobs(&mut live, 4));
         assert_eq!(jobs(&mut live, 4), Vec::<String>::new());
         let marker = next_task(&mut live, 7);
         assert_eq!(marker, None);
-        assert!(live.has_jobs(0, None));
+        assert!(has_jobs(&mut live, 0));
         assert_eq!(jobs(&mut live, 0), ["append 1", "append 2"]);
         live.append(append(3, "s")).unwrap();
         started(&mut live);
@@ -1549,49 +1547,16 @@ mod tests {
         replay.append(append(2, "t")).unwrap();
         replay.peeked(marker, vec![]).unwrap();
         assert_eq!(jobs(&mut replay, 0), ["append 1", "append 2"]);
-        assert!(!replay.has_jobs(1, None));
-        assert_eq!(replay.next_ready_activation(), None);
+        assert!(!has_jobs(&mut replay, 1));
+        assert_eq!(next_ready_activation(&replay), None);
         replay.append(append(3, "s")).unwrap();
-        assert_eq!(replay.next_ready_activation(), Some(2));
+        assert_eq!(next_ready_activation(&replay), Some(2));
         assert_eq!(jobs(&mut replay, 1), Vec::<String>::new());
         assert_eq!(jobs(&mut replay, 2), ["append 3"]);
         replay.append(append(4, "s")).unwrap();
         replay.marker_recorded().unwrap();
         replay.go_live().unwrap();
         assert_eq!(started(&mut replay), ["append 4 of s at 13"]);
-    }
-
-    #[test]
-    fn a_release_ends_with_its_activation() {
-        let marker = history(|marker| assert!(marker.append_result(&append_done(1, "1"), 2)));
-        let mut replay = calls(Phase::Replaying, 9);
-        replay.append(append(1, "1")).unwrap();
-        replay.peeked(marker, vec![]).unwrap();
-        replay.release_ready();
-        assert_eq!(jobs(&mut replay, 0), ["append 1"]);
-        // A result of the next task waits for its own activation.
-        replay.append(append(2, "2")).unwrap();
-        let next = history(|marker| assert!(marker.append_result(&append_done(2, "2"), 1)));
-        replay.peeked(next, vec![]).unwrap();
-        assert!(!replay.has_jobs(0, None));
-    }
-
-    #[test]
-    fn a_result_waits_behind_a_read_that_workflow_code_has_not_sent() {
-        // The first run gave append 1 in activation 1, read 1 in 2 and append 2 in 3, and
-        // Workflow code sent the read at the result of append 1.
-        let marker = history(|marker| {
-            assert!(marker.append_result(&append_done(1, "1"), 1));
-            marker.read_result(ReadDone::cancelled(&stream("r"), 1, vec![]), 2);
-            assert!(marker.append_result(&append_done(2, "2"), 3));
-        });
-        let mut replay = calls(Phase::Replaying, 9);
-        for seq in [1, 2] {
-            replay.append(append(seq, &seq.to_string())).unwrap();
-        }
-        replay.peeked(marker, vec![]).unwrap();
-        replay.release_ready();
-        assert_eq!(jobs(&mut replay, 0), ["append 1"]);
     }
 
     #[test]
@@ -1696,7 +1661,8 @@ mod tests {
     impl Run {
         /// Gives Workflow code the jobs of the next activation.
         fn take_jobs(&mut self) -> Vec<Variant> {
-            let jobs = self.calls.take_jobs(self.activation, None);
+            release_up_to(&mut self.calls, self.activation);
+            let jobs = self.calls.take_jobs(self.activation);
             self.activation += 1;
             jobs
         }
@@ -1835,10 +1801,10 @@ mod tests {
             let mut activations = vec![];
             let mut first = task.has_events;
             while !run.ended {
-                if !first && !run.calls.has_jobs(run.activation, None) {
+                if !first && !has_jobs(&mut run.calls, run.activation) {
                     // For a History with chunking off, Core sets its activation index to that of
                     // the next result from History when nothing else needs an activation.
-                    match run.calls.next_ready_activation() {
+                    match next_ready_activation(&run.calls) {
                         Some(at) if at > run.activation => run.activation = at,
                         _ => break,
                     }
@@ -2041,7 +2007,7 @@ mod tests {
         /// Runs the task in hand until it completes, and returns an error if it fails.
         fn run_task(&mut self) -> Result<(), ()> {
             self.task.has_events = self.history.is_empty() || self.rng.random_bool(0.6);
-            if self.task.has_events || self.run.calls.has_jobs(self.run.activation, None) {
+            if self.task.has_events || has_jobs(&mut self.run.calls, self.run.activation) {
                 self.activate()?;
             }
             loop {
@@ -2049,7 +2015,7 @@ mod tests {
                     self.complete();
                     return Ok(());
                 }
-                if self.run.calls.has_jobs(self.run.activation, None) {
+                if has_jobs(&mut self.run.calls, self.run.activation) {
                     self.activate()?;
                     continue;
                 }
@@ -2541,7 +2507,11 @@ mod tests {
                 !self.run.ended || running == 0,
                 "seed {seed}: {running} calls run"
             );
-            assert!(self.run.calls.ready.is_empty(), "seed {seed}");
+            let calls = &self.run.calls;
+            assert!(
+                calls.ready.is_empty() && calls.released.is_empty(),
+                "seed {seed}"
+            );
             let queued = self.run.calls.queues.values().flatten();
             let waiting = self.run.calls.done.iter().chain(queued);
             assert!(
@@ -3182,8 +3152,8 @@ mod tests {
                 // Core takes the results that wait in their order, up to the first that doesn't
                 // fit, and the marker records them with the activation.
                 let waiting: Vec<CallKey> = calls.done.iter().copied().collect();
-                let took = if calls.has_jobs(activation, None) && rng.random_bool(0.8) {
-                    let jobs = calls.take_jobs(activation, None);
+                let took = if calls.has_jobs(activation) && rng.random_bool(0.8) {
+                    let jobs = calls.take_jobs(activation);
                     let results: Vec<CallKey> = jobs.iter().map(key_of).collect();
                     assert_eq!(results, waiting[..results.len()], "seed {seed}");
                     for job in jobs {

@@ -1,7 +1,7 @@
 use super::super::local_activity_state_machine::ResolveDat;
 use crate::{
     protosext::{CompleteLocalActivityData, ValidScheduleLA},
-    worker::{ExecutingLAId, LocalActRequest, NewLocalAct},
+    worker::{ExecutingLAId, LocalActRequest, NewLocalAct, workflow::streams::CallKey},
 };
 use std::{
     collections::{HashSet, VecDeque},
@@ -10,10 +10,32 @@ use std::{
 use temporalio_common::protos::temporal::api::common::v1::WorkflowExecution;
 
 struct Preresolution {
-    seq: u32,
     /// Older markers have no group, so replay must keep their existing batching behavior.
     activation_index: Option<u64>,
-    resolution: ResolveDat,
+    result: PeekedResult,
+}
+
+/// A result of History that a replay holds for the activation of the first run.
+enum PeekedResult {
+    LocalActivity {
+        seq: u32,
+        resolution: ResolveDat,
+    },
+    /// The result of a Stream call. Its job stays with the calls of the run.
+    Stream(CallKey),
+}
+
+/// The result of History that a replay gives next.
+#[derive(Clone, Copy)]
+pub(super) enum NextPeeked {
+    LocalActivity(u32),
+    Stream((u64, CallKey)),
+}
+
+impl Preresolution {
+    fn is_local_activity(&self, of_seq: u32) -> bool {
+        matches!(self.result, PeekedResult::LocalActivity { seq, .. } if seq == of_seq)
+    }
 }
 
 #[derive(Default)]
@@ -25,7 +47,7 @@ pub(super) struct LocalActivityData {
     /// Seq #s of local activities which we have sent to be executed but have not yet resolved
     executing: HashSet<u32>,
     /// Local activity resolutions in the order their markers were found while looking ahead at the
-    /// next WFT.
+    /// next WFT, and the Stream results of that WFT, each after the resolutions of its activation.
     preresolutions: VecDeque<Preresolution>,
     /// Position of the next activation within the current WFT. Recorded on markers so replay can
     /// deliver each resolution in the same activation it was delivered in originally. Counting
@@ -93,38 +115,70 @@ impl LocalActivityData {
 
     pub(super) fn insert_peeked_marker(&mut self, dat: CompleteLocalActivityData) {
         self.preresolutions.push_back(Preresolution {
-            seq: dat.marker_dat.seq,
             activation_index: dat.marker_dat.activation_index,
-            resolution: dat.into(),
+            result: PeekedResult::LocalActivity {
+                seq: dat.marker_dat.seq,
+                resolution: dat.into(),
+            },
         });
+    }
+
+    /// Inserts the Stream results of a peeked marker, which come in the order of the first run.
+    /// In one activation, the first run gave the results of Local Activities before them.
+    pub(super) fn insert_peeked_stream_results(&mut self, results: Vec<(u64, CallKey)>) {
+        for (activation_index, call) in results {
+            let comes_before = |item: &Preresolution| {
+                (item.activation_index).is_none_or(|index| index <= activation_index)
+            };
+            let at = self.preresolutions.iter().rposition(comes_before);
+            let item = Preresolution {
+                activation_index: Some(activation_index),
+                result: PeekedResult::Stream(call),
+            };
+            self.preresolutions.insert(at.map_or(0, |at| at + 1), item);
+        }
     }
 
     pub(super) fn take_preresolution(&mut self, seq: u32) -> Option<ResolveDat> {
         let idx = self
             .preresolutions
             .iter()
-            .position(|item| item.seq == seq)?;
+            .position(|item| item.is_local_activity(seq))?;
         let item = self
             .preresolutions
             .remove(idx)
             .expect("This index was just found to contain seq");
-        Some(item.resolution)
+        match item.result {
+            PeekedResult::LocalActivity { resolution, .. } => Some(resolution),
+            PeekedResult::Stream(_) => None,
+        }
     }
 
-    /// Returns the seq of the next peeked resolution, unless it was recorded for a later
-    /// activation in this WFT and `include_held` is false.
-    pub(super) fn peek_preresolution_seq(&self, include_held: bool) -> Option<u32> {
+    /// Takes the Stream result that [`Self::peek_preresolution`] returned.
+    pub(super) fn take_stream_preresolution(&mut self) {
+        self.preresolutions.pop_front();
+    }
+
+    /// Returns the next peeked resolution, unless it was recorded for a later activation in this
+    /// WFT and `include_held` is false.
+    pub(super) fn peek_preresolution(&self, include_held: bool) -> Option<NextPeeked> {
         let item = self.preresolutions.front()?;
         if !include_held && self.is_held(item) {
             return None;
         }
-        Some(item.seq)
+        Some(match item.result {
+            PeekedResult::LocalActivity { seq, .. } => NextPeeked::LocalActivity(seq),
+            PeekedResult::Stream(call) => {
+                let activation_index = item.activation_index.expect("A Stream result has one");
+                NextPeeked::Stream((activation_index, call))
+            }
+        })
     }
 
     pub(super) fn has_held_preresolution(&self, seq: u32) -> bool {
         self.preresolutions
             .iter()
-            .any(|item| item.seq == seq && self.is_held(item))
+            .any(|item| item.is_local_activity(seq) && self.is_held(item))
     }
 
     fn is_held(&self, item: &Preresolution) -> bool {
@@ -140,31 +194,14 @@ impl LocalActivityData {
         self.activation_index += 1;
     }
 
-    pub(super) fn advance_to_next_held_activation(&mut self, stream: Option<u64>) {
-        if let Some(activation_index) = self.next_held_activation(stream) {
-            self.activation_index = self.activation_index.max(activation_index);
-        }
-    }
-
-    /// Returns the lowest activation index of a held result of History. That is the index of the
-    /// next peeked resolution, or `stream`, the index of the next Stream result, if it is lower.
-    /// The Stream result then comes first, in a separate activation. It's `None` with no peeked
-    /// resolution, or with one whose marker has no index and so isn't held.
-    pub(super) fn next_held_activation(&self, stream: Option<u64>) -> Option<u64> {
-        let marker = self.next_resolution_activation()?;
-        Some(stream.map_or(marker, |stream| stream.min(marker)))
-    }
-
-    /// Returns the activation index of the next peeked resolution, if its marker has one.
-    pub(super) fn next_resolution_activation(&self) -> Option<u64> {
-        self.preresolutions
+    pub(super) fn advance_to_next_resolution_activation(&mut self) {
+        if let Some(activation_index) = self
+            .preresolutions
             .front()
             .and_then(|item| item.activation_index)
-    }
-
-    /// Advances to `activation_index`, for a Stream result that History has at that index.
-    pub(super) fn advance_to_activation(&mut self, activation_index: u64) {
-        self.activation_index = self.activation_index.max(activation_index);
+        {
+            self.activation_index = self.activation_index.max(activation_index);
+        }
     }
 
     pub(super) fn current_activation_index(&self) -> u64 {

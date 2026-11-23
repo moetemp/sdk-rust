@@ -9,7 +9,9 @@ mod replay;
 #[cfg(test)]
 mod test_store;
 
-pub(crate) use calls::{Phase, StreamCalls, is_stream_replay_failure, set_replay_failure_type};
+pub(crate) use calls::{
+    CallKey, Phase, StreamCalls, is_stream_replay_failure, set_replay_failure_type,
+};
 pub(crate) use manager::{StreamManager, StreamResolution};
 pub(crate) use marker::{StreamMarker, is_stream_marker, marker_details, peeked_marker};
 pub(super) use replay::StreamRecordsReq;
