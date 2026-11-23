@@ -821,16 +821,8 @@ mod tests {
                 }
             };
             let store = Arc::new(ModelStore::new(Model {
-                rng: StdRng::seed_from_u64(seed),
-                entries,
-                closed,
-                fault: Box::new(fault),
                 ignores_wait: rng.random_bool(0.3),
-                reading: (0, 0),
-                moved_to: None,
-                empty_until: None,
-                answered_early: 0,
-                violations: vec![],
+                ..Model::new(seed, entries, closed, fault)
             }));
             let runtime = StreamRuntime::new(store.clone(), StoreLimits::default());
             let mut runtimes = StreamRuntimes::new([("mem".to_string(), Arc::new(runtime))]);
