@@ -3,18 +3,15 @@
 
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::collections::{HashMap, HashSet, VecDeque};
 use temporalio_streams::{
     AnyError, AnyReason, AppendError, AppendReason, CloseError, CloseReason, CreateError,
-    DescribeError, DescribeReason, ReadError, ReadReason, StreamError, StreamStore,
+    DescribeError, ReadError, StreamError, StreamStore,
     attempt::{ATTEMPT_KEY_LEN, attempt_key, producer_key},
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        ReadRecordsRequest, ReadRecordsResponse, StreamRecord, StreamStatus,
+        ReadRecordsRequest, ReadRecordsResponse, StreamRecord,
     },
 };
 use tokio::sync::watch;
@@ -65,27 +62,17 @@ struct State {
     failures: HashMap<Op, (AnyError, usize)>,
     panics: HashSet<Op>,
     lost_answers: HashMap<Op, usize>,
-    delays: usize,
-    late: Vec<AppendRecordsRequest>,
 }
 
+/// The number of the last batches of each Producer of a Stream that the Store remembers.
+const WINDOW: usize = 4;
+
 /// A Store in memory. It fences an earlier attempt of a Producer, and writes nothing for a resend
-/// of one of the last `window` batches of a Producer of a Stream.
+/// of one of the last `WINDOW` batches of a Producer of a Stream.
+#[derive(Default)]
 pub struct MemoryStore {
     state: Mutex<State>,
     released: watch::Sender<u64>,
-    /// The number of the last batches of each Producer of a Stream that the Store remembers.
-    pub window: AtomicUsize,
-}
-
-impl Default for MemoryStore {
-    fn default() -> Self {
-        Self {
-            state: Mutex::default(),
-            released: watch::Sender::default(),
-            window: AtomicUsize::new(4),
-        }
-    }
 }
 
 impl MemoryStore {
@@ -124,20 +111,6 @@ impl MemoryStore {
     /// Makes the next `times` calls of `op` write, and then fail with `StoreUnavailable`.
     pub fn lose_answers(&self, op: Op, times: usize) {
         self.state.lock().lost_answers.insert(op, times);
-    }
-
-    /// Makes the next `times` appends get no answer, and keeps them for [`Self::write_late`].
-    pub fn delay_appends(&self, times: usize) {
-        self.state.lock().delays = times;
-    }
-
-    /// Writes the delayed append with `request_id`, as a Store does that finishes a write after
-    /// its caller gave up.
-    pub fn write_late(&self, request_id: &str) {
-        let mut state = self.state.lock();
-        let at = (state.late.iter()).position(|request| request.request_id == request_id);
-        let request = state.late.remove(at.expect("The append was delayed"));
-        let _ = state.append(request, self.window.load(Ordering::Relaxed));
     }
 
     pub fn requests(&self) -> Vec<Request> {
@@ -211,7 +184,6 @@ impl State {
     fn append(
         &mut self,
         request: AppendRecordsRequest,
-        window: usize,
     ) -> Result<AppendRecordsResponse, AppendError> {
         let stream = self.streams.get_mut(&request.stream_id);
         let stream =
@@ -260,7 +232,7 @@ impl State {
         };
         let batches = stream.producers.entry(id).or_default();
         batches.push_back(written);
-        if batches.len() > window {
+        if batches.len() > WINDOW {
             batches.pop_front();
         }
         Ok(AppendRecordsResponse {
@@ -317,48 +289,16 @@ impl StreamStore for MemoryStore {
         Box::pin(async move {
             self.arrive(Op::Append, Request::Append(request.clone()))
                 .await?;
-            let delayed = {
-                let mut state = self.state.lock();
-                let delayed = state.delays > 0;
-                if delayed {
-                    state.delays -= 1;
-                    state.late.push(request.clone());
-                }
-                delayed
-            };
-            if delayed {
-                return std::future::pending().await;
-            }
-            let window = self.window.load(Ordering::Relaxed);
-            let appended = self.state.lock().append(request, window);
+            let appended = self.state.lock().append(request);
             self.answer(Op::Append, appended)
         })
     }
 
     fn read_records(
         &self,
-        request: ReadRecordsRequest,
+        _: ReadRecordsRequest,
     ) -> BoxFuture<'_, Result<ReadRecordsResponse, ReadError>> {
-        Box::pin(async move {
-            let state = self.state.lock();
-            let stream = state.streams.get(&request.stream_id);
-            let stream =
-                stream.ok_or_else(|| ReadError::operation(ReadReason::NotFound, NOT_CREATED))?;
-            let after: Vec<&StreamRecord> = (stream.records.iter())
-                .filter(|record| record.offset > request.from_offset)
-                .collect();
-            let records: Vec<StreamRecord> = (after.iter())
-                .take(request.max_records.max(1) as usize)
-                .map(|record| (*record).clone())
-                .collect();
-            Ok(ReadRecordsResponse {
-                done: stream.closed && records.len() == after.len(),
-                last_offset: records
-                    .last()
-                    .map_or(request.from_offset, |r| r.offset.clone()),
-                records,
-            })
-        })
+        unimplemented!("No test reads this Store")
     }
 
     fn close_stream(
@@ -375,26 +315,8 @@ impl StreamStore for MemoryStore {
 
     fn describe_stream(
         &self,
-        request: DescribeStreamRequest,
+        _: DescribeStreamRequest,
     ) -> BoxFuture<'_, Result<DescribeStreamResponse, DescribeError>> {
-        Box::pin(async move {
-            let state = self.state.lock();
-            let stream = state.streams.get(&request.stream_id);
-            let reason = DescribeReason::NotFound;
-            let stream = stream.ok_or_else(|| DescribeError::operation(reason, NOT_CREATED))?;
-            let status = if stream.closed {
-                StreamStatus::Closed
-            } else {
-                StreamStatus::Open
-            };
-            Ok(DescribeStreamResponse {
-                status: status as i32,
-                last_offset: stream
-                    .records
-                    .last()
-                    .map(|r| r.offset.clone())
-                    .unwrap_or_default(),
-            })
-        })
+        unimplemented!("No test describes a Stream of this Store")
     }
 }
