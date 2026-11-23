@@ -3,7 +3,7 @@
 use futures_util::future::BoxFuture;
 use parking_lot::Mutex;
 use prost::Message;
-use rand::RngExt;
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use temporalio_streams::{
     AppendError, CloseError, CreateError, DescribeError, ReadError, StreamStore,
@@ -46,14 +46,13 @@ pub(crate) struct ModelStore {
 }
 
 pub(crate) struct Model {
-    pub(crate) rng: rand::rngs::StdRng,
+    pub(crate) rng: StdRng,
     pub(crate) entries: Vec<Entry>,
     /// The Stream is closed once its last entry came.
     pub(crate) closed: bool,
     /// Returns the fault of each read, if it has one. The test checks each request in it too.
     #[allow(clippy::type_complexity)]
-    pub(crate) fault:
-        Box<dyn FnMut(&mut rand::rngs::StdRng, &ReadRecordsRequest) -> Option<Fault> + Send>,
+    pub(crate) fault: Box<dyn FnMut(&mut StdRng, &ReadRecordsRequest) -> Option<Fault> + Send>,
     /// Each read answers immediately with what came, as a Store that can't wait does.
     pub(crate) ignores_wait: bool,
     /// The reads that run now, and the maximum that ran at the same time.
@@ -66,6 +65,30 @@ pub(crate) struct Model {
     /// The answers with nothing that came before the read's wait was up.
     pub(crate) answered_early: usize,
     pub(crate) violations: Vec<String>,
+}
+
+impl Model {
+    /// Returns the model of a Stream with `entries`, whose reads get the faults of `fault`. Its
+    /// Store waits as each read asks.
+    pub(crate) fn new(
+        seed: u64,
+        entries: Vec<Entry>,
+        closed: bool,
+        fault: impl FnMut(&mut StdRng, &ReadRecordsRequest) -> Option<Fault> + Send + 'static,
+    ) -> Self {
+        Self {
+            rng: StdRng::seed_from_u64(seed),
+            entries,
+            closed,
+            fault: Box::new(fault),
+            ignores_wait: false,
+            reading: (0, 0),
+            moved_to: None,
+            empty_until: None,
+            answered_early: 0,
+            violations: vec![],
+        }
+    }
 }
 
 impl ModelStore {

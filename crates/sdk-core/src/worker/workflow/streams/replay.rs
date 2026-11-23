@@ -694,18 +694,7 @@ mod tests {
             kept.lock().push((now, failed));
             fault
         };
-        let model = Model {
-            rng: StdRng::seed_from_u64(seed),
-            entries,
-            closed: rng.random_bool(0.5),
-            fault: Box::new(fault),
-            ignores_wait: false,
-            reading: (0, 0),
-            moved_to: None,
-            empty_until: None,
-            answered_early: 0,
-            violations: vec![],
-        };
+        let model = Model::new(seed, entries, rng.random_bool(0.5), fault);
         Replayed {
             kind,
             stream,
@@ -964,18 +953,7 @@ mod tests {
             at: Duration::ZERO,
             record: Some(given.clone()),
         };
-        let model = ModelStore::new(Model {
-            rng: StdRng::seed_from_u64(0),
-            entries: vec![entry],
-            closed: false,
-            fault: Box::new(fault),
-            ignores_wait: false,
-            reading: (0, 0),
-            moved_to: None,
-            empty_until: None,
-            answered_early: 0,
-            violations: vec![],
-        });
+        let model = ModelStore::new(Model::new(0, vec![entry], false, fault));
         let runtime = StreamRuntime::new(Arc::new(model), StoreLimits::default());
         let mut runtimes = StreamRuntimes::new([(stream.store, Arc::new(runtime))]);
         runtimes.settings = settings;
