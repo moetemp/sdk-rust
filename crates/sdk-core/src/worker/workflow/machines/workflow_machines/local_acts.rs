@@ -16,6 +16,7 @@ struct Preresolution {
 }
 
 /// A result of History that a replay holds for the activation of the first run.
+#[allow(clippy::large_enum_variant)] // A run holds few results at a time.
 enum PeekedResult {
     LocalActivity {
         seq: u32,
