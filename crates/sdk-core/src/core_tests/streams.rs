@@ -1937,11 +1937,12 @@ async fn a_call_of_an_update_handler_runs_after_the_update_is_accepted(#[case] c
 }
 
 /// The kind of a call of a first run that [`replay_calls`] replays. In one activation the first
-/// run gave the results of Local Activities before those of appends.
+/// run gave the results of Local Activities before those of appends, and those of reads last.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
     LocalActivity,
     Append,
+    Read,
 }
 
 /// A call of a first run whose task 2 gave its result. Its seq is its place in the list of calls.
@@ -2009,10 +2010,19 @@ async fn replay_calls(
                 activation_index,
                 result: Some(stream_append_result::Result::Appended(offsets.clone())),
             }),
+            // A page with no Record, which a replay gives with no Store read.
+            Kind::Read => data.reads.push(StreamReadResult {
+                seq,
+                stream_id: format!("r{seq}"),
+                store: STORE.to_string(),
+                activation_index,
+                from_offset: vec![],
+                result: Some(stream_read_result::Result::Page(StreamReadPage::default())),
+            }),
         }
     }
-    if !data.appends.is_empty() {
-        let records = vec![];
+    if !data.appends.is_empty() || !data.reads.is_empty() {
+        let records = vec![vec![]; data.reads.len()];
         t.add(MarkerRecordedEventAttributes {
             marker_name: STREAM_MARKER_NAME.to_string(),
             details: marker_details(StreamMarker { data, records }),
@@ -2032,6 +2042,12 @@ async fn replay_calls(
         made.map(|(seq, call)| match call.kind {
             Kind::LocalActivity => local_activity(seq),
             Kind::Append => append(seq, &format!("a{seq}")),
+            Kind::Read => ReadStream {
+                seq,
+                stream: Some(stream(&format!("r{seq}"))),
+                ..Default::default()
+            }
+            .into(),
         })
     };
     let (mut activations, mut left) = (vec![], calls.len());
@@ -2044,6 +2060,7 @@ async fn replay_calls(
             .map(|job| match job.variant.as_ref() {
                 Some(Job::ResolveActivity(result)) => result.seq,
                 Some(Job::ResolveStreamAppend(result)) => result.seq,
+                Some(Job::ResolveStreamRead(result)) => result.seq,
                 other => panic!("{other:?}"),
             })
             .collect();
@@ -2064,11 +2081,12 @@ async fn replay_calls(
 }
 
 // A replay gives the result of an append where it gives the result of a Local Activity at the
-// same place. A task with both gives its results in the order of the first run.
+// same place. A task with Local Activities, appends and reads gives its results in the order of
+// the first run.
 #[tokio::test]
 async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_activity() {
     let store = store(&[]).await;
-    let (local, append) = (Kind::LocalActivity, Kind::Append);
+    let (local, append, read) = (Kind::LocalActivity, Kind::Append, Kind::Read);
     let (mut batched, mut apart) = (0, 0);
     for seed in 0..200 {
         let _seed = SeedOnPanic(seed);
@@ -2087,19 +2105,19 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
             1 => (false, 0, vec![(append, 0, None), (local, 1, None)]),
             2 => (true, 1, vec![(append, 0, None), (local, 1, None)]),
             // Workflow code makes Local Activity 4 at the result of call 1, and the first run got
-            // its result with the one of append 2, after the one of append 3.
+            // its result with the one of read 2, after the one of append 3.
             3 => (
                 true,
                 1,
                 vec![
                     (local, 0, None),
-                    (append, 2, None),
+                    (read, 2, None),
                     (append, 1, None),
                     (local, 2, Some(1)),
                 ],
             ),
             _ => {
-                let kind = |rng: &mut StdRng| [local, append][rng.random_range(0..2)];
+                let kind = |rng: &mut StdRng| [local, append, read][rng.random_range(0..3)];
                 let mut picked: Vec<(Kind, u64, Option<u32>)> = (0..rng.random_range(1..=3))
                     .map(|_| (kind(&mut rng), rng.random_range(0..4), None))
                     .collect();
@@ -2140,14 +2158,29 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
                 .filter(|other| other.activation == call.activation);
             with.count() == 1
         };
-        let made_one_before = |call: &Call| {
-            let after = call.after.map(|after| calls[after as usize - 1].activation);
-            after.is_some_and(|after| after + 1 == call.activation)
-        };
+        // The activation of task 2 that made a call, or `None` for task 1.
+        let made = |call: &Call| call.after.map(|after| calls[after as usize - 1].activation);
+        let made_one_before = |call: &Call| made(call).is_some_and(|at| at + 1 == call.activation);
         if calls
             .iter()
             .any(|call| made_one_before(call) && !alone(call))
         {
+            continue;
+        }
+        // The message of the rejected Update doesn't wait for a read, so a completion of task 2
+        // that leaves only reads in flight completes the task. A result comes in task 2 only if
+        // a call that isn't a read stays in flight past it, or it is alone and not the result of
+        // a read, or no call stays in flight and it came while Workflow code had the activation
+        // before it.
+        let comes = |call: &Call| {
+            let at = Some(call.activation);
+            let mut later =
+                (calls.iter()).filter(|other| Some(other.activation) > at && made(other) < at);
+            later.clone().any(|other| other.kind != read)
+                || (alone(call) && call.kind != read)
+                || (later.next().is_none() && !made_one_before(call))
+        };
+        if first == 1 && !calls.iter().all(comes) {
             continue;
         }
         let all = |kind: Kind| -> Vec<Call> {
@@ -2172,14 +2205,14 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
             assert_eq!(replays[1], replays[0], "{case}");
             if chunking {
                 // With Local Activities alone, the result of call 2 comes with the one of call 3,
-                // and after it. The fixed shapes with both kinds replay as their first run.
+                // and after it. The first three fixed shapes replay as their first run.
                 if seed == 0 {
                     assert_eq!(replays[0], [vec![1], vec![3, 2]], "{case}");
                 }
                 if seed <= 2 {
                     assert_eq!(replays[2], first_run(&calls), "{case}");
                 }
-                // Append 2 waits for the result of Local Activity 4, which the first run gave
+                // Read 2 waits for the result of Local Activity 4, which the first run gave
                 // with it.
                 if seed == 3 {
                     assert_eq!(replays[2], [vec![1, 3], vec![4, 2]], "{case}");
@@ -2190,6 +2223,7 @@ async fn a_replay_gives_a_stream_result_where_it_gives_the_result_of_a_local_act
         }
     }
     // In some seeds a replay with chunking on gives the results of two activations in one, and
-    // in some a task with both kinds keeps apart what Local Activities alone give in one.
+    // in some a task with more than one kind keeps apart what Local Activities alone give in
+    // one.
     assert!(batched > 0 && apart > 0, "{batched} {apart}");
 }
