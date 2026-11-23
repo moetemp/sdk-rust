@@ -864,6 +864,7 @@ impl ManagedRun {
                         result: ActivationCompleteResult {
                             outcome: ActivationCompleteOutcome::DoNothing,
                             replaying: self.wfm.machines.replaying,
+                            task_token: self.wft.as_ref().map(|t| t.info.task_token.clone()),
                         },
                         resp_chan: completion.resp_chan,
                     }))
@@ -1265,7 +1266,11 @@ impl ManagedRun {
             self.wfm.wft_completion_reported();
         }
         FulfillableActivationComplete {
-            result: ActivationCompleteResult { outcome, replaying },
+            result: ActivationCompleteResult {
+                outcome,
+                replaying,
+                task_token: self.wft.as_ref().map(|t| t.info.task_token.clone()),
+            },
             resp_chan,
         }
     }
@@ -1333,6 +1338,7 @@ impl ManagedRun {
                 .send(ActivationCompleteResult {
                     outcome,
                     replaying: self.wfm.machines.replaying,
+                    task_token: self.wft.as_ref().map(|t| t.info.task_token.clone()),
                 })
                 .is_err()
         {
