@@ -6,14 +6,11 @@ use super::{
     cancel_workflow_state_machine::cancel_workflow,
     complete_workflow_state_machine::complete_workflow,
     continue_as_new_workflow_state_machine::continue_as_new,
-    fail_workflow_state_machine::fail_workflow,
-    local_activity_state_machine::new_local_activity,
-    patch_state_machine::has_change,
-    signal_external_state_machine::new_external_signal,
-    stream_marker_state_machine::stream_marker,
-    timer_state_machine::new_timer,
+    fail_workflow_state_machine::fail_workflow, local_activity_state_machine::new_local_activity,
+    patch_state_machine::has_change, signal_external_state_machine::new_external_signal,
+    stream_marker_state_machine::stream_marker, timer_state_machine::new_timer,
     upsert_search_attributes_state_machine::upsert_search_attrs,
-    workflow_machines::local_acts::{LocalActivityData, NextPeeked},
+    workflow_machines::local_acts::LocalActivityData, workflow_machines::local_acts::NextPeeked,
     workflow_task_state_machine::WorkflowTaskMachine,
 };
 use crate::{
