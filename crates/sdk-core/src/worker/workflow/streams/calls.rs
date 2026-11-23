@@ -1914,6 +1914,8 @@ mod tests {
         cancelled_in_history: usize,
         /// The results of calls that Core had stopped.
         late_results: usize,
+        /// The tasks that only reads held, which completed for a close intent.
+        completed_for_intent: usize,
     }
 
     /// The state as of the last task in History, which a failed task goes back to.
@@ -2078,7 +2080,8 @@ mod tests {
                     self.complete();
                     return Ok(());
                 }
-                // The heartbeat came while the last activation was out.
+                // The heartbeat came while the last activation was out, or a close intent
+                // completed the task.
                 if !self.run.calls.task.is_open() {
                     self.complete();
                     return Ok(());
@@ -2191,6 +2194,12 @@ mod tests {
             result.unwrap_or_else(|error| panic!("seed {}: {error:?}", self.seed));
             for resolution in late {
                 self.run.calls.resolve(resolution);
+            }
+            // A close intent doesn't wait for a read, so it completes a task that only reads hold.
+            let calls = &mut self.run.calls;
+            if calls.task.is_open() && calls.holds_only_reads() && calls.has_intents() {
+                self.seen.completed_for_intent += 1;
+                calls.set_task(TaskState::Completing(self.task_attempt));
             }
             for command in &commands {
                 match command {
@@ -2786,6 +2795,7 @@ mod tests {
             cancelled_at_go_live,
             cancelled_in_history,
             late_results,
+            completed_for_intent,
         } = seen;
         let counts = [
             full_ledgers,
@@ -2801,6 +2811,7 @@ mod tests {
             cancelled_at_go_live,
             cancelled_in_history,
             late_results,
+            completed_for_intent,
         ];
         let counts = [&counts[..], &cancels[..]].concat();
         assert!(counts.iter().all(|count| *count > 0), "{counts:?}");
