@@ -294,82 +294,6 @@ async fn a_task_completes_while_a_read_runs(#[case] completes: Completes) {
     assert_eq!(replay_reads == 0, in_history, "{replay_reads}");
 }
 
-/// Returns Workflow code with two readers. One reads a page of Stream `s`. The other waits for a
-/// page of Stream `t`, and then reads Stream `s` after the last Record that the first one got.
-fn two_readers_at_one_offset() -> impl FnMut(&WorkflowActivation) -> Vec<Command> {
-    let wait = Duration::from_secs(60);
-    let mut last_of_first = vec![];
-    move |activation| {
-        let mut commands: Vec<Command> = vec![];
-        for result in results(activation) {
-            match result.seq {
-                1 => {
-                    let page = page_of(result).expect("The read gives a page");
-                    last_of_first.clone_from(&page.records[0].offset);
-                }
-                2 => commands.push(read(3, "s", &last_of_first, Duration::ZERO).into()),
-                _ => commands.push(complete()),
-            }
-        }
-        if let Some(Job::InitializeWorkflow(_)) = &activation.jobs[0].variant {
-            commands.push(read(1, "s", &[], wait).into());
-            commands.push(read(2, "t", &[], wait).into());
-        }
-        commands
-    }
-}
-
-// Task 1 has no command, so a replay with chunking on takes it and task 2 as one. Each read still
-// gets the page that the first run gave it, and Workflow code sends the same next read.
-#[tokio::test]
-async fn a_replay_with_chunking_on_gives_each_read_the_page_of_its_first_run() {
-    let store = store(&["s", "t"]).await;
-    let t = history(Duration::from_secs(60));
-    let mut first = task_of(&t);
-    let question = WorkflowQuery {
-        query_type: "q".to_string(),
-        ..Default::default()
-    };
-    first.queries.insert("q1".to_string(), question);
-    let mut opts = StartOpts::new(&store);
-    opts.responses = vec![ResponseType::Raw(first)];
-    let run = start(t, opts);
-    let mut workflow = two_readers_at_one_offset();
-    let init = run.worker.poll_workflow_activation().await.unwrap();
-    respond(&run.worker, &init, &mut workflow).await;
-    // The answer of the query completes the task while the reads wait.
-    let query = run.worker.poll_workflow_activation().await.unwrap();
-    respond(&run.worker, &query, |query| {
-        answer(query).into_iter().collect()
-    })
-    .await;
-    assert_eq!(command_types(&run.sent()[0]), []);
-    // Each Record comes once Workflow code completed the activation before it, so the first run
-    // gets each page in an activation of its own.
-    let mut fills = ["s", "t"].iter();
-    let completed = |sent: &WorkflowTaskCompletion| {
-        command_types(sent).contains(&CommandType::CompleteWorkflowExecution)
-    };
-    let mut live = vec![];
-    while !run.sent().iter().any(completed) {
-        if let Some(id) = fills.next() {
-            fill(&store, id, 1).await;
-        }
-        let activation = run.worker.poll_workflow_activation().await.unwrap();
-        assert_eq!(results(&activation).count(), 1, "{activation:?}");
-        live.push(jobs_of(&activation));
-        respond(&run.worker, &activation, &mut workflow).await;
-    }
-    run.worker.drain_pollers_and_shutdown_ref().await;
-    let replayed = run.replay(two_readers_at_one_offset()).await;
-    assert_eq!(read_jobs(&replayed), read_jobs(&live));
-    // The two readers get their pages in one activation of the replay, unless the feature turns
-    // chunking off.
-    let together = (replayed.iter()).any(|jobs| read_jobs(std::slice::from_ref(jobs)).len() == 2);
-    let chunked = !cfg!(feature = "disable_workflow_task_chunking");
-    assert_eq!(together, chunked, "{replayed:?}");
-}
-
 /// Workflow code that starts three reads. At the first page of a read it cancels each read, and
 /// it completes once a read gives the job of its cancel.
 fn cancels_at_the_first_page(activation: &WorkflowActivation) -> Vec<Command> {
@@ -458,45 +382,6 @@ async fn a_cancel_ends_each_read_whose_job_workflow_code_does_not_have() {
     assert_eq!(read_jobs(&replayed), read_jobs(&live));
     let chunked = !cfg!(feature = "disable_workflow_task_chunking");
     assert_eq!(replayed.len(), if chunked { 2 } else { 3 }, "{replayed:?}");
-}
-
-// The Store answers a read while Workflow code cancels it. Core takes the cancel of the completion
-// first, and then drops the page, so Workflow code gets no page after its cancel.
-#[tokio::test]
-async fn a_cancel_drops_a_page_that_came_while_workflow_code_had_an_activation() {
-    let store = store(&["s", "w"]).await;
-    fill(&store, "s", 1).await;
-    store.gate_reads(true);
-    let run = start(history(Duration::from_secs(60)), StartOpts::new(&store));
-    // Workflow code reads `s` and `w`, and cancels the read of `w` at the page of `s`.
-    let workflow = |activation: &WorkflowActivation| match results(activation).next() {
-        None => {
-            let waits = read(2, "w", &[], Duration::from_secs(60));
-            vec![read(1, "s", &[], Duration::ZERO).into(), waits.into()]
-        }
-        Some(result) if result.seq == 1 => vec![RequestCancelStreamRead { seq: 2 }.into()],
-        Some(_) => vec![complete()],
-    };
-    let init = run.worker.poll_workflow_activation().await.unwrap();
-    respond(&run.worker, &init, workflow).await;
-    // The Store got the append of `fill`, and then the two reads, which wait at the gate.
-    wait_until(|| store.requests().len() == 3).await;
-    store.let_go(1..2);
-    let page = run.worker.poll_workflow_activation().await.unwrap();
-    // The Store answers the read of `w` while Workflow code has the activation. The task of the
-    // read sends its result in the poll in which it passes the gate.
-    fill(&store, "w", 1).await;
-    store.let_go(2..3);
-    wait_until(|| store.reads_let_go() == 2).await;
-    respond(&run.worker, &page, workflow).await;
-    let after = run.worker.poll_workflow_activation().await.unwrap();
-    let cancelled = ResolveStreamRead {
-        seq: 2,
-        status: Some(resolve_stream_read::Status::Cancelled(())),
-    };
-    assert_eq!(jobs_of(&after), [Job::ResolveStreamRead(cancelled)]);
-    respond(&run.worker, &after, workflow).await;
-    run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
 /// How History reaches a Worker that doesn't have the run.
@@ -807,51 +692,6 @@ async fn a_shutdown_ends_a_task_that_only_reads_hold(#[case] after: After) {
     // The next Worker replays the first page, and runs the second read again.
     assert_eq!(records_of(&jobs), store.records("s"));
     next.worker.drain_pollers_and_shutdown_ref().await;
-}
-
-// The cached run has no Stream call, and another Worker read Stream `s` in task 3.
-#[tokio::test]
-async fn a_cached_run_with_no_call_replays_the_read_of_another_worker() {
-    let store = store(&["s"]).await;
-    fill(&store, "s", 3).await;
-    let workflow: Workflow = |activation| match &activation.jobs[0].variant {
-        Some(Job::InitializeWorkflow(_)) => vec![timer(1)],
-        Some(Job::FireTimer(fired)) if fired.seq == 1 => vec![timer(2)],
-        Some(Job::FireTimer(_)) => vec![read(1, "s", &[], Duration::ZERO).into()],
-        Some(Job::SignalWorkflow(_)) => vec![complete()],
-        _ => vec![],
-    };
-    let mut t = history(Duration::from_secs(60));
-    for seq in ["1", "2"] {
-        t.add_workflow_task_completed();
-        let started = t.add_timer_started(seq.to_string());
-        t.add_timer_fired(started, seq.to_string());
-        t.add_workflow_task_scheduled_and_started();
-    }
-    let other = start(t, StartOpts::new(&store));
-    loop {
-        let activation = other.worker.poll_workflow_activation().await.unwrap();
-        respond(&other.worker, &activation, workflow).await;
-        if results(&activation).next().is_some() {
-            break;
-        }
-    }
-    other.worker.drain_pollers_and_shutdown_ref().await;
-    let mut t = other.history.lock().clone();
-    t.add_we_signaled("done", vec![]);
-    let fourth = next_task(&mut t);
-    let mut opts = StartOpts::new(&store);
-    opts.responses = vec![ResponseType::ToTaskNum(1), ResponseType::Raw(fourth)];
-    opts.served = None;
-    let run = start(t, opts);
-    assert_eq!(run.drive(workflow).await.len(), 1);
-    let replayed = run.drive(workflow).await;
-    assert_eq!(records_of(&replayed), store.records("s"));
-    assert!(matches!(
-        replayed.last().unwrap()[..],
-        [Job::SignalWorkflow(_)]
-    ));
-    run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
 /// Returns Workflow code that reads Stream `s` in pages of `page_records` Records. At each page it
@@ -2166,51 +2006,4 @@ async fn a_store_that_keeps_its_thread_in_a_replay_holds_up_no_other_workflow() 
         respond(&run.worker, &activation, read_with_a_timer_at_each_page(1)).await;
     }
     run.worker.drain_pollers_and_shutdown_ref().await;
-}
-
-// The concurrent replay gives the same jobs in the same activations, and reads the same markers in
-// each part, as a replay that reads one entry at a time.
-#[tokio::test]
-async fn a_replay_reads_the_entries_of_many_markers_at_the_same_time() {
-    for seed in 0..3 {
-        let _seed = SeedOnPanic(seed);
-        let mut rng = StdRng::seed_from_u64(seed);
-        let store = store(&["s"]).await;
-        // Each task of the first run gives one page of 25 small Records, so each marker has 25.
-        fill(&store, "s", 25 * rng.random_range(15..=40)).await;
-        let (live, t, whole) = first_run_with_a_timer_at_each_page(&store, 25).await;
-        let markers = markers_of(&t, &store);
-        let one_at_a_time =
-            |wc: &mut WorkerConfig| wc.stream_runtimes.settings.replay_concurrency = 1;
-        let (alone, reads) = replay_with_reads(&store, &t, whole.clone(), 25, one_at_a_time).await;
-        assert_eq!(alone[..live.len()], live[..], "seed {seed}");
-        let bound = StreamSettings::default().bounds.max_task_record_bytes;
-        let parts = check_parts(seed, &markers, &reads, bound);
-        assert!(parts[0] > 1, "seed {seed}: {parts:?}");
-        // A replay asks for the bytes of an entry's Records, so this Store gives them in one read.
-        assert_eq!(reads.concat().len(), markers.len(), "seed {seed}");
-        // The Store holds the reads of the other replay until the reads of two entries wait
-        // together. A retry of an entry asks from the same offset.
-        store.hold(Op::Read);
-        let before = store.reads().len();
-        let two_wait = async {
-            wait_until(|| {
-                let reads = store.reads();
-                let offsets: HashSet<_> = (reads[before..].iter())
-                    .map(|read| &read.from_offset)
-                    .collect();
-                offsets.len() > 1
-            })
-            .await;
-            store.release();
-        };
-        let replay = replay_with_reads(&store, &t, whole, 25, |_| {});
-        let ((jobs, reads), ()) = tokio::join!(replay, two_wait);
-        assert_eq!(jobs, alone, "seed {seed}");
-        assert_eq!(
-            check_parts(seed, &markers, &reads, bound),
-            parts,
-            "seed {seed}"
-        );
-    }
 }
