@@ -242,12 +242,7 @@ async fn a_task_completes_while_a_read_runs(#[case] completes: Completes) {
     let early = &sent[early];
     assert!(early.force_create_new_workflow_task, "{early:?}");
     let entries = marker(early).map_or(vec![], |marker| marker.reads);
-    let pages: Vec<_> = (entries.iter())
-        .filter_map(|read| match &read.result {
-            Some(stream_read_result::Result::Page(page)) => Some(page),
-            _ => None,
-        })
-        .collect();
+    let pages: Vec<_> = entries.iter().filter_map(recorded_page).collect();
     match completes {
         // The heartbeat can come before a page, so the pages are in the markers of several tasks.
         // Each page of the 13 Records has its digest.
@@ -396,6 +391,19 @@ enum Path {
     InALaterPart,
 }
 
+/// Fires the timer that the History of `t` started last.
+fn fire_last_timer(t: &mut TestHistoryBuilder) {
+    let events = t.get_full_history_info().unwrap().into_events();
+    let started = (events.iter().rev()).find_map(|event| match &event.attributes {
+        Some(history_event::Attributes::TimerStartedEventAttributes(timer)) => {
+            Some((event.event_id, timer.timer_id.clone()))
+        }
+        _ => None,
+    });
+    let (started, id) = started.unwrap();
+    t.add_timer_fired(started, id);
+}
+
 /// What a replay finds of the Records of its read.
 #[derive(Clone, Copy, Debug)]
 enum Replay {
@@ -502,11 +510,7 @@ async fn the_replay_rule_holds_on_each_history_path(#[case] path: Path, #[case] 
         }
         first.worker.drain_pollers_and_shutdown_ref().await;
         t = first.history.lock().clone();
-        let events = t.get_full_history_info().unwrap().into_events();
-        let started = (events.iter().rev())
-            .find(|event| event.event_type() == EventType::TimerStarted)
-            .unwrap();
-        t.add_timer_fired(started.event_id, (2 * seq).to_string());
+        fire_last_timer(&mut t);
         if seq == 1 {
             t.add_full_wf_task();
             let started = t.add_timer_started("3".to_string());
@@ -747,13 +751,19 @@ async fn first_run_with_a_timer_at_each_page(
     }
     first.worker.drain_pollers_and_shutdown_ref().await;
     let mut t = first.history.lock().clone();
-    let events = t.get_full_history_info().unwrap().into_events();
-    let started = (events.iter().rev())
-        .find(|event| event.event_type() == EventType::TimerStarted)
-        .unwrap();
-    t.add_timer_fired(started.event_id, "1".to_string());
+    fire_last_timer(&mut t);
     let whole = next_task(&mut t);
     (live, t, whole)
+}
+
+/// Completes `activation` if it only evicts its run, and returns true if it did.
+async fn evicted(worker: &Worker, activation: &WorkflowActivation) -> bool {
+    let evicts = activation.is_only_eviction();
+    if evicts {
+        let empty = WorkflowActivationCompletion::empty(activation.run_id.clone());
+        let _ = worker.complete_workflow_activation(empty).await;
+    }
+    evicts
 }
 
 fn recorded_page(entry: &StreamReadResult) -> Option<&StreamReadPage> {
@@ -835,9 +845,7 @@ async fn replay_with_reads(
         let all = store.reads();
         reads.push(all[seen..].to_vec());
         seen = all.len();
-        if activation.is_only_eviction() {
-            let empty = WorkflowActivationCompletion::empty(activation.run_id);
-            let _ = run.worker.complete_workflow_activation(empty).await;
+        if evicted(&run.worker, &activation).await {
             break;
         }
         jobs.push(jobs_of(&activation));
@@ -1147,11 +1155,7 @@ async fn first_run_with_peeked_results(
     run.worker.drain_pollers_and_shutdown_ref().await;
     store.release();
     let mut t = run.history.lock().clone();
-    let events = t.get_full_history_info().unwrap().into_events();
-    let started = (events.iter().rev())
-        .find(|event| event.event_type() == EventType::TimerStarted)
-        .unwrap();
-    t.add_timer_fired(started.event_id, "1".to_string());
+    fire_last_timer(&mut t);
     (live, t)
 }
 
@@ -1495,15 +1499,7 @@ async fn a_replay_goes_on_after_a_task_with_no_job_before_the_next_part(#[case] 
     if let NoJob::EmptyUnchunked = no_job {
         disable_chunking(&mut t);
     }
-    let events = t.get_full_history_info().unwrap().into_events();
-    let started = (events.iter())
-        .find(|event| {
-            matches!(&event.attributes,
-                Some(history_event::Attributes::TimerStartedEventAttributes(timer))
-                    if timer.timer_id == "1")
-        })
-        .unwrap();
-    t.add_timer_fired(started.event_id, "1".to_string());
+    fire_last_timer(&mut t);
     let whole = next_task(&mut t);
     // The first marker is a part, and the next one comes after the two tasks with no page.
     let markers = recorded_markers(&whole.history.as_ref().unwrap().events);
@@ -1567,9 +1563,7 @@ async fn a_replay_fails_the_workflow_with_the_next_part_unread(
         let drive = async {
             while let Ok(activation) = replay.worker.poll_workflow_activation().await {
                 let run_id = activation.run_id.clone();
-                if activation.is_only_eviction() {
-                    let completion = WorkflowActivationCompletion::empty(run_id);
-                    let _ = replay.worker.complete_workflow_activation(completion).await;
+                if evicted(&replay.worker, &activation).await {
                     break;
                 }
                 jobs.push(jobs_of(&activation));
@@ -1761,9 +1755,7 @@ async fn two_tasks_of_a_run_that_is_not_cached_each_get_their_result() {
             let activation = (tokio::time::timeout(Duration::from_secs(30), poll).await)
                 .unwrap_or_else(|_| panic!("seed {seed}: a task got no activation"))
                 .unwrap();
-            if activation.is_only_eviction() {
-                let empty = WorkflowActivationCompletion::empty(activation.run_id);
-                let _ = run.worker.complete_workflow_activation(empty).await;
+            if evicted(&run.worker, &activation).await {
                 runs.push(vec![]);
                 continue;
             }
@@ -1950,18 +1942,7 @@ async fn a_failed_fetch_of_another_task_fails_no_completion_that_waits_for_recor
     completion.await.unwrap();
     // The replay goes on to the end of the task, which completes. Then the run leaves the cache,
     // and Core fails the task of the query.
-    loop {
-        let activation = run.worker.poll_workflow_activation().await.unwrap();
-        if activation.is_only_eviction() {
-            let empty = WorkflowActivationCompletion::empty(activation.run_id);
-            run.worker
-                .complete_workflow_activation(empty)
-                .await
-                .unwrap();
-            break;
-        }
-        respond(&run.worker, &activation, workflow).await;
-    }
+    run.drive(workflow).await;
     assert_eq!(run.sent().len(), 1);
     let failed = run.failed.lock().clone();
     let [(cause, message)] = &failed[..] else {
