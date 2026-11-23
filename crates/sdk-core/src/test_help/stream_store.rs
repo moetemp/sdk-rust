@@ -1,5 +1,5 @@
-//! The one Stream Store of Core's tests. It does what [`StreamStore`] requires, and each test sets
-//! its faults.
+//! A Stream Store in memory for Core's tests. It does what [`StreamStore`] requires, and each test
+//! sets its faults.
 
 use futures_util::future::BoxFuture;
 use parking_lot::{Condvar, Mutex};
@@ -9,12 +9,12 @@ use std::{
 };
 use temporalio_streams::{
     AnyError, AnyReason, AppendError, AppendReason, CloseError, CloseReason, CreateError,
-    DescribeError, DescribeReason, ReadError, ReadReason, StreamError, StreamStore,
+    DescribeError, ReadError, ReadReason, StreamError, StreamStore,
     attempt::{ATTEMPT_KEY_LEN, attempt_key, producer_key},
     proto::{
         AppendRecordsRequest, AppendRecordsResponse, CloseStreamRequest, CloseStreamResponse,
         CreateStreamRequest, CreateStreamResponse, DescribeStreamRequest, DescribeStreamResponse,
-        ReadRecordsRequest, ReadRecordsResponse, StreamRecord, StreamStatus,
+        ReadRecordsRequest, ReadRecordsResponse, StreamRecord,
     },
 };
 use tokio::sync::watch;
@@ -427,26 +427,8 @@ impl StreamStore for MemoryStore {
 
     fn describe_stream(
         &self,
-        request: DescribeStreamRequest,
+        _: DescribeStreamRequest,
     ) -> BoxFuture<'_, Result<DescribeStreamResponse, DescribeError>> {
-        Box::pin(async move {
-            let state = self.state.lock();
-            let stream = state.streams.get(&request.stream_id);
-            let reason = DescribeReason::NotFound;
-            let stream = stream.ok_or_else(|| DescribeError::operation(reason, NOT_CREATED))?;
-            let status = if stream.closed {
-                StreamStatus::Closed
-            } else {
-                StreamStatus::Open
-            };
-            Ok(DescribeStreamResponse {
-                status: status as i32,
-                last_offset: stream
-                    .records
-                    .last()
-                    .map(|r| r.offset.clone())
-                    .unwrap_or_default(),
-            })
-        })
+        unimplemented!("No test describes a Stream of this Store")
     }
 }
