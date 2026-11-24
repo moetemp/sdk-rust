@@ -36,6 +36,17 @@ Legacy chunking groups such WFT sequences into a "logical" WFT with the last WFT
 work in it. This can also merge commandless tasks that delivered signals, changing the timestamps
 and grouping of their activation jobs on replay.
 
+A completion whose SDK metadata has `stream_calls` counts as real work, and a replay never merges
+the commandless tasks before it into its task. Local activity markers count activations from the
+start of a logical WFT, so such a merge would let a replay move local activity results of a task
+with Stream calls past its Stream results. When the history it has ends before the next
+completion, the lookahead asks for more, and at the end of history it merges as before. So a
+worker that takes over a run can still merge commandless tasks with the task in hand. Core then
+completes that task as soon as workflow code appends to a Stream, and the result of the append
+comes in a later task. If the task in hand has events of its own, a later replay that keeps the
+tasks apart gives the jobs of those events in a separate activation, where that worker gave them
+together.
+
 ## Disabling chunking
 
 The non-default Core Cargo feature `disable_workflow_task_chunking` records Core SDK flag 5,

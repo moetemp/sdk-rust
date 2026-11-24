@@ -26,6 +26,7 @@ use temporalio_common::protos::{
     coresdk::{
         ActivityTaskCompletion,
         activity_result::ActivityExecutionResult,
+        activity_task::activity_task,
         workflow_activation::{
             ResolveStreamAppend, ResolveStreamClose, StreamAppended, WorkflowActivation,
             remove_from_cache::EvictionReason, resolve_stream_append,
@@ -66,6 +67,7 @@ use temporalio_streams::{
     record::StoreLimits,
 };
 use tokio::sync::{
+    Notify,
     mpsc::{UnboundedReceiver, UnboundedSender},
     oneshot::{self, error::TryRecvError},
 };
@@ -1972,8 +1974,17 @@ struct Progress {
     step: usize,
     /// The Local Activities that have no result yet.
     running: usize,
-    /// The step that each activation with an event took, empty if it took none.
-    taken: Vec<Vec<Command>>,
+    /// The steps of the script that each activation with an event took.
+    taken: Vec<Vec<usize>>,
+}
+
+/// The activations that a run had on a Worker before a new Worker took it over, with the steps of
+/// the script that each of them took.
+struct Earlier {
+    first: Vec<Vec<String>>,
+    taken: Vec<Vec<usize>>,
+    /// The number of those activations that the new Worker gave again.
+    at: usize,
 }
 
 /// Returns the commands of the Workflow code of `script` for `activation`. It answers each query
@@ -1984,9 +1995,14 @@ struct Progress {
 /// sends the last command, Core gives it in one more activation and records its marker after that
 /// command. A replay then stops at the last command while it still replays, so the replay Worker
 /// never evicts the run.
+///
+/// On a Worker that took the run over, an activation that gives activations of the `earlier`
+/// Worker again takes the steps that they took, as in a replay. Each such activation must have the
+/// jobs of one or more of them, one after the other.
 fn scripted(
     script: &[Vec<Command>],
     progress: &mut Progress,
+    earlier: Option<&mut Earlier>,
     activation: &WorkflowActivation,
 ) -> Vec<Command> {
     let mut commands = vec![];
@@ -2017,34 +2033,49 @@ fn scripted(
     if !leaves_events {
         return commands;
     }
-    let last = progress.step + 1 == script.len();
-    let step = match script.get(progress.step) {
-        Some(step) if !last || progress.running == 0 => {
-            progress.step += 1;
-            step.clone()
+    let steps = match earlier {
+        Some(earlier) if earlier.at < earlier.first.len() => {
+            let jobs: Vec<Job> = (activation.jobs.iter())
+                .filter_map(|job| job.variant.clone())
+                .collect();
+            let jobs = with_events(&[jobs]).concat();
+            let count = joined(&earlier.first, earlier.at, &jobs);
+            let again = &earlier.first[earlier.at..];
+            assert!(count > 0, "{jobs:?} doesn't give {again:?} again");
+            let steps = earlier.taken[earlier.at..earlier.at + count].concat();
+            earlier.at += count;
+            steps
         }
-        _ => vec![],
+        _ => {
+            let last = progress.step + 1 == script.len();
+            match progress.step < script.len() && (!last || progress.running == 0) {
+                true => vec![progress.step],
+                false => vec![],
+            }
+        }
     };
-    progress.running += (step.iter())
+    if let Some(step) = steps.last() {
+        progress.step = step + 1;
+    }
+    let step_commands = steps.iter().flat_map(|step| &script[*step]);
+    progress.running += (step_commands.clone())
         .filter(|command| matches!(command, Command::ScheduleLocalActivity(_)))
         .count();
-    commands.extend(step.iter().cloned());
-    progress.taken.push(step);
+    commands.extend(step_commands.cloned());
+    progress.taken.push(steps);
     commands
 }
 
-/// Returns the number of activations of the first run (`first`), from `at` on, whose jobs are
-/// the jobs of one activation of a replay (`jobs`), in any order. Returns 0 if there are none.
-fn merged(first: &[Vec<String>], at: usize, jobs: &[String]) -> usize {
-    let mut left: Vec<&String> = jobs.iter().collect();
+/// Returns the number of activations of the first run (`first`), from `at` on, whose jobs one after
+/// the other are the jobs of one activation of a replay (`jobs`). Returns 0 if there are none.
+fn joined(first: &[Vec<String>], at: usize, jobs: &[String]) -> usize {
+    let mut rest = jobs;
     for (count, activation) in (1..).zip(&first[at.min(first.len())..]) {
-        for job in activation {
-            let Some(place) = left.iter().position(|other| *other == job) else {
-                return 0;
-            };
-            left.remove(place);
-        }
-        if left.is_empty() {
+        let Some(after) = rest.strip_prefix(&activation[..]) else {
+            return 0;
+        };
+        rest = after;
+        if rest.is_empty() {
             return count;
         }
     }
@@ -2053,38 +2084,20 @@ fn merged(first: &[Vec<String>], at: usize, jobs: &[String]) -> usize {
 
 /// Returns the commands of a replay for an activation with the jobs `jobs`. With chunking on, a
 /// replay can give the jobs of several activations of the first run (`first`) in one, and Workflow
-/// code then takes the step that the first run took in each of them (`taken`).
+/// code then takes the steps of `script` that the first run took in each of them (`taken`).
 fn replayed(
     first: &[Vec<String>],
-    taken: &[Vec<Command>],
+    script: &[Vec<Command>],
+    taken: &[Vec<usize>],
     at: &mut usize,
     jobs: &[String],
 ) -> Vec<Command> {
-    let count = merged(first, *at, jobs).max(1);
-    let steps = taken.iter().skip(*at).take(count);
+    let count = joined(first, *at, jobs).max(1);
+    let steps = taken.iter().skip(*at).take(count).flatten();
     *at += count;
-    steps.flatten().cloned().collect()
-}
-
-/// Returns the results of one kind, `local` or Stream calls, in the order of their activations.
-fn of_kind(jobs: &[Vec<String>], local: bool) -> Vec<&String> {
-    let is_local = |job: &&String| job.starts_with("local");
-    let is_stream = |job: &&String| job.starts_with("append") || job.starts_with("close");
-    (jobs.iter().flatten())
-        .filter(|job| if local { is_local(job) } else { is_stream(job) })
+    steps
+        .flat_map(|step| script[*step].iter().cloned())
         .collect()
-}
-
-/// Returns the jobs of each activation with no Local Activity result, leaving out the activations
-/// with no other job.
-fn without_locals(jobs: &[Vec<String>]) -> Vec<Vec<String>> {
-    let kept = jobs.iter().map(|jobs| {
-        (jobs.iter())
-            .filter(|job| !job.starts_with("local"))
-            .cloned()
-            .collect::<Vec<_>>()
-    });
-    kept.filter(|jobs| !jobs.is_empty()).collect()
 }
 
 /// Returns a job as `append 3`, `append 3 failed`, `close 1`, `local 2` or the name of its kind.
@@ -2120,6 +2133,27 @@ fn with_events(jobs: &[Vec<Job>]) -> Vec<Vec<String>> {
     kept.filter(|jobs| !jobs.is_empty()).collect()
 }
 
+/// Completes each Local Activity of `worker` after a random wait, and each cancel of one at once.
+async fn complete_local_activities(worker: &Worker, rng: &mut StdRng) {
+    while let Ok(task) = worker.poll_activity_task().await {
+        let result = match task.variant {
+            Some(activity_task::Variant::Cancel(_)) => {
+                ActivityExecutionResult::cancel_from_details(None)
+            }
+            _ => {
+                tokio::time::sleep(Duration::from_millis(rng.random_range(0..30))).await;
+                ActivityExecutionResult::ok(vec![1].into())
+            }
+        };
+        let completion = ActivityTaskCompletion {
+            task_token: task.task_token,
+            result: Some(result),
+        };
+        worker.complete_activity_task(completion).await.unwrap();
+    }
+    std::future::pending().await
+}
+
 /// The cases that the generated runs reached, over all seeds.
 #[derive(Debug, Default)]
 struct Reached {
@@ -2133,14 +2167,16 @@ struct Reached {
     updates: usize,
     /// The completions that asked for a new task.
     forced: usize,
+    /// The runs that a new Worker took over.
+    taken_over: usize,
 }
 
 // The first run of generated Workflow code, with Local Activities, queries, rejected Updates and
 // Store calls that wait, writes a History whose replay gives the same jobs in the same activations.
 // Queries and rejected Updates leave no event, so the replay has none of their jobs. With chunking
-// on, one activation of the replay can have the jobs of several, and a Local Activity result can
-// come earlier, but each kind of result keeps its order. With no Local Activity, the jobs keep the
-// order of the first run.
+// on, one activation of the replay can have the jobs of several, in the order of the first run.
+// Some runs move to a new Worker in the middle, and the activations of that Worker are then the
+// first run.
 #[tokio::test]
 async fn a_replay_gives_the_activations_of_the_first_run() {
     let ids = ["s0", "s1", "s2"];
@@ -2150,87 +2186,131 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
         let mut rng = StdRng::seed_from_u64(seed);
         let script = script(&mut rng);
         let store = store(&ids).await;
-        let mut opts = StartOpts::new(&store);
-        opts.configure =
-            |wc| wc.stream_runtimes.settings.task_time = Some(Duration::from_millis(100));
         // The server gives each task with a Signal, and some of them with a query or an Update.
         // A forced task has no new event. Each completion lets the Store answer the calls that
-        // wait, so a task that waits for one ends.
-        let (server_rng, released) = (Mutex::new(StdRng::seed_from_u64(!seed)), store.clone());
-        opts.eager = Some(Box::new(move |completion, t| {
-            for id in ids {
-                released.release_stream(id);
-            }
-            let types = command_types(completion);
-            if types.contains(&CommandType::CompleteWorkflowExecution) {
-                return None;
-            }
-            let mut rng = server_rng.lock();
-            let forced = completion.force_create_new_workflow_task;
-            if !forced {
-                t.add_we_signaled("go", vec![]);
-            }
-            let mut task = next_task(t);
-            if rng.random_bool(0.3) {
-                let question = WorkflowQuery {
-                    query_type: "q".to_string(),
-                    ..Default::default()
-                };
-                task.queries
-                    .insert(format!("q{}", t.current_event_id()), question);
-            }
-            if !forced && rng.random_bool(0.3) {
-                let update = format!("u{}", t.current_event_id());
-                task.add_update_request(update, t.current_event_id() - 1);
-            }
-            Some(task)
-        }));
-        let run = start(history(Duration::from_secs(1)), opts);
-        let (mut progress, mut made, mut number) = (Progress::default(), HashMap::new(), 0);
-        let workflow = |activation: &WorkflowActivation| {
-            // The Store answers some of the calls that wait, and some calls of this activation
-            // wait.
-            for id in ids.iter().filter(|_| rng.random_bool(0.5)) {
-                store.release_stream(id);
-            }
-            let commands = scripted(&script, &mut progress, activation);
-            for command in &commands {
-                let (call, stream) = match command {
-                    Command::AppendToStream(append) => {
-                        (format!("append {}", append.seq), &append.stream)
+        // wait, so a task that waits for one ends. Once in a run, after a random completion or after
+        // the first heartbeat, a forced completion with no event and no ledger, it keeps the next
+        // task for a new Worker.
+        let (handover, handed_over) = (Arc::new(Notify::new()), Arc::new(Mutex::new(false)));
+        let server = {
+            let (released, handover, handed_over) =
+                (store.clone(), handover.clone(), handed_over.clone());
+            let mut rng = StdRng::seed_from_u64(!seed);
+            Arc::new(Mutex::new(
+                move |completion: &WorkflowTaskCompletion, t: &mut TestHistoryBuilder| {
+                    for id in ids {
+                        released.release_stream(id);
                     }
-                    Command::CloseStream(close) => (format!("close {}", close.seq), &close.stream),
-                    _ => continue,
-                };
-                made.insert(call, number);
-                if rng.random_bool(0.3) {
-                    store.hold_stream(&stream.as_ref().unwrap().id);
-                }
-            }
-            number += 1;
-            commands
+                    let types = command_types(completion);
+                    if types.contains(&CommandType::CompleteWorkflowExecution) {
+                        return None;
+                    }
+                    let forced = completion.force_create_new_workflow_task;
+                    if !forced {
+                        t.add_we_signaled("go", vec![]);
+                    }
+                    let heartbeat = forced
+                        && completion.sdk_metadata.stream_calls.is_none()
+                        && types
+                            .iter()
+                            .all(|kind| *kind == CommandType::ProtocolMessage);
+                    let mut handed = handed_over.lock();
+                    if !*handed && rng.random_bool(if heartbeat { 1.0 } else { 0.1 }) {
+                        t.add_workflow_task_scheduled_and_started();
+                        *handed = true;
+                        handover.notify_one();
+                        return None;
+                    }
+                    let mut task = next_task(t);
+                    if rng.random_bool(0.3) {
+                        let question = WorkflowQuery {
+                            query_type: "q".to_string(),
+                            ..Default::default()
+                        };
+                        task.queries
+                            .insert(format!("q{}", t.current_event_id()), question);
+                    }
+                    if !forced && rng.random_bool(0.3) {
+                        let update = format!("u{}", t.current_event_id());
+                        task.add_update_request(update, t.current_event_id() - 1);
+                    }
+                    Some(task)
+                },
+            ))
         };
+        let opts = || {
+            let mut opts = StartOpts::new(&store);
+            opts.configure =
+                |wc| wc.stream_runtimes.settings.task_time = Some(Duration::from_millis(100));
+            let server = server.clone();
+            opts.eager = Some(Box::new(move |completion, t| {
+                (*server.lock())(completion, t)
+            }));
+            opts
+        };
+        let mut run = start(history(Duration::from_secs(1)), opts());
         let mut locals_rng = StdRng::seed_from_u64(seed + 1);
-        let locals = async {
-            while let Ok(task) = run.worker.poll_activity_task().await {
-                let wait = Duration::from_millis(locals_rng.random_range(0..30));
-                tokio::time::sleep(wait).await;
-                let completion = ActivityTaskCompletion {
-                    task_token: task.task_token,
-                    result: Some(ActivityExecutionResult::ok(vec![1].into())),
-                };
-                run.worker.complete_activity_task(completion).await.unwrap();
+        let (mut earlier, mut progress, mut made) = (None, Progress::default(), HashMap::new());
+        let live = loop {
+            let mut number = 0;
+            let workflow = |activation: &WorkflowActivation| {
+                // The Store answers some of the calls that wait, and some calls of this activation
+                // wait.
+                for id in ids.iter().filter(|_| rng.random_bool(0.5)) {
+                    store.release_stream(id);
+                }
+                let commands = scripted(&script, &mut progress, earlier.as_mut(), activation);
+                for command in &commands {
+                    let (call, stream) = match command {
+                        Command::AppendToStream(append) => {
+                            (format!("append {}", append.seq), &append.stream)
+                        }
+                        Command::CloseStream(close) => {
+                            (format!("close {}", close.seq), &close.stream)
+                        }
+                        _ => continue,
+                    };
+                    made.insert(call, number);
+                    if rng.random_bool(0.3) {
+                        store.hold_stream(&stream.as_ref().unwrap().id);
+                    }
+                }
+                number += 1;
+                commands
+            };
+            let run_id = run.history.lock().get_orig_run_id().to_string();
+            let evict = async {
+                handover.notified().await;
+                run.worker.request_workflow_eviction(&run_id);
+                std::future::pending().await
+            };
+            let live = tokio::select! {
+                jobs = run.drive(workflow) => jobs,
+                () = complete_local_activities(&run.worker, &mut locals_rng) => unreachable!(),
+                () = evict => unreachable!(),
+            };
+            run.worker.drain_pollers_and_shutdown_ref().await;
+            let sent = run.sent();
+            reached.forced += sent
+                .iter()
+                .filter(|c| c.force_create_new_workflow_task)
+                .count();
+            if !*handed_over.lock() || earlier.is_some() {
+                break live;
             }
-            std::future::pending().await
+            reached.taken_over += 1;
+            // A new Worker with an empty cache gets the task that the server kept.
+            let taken = std::mem::take(&mut progress.taken);
+            earlier = Some(Earlier {
+                first: with_events(&live),
+                taken,
+                at: 0,
+            });
+            (progress, made) = (Progress::default(), HashMap::new());
+            let history = run.history.lock().clone();
+            run = start(history, opts());
         };
-        let live = tokio::select! {
-            jobs = run.drive(workflow) => jobs,
-            () = locals => unreachable!(),
-        };
-        run.worker.drain_pollers_and_shutdown_ref().await;
         let first = with_events(&live);
-        let has_local = (script.iter().flatten())
-            .any(|command| matches!(command, Command::ScheduleLocalActivity(_)));
         for chunking in [false, true] {
             let mut at = 0;
             let workflow = |activation: &WorkflowActivation| {
@@ -2238,35 +2318,22 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
                     .filter_map(|job| job.variant.clone())
                     .collect();
                 let jobs = with_events(&[jobs]).concat();
-                replayed(&first, &progress.taken, &mut at, &jobs)
+                replayed(&first, &script, &progress.taken, &mut at, &jobs)
             };
             let replayed = with_events(&run.replay_with(chunking, workflow).await);
             if !chunking {
                 assert_eq!(replayed, first, "seed {seed}");
                 continue;
             }
-            // Without the Local Activity results, each activation of the replay has the jobs of
-            // one or more activations of the first run, in turn. A task that completes with no
-            // command and no ledger joins the next one, and a Local Activity result of the next
-            // one can then come earlier, also before a Stream result of an earlier activation.
-            let (rest, first_rest) = (without_locals(&replayed), without_locals(&first));
+            // Each activation of the replay has the jobs of one or more activations of the first
+            // run, one after the other.
             let mut at = 0;
-            for jobs in &rest {
-                let count = merged(&first_rest, at, jobs);
+            for jobs in &replayed {
+                let count = joined(&first, at, jobs);
                 assert!(count > 0, "seed {seed}: {replayed:?} {first:?}");
                 at += count;
             }
-            assert_eq!(at, first_rest.len(), "seed {seed}: {replayed:?} {first:?}");
-            for local in [false, true] {
-                assert_eq!(
-                    of_kind(&replayed, local),
-                    of_kind(&first, local),
-                    "seed {seed}"
-                );
-            }
-            if !has_local {
-                assert_eq!(replayed.concat(), first.concat(), "seed {seed}");
-            }
+            assert_eq!(at, first.len(), "seed {seed}: {replayed:?} {first:?}");
         }
 
         for (at, jobs) in live.iter().enumerate() {
@@ -2289,11 +2356,6 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
                 reached.updates += usize::from(matches!(job, Job::DoUpdate(_)));
             }
         }
-        let sent = run.sent();
-        reached.forced += sent
-            .iter()
-            .filter(|c| c.force_create_new_workflow_task)
-            .count();
     }
     let Reached {
         in_round,
@@ -2302,7 +2364,8 @@ async fn a_replay_gives_the_activations_of_the_first_run() {
         queries,
         updates,
         forced,
+        taken_over,
     } = reached;
-    let counts = [in_round, late, mixed, queries, updates, forced];
+    let counts = [in_round, late, mixed, queries, updates, forced, taken_over];
     assert!(counts.iter().all(|count| *count > 0), "{reached:?}");
 }

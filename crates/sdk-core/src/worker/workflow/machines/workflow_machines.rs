@@ -803,6 +803,13 @@ impl WorkflowMachines {
         let num_events_to_process = events.len();
         if num_events_to_process > 0 {
             self.local_activity_data.wft_applied();
+            // A Worker that takes over a run joins the task in hand with a heartbeat before it,
+            // since History doesn't have the completion that would keep them apart yet.
+            let joined = (events.windows(2)).any(|pair| {
+                pair[0].event_type() == EventType::WorkflowTaskStarted
+                    && pair[1].event_type() == EventType::WorkflowTaskCompleted
+            });
+            self.stream_calls.set_joined(joined);
         }
 
         // Process any WFT completed events in the next sequence, as well as peek ahead to the
