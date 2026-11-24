@@ -56,14 +56,13 @@ relevant information.
   reads one page, of at most the `max_records` and the `max_bytes` of the command, and gets one
   `ResolveStreamRead` job with the page, a failure or a cancel. `RequestCancelStreamRead` cancels
   a read, whose job is then `cancelled` unless lang already got it. A task gives at most 16 MiB
-  of Records. Its ledger has an entry for each read, with a digest of the Records of its page, or
-  the Records with `records_in_history`. Such a read fails with `stream_unsupported` for a Record
-  over 1.5 MiB, which a ledger can't hold. A replay reads digested Records again, a part of at most
-  16 MiB at a time by their recorded size, and tries each Store in an outage for at most
-  `replay_retry_bound`, 3 s by default. If the Store doesn't have the same Records, the task
-  fails. With the new `WorkflowErrorType::StreamReplay` variant in `workflow_failure_errors`, the
-  Workflow fails in its place, on the first attempt of the task. A command, a message or a close
-  intent completes a task while its reads wait, and so does a graceful shutdown.
+  of Records. Its ledger has an entry for each read, with a digest of the Records of its page. A
+  replay reads digested Records again, a part of at most 16 MiB at a time by their recorded size,
+  and tries each Store in an outage for at most `replay_retry_bound`, 3 s by default. If the Store
+  doesn't have the same Records, the task fails. With the new `WorkflowErrorType::StreamReplay`
+  variant in `workflow_failure_errors`, the Workflow fails in its place, on the first attempt of the
+  task. A command, a message or a close intent completes a task while its reads wait, and so does a
+  graceful shutdown.
 
 ## [0.12.0] - 2026-11-23
 

@@ -67,11 +67,7 @@ fn workflow(activation: &WorkflowActivation) -> Vec<Command> {
                     ..Default::default()
                 };
                 commands.push(read(1, "in").into());
-                let in_history = ReadStream {
-                    records_in_history: true,
-                    ..read(2, "in")
-                };
-                commands.push(in_history.into());
+                commands.push(read(2, "in").into());
                 let waits = ReadStream {
                     wait: Some(prost_dur!(from_secs(60))),
                     ..read(3, "quiet")
@@ -123,9 +119,6 @@ fn entries(ledger: &StreamLedger) -> Vec<String> {
     let intents = (ledger.close_intents.iter()).map(|i| format!("close intent {}", i.seq));
     let closes = ledger.closes.iter().map(|c| format!("close {}", c.seq));
     let reads = ledger.reads.iter().map(|read| match &read.result {
-        Some(stream_read_result::Result::Page(page)) if page.digest.is_empty() => {
-            format!("read {} with {} Records", read.seq, page.record_count)
-        }
         Some(stream_read_result::Result::Page(page)) => {
             format!("read {} with a digest of {}", read.seq, page.record_count)
         }
@@ -135,9 +128,9 @@ fn entries(ledger: &StreamLedger) -> Vec<String> {
     appends.chain(intents).chain(closes).chain(reads).collect()
 }
 
-/// Returns a Store with the Streams `out`, `in` and `quiet`, its runtime for a Worker, and the
-/// bodies of the three Records that `in` has.
-async fn store() -> (Arc<MemoryStore>, StreamRuntimes, Vec<Payload>) {
+/// Returns a Store with the Streams `out`, `in` and `quiet`, and its runtime for a Worker. The
+/// Stream `in` has three Records.
+async fn store() -> (Arc<MemoryStore>, StreamRuntimes) {
     let store = Arc::new(MemoryStore::default());
     for id in ["out", "in", "quiet"] {
         let create = CreateStreamRequest {
@@ -161,14 +154,14 @@ async fn store() -> (Arc<MemoryStore>, StreamRuntimes, Vec<Payload>) {
     store.append_records(fill, String::new()).await.unwrap();
     let runtime = Arc::new(StreamRuntime::new(store.clone(), StoreLimits::default()));
     let runtimes = StreamRuntimes::new([(STORE.to_string(), runtime)]);
-    (store, runtimes, bodies)
+    (store, runtimes)
 }
 
 // The attempt of a Stream call and the ledger of a Workflow Task depend on what the server does
 // with a failed task and with a task that Core forces, which a mock server can't show.
 #[tokio::test]
 async fn stream_calls_write_as_the_servers_task_and_replay_from_its_ledgers() {
-    let (store, runtimes, bodies) = store().await;
+    let (store, runtimes) = store().await;
     let mut starter = CoreWfStarter::new("stream_calls_write_as_the_servers_task");
     // A task must not reach its heartbeat, which would split its results over two ledgers.
     starter.workflow_options.task_timeout = Some(Duration::from_secs(60));
@@ -214,7 +207,6 @@ async fn stream_calls_write_as_the_servers_task_and_replay_from_its_ledgers() {
     // ran, so their results are in the ledger of the next task.
     let history = starter.get_history().await;
     let mut ledgers = vec![];
-    let mut held = vec![];
     // The attempt of each Workflow Task, by the id of its started event.
     let mut attempts = HashMap::new();
     let mut scheduled_attempt = 0;
@@ -231,7 +223,6 @@ async fn stream_calls_write_as_the_servers_task_and_replay_from_its_ledgers() {
                 if !metadata.core_stream_calls.is_empty() {
                     let ledger = StreamLedger::decode(&metadata.core_stream_calls[..]).unwrap();
                     ledgers.push((event.event_id, entries(&ledger)));
-                    held.extend(ledger.records.into_iter().filter_map(|record| record.body));
                 }
             }
             // The Workflow has no Local Activity and no patch, so a marker can only be Core's.
@@ -249,14 +240,12 @@ async fn stream_calls_write_as_the_servers_task_and_replay_from_its_ledgers() {
         vec![
             "close intent 1",
             "read 1 with a digest of 2",
-            "read 2 with 2 Records",
+            "read 2 with a digest of 2",
             "read 3 cancelled",
         ],
         vec!["close 1"],
     ];
     assert_eq!(recorded, expected);
-    // The ledger holds the Records of the read with `records_in_history`.
-    assert_eq!(held, bodies[..2]);
 
     // Each write has the attempt that the server gave its Workflow Task. The append ran in both
     // attempts of task 1, and the close ran as the task that recorded its intent.

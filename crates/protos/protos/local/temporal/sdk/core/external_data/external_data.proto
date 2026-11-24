@@ -6,7 +6,6 @@ option ruby_package = "Temporalio::Internal::Bridge::Api::ExternalData";
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
-import "temporal/api/stream/v1/message.proto";
 
 // This file defines data that Core might write externally. The first motivating case being
 // storing data in markers in event history. Defining such data as protos provides an easy way
@@ -58,9 +57,6 @@ message StreamLedger {
   repeated StreamAppendResult appends = 2;
   repeated StreamCloseResult closes = 3;
   repeated StreamReadResult reads = 4;
-  // The Records of the reads with `records_in_history`, in the order of `reads`, and those of one
-  // read in the order of its Stream.
-  repeated temporal.api.stream.v1.StreamRecord records = 5;
 }
 
 message StreamCloseIntent {
@@ -128,9 +124,7 @@ message StreamReadPage {
   uint32 record_count = 1;
   // True if the Stream was closed and had no Record after this page.
   bool done = 2;
-  // The first 16 bytes of the SHA-256 of the Records. It's empty for a read with
-  // `records_in_history`, whose Records are in the ledger, or if the page has no
-  // Record.
+  // The first 16 bytes of the SHA-256 of the Records. It's empty if the page has no Record.
   bytes digest = 3;
   // The bytes of the Records, each as a page of a read encodes it, with the tag and the length of
   // its field. That is the measure of the `max_bytes` of a read. It's set when `digest` is, so a

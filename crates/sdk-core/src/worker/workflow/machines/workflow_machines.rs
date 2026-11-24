@@ -38,13 +38,12 @@ use crate::{
                 upsert_search_attributes_state_machine::upsert_search_attrs_internal,
             },
             nondeterminism,
-            streams::{
-                Ledger, Phase, ReplayReads, StreamCalls, encode_ledger, has_ledger, peeked_ledger,
-            },
+            streams::{Phase, ReplayReads, StreamCalls, has_ledger, peeked_ledger},
         },
     },
 };
 use anyhow::Context;
+use prost::Message;
 use siphasher::sip::SipHasher13;
 use slotmap::{SlotMap, SparseSecondaryMap};
 use std::{
@@ -62,6 +61,7 @@ use temporalio_common::{
         VERSION_SEARCH_ATTR_KEY,
         coresdk::{
             common::{NamespacedWorkflowExecution, VersioningIntent},
+            external_data::StreamLedger,
             workflow_activation::{
                 self, NotifyHasPatch, UpdateRandomSeed, WorkflowActivation, workflow_activation_job,
             },
@@ -712,7 +712,7 @@ impl WorkflowMachines {
         }
         let mut metadata = flags.gather_for_wft_complete();
         if let Some(ledger) = self.stream_calls.take_ledger() {
-            metadata.core_stream_calls = encode_ledger(ledger);
+            metadata.core_stream_calls = ledger.encode_to_vec();
         }
         metadata
     }
@@ -995,7 +995,7 @@ impl WorkflowMachines {
         enum DelayedAction {
             LocalActivityMarker(Box<CompleteLocalActivityData>),
             ProtocolMessage(IncomingProtocolMessage),
-            StreamLedger(i64, Ledger),
+            StreamLedger(i64, StreamLedger),
         }
         let mut delayed_actions = vec![];
         // Scan through to the next WFT, searching for any patch / la markers, so that we can

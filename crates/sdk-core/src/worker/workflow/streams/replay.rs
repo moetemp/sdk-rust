@@ -1,11 +1,11 @@
-//! Reads the Records of History's read entries again for a replay. The entry of a read without
-//! `records_in_history` has only a count and a digest, so the replay reads that many Records after
-//! the entry's offset and checks them against the digest.
+//! Reads the Records of History's read entries again for a replay. The entry of a read has only a
+//! count and a digest, so the replay reads that many Records after the entry's offset and checks
+//! them against the digest.
 
 use super::{
     StreamRuntimes,
     digest::digest,
-    ledger::{Ledger, has_ledger, peeked_ledger},
+    ledger::{has_ledger, peeked_ledger},
     manager::{cut, is_outage, next_wait, retry_waits},
 };
 use crate::worker::{
@@ -50,7 +50,7 @@ pub(crate) enum ReplayError {
 }
 
 /// The Records that a replay read for the read entries of one ledger, by the index of each entry.
-/// An entry whose ledger holds its Records, or that has none, has no result.
+/// An entry with no Records has no result.
 pub(crate) type LedgerReads = Vec<Option<Result<Vec<StreamRecord>, ReplayError>>>;
 
 /// The Records that a replay read for the ledgers of a History, by the event id of each ledger.
@@ -135,10 +135,10 @@ pub(crate) fn needs_records(entry: &StreamReadResult) -> bool {
     unread_page(entry).is_some()
 }
 
-/// Returns the page of `entry` if History has only the digest of its Records.
+/// Returns the page of `entry` if it has Records.
 fn unread_page(entry: &StreamReadResult) -> Option<&StreamReadPage> {
     match &entry.result {
-        Some(stream_read_result::Result::Page(page)) if !page.digest.is_empty() => Some(page),
+        Some(stream_read_result::Result::Page(page)) if page.record_count > 0 => Some(page),
         _ => None,
     }
 }
@@ -191,10 +191,10 @@ impl ReplayReader {
         Self { runtimes, unread }
     }
 
-    /// Queues each ledger in `events` that has a read entry with no Records in History.
+    /// Queues each ledger in `events` that has a read entry with Records.
     pub(crate) fn queue<'a>(&mut self, events: impl Iterator<Item = &'a HistoryEvent>) {
         for event in events {
-            let Some(Ok(Ledger { data, .. })) = peeked_ledger(event) else {
+            let Some(Ok(data)) = peeked_ledger(event) else {
                 continue;
             };
             let unread = |(index, entry): (usize, &StreamReadResult)| {
@@ -462,7 +462,6 @@ pub(crate) fn offset_text(offset: &[u8]) -> String {
 mod tests {
     use super::super::{
         StreamSettings,
-        ledger::encode_ledger,
         test_store::{Entry, Fault, Model, ModelStore, client},
     };
     use super::*;
@@ -533,18 +532,13 @@ mod tests {
     }
 
     /// Returns the entry of a read that gave the page `given` after `from_offset`. It has the
-    /// digest of the Records, unless the ledger holds them.
-    fn page_entry(
-        seq: u32,
-        from_offset: &[u8],
-        given: &[StreamRecord],
-        in_history: bool,
-    ) -> StreamReadResult {
+    /// digest of the Records.
+    fn page_entry(seq: u32, from_offset: &[u8], given: &[StreamRecord]) -> StreamReadResult {
         let mut page = StreamReadPage {
             record_count: given.len() as u32,
             ..Default::default()
         };
-        if !in_history && !given.is_empty() {
+        if !given.is_empty() {
             page.digest = digest(given);
             let size = |record: &StreamRecord| field_len(record.encoded_len());
             page.record_bytes = given.iter().map(size).sum::<usize>() as u64;
@@ -728,7 +722,7 @@ mod tests {
             let mut expected = vec![];
             let ledgers = rng.random_range(1..=4);
             for event_id in 1..=ledgers {
-                let mut ledger = Ledger::default();
+                let mut ledger = StreamLedger::default();
                 for seq in 1..=rng.random_range(1..=4) {
                     let of = rng.random_range(0..2);
                     let records = &stores[of].records;
@@ -742,20 +736,15 @@ mod tests {
                         at => records[at - 1].offset.clone(),
                     };
                     let given = records[from..from + count].to_vec();
-                    let in_history = rng.random_bool(0.2);
-                    let mut entry = page_entry(seq, &after_offset, &given, in_history);
+                    let mut entry = page_entry(seq, &after_offset, &given);
                     entry.stream_id.clone_from(&stores[of].stream.id);
                     entry.store.clone_from(&stores[of].stream.store);
-                    ledger.data.reads.push(entry);
-                    let read = (!in_history && count > 0).then_some(given.clone());
-                    ledger.records.push(match in_history {
-                        true => given,
-                        false => vec![],
-                    });
+                    ledger.reads.push(entry);
+                    let read = (count > 0).then_some(given);
                     expected.push((event_id, seq as usize - 1, of, after_offset, read));
                 }
-                events.push(completed(event_id, encode_ledger(ledger.clone())));
-                datas.push(ledger.data);
+                events.push(completed(event_id, ledger.encode_to_vec()));
+                datas.push(ledger);
             }
             let served = (stores.iter())
                 .filter(|store| store.kind != Store::NoRuntime)
@@ -882,7 +871,7 @@ mod tests {
                     now.len() >= given.len() && now[..given.len()] == given[..]
                 }) && kind != Store::Gone;
                 match (given, result) {
-                    // An entry with its Records in History, or with none, reads no Store.
+                    // An entry with no Records reads no Store.
                     (None, None) => {}
                     (Some(given), Some(Ok(records))) => {
                         assert!(
@@ -933,7 +922,7 @@ mod tests {
             id: "s".to_string(),
             store: "mem".to_string(),
         };
-        let mut entry = page_entry(1, &[], std::slice::from_ref(&given), false);
+        let mut entry = page_entry(1, &[], std::slice::from_ref(&given));
         if let Some(stream_read_result::Result::Page(page)) = &mut entry.result {
             page.record_bytes -= less;
         }
@@ -943,11 +932,7 @@ mod tests {
             reads: vec![entry],
             ..Default::default()
         };
-        let ledger = Ledger {
-            data,
-            records: vec![vec![]],
-        };
-        let event = completed(1, encode_ledger(ledger));
+        let event = completed(1, data.encode_to_vec());
         let entry = Entry {
             offset: vec![1],
             at: Duration::ZERO,

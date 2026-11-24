@@ -3,7 +3,7 @@
 
 use super::{
     DEFAULT_PAGE_BYTES, DEFAULT_PAGE_RECORDS, LedgerReads, StreamRuntimes, TaskState,
-    ledger::{Ledger, LedgerBuilder, ReadDone, Waiting, append_job, close_job, read_job},
+    ledger::{LedgerBuilder, ReadDone, Waiting, append_job, close_job, read_job},
     manager::{Call, Op, Outcome, ReadCall, Request, StreamResolution},
     replay::{ReplayError, needs_records, offset_text},
 };
@@ -321,7 +321,6 @@ impl StreamCalls {
             stream,
             from_offset,
             wait,
-            records_in_history,
             max_records,
             max_bytes,
         } = command;
@@ -335,12 +334,8 @@ impl StreamCalls {
                 WFMachinesError::Fatal(format!("Stream {call} is invalid: {}", error.message))
             })?;
         self.check_runtime(&stream)?;
-        // A page must fit an empty task, and an empty ledger if the ledger holds its Records.
-        let settings = self.runtimes.settings;
-        let mut room = settings.max_task_record_bytes();
-        if records_in_history {
-            room = room.min(settings.max_marker_record_bytes());
-        }
+        // A page must fit an empty task.
+        let room = self.runtimes.settings.max_task_record_bytes();
         let max_bytes = match max_bytes {
             0 => DEFAULT_PAGE_BYTES,
             max => max,
@@ -355,11 +350,7 @@ impl StreamCalls {
             max_bytes: max_bytes.min(i64::try_from(room).unwrap_or(i64::MAX)),
             wait: None,
         };
-        let state = ReadState::Waiting(ReadCall {
-            request,
-            wait,
-            records_in_history,
-        });
+        let state = ReadState::Waiting(ReadCall { request, wait });
         let read = Read {
             stream,
             from_offset,
@@ -508,7 +499,7 @@ impl StreamCalls {
     /// replay read for its read entries.
     pub(crate) fn peeked(
         &mut self,
-        ledger: Ledger,
+        data: StreamLedger,
         mut replayed: LedgerReads,
     ) -> Result<(), WFMachinesError> {
         let StreamLedger {
@@ -516,8 +507,7 @@ impl StreamCalls {
             appends,
             closes,
             reads,
-            ..
-        } = ledger.data;
+        } = data;
         for intent in close_intents {
             let seq = intent.seq;
             if self.held.intents.insert(seq, intent).is_some() {
@@ -539,10 +529,8 @@ impl StreamCalls {
             }
             self.match_result(seq)?;
         }
-        let mut in_history = ledger.records.into_iter();
         for (index, entry) in reads.into_iter().enumerate() {
             let seq = entry.seq;
-            let held = in_history.next().unwrap_or_default();
             let records = if needs_records(&entry) {
                 (replayed.get_mut(index).and_then(Option::take)).unwrap_or_else(|| {
                     Err(ReplayError::Unavailable(format!(
@@ -550,7 +538,7 @@ impl StreamCalls {
                     )))
                 })
             } else {
-                Ok(held)
+                Ok(vec![])
             };
             let held = HeldRead { entry, records };
             if self.held.reads.insert(seq, held).is_some() {
@@ -769,7 +757,7 @@ impl StreamCalls {
     }
 
     /// Returns the ledger of the task as it completes, with the intent of each close that fits.
-    pub(crate) fn take_ledger(&mut self) -> Option<Ledger> {
+    pub(crate) fn take_ledger(&mut self) -> Option<StreamLedger> {
         if matches!(self.phase, Phase::Replaying | Phase::ReplayOnly) {
             return None;
         }
@@ -1290,10 +1278,7 @@ fn stop_call(requests: &mut Vec<Request>, call_id: u64) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        MAX_MARKER_ONE_RECORD_BYTES, StreamManager, StreamSettings, digest::digest,
-        ledger::encode_ledger, manager::recorded,
-    };
+    use super::super::{StreamManager, StreamSettings, digest::digest, manager::recorded};
     use super::*;
     use crate::test_help::stream_store::{MemoryStore, Request as StoreRequest};
     use prost::Message;
@@ -1334,7 +1319,7 @@ mod tests {
     }
 
     /// Completes the current task, and opens the next one.
-    fn next_task(calls: &mut StreamCalls, task: i64) -> Option<Ledger> {
+    fn next_task(calls: &mut StreamCalls, task: i64) -> Option<StreamLedger> {
         let ledger = calls.take_ledger();
         calls.set_task(TaskState::NoTask);
         calls.set_task(TaskState::Open(task_attempt(task)));
@@ -1395,7 +1380,7 @@ mod tests {
     }
 
     /// Returns a ledger that `write` fills.
-    fn history(write: impl FnOnce(&mut LedgerBuilder)) -> Ledger {
+    fn history(write: impl FnOnce(&mut LedgerBuilder)) -> StreamLedger {
         let mut ledger = LedgerBuilder::new(StreamSettings::default());
         write(&mut ledger);
         ledger.take().unwrap()
@@ -1536,7 +1521,7 @@ mod tests {
             calls.close(close(seq, &long(seq))).unwrap();
         }
         let first = next_task(&mut calls, 7).unwrap();
-        let sealed = first.data.close_intents.len() as u32;
+        let sealed = first.close_intents.len() as u32;
         assert!(sealed < 70, "{sealed}");
         calls.ledger_recorded().unwrap();
         finish(&mut calls, CallKey::Append(1), None);
@@ -1573,7 +1558,7 @@ mod tests {
         finish(&mut live, CallKey::Append(3), None);
         assert_eq!(jobs(&mut live, 2), ["append 3"]);
         let ledger = next_task(&mut live, 11).unwrap();
-        let entries: Vec<_> = (ledger.data.appends.iter())
+        let entries: Vec<_> = (ledger.appends.iter())
             .map(|append| (append.seq, append.activation_index))
             .collect();
         assert_eq!(entries, [(1, 0), (2, 0), (3, 2)]);
@@ -1680,7 +1665,7 @@ mod tests {
         /// activation even with no Stream result.
         has_events: bool,
         activations: Vec<Activation>,
-        ledger: Option<Ledger>,
+        ledger: Option<StreamLedger>,
         /// True if this task sent the last command of the Workflow.
         ends_workflow: bool,
     }
@@ -1767,18 +1752,6 @@ mod tests {
         &stream.records[from.unwrap_or(stream.records.len())..]
     }
 
-    /// The reads of `history` that keep their Records in History.
-    fn in_history(history: &[Task]) -> BTreeSet<u32> {
-        (history.iter())
-            .flat_map(|task| &task.activations)
-            .flat_map(|activation| &activation.commands)
-            .filter_map(|command| match command {
-                Command::Read(read) if read.records_in_history => Some(read.seq),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// Returns the page of a read entry, if its result is one.
     fn page_of(entry: &StreamReadResult) -> Option<&StreamReadPage> {
         match &entry.result {
@@ -1793,13 +1766,12 @@ mod tests {
         task: usize,
         ledger: &StreamLedger,
         streams: &Streams,
-        in_history: &BTreeSet<u32>,
         gone: &dyn Fn(usize, usize) -> Option<String>,
     ) -> LedgerReads {
         (ledger.reads.iter().enumerate())
             .map(|(index, entry)| {
                 let count = page_of(entry)?.record_count as usize;
-                if in_history.contains(&entry.seq) || count == 0 {
+                if count == 0 {
                     return None;
                 }
                 if let Some(message) = gone(task, index) {
@@ -1830,7 +1802,6 @@ mod tests {
         (streams, runtimes): (&Streams, &StreamRuntimes),
         gone: &dyn Fn(usize, usize) -> Option<String>,
     ) -> Result<Replayed, WFMachinesError> {
-        let in_history = in_history(history);
         let calls = StreamCalls::new("n", "w", "r", runtimes.clone(), Phase::Replaying, true);
         let mut run = Run {
             calls,
@@ -1846,7 +1817,7 @@ mod tests {
             }
             // Core peeks the ledger that the task's completion recorded before it activates.
             if let Some(ledger) = &task.ledger {
-                let reads = store_reads(index, &ledger.data, streams, &in_history, gone);
+                let reads = store_reads(index, ledger, streams, gone);
                 run.calls.peeked(ledger.clone(), reads)?;
             }
             run.activation = 0;
@@ -1964,7 +1935,6 @@ mod tests {
             let mut runtimes = runtimes(&["mem"]);
             if rng.random_bool(0.3) {
                 runtimes.settings.bounds.max_task_record_bytes = rng.random_range(1..=400);
-                runtimes.settings.bounds.max_marker_record_bytes = rng.random_range(1..=100);
             }
             let run = Run {
                 calls: StreamCalls::new("n", "w", "r", runtimes.clone(), Phase::Live, true),
@@ -2265,7 +2235,6 @@ mod tests {
                             stream: Some(stream(&id)),
                             from_offset,
                             wait: None,
-                            records_in_history: self.rng.random_bool(0.5),
                             max_records,
                             max_bytes: 0,
                         }));
@@ -2489,8 +2458,7 @@ mod tests {
                         })
                     };
                     let from_offset = request.from_offset.clone();
-                    let in_history = read.records_in_history;
-                    let done = ReadDone::new(&of, call.seq, from_offset, page, in_history);
+                    let done = ReadDone::new(&of, call.seq, from_offset, page);
                     return StreamResolution {
                         call_id: call.call_id,
                         seq: call.seq,
@@ -2518,7 +2486,7 @@ mod tests {
         fn complete(&mut self) {
             let ledger = self.run.calls.take_ledger();
             self.run.calls.set_task(TaskState::NoTask);
-            for entry in ledger.iter().map(|ledger| &ledger.data) {
+            for entry in ledger.iter() {
                 for append in &entry.appends {
                     self.unresolved.remove(&CallKey::Append(append.seq));
                 }
@@ -2604,7 +2572,7 @@ mod tests {
             // The replay resumes each call whose result no ledger has, and only those.
             assert_eq!(run.tracked(), self.unresolved, "seed {seed}");
             let recorded: BTreeSet<CallKey> = (self.history.iter())
-                .filter_map(|task| Some(&task.ledger.as_ref()?.data))
+                .filter_map(|task| task.ledger.as_ref())
                 .flat_map(|ledger| {
                     (ledger
                         .appends
@@ -2716,15 +2684,14 @@ mod tests {
                     }
                 }
             }
-            let in_history = in_history(&self.history);
             let mut reached = vec![];
             for (task, of) in self.history.iter().enumerate() {
                 let Some(ledger) = &of.ledger else {
                     continue;
                 };
-                for (index, entry) in ledger.data.reads.iter().enumerate() {
+                for (index, entry) in ledger.reads.iter().enumerate() {
                     let count = page_of(entry).map_or(0, |page| page.record_count);
-                    if in_history.contains(&entry.seq) || count == 0 {
+                    if count == 0 {
                         continue;
                     }
                     let reach = match started[&entry.seq] {
@@ -2764,8 +2731,8 @@ mod tests {
         job: Option<resolve_stream_read::Status>,
     }
 
-    // A replay reads the Records of a page from the Store, unless History has them. A read with a
-    // cancel gets the job that History has, or the job of its cancel once the replay is over.
+    // A replay reads the Records of a page from the Store. A read with a cancel gets the job that
+    // History has, or the job of its cancel once the replay is over.
     #[test]
     fn a_replay_of_history_gives_workflow_code_the_same_jobs_in_the_same_activations() {
         let mut seen = Seen::default();
@@ -2856,7 +2823,7 @@ mod tests {
                     task += 4;
                     if let Some(ledger) = next_task(&mut calls, task) {
                         calls.ledger_recorded().unwrap();
-                        for intent in &ledger.data.close_intents {
+                        for intent in &ledger.close_intents {
                             queues
                                 .entry(intent.stream_id.clone())
                                 .or_default()
@@ -2893,39 +2860,15 @@ mod tests {
         assert!(together > 0);
     }
 
-    /// Returns a page for the read `call`, of up to what it asked for, or of one larger Record,
-    /// which has up to `max_record_bytes` in its stored form. A read whose Record no ledger can
-    /// hold goes into `too_large`.
-    fn page_of_any_size(
-        rng: &mut StdRng,
-        (call, read): (&Call, &ReadCall),
-        too_large: &mut HashSet<u32>,
-        max_record_bytes: usize,
-    ) -> StreamResolution {
-        let in_history = read.records_in_history;
-        let mut records = make_page(rng, read.request.max_bytes as usize);
-        if in_history && rng.random_bool(0.1) {
-            // The stored form of a Record of this size is 8 bytes longer than its data.
-            let data = vec![0; max_record_bytes - rng.random_range(8..64)];
-            let body = Payload {
-                data,
-                ..Default::default()
-            };
-            if field_len(body.encoded_len()) > MAX_MARKER_ONE_RECORD_BYTES {
-                too_large.insert(call.seq);
-            }
-            records = vec![StreamRecord {
-                offset: vec![1],
-                body: Some(body),
-                producer: None,
-            }];
-        }
+    /// Returns a page for the read `call`, of up to what it asked for, or of one larger Record.
+    fn page_of_any_size(rng: &mut StdRng, (call, read): (&Call, &ReadCall)) -> StreamResolution {
+        let records = make_page(rng, read.request.max_bytes as usize);
         let page = Ok(ReadRecordsResponse {
             records,
             ..Default::default()
         });
         let stream = read.request.r#ref.clone().unwrap();
-        let done = ReadDone::new(&stream, call.seq, vec![], page, in_history);
+        let done = ReadDone::new(&stream, call.seq, vec![], page);
         StreamResolution {
             call_id: call.call_id,
             seq: call.seq,
@@ -2966,54 +2909,45 @@ mod tests {
     }
 
     /// Checks the read entries of the ledger of a task against the pages that Core took in the
-    /// task, by activation and seq, and checks the two bounds of the Records of a task.
+    /// task, by activation and seq, and checks the bound of the Records of a task.
     fn check_pages(
         seed: u64,
         settings: &StreamSettings,
-        ledger: &Ledger,
+        ledger: &StreamLedger,
         pages: &[(u64, u32, Vec<StreamRecord>)],
     ) {
         // Each part of a ledger has a bound, so the encoded ledger stays under 2 MiB.
-        let size = encode_ledger(ledger.clone()).len();
+        let size = ledger.encoded_len();
         assert!(size < 2 * 1024 * 1024, "seed {seed}: {size}");
-        let held = ledger.data.reads.iter().zip(&ledger.records);
-        let held: Vec<_> = held.filter(|(entry, _)| page_of(entry).is_some()).collect();
-        let entries: Vec<(u64, u32)> = (held.iter())
-            .map(|(read, _)| (read.activation_index, read.seq))
+        let entries: Vec<&StreamReadResult> = (ledger.reads.iter())
+            .filter(|entry| page_of(entry).is_some())
+            .collect();
+        let at: Vec<(u64, u32)> = (entries.iter())
+            .map(|read| (read.activation_index, read.seq))
             .collect();
         let taken: Vec<(u64, u32)> = pages.iter().map(|(at, seq, _)| (*at, *seq)).collect();
-        assert_eq!(entries, taken, "seed {seed}");
-        for ((entry, held), (_, _, records)) in held.into_iter().zip(pages) {
-            let page = page_of(entry).unwrap();
-            assert_eq!(page.record_count as usize, records.len(), "seed {seed}");
-            if page.digest.is_empty() {
-                assert_eq!((held, page.record_bytes), (records, 0), "seed {seed}");
-            } else {
-                assert!(held.is_empty(), "seed {seed}");
-                let bytes = (records.iter())
-                    .map(|record| field_len(record.encoded_len()))
-                    .sum::<usize>() as u64;
-                let recorded = (page.digest.clone(), page.record_bytes);
-                assert_eq!(recorded, (digest(records), bytes), "seed {seed}");
-            }
-        }
+        assert_eq!(at, taken, "seed {seed}");
         let bytes = |records: &mut dyn Iterator<Item = &StreamRecord>| {
             records
                 .map(|record| field_len(record.encoded_len()))
                 .sum::<usize>()
         };
-        // An empty task or ledger takes any page, and a page larger than the room is one Record.
+        for (entry, (_, _, records)) in entries.into_iter().zip(pages) {
+            let page = page_of(entry).unwrap();
+            assert_eq!(page.record_count as usize, records.len(), "seed {seed}");
+            let expected = match records.is_empty() {
+                true => (vec![], 0),
+                false => (digest(records), bytes(&mut records.iter()) as u64),
+            };
+            let recorded = (page.digest.clone(), page.record_bytes);
+            assert_eq!(recorded, expected, "seed {seed}");
+        }
+        // An empty task takes any page, and a page larger than the room is one Record.
         let given = bytes(&mut pages.iter().flat_map(|(_, _, records)| records));
         let one_record = matches!(pages, [(_, _, records)] if records.len() == 1);
         assert!(
             given <= settings.bounds.max_task_record_bytes || one_record,
             "seed {seed}: {given}"
-        );
-        let held = bytes(&mut ledger.records.iter().flatten());
-        let first_alone = ledger.records.iter().flatten().count() == 1;
-        assert!(
-            held <= settings.bounds.max_marker_record_bytes || first_alone,
-            "seed {seed}: {held}"
         );
     }
 
@@ -3022,7 +2956,7 @@ mod tests {
     #[test]
     fn each_result_and_intent_is_in_exactly_one_ledger_in_order() {
         let (mut full, mut oversized, mut out_of_order) = (0, 0, 0);
-        let (mut pages_wait, mut larger_first, mut failed_reads) = (0, 0, 0);
+        let (mut pages_wait, mut larger_first) = (0, 0);
         for seed in 0..SEEDS {
             let mut rng = StdRng::seed_from_u64(seed);
             // A small bound fills a ledger after a few entries, and the default after many.
@@ -3031,22 +2965,17 @@ mod tests {
                 runtimes.settings.bounds.max_ledger_bytes = rng.random_range(1..=16 * 1024);
             }
             let max_entry = runtimes.settings.bounds.max_ledger_bytes;
-            // Small bounds of Records fill a task or a ledger with a few pages, and a Record can
-            // be larger than a ledger holds.
+            // Small bounds of Records fill a task with a few pages, and a Record can be larger than
+            // a task holds.
             if rng.random_bool(0.5) {
                 runtimes.settings.bounds.max_task_record_bytes = rng.random_range(1..=4000);
-                runtimes.settings.bounds.max_marker_record_bytes = rng.random_range(1..=1000);
             }
             let settings = runtimes.settings;
-            // The limits of a Store's runtime can have a larger Record size than the default one,
-            // which is the size that a ledger holds.
-            let max_record_bytes = MAX_MARKER_ONE_RECORD_BYTES * rng.random_range(1..=2);
             let mut calls = StreamCalls::new("n", "w", "r", runtimes, Phase::Live, true);
             calls.set_task(TaskState::Open(task_attempt(3)));
             let budget = rng.random_range(1..=150);
             let (mut appends, mut closes, mut reads) = (0, 0, 0);
             let mut in_flight: Vec<Call> = vec![];
-            let mut too_large = HashSet::new();
             // The results that Core took in each task, in order, with their activation.
             let mut taken: Vec<Vec<(u64, CallKey)>> = vec![vec![]];
             let mut ledgers = vec![];
@@ -3084,7 +3013,6 @@ mod tests {
                             let read = ReadStream {
                                 seq: reads,
                                 stream: Some(stream(&id)),
-                                records_in_history: rng.random_bool(0.5),
                                 ..Default::default()
                             };
                             calls.read(read).unwrap();
@@ -3097,8 +3025,7 @@ mod tests {
                 for _ in 0..rng.random_range(0..=in_flight.len().min(6)) {
                     let call = in_flight.swap_remove(rng.random_range(0..in_flight.len()));
                     let resolution = if let Op::Read(read) = &call.op {
-                        let read = (&call, read);
-                        page_of_any_size(&mut rng, read, &mut too_large, max_record_bytes)
+                        page_of_any_size(&mut rng, (&call, read))
                     } else {
                         let bytes = rng.random_range(0..4200);
                         let failure = rng.random_bool(0.7).then(|| refused("x".repeat(bytes)));
@@ -3118,17 +3045,10 @@ mod tests {
                         let Variant::ResolveStreamRead(read) = job else {
                             continue;
                         };
-                        // A read fails if no ledger can hold a Record of its page.
-                        let too_large = too_large.contains(&read.seq);
-                        match read.status {
-                            Some(resolve_stream_read::Status::Page(page)) if !too_large => {
-                                pages.push((activation, read.seq, page.records));
-                            }
-                            Some(resolve_stream_read::Status::Failed(_)) if too_large => {
-                                failed_reads += 1;
-                            }
-                            _ => panic!("seed {seed}: {read:?}"),
-                        }
+                        let Some(resolve_stream_read::Status::Page(page)) = read.status else {
+                            panic!("seed {seed}: {read:?}");
+                        };
+                        pages.push((activation, read.seq, page.records));
                     }
                     results.len()
                 } else {
@@ -3170,12 +3090,11 @@ mod tests {
                 if finished || calls.must_complete(activation) || rng.random_bool(0.03) {
                     task += 4;
                     let ledger = next_task(&mut calls, task);
-                    let taken_marker = ledger.clone().unwrap_or_default();
-                    check_pages(seed, &settings, &taken_marker, &pages);
-                    let held: Vec<&StreamRecord> = taken_marker.records.iter().flatten().collect();
-                    larger_first += usize::from(matches!(held[..], [record]
+                    check_pages(seed, &settings, &ledger.clone().unwrap_or_default(), &pages);
+                    let given: Vec<&StreamRecord> = pages.iter().flat_map(|page| &page.2).collect();
+                    larger_first += usize::from(matches!(given[..], [record]
                         if field_len(record.encoded_len())
-                            > settings.bounds.max_marker_record_bytes));
+                            > settings.bounds.max_task_record_bytes));
                     pages.clear();
                     if ledger.is_some() {
                         calls.ledger_recorded().unwrap();
@@ -3190,7 +3109,7 @@ mod tests {
             }
             // Each ledger records the results of its task in the order that Core took them, with
             // their activations. The appends come first, then the closes, and then the reads.
-            for (index, ledger) in ledgers.iter().map(|ledger| &ledger.data).enumerate() {
+            for (index, ledger) in ledgers.iter().enumerate() {
                 let appended = ledger.appends.iter();
                 let recorded: Vec<(u64, CallKey)> = (appended)
                     .map(|append| (append.activation_index, CallKey::Append(append.seq)))
@@ -3225,17 +3144,14 @@ mod tests {
                 );
             };
             let all = |seqs: &dyn Fn(&StreamLedger) -> Vec<u32>| -> Vec<u32> {
-                ledgers
-                    .iter()
-                    .flat_map(|ledger| seqs(&ledger.data))
-                    .collect()
+                ledgers.iter().flat_map(seqs).collect()
             };
             once(all(&|m| m.appends.iter().map(|a| a.seq).collect()), appends);
             once(all(&|m| m.closes.iter().map(|c| c.seq).collect()), closes);
             once(all(&|m| m.reads.iter().map(|r| r.seq).collect()), reads);
             let intents = all(&|m| m.close_intents.iter().map(|i| i.seq).collect());
             assert_eq!(intents, (1..=closes).collect::<Vec<_>>(), "seed {seed}");
-            for ledger in ledgers.iter().map(|ledger| &ledger.data) {
+            for ledger in &ledgers {
                 let entries = ledger.appends.len()
                     + ledger.close_intents.len()
                     + ledger.closes.len()
@@ -3247,14 +3163,7 @@ mod tests {
             }
         }
         // The scripts reach each case that the test is for.
-        let counts = [
-            full,
-            oversized,
-            out_of_order,
-            pages_wait,
-            larger_first,
-            failed_reads,
-        ];
+        let counts = [full, oversized, out_of_order, pages_wait, larger_first];
         assert!(counts.iter().all(|count| *count > 0), "{counts:?}");
     }
 
@@ -3281,7 +3190,7 @@ mod tests {
     /// of the changed entry.
     fn mutate(rng: &mut StdRng, history: &mut [Task]) -> Option<(Change, usize)> {
         let entries: Vec<(usize, CallKey)> = (history.iter().enumerate())
-            .filter_map(|(index, task)| Some((index, &task.ledger.as_ref()?.data)))
+            .filter_map(|(index, task)| Some((index, task.ledger.as_ref()?)))
             .flat_map(|(index, ledger)| {
                 (ledger
                     .appends
@@ -3330,10 +3239,7 @@ mod tests {
             }
             return Some((change, task));
         }
-        let Ledger {
-            data: ledger,
-            records,
-        } = history[task].ledger.as_mut().unwrap();
+        let ledger = history[task].ledger.as_mut().unwrap();
         match call {
             CallKey::Append(seq) => {
                 let at = ledger.appends.iter().position(|append| append.seq == seq)?;
@@ -3374,15 +3280,11 @@ mod tests {
             CallKey::Read(seq) => {
                 let at = ledger.reads.iter().position(|read| read.seq == seq)?;
                 match change {
-                    Change::Twice => {
-                        ledger.reads.push(ledger.reads[at].clone());
-                        records.push(records[at].clone());
-                    }
+                    Change::Twice => ledger.reads.push(ledger.reads[at].clone()),
                     Change::Seq => ledger.reads[at].seq = 999,
                     Change::Activation => ledger.reads[at].activation_index += 1,
                     _ => {
                         let entry = ledger.reads.remove(at);
-                        records.remove(at);
                         ledger.appends.push(StreamAppendResult {
                             seq,
                             stream_id: entry.stream_id,
@@ -3529,7 +3431,7 @@ mod tests {
                     unserved.insert(call, error);
                 }
             }
-            let ledger = calls.take_ledger().unwrap_or_default().data;
+            let ledger = calls.take_ledger().unwrap_or_default();
             calls.ledger_recorded().unwrap();
             let mut sent = calls.take_requests();
             let at_go_live = calls.go_live();

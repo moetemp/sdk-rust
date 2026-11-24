@@ -10,7 +10,7 @@ mod replay;
 mod test_store;
 
 pub(crate) use calls::{Phase, StreamCalls, is_stream_replay_failure, set_replay_failure_type};
-pub(crate) use ledger::{Ledger, encode_ledger, has_ledger, peeked_ledger};
+pub(crate) use ledger::{has_ledger, peeked_ledger};
 pub(crate) use manager::{StreamManager, StreamResolution};
 pub(super) use replay::StreamRecordsReq;
 pub(crate) use replay::{LedgerReads, ReplayReader, ReplayReads};
@@ -41,16 +41,6 @@ const MAX_LEDGER_BYTES: usize = 256 * 1024;
 /// reads. A replay reads digested Records again in parts of this size by the bytes that History
 /// recorded. One ledger over it still makes a separate part.
 const MAX_TASK_RECORD_BYTES: usize = 16 * 1024 * 1024;
-
-/// The maximum size of the Records that one ledger holds for reads with `records_in_history`, as
-/// the pages of their reads encode them. A ledger takes no more bytes for a Record than its page
-/// does. One larger Record still fits as the ledger's first.
-const MAX_MARKER_RECORD_BYTES: usize = 1024 * 1024;
-
-/// The maximum size of one Record that a ledger holds, in its stored form. A read with
-/// `records_in_history` fails for a larger Record, whatever the limits of the Store's runtime.
-/// With [`MAX_LEDGER_BYTES`], this keeps a ledger under the blob size limit of the server.
-const MAX_MARKER_ONE_RECORD_BYTES: usize = 1536 * 1024;
 
 /// The maximum number of Records in the page of a read whose command has no `max_records`.
 const DEFAULT_PAGE_RECORDS: i32 = 256;
@@ -174,15 +164,6 @@ impl StreamSettings {
         let max = MAX_TASK_RECORD_BYTES;
         max
     }
-
-    /// Returns [`MAX_MARKER_RECORD_BYTES`], or the bound that a test set.
-    pub(crate) fn max_marker_record_bytes(&self) -> usize {
-        #[cfg(test)]
-        let max = self.bounds.max_marker_record_bytes;
-        #[cfg(not(test))]
-        let max = MAX_MARKER_RECORD_BYTES;
-        max
-    }
 }
 
 /// The bounds of the Stream calls that a test sets in place of the constants.
@@ -191,7 +172,6 @@ impl StreamSettings {
 pub(crate) struct TestBounds {
     pub(crate) max_ledger_bytes: usize,
     pub(crate) max_task_record_bytes: usize,
-    pub(crate) max_marker_record_bytes: usize,
 }
 
 #[cfg(test)]
@@ -200,7 +180,6 @@ impl Default for TestBounds {
         Self {
             max_ledger_bytes: MAX_LEDGER_BYTES,
             max_task_record_bytes: MAX_TASK_RECORD_BYTES,
-            max_marker_record_bytes: MAX_MARKER_RECORD_BYTES,
         }
     }
 }

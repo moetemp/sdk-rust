@@ -508,13 +508,12 @@ message CloseStream {
 //   completes once Workflow code sends a command for the server while only reads hold the task,
 //   and at the latest at its heartbeat. A read that still waits adds the three events of a forced
 //   Workflow Task at each heartbeat.
-// * One Workflow Task gives at most 16 MiB of Records, and its ledger holds at most 1 MiB of them
-//   for reads with `records_in_history`. A page that doesn't fit comes in the next task, which
-//   Core forces.
-// * Without `records_in_history`, History has the count and a digest of the Records of each page.
-//   A replay reads each page from the Store again, within the timeout of its Workflow Task. A
-//   query of a run that isn't cached replays too. Once the Store no longer has the same Records,
-//   each replay fails, also the one for a query of a closed Workflow.
+// * One Workflow Task gives at most 16 MiB of Records. A page that doesn't fit comes in the next
+//   task, which Core forces.
+// * History has the count and a digest of the Records of each page. A replay reads each page from
+//   the Store again, within the timeout of its Workflow Task. A query of a run that isn't cached
+//   replays too. Once the Store no longer has the same Records, each replay fails, also the one for
+//   a query of a closed Workflow.
 //
 // A read gets no job at the Workflow's last command, at a failed Workflow Task, at an eviction and
 // at the shutdown of the Worker. After the last three the Workflow replays. The replay gives each
@@ -539,16 +538,11 @@ message ReadStream {
     // How long the read waits for a Record if the Stream has none after `from_offset`. If it's
     // unset, the read doesn't wait.
     google.protobuf.Duration wait = 4;
-    // If set, the ledger of the task holds the Records of the page, so a replay doesn't read the
-    // Store. A ledger can't hold a Record whose Producer and body have more than 1.5 MiB, so the
-    // read fails with `stream_unsupported` for one.
-    bool records_in_history = 5;
     // The maximum number of Records in the page, which is 256 if this is zero.
-    int32 max_records = 6;
+    int32 max_records = 5;
     // The maximum size of the Records in the page, which is 4 MiB if this is zero. Core asks the
-    // Store for at most 16 MiB, and for at most 1 MiB with `records_in_history`. One larger Record
-    // still comes as a page, unless the read fails for it with `records_in_history`.
-    int64 max_bytes = 7;
+    // Store for at most 16 MiB. One larger Record still comes as a page.
+    int64 max_bytes = 6;
 }
 
 // Cancels a read, as `RequestCancelLocalActivity` cancels a Local Activity whose cancellation type

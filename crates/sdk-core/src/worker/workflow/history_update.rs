@@ -924,7 +924,6 @@ fn disables_chunking(event: &HistoryEvent) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::super::streams::{Ledger, encode_ledger};
     use super::*;
     use crate::{
         replay::{HistoryInfo, TestHistoryBuilder, canned_histories},
@@ -932,6 +931,7 @@ mod tests {
         worker::client::mocks::mock_worker_client,
     };
     use futures_util::TryStreamExt;
+    use prost::Message;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use temporalio_common::protos::{
         coresdk::external_data::{
@@ -2045,10 +2045,7 @@ mod tests {
             reads: vec![read],
             ..Default::default()
         };
-        encode_ledger(Ledger {
-            data,
-            records: vec![vec![]],
-        })
+        data.encode_to_vec()
     }
 
     // The machines take a WFT sequence and peek the one after it, whose ledgers then get their

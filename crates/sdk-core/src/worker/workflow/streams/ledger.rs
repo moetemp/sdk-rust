@@ -2,11 +2,7 @@
 //! calls. Core puts it on the completion of the task, and History keeps it in the
 //! `WorkflowTaskCompleted` event.
 
-use super::{
-    MAX_MARKER_ONE_RECORD_BYTES, StreamSettings,
-    digest::digest,
-    manager::{failure_of, recorded},
-};
+use super::{StreamSettings, digest::digest, manager::failure_of};
 use crate::worker::workflow::WFMachinesError;
 use prost::{Message, encoding::encoded_len_varint};
 use temporalio_common::protos::{
@@ -23,23 +19,13 @@ use temporalio_common::protos::{
     temporal::api::history::v1::{HistoryEvent, history_event},
 };
 use temporalio_streams::{
-    AnyError, AnyReason,
     proto::{ReadRecordsResponse, StreamErrorReason, StreamRecord, StreamRef},
-    record::{self, field_len},
+    record::field_len,
 };
 
 /// The maximum activation index that Core takes from a ledger entry. A replay adds one to the
 /// index of an entry for each later activation, and the bound prevents an overflow of that sum.
 const MAX_ACTIVATION: u64 = u32::MAX as u64;
-
-/// A ledger, as Core builds it and as it reads one from History.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub(crate) struct Ledger {
-    pub(crate) data: StreamLedger,
-    /// The Records that the ledger holds for each entry of `data.reads`, by the index of the
-    /// entry. Only the page of a read with `records_in_history` has its Records here.
-    pub(crate) records: Vec<Vec<StreamRecord>>,
-}
 
 /// The entry of a result that waits for an activation, as a ledger records it, with its encoded
 /// size.
@@ -75,64 +61,42 @@ pub(crate) struct ReadDone {
     records: Vec<StreamRecord>,
     /// The size of `records`, as the page of a read encodes them.
     bytes: usize,
-    records_in_history: bool,
 }
 
 impl ReadDone {
     /// Converts the result of read `seq` of `stream` into its ledger entry. The entry of a page
-    /// gets the digest of its Records, unless a ledger holds them.
+    /// gets the digest of its Records.
     pub(crate) fn new(
         stream: &StreamRef,
         seq: u32,
         from_offset: Vec<u8>,
         result: Result<ReadRecordsResponse, StreamFailure>,
-        records_in_history: bool,
     ) -> Self {
         let page = match result {
             Ok(page) => page,
             Err(failure) => {
                 let result = stream_read_result::Result::Failure(failure);
-                return Self::of(stream, seq, from_offset, result, vec![], false);
+                return Self::of(stream, seq, from_offset, result, vec![]);
             }
         };
-        // A ledger must stay under the blob size limit of the server, whatever Record size the
-        // limits of the Store's runtime have.
-        let too_large = (page.records.iter().map(stored_len).enumerate())
-            .find(|(_, len)| records_in_history && *len > MAX_MARKER_ONE_RECORD_BYTES);
-        if let Some((at, len)) = too_large {
-            let message = format!(
-                "Record {at} of the page has {len} bytes, and a read with records_in_history takes \
-                 at most {MAX_MARKER_ONE_RECORD_BYTES}"
-            );
-            let failure = recorded(&AnyError::new(AnyReason::Unsupported, message));
-            let result = stream_read_result::Result::Failure(failure);
-            return Self::of(stream, seq, from_offset, result, vec![], false);
-        }
         let mut entry = StreamReadPage {
             record_count: page.records.len() as u32,
             done: page.done,
             ..Default::default()
         };
-        if !records_in_history && !page.records.is_empty() {
+        if !page.records.is_empty() {
             entry.digest = digest(&page.records);
             entry.record_bytes = record_bytes(&page.records) as u64;
         }
         let result = stream_read_result::Result::Page(entry);
-        Self::of(
-            stream,
-            seq,
-            from_offset,
-            result,
-            page.records,
-            records_in_history,
-        )
+        Self::of(stream, seq, from_offset, result, page.records)
     }
 
     /// Returns the result of read `seq` of `stream` that Workflow code cancelled before it got
     /// the job of the read.
     pub(crate) fn cancelled(stream: &StreamRef, seq: u32, from_offset: Vec<u8>) -> Self {
         let result = stream_read_result::Result::Cancelled(());
-        Self::of(stream, seq, from_offset, result, vec![], false)
+        Self::of(stream, seq, from_offset, result, vec![])
     }
 
     fn of(
@@ -141,7 +105,6 @@ impl ReadDone {
         from_offset: Vec<u8>,
         result: stream_read_result::Result,
         records: Vec<StreamRecord>,
-        records_in_history: bool,
     ) -> Self {
         let entry = StreamReadResult {
             seq,
@@ -155,25 +118,15 @@ impl ReadDone {
             entry: Waiting::new(entry),
             bytes: record_bytes(&records),
             records,
-            records_in_history,
         }
     }
-}
-
-/// Returns the size of `record` in its stored form, which is the measure of a Record size limit.
-fn stored_len(record: &StreamRecord) -> usize {
-    let producer = record.producer.as_ref().map(Message::encoded_len);
-    let body = record.body.as_ref().map(Message::encoded_len);
-    (producer.into_iter().chain(body))
-        .map(record::field_len)
-        .sum()
 }
 
 /// Returns the size of `records` as the page of a read encodes them, which is the measure of the
 /// `max_bytes` of a read.
 fn record_bytes(records: &[StreamRecord]) -> usize {
     (records.iter())
-        .map(|record| record::field_len(record.encoded_len()))
+        .map(|record| field_len(record.encoded_len()))
         .sum()
 }
 
@@ -230,12 +183,10 @@ pub(crate) fn read_job(entry: &StreamReadResult, records: Vec<StreamRecord>) -> 
 #[derive(Debug)]
 pub(crate) struct LedgerBuilder {
     data: StreamLedger,
-    /// The Records that the ledger holds for each entry of `data.reads`.
-    held: Vec<Vec<StreamRecord>>,
     /// The encoded size of `data`.
     bytes: usize,
-    /// The bytes of the Records that the task gave Workflow code, and of those in `held`.
-    records: (usize, usize),
+    /// The bytes of the Records that the task gave Workflow code.
+    records: usize,
     settings: StreamSettings,
 }
 
@@ -245,8 +196,7 @@ impl LedgerBuilder {
         Self {
             bytes: 0,
             data: StreamLedger::default(),
-            held: vec![],
-            records: (0, 0),
+            records: 0,
             settings,
         }
     }
@@ -325,30 +275,18 @@ impl LedgerBuilder {
             activation_index: activation,
             ..done.entry.entry
         };
-        self.records.0 += done.bytes;
-        let mut held = vec![];
-        if done.records_in_history {
-            self.records.1 += done.bytes;
-            held.clone_from(&done.records);
-        }
-        self.held.push(held);
+        self.records += done.bytes;
         let job = read_job(&entry, done.records);
         self.data.reads.push(entry);
         job
     }
 
     /// Returns true if the ledger and the task have room for the result of a read, without
-    /// recording it. An empty task or ledger takes any page. A read asks for at most the bytes
-    /// that an empty task or ledger holds, and a page over that size has a single Record.
+    /// recording it. An empty task takes any page. A read asks for at most the bytes that an empty
+    /// task holds, and a page over that size has a single Record.
     pub(crate) fn has_room_for_read(&self, done: &ReadDone, activation: u64) -> bool {
-        let (task, held) = self.records;
         let max_task_record_bytes = self.settings.max_task_record_bytes();
-        let max_marker_record_bytes = self.settings.max_marker_record_bytes();
-        if done.bytes > 0
-            && (has_no_room(task, done.bytes, max_task_record_bytes)
-                || (done.records_in_history
-                    && has_no_room(held, done.bytes, max_marker_record_bytes)))
-        {
+        if done.bytes > 0 && has_no_room(self.records, done.bytes, max_task_record_bytes) {
             return false;
         }
         self.has_room(done.entry.len_at(activation))
@@ -359,16 +297,13 @@ impl LedgerBuilder {
     }
 
     /// Returns the ledger, if it has an entry, and leaves an empty builder for the next task.
-    pub(crate) fn take(&mut self) -> Option<Ledger> {
+    pub(crate) fn take(&mut self) -> Option<StreamLedger> {
         if self.is_empty() {
             return None;
         }
         let builder = std::mem::replace(self, Self::new(self.settings));
         debug_assert_eq!(builder.bytes, builder.data.encoded_len());
-        Some(Ledger {
-            data: builder.data,
-            records: builder.held,
-        })
+        Some(builder.data)
     }
 
     /// An empty ledger accepts any entry, because each input of an entry has a bound.
@@ -391,14 +326,6 @@ fn has_no_room(current: usize, records: usize, max: usize) -> bool {
     current > 0 && (current > max || records > max - current)
 }
 
-/// Encodes `ledger` for the completion of its task. The Records of reads with
-/// `records_in_history` go into `records`, in the order of the entries.
-pub(crate) fn encode_ledger(ledger: Ledger) -> Vec<u8> {
-    let Ledger { mut data, records } = ledger;
-    data.records = records.into_iter().flatten().collect();
-    data.encode_to_vec()
-}
-
 /// Returns true if `event` is the completion of a Workflow Task with a ledger.
 pub(crate) fn has_ledger(event: &HistoryEvent) -> bool {
     ledger_of(event).is_some()
@@ -407,7 +334,7 @@ pub(crate) fn has_ledger(event: &HistoryEvent) -> bool {
 /// Decodes the ledger of a `WorkflowTaskCompleted` event, and returns `None` for an event with no
 /// ledger. A ledger that doesn't decode, or that has a result which Core can't give Workflow code,
 /// is an error.
-pub(crate) fn peeked_ledger(event: &HistoryEvent) -> Option<Result<Ledger, WFMachinesError>> {
+pub(crate) fn peeked_ledger(event: &HistoryEvent) -> Option<Result<StreamLedger, WFMachinesError>> {
     ledger_of(event).map(decode)
 }
 
@@ -423,9 +350,9 @@ fn ledger_of(event: &HistoryEvent) -> Option<&[u8]> {
     }
 }
 
-fn decode(encoded: &[u8]) -> Result<Ledger, WFMachinesError> {
+fn decode(encoded: &[u8]) -> Result<StreamLedger, WFMachinesError> {
     let bad = |why: String| WFMachinesError::Fatal(format!("The Stream ledger {why}"));
-    let mut data =
+    let data =
         StreamLedger::decode(encoded).map_err(|error| bad(format!("doesn't decode: {error}")))?;
     if let Some(append) = data.appends.iter().find(|append| append.result.is_none()) {
         return Err(bad(format!("has no result of append {}", append.seq)));
@@ -463,24 +390,7 @@ fn decode(encoded: &[u8]) -> Result<Ledger, WFMachinesError> {
             "has an entry at activation {activation}, above the maximum of {MAX_ACTIVATION}"
         )));
     }
-    // A page with no digest has its Records in the ledger, and takes the next ones of the list.
-    let counts = data.reads.iter().map(|read| match &read.result {
-        Some(stream_read_result::Result::Page(page)) if page.digest.is_empty() => page.record_count,
-        _ => 0,
-    });
-    let counted: u64 = counts.clone().map(u64::from).sum();
-    let held = std::mem::take(&mut data.records);
-    if counted != held.len() as u64 {
-        return Err(bad(format!(
-            "counts {counted} Records in its entries, and has {}",
-            held.len()
-        )));
-    }
-    let mut held = held.into_iter();
-    let records = counts
-        .map(|count| held.by_ref().take(count as usize).collect())
-        .collect();
-    Ok(Ledger { data, records })
+    Ok(data)
 }
 
 #[cfg(test)]
@@ -583,22 +493,20 @@ mod tests {
             records: vec![record(8, "1.5"), record(9, "1.6"), record(10, "1.4")],
             ..Default::default()
         };
-        let prices = ReadDone::new(&stream("prices"), 1, offset(7), Ok(prices), false);
+        let prices = ReadDone::new(&stream("prices"), 1, offset(7), Ok(prices));
         builder.read_result(prices, 0);
-        let replies = vec![record(1, "hello"), record(2, "bye")];
-        let page = ReadRecordsResponse {
-            records: replies.clone(),
+        let replies = ReadRecordsResponse {
+            records: vec![record(1, "hello"), record(2, "bye")],
             done: true,
             ..Default::default()
         };
-        let in_history = ReadDone::new(&stream("replies"), 2, vec![], Ok(page), true);
-        builder.read_result(in_history, 1);
+        let replies = ReadDone::new(&stream("replies"), 2, vec![], Ok(replies));
+        builder.read_result(replies, 1);
         builder.read_result(ReadDone::cancelled(&stream("prices"), 3, offset(10)), 1);
         assert!(builder.close_intent(&stream("orders"), 2));
         let ledger = builder.take().unwrap();
-        assert_eq!(ledger.records, [vec![], replies, vec![]]);
 
-        let encoded = encode_ledger(ledger.clone());
+        let encoded = ledger.encode_to_vec();
         let pinned = [
             // The intent of close 2 on `orders`.
             "0a11080212066f72646572731a057265646973",
@@ -612,15 +520,11 @@ mod tests {
             // Read 1 of `prices`, with its digest.
             "2234080112067072696365731a0572656469732a080000000000000007321708031a101be96426707f0f",
             "4fff8300217b932d4d20db01",
-            // Read 2 of `replies`, whose Records the ledger holds.
-            "221a080212077265706c6965731a0572656469732001320408021001",
+            // Read 2 of `replies`, with its digest.
+            "222f080212077265706c6965731a05726564697320013219080210011a1057e53d263ef48dd39e62ca29",
+            "4ef6a2de209401",
             // Read 3 of `prices`, cancelled.
             "221f080312067072696365731a05726564697320012a08000000000000000a4200",
-            // The two Records of read 2.
-            "2a490a112a0f0a0764656661756c74120466656564122a0a160a08656e636f64696e67120a6a736f6e2f",
-            "706c61696e12107b2274657874223a2268656c6c6f227d1a0800000000000000012a470a112a0f0a0764",
-            "656661756c7412046665656412280a160a08656e636f64696e67120a6a736f6e2f706c61696e120e7b22",
-            "74657874223a22627965227d1a080000000000000002",
         ];
         assert_eq!(hex(&encoded), pinned.concat());
         assert_eq!(peeked_ledger(&event(encoded)), Some(Ok(ledger)));
@@ -739,7 +643,7 @@ mod tests {
     }
 
     /// Returns a ledger with random entries of each kind, as the builder of a task makes it.
-    fn valid_ledger(rng: &mut StdRng) -> Ledger {
+    fn valid_ledger(rng: &mut StdRng) -> StreamLedger {
         let mut builder = LedgerBuilder::new(StreamSettings::default());
         let activation = |rng: &mut StdRng| match rng.random_bool(0.9) {
             true => rng.random_range(0..10),
@@ -774,9 +678,9 @@ mod tests {
             };
             let stream = stream(rng);
             let done = match rng.random_range(0..5) {
-                0 => ReadDone::new(&stream, seq, offset(rng), Err(failure(rng)), false),
+                0 => ReadDone::new(&stream, seq, offset(rng), Err(failure(rng))),
                 1 => ReadDone::cancelled(&stream, seq, offset(rng)),
-                _ => ReadDone::new(&stream, seq, offset(rng), Ok(page), rng.random_bool(0.6)),
+                _ => ReadDone::new(&stream, seq, offset(rng), Ok(page)),
             };
             builder.read_result(done, activation(rng));
         }
@@ -785,71 +689,34 @@ mod tests {
 
     #[test]
     fn a_ledger_reads_back_as_it_was_written() {
-        let mut with_records = 0;
         for seed in 0..1000 {
             let mut rng = StdRng::seed_from_u64(seed);
             let ledger = valid_ledger(&mut rng);
-            let holding = ledger.records.iter().filter(|held| !held.is_empty());
-            with_records += usize::from(holding.count() > 1);
-            // Core bounds the Records of a ledger by their size in the pages of their reads, so
-            // the ledger must take no more bytes for the Records than those pages do.
-            let in_pages: usize = ledger.records.iter().map(|held| record_bytes(held)).sum();
-            let encoded = encode_ledger(ledger.clone());
-            let in_ledger = encoded.len() - ledger.data.encoded_len();
-            assert!(in_ledger <= in_pages, "seed {seed}: {in_ledger}");
-            let read_back = peeked_ledger(&event(encoded));
+            let read_back = peeked_ledger(&event(ledger.encode_to_vec()));
             assert_eq!(read_back, Some(Ok(ledger)), "seed {seed}");
         }
-        assert!(with_records > 0, "No ledger had the Records of two reads");
         // A completion with no Stream call has no ledger.
         assert!(!has_ledger(&event(vec![])));
     }
 
     /// Breaks one rule of `ledger`. Returns the encoded ledger and the reason that the decode
     /// gives, or the start of it where the rest is the text of the protobuf decoder.
-    fn corrupt(rng: &mut StdRng, mut ledger: Ledger) -> (Vec<u8>, String) {
-        let why = match rng.random_range(0..5) {
+    fn corrupt(rng: &mut StdRng, mut ledger: StreamLedger) -> (Vec<u8>, String) {
+        let why = match rng.random_range(0..4) {
             0 => {
                 // A field whose length passes the end of the ledger.
-                let mut encoded = encode_ledger(ledger);
+                let mut encoded = ledger.encode_to_vec();
                 encoded.extend([0x0a, 0x7f]);
                 return (encoded, "doesn't decode: ".to_string());
             }
             1 => {
-                // The entries count one Record more than the ledger has, or one fewer.
-                let held: usize = ledger.records.iter().map(Vec::len).sum();
-                let counted = if rng.random_bool(0.5) || held == 0 {
-                    let page = StreamReadPage {
-                        record_count: 1,
-                        ..Default::default()
-                    };
-                    ledger.data.reads.push(StreamReadResult {
-                        seq: 99,
-                        result: Some(stream_read_result::Result::Page(page)),
-                        ..Default::default()
-                    });
-                    held + 1
-                } else {
-                    ledger.records.push(vec![record(rng)]);
-                    ledger.data.reads.push(StreamReadResult {
-                        seq: 99,
-                        result: Some(stream_read_result::Result::Cancelled(())),
-                        ..Default::default()
-                    });
-                    held
-                };
-                let has = ledger.records.iter().map(Vec::len).sum::<usize>();
-                let why = format!("counts {counted} Records in its entries, and has {has}");
-                return (encode_ledger(ledger), why);
-            }
-            2 => {
                 let read = rng.random_bool(0.5);
                 match read {
-                    true => ledger.data.reads.push(StreamReadResult {
+                    true => ledger.reads.push(StreamReadResult {
                         seq: 99,
                         ..Default::default()
                     }),
-                    false => ledger.data.appends.push(StreamAppendResult {
+                    false => ledger.appends.push(StreamAppendResult {
                         seq: 99,
                         ..Default::default()
                     }),
@@ -857,21 +724,21 @@ mod tests {
                 let kind = if read { "read" } else { "append" };
                 format!("has no result of {kind} 99")
             }
-            3 => {
+            2 => {
                 let activation = rng.random_range(MAX_ACTIVATION + 1..=u64::MAX);
                 match rng.random_range(0..3) {
-                    0 => ledger.data.appends.push(StreamAppendResult {
+                    0 => ledger.appends.push(StreamAppendResult {
                         seq: 99,
                         activation_index: activation,
                         result: Some(stream_append_result::Result::Appended(Default::default())),
                         ..Default::default()
                     }),
-                    1 => ledger.data.closes.push(StreamCloseResult {
+                    1 => ledger.closes.push(StreamCloseResult {
                         seq: 99,
                         activation_index: activation,
                         failure: None,
                     }),
-                    _ => ledger.data.reads.push(StreamReadResult {
+                    _ => ledger.reads.push(StreamReadResult {
                         seq: 99,
                         activation_index: activation,
                         result: Some(stream_read_result::Result::Cancelled(())),
@@ -886,17 +753,17 @@ mod tests {
                     message: "A later version of Core has this reason".to_string(),
                 };
                 match rng.random_range(0..3) {
-                    0 => ledger.data.appends.push(StreamAppendResult {
+                    0 => ledger.appends.push(StreamAppendResult {
                         seq: 99,
                         result: Some(stream_append_result::Result::Failure(later)),
                         ..Default::default()
                     }),
-                    1 => ledger.data.closes.push(StreamCloseResult {
+                    1 => ledger.closes.push(StreamCloseResult {
                         seq: 99,
                         failure: Some(later),
                         ..Default::default()
                     }),
-                    _ => ledger.data.reads.push(StreamReadResult {
+                    _ => ledger.reads.push(StreamReadResult {
                         seq: 99,
                         result: Some(stream_read_result::Result::Failure(later)),
                         ..Default::default()
@@ -907,7 +774,7 @@ mod tests {
                     .to_string()
             }
         };
-        (encode_ledger(ledger), why)
+        (ledger.encode_to_vec(), why)
     }
 
     #[test]

@@ -63,7 +63,6 @@ pub(crate) struct ReadCall {
     pub(crate) request: ReadRecordsRequest,
     /// How long the read waits for a Record.
     pub(crate) wait: Duration,
-    pub(crate) records_in_history: bool,
 }
 
 /// The result of a call, for its run.
@@ -259,8 +258,7 @@ async fn run(
             let from_offset = read.request.from_offset.clone();
             let page = read_page(runtime, read.request, read.wait, settings, note).await;
             let page = page.map_err(|error| recorded(&error));
-            let in_history = read.records_in_history;
-            Outcome::Read(ReadDone::new(&stream, seq, from_offset, page, in_history))
+            Outcome::Read(ReadDone::new(&stream, seq, from_offset, page))
         }
     }
 }
@@ -825,11 +823,7 @@ mod tests {
                     max_bytes,
                     wait: None,
                 };
-                let read = ReadCall {
-                    request,
-                    wait,
-                    records_in_history: rng.random_bool(0.5),
-                };
+                let read = ReadCall { request, wait };
                 let call = Call {
                     call_id,
                     seq: call_id as u32,

@@ -146,7 +146,7 @@ fn records_of(jobs: &[Vec<Job>]) -> Vec<StreamRecord> {
 enum Completes {
     /// The heartbeat, while a read waits for a Record.
     AtTheHeartbeat,
-    /// A timer that Workflow code starts with its second read, with the Records in History.
+    /// A timer that Workflow code starts with its second read.
     ForATimer,
     /// The rejection of an Update while a read waits.
     ForAnUpdateRejection,
@@ -190,7 +190,6 @@ async fn a_task_completes_while_a_read_runs(#[case] completes: Completes) {
     let page = move |read: ReadStream| -> Command {
         ReadStream {
             max_records: 5,
-            records_in_history: completes == Completes::ForATimer,
             ..read
         }
         .into()
@@ -258,7 +257,7 @@ async fn a_task_completes_while_a_read_runs(#[case] completes: Completes) {
         }
         Completes::ForATimer => {
             assert_eq!(command_types(early)[..1], [CommandType::StartTimer]);
-            assert_eq!((pages[0].record_count, pages[0].digest.len()), (5, 0));
+            assert_eq!((pages[0].record_count, pages[0].digest.len()), (5, 16));
         }
         Completes::ForAnUpdateRejection => assert_eq!(early.messages.len(), 1),
         Completes::ForACloseIntent => {
@@ -280,11 +279,10 @@ async fn a_task_completes_while_a_read_runs(#[case] completes: Completes) {
     if completes == Completes::ForAnUpdateRejection {
         return;
     }
-    // A replay gives the same jobs. With `records_in_history` it reads no Store.
+    // A replay gives the same jobs.
     assert_eq!(run.replay(workflow).await, live);
     let replay_reads = store.reads().len() - reads.len();
-    let in_history = completes == Completes::ForATimer;
-    assert_eq!(replay_reads == 0, in_history, "{replay_reads}");
+    assert!(replay_reads > 0, "{replay_reads}");
 }
 
 /// Workflow code that starts three reads. At the first page of a read it cancels each read, and
@@ -293,11 +291,7 @@ fn cancels_at_the_first_page(activation: &WorkflowActivation) -> Vec<Command> {
     let mut commands: Vec<Command> = vec![];
     if let Some(Job::InitializeWorkflow(_)) = &activation.jobs[0].variant {
         for (seq, id) in [(1, "s"), (2, "t")] {
-            let page = ReadStream {
-                records_in_history: true,
-                ..read(seq, id, &[], Duration::ZERO)
-            };
-            commands.push(page.into());
+            commands.push(read(seq, id, &[], Duration::ZERO).into());
         }
         commands.push(read(3, "w", &[], Duration::from_secs(60)).into());
     }
@@ -311,11 +305,11 @@ fn cancels_at_the_first_page(activation: &WorkflowActivation) -> Vec<Command> {
 }
 
 // Workflow code has the first page when it cancels, so the read of that page keeps it. The other
-// page has no room in the ledger and read 3 waits for a Record, so both get a `cancelled` job.
+// page has no room in the task and read 3 waits for a Record, so both get a `cancelled` job.
 #[tokio::test]
 async fn a_cancel_ends_each_read_whose_job_workflow_code_does_not_have() {
     let store = store(&["s", "t", "w"]).await;
-    // The pages of reads 1 and 2 don't fit one ledger together.
+    // The pages of reads 1 and 2 don't fit one task together.
     append_sized(&store, "s", 600 * 1024).await;
     append_sized(&store, "t", 600 * 1024).await;
     store.gate_reads(true);
@@ -331,6 +325,9 @@ async fn a_cancel_ends_each_read_whose_job_workflow_code_does_not_have() {
     let mut opts = StartOpts::new(&store);
     opts.tasks = Some(receiver);
     opts.served = None;
+    opts.configure = Box::new(|wc| {
+        wc.stream_runtimes.settings.bounds.max_task_record_bytes = 1024 * 1024;
+    });
     let run = start(t, opts);
     let init = run.worker.poll_workflow_activation().await.unwrap();
     respond(&run.worker, &init, cancels_at_the_first_page).await;
@@ -369,6 +366,8 @@ async fn a_cancel_ends_each_read_whose_job_workflow_code_does_not_have() {
     let expected = [vec![(3 - other, true)], vec![(other, false), (3, false)]];
     assert_eq!(got, expected);
     run.worker.drain_pollers_and_shutdown_ref().await;
+    // The replay reads the page that Workflow code got from the Store again.
+    store.gate_reads(false);
     // A replay with chunking on takes the two tasks as one. It gives the jobs of task 2 in one
     // activation, so the jobs of the two cancelled reads come before Workflow code cancels.
     let replayed = run.replay(cancels_at_the_first_page).await;
@@ -772,7 +771,7 @@ fn ledgers_of(t: &TestHistoryBuilder, store: &MemoryStore) -> Vec<(Vec<u8>, usiz
     (events.iter())
         .filter_map(|event| peeked_ledger(event)?.ok())
         .map(|ledger| {
-            let entry = &ledger.data.reads[0];
+            let entry = &ledger.reads[0];
             let count = recorded_page(entry).map_or(0, |page| page.record_count);
             let bytes = (records.iter())
                 .filter(|record| record.offset > entry.from_offset)
@@ -1202,7 +1201,7 @@ fn disable_chunking(t: &mut TestHistoryBuilder) {
 fn recorded_ledgers(events: &[HistoryEvent]) -> Vec<(u64, i64)> {
     (events.iter())
         .filter_map(|event| {
-            let ledger = peeked_ledger(event)?.ok()?.data;
+            let ledger = peeked_ledger(event)?.ok()?;
             let pages = ledger.reads.iter().filter_map(recorded_page);
             let recorded = pages.map(|page| page.record_bytes).sum();
             Some((recorded, event.event_id))
