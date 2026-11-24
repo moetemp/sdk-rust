@@ -57,6 +57,9 @@ relevant information.
   Workflow's last command arrives, as it drops a Local Activity. If a call is waiting to try again
   at the task's heartbeat, because a try failed with `StoreUnavailable` or got no answer within
   `try_deadline`, the task fails, and its failure message starts with `StreamStoreUnavailable:`.
+  With workflow task chunking on, a replay never joins a task whose completion has `stream_calls`
+  with the commandless tasks before it. A Worker that takes over a run joins them when that task
+  is the task in hand, and then gives no append of the task a round.
 
 ## [0.12.0] - 2026-11-23
 

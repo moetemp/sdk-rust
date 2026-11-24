@@ -828,7 +828,22 @@ fn find_end_index_of_next_wft_seq_chunked(
                             // If we've never seen an interesting event and the next two events are
                             // a completion with no ledger followed immediately again by scheduled,
                             // then this is a WFT heartbeat and also doesn't conclude the sequence.
-                            continue;
+                            // It does when the next completion has a ledger. Local Activity markers
+                            // count activations from the start of a sequence, so a task with Stream
+                            // calls starts its own, or a replay can move its Local Activity results
+                            // past its Stream results.
+                            let next_completion = (events[ix + 2..].iter())
+                                .find(|e| e.event_type() == EventType::WorkflowTaskCompleted);
+                            match next_completion {
+                                Some(completed) if has_ledger(completed) => {
+                                    return NextWFTSeqEndIndex::Complete(ix);
+                                }
+                                // More History can still have that completion.
+                                None if !has_last_wft => {
+                                    return NextWFTSeqEndIndex::Incomplete(events.len() - 1);
+                                }
+                                _ => continue,
+                            }
                         } else {
                             // If we see an update accepted command after WFT completed, we want to
                             // conclude the WFT sequence where that update should have been
@@ -1191,11 +1206,13 @@ mod tests {
         assert_eq!(seq.len(), 2);
     }
 
-    // A completion with a ledger, even one with no entry, gives the WFT sequences of a command
-    // event right after it, also for a task with no other command and a forced next task.
+    // A completion with a ledger, even one with no entry, ends sequences as a command event right
+    // after it does, and the task before it ends its sequence too. So a task with Stream calls never
+    // joins the heartbeats before it, also when History comes in pages and the lookahead has to wait
+    // for the completion of the next task.
     #[test]
-    fn a_ledger_ends_sequences_as_a_command_after_its_completion_does() {
-        let mut forced_ledgers = 0;
+    fn a_ledger_ends_the_sequences_around_its_task() {
+        let (mut forced_ledgers, mut splits) = (0, 0);
         for seed in 0..300 {
             let mut rng = StdRng::seed_from_u64(seed);
             let chunking = rng.random_bool(0.5);
@@ -1205,9 +1222,16 @@ mod tests {
                 t.add_by_type(EventType::WorkflowExecutionStarted);
                 t.add_workflow_task_scheduled_and_started();
             }
-            // The started events of the History with ledgers, by the id of the same event in the
-            // History with commands.
-            let mut ids = vec![];
+            // The started event of each task in the History with ledgers, the id of the same event
+            // in the History with commands, and whether the completion of the task has a ledger.
+            let started = |with_ledger: &TestHistoryBuilder, with_command: &TestHistoryBuilder| {
+                (
+                    with_ledger.current_event_id(),
+                    with_command.current_event_id(),
+                    false,
+                )
+            };
+            let mut tasks = vec![started(&with_ledger, &with_command)];
             for task in 0..rng.random_range(1..8) {
                 let (ledger, command) = (rng.random_bool(0.5), rng.random_bool(0.3));
                 let forced = rng.random_bool(0.6);
@@ -1225,17 +1249,31 @@ mod tests {
                 if ledger {
                     with_ledger.set_stream_calls_last_wft(Default::default());
                     with_command.add_by_type(EventType::TimerStarted);
+                    tasks.last_mut().unwrap().2 = true;
                 }
                 if !forced {
                     for t in [&mut with_ledger, &mut with_command] {
                         t.add_we_signaled("s", vec![]);
                     }
                 }
+                // Some attempts of the next task fail or time out.
+                let failed = rng.random_bool(0.5);
+                for _ in 0..rng.random_range(0..3) {
+                    for t in [&mut with_ledger, &mut with_command] {
+                        t.add_workflow_task_scheduled_and_started();
+                        match failed {
+                            true => t.add_workflow_task_failed_with_failure(
+                                WorkflowTaskFailedCause::UnhandledCommand,
+                                Default::default(),
+                            ),
+                            false => t.add_workflow_task_timed_out(),
+                        }
+                    }
+                }
                 for t in [&mut with_ledger, &mut with_command] {
                     t.add_workflow_task_scheduled_and_started();
                 }
-                let started = with_ledger.current_event_id();
-                ids.push((started, with_command.current_event_id()));
+                tasks.push(started(&with_ledger, &with_command));
             }
             let ends = |t: &TestHistoryBuilder| {
                 let mut update = t.as_history_update();
@@ -1246,16 +1284,38 @@ mod tests {
                 }
                 ends
             };
-            let to_command_ids = |ends: Vec<i64>| -> Vec<i64> {
-                let started = |end: i64| ids.iter().find(|(id, _)| *id == end).map(|ids| ids.1);
-                ends.into_iter()
-                    .map(|end| started(end).unwrap_or(end))
-                    .collect()
+            let to_ledger_id = |end: i64| {
+                let same = tasks.iter().find(|(_, id, _)| *id == end);
+                same.map_or(end, |(id, _, _)| *id)
             };
-            let expected = ends(&with_command);
-            assert_eq!(to_command_ids(ends(&with_ledger)), expected, "seed {seed}");
+            let mut expected: Vec<i64> =
+                ends(&with_command).into_iter().map(to_ledger_id).collect();
+            let before = expected.len();
+            let after_ledger = tasks.windows(2).filter(|pair| pair[1].2);
+            expected.extend(after_ledger.clone().map(|pair| pair[0].0));
+            expected.sort_unstable();
+            expected.dedup();
+            splits += expected.len() - before;
+            assert_eq!(ends(&with_ledger), expected, "seed {seed}");
+            // The ends that the lookahead finds in each first part of the History, with more to
+            // come, never put a task with a ledger in the sequence of the task before it.
+            let events = with_ledger.get_full_history_info().unwrap().into_events();
+            for cut in 1..events.len() {
+                let (mut from_id, mut found) = (0, vec![]);
+                while let NextWFTSeqEndIndex::Complete(ix) =
+                    find_end_index_of_next_wft_seq(&events[..cut], from_id, false, !chunking)
+                {
+                    from_id = events[ix].event_id;
+                    found.push(from_id);
+                }
+                for pair in after_ledger.clone() {
+                    if found.iter().any(|end| *end >= pair[1].0) {
+                        assert!(found.contains(&pair[0].0), "seed {seed}, cut {cut}");
+                    }
+                }
+            }
         }
-        assert!(forced_ledgers > 0);
+        assert!(forced_ledgers > 0 && splits > 0);
     }
 
     #[test]

@@ -51,10 +51,8 @@ import "temporal/sdk/core/nexus/nexus.proto";
 //  normally would have when executing.
 // * The results of Stream calls go after the local activity resolutions, because a replay also
 //  scans ahead for their ledger. Appends go before closes, and each kind is in `seq` order. With
-//  workflow task chunking on, a replay can give the results of several activations in one, and a
-//  local activity resolution can come in an earlier activation. The local activity resolutions
-//  and the Stream results each keep their order, but a local activity resolution can then come
-//  before a Stream result that the first run gave earlier (see `ResolveStreamAppend`).
+//  workflow task chunking on, a replay can give the jobs of several activations in one, in the
+//  order of the first run (see `ResolveStreamAppend`).
 // * Queries always go last (and, in fact, always come in their own activation)
 // * Evictions also always come in their own activation
 //
@@ -448,17 +446,20 @@ message RemoveFromCache {
 // results of a round that are ready in the activation right after the one of their commands, once
 // each append of the round has an answer or the Stream time of the Workflow Task is up. Any other
 // result comes in the first activation of a later task: an append that has no answer at the end of
-// its round, an append that lang sends when the task has no Stream time left, and a result with
-// no room in the ledger of the task. Inside one activation the results are in `seq` order, with
-// the appends before the closes, after the other jobs.
+// its round, an append that lang sends when the task has no Stream time left or in a task that
+// Core joined with the task before it (see below), and a result with no room in the ledger of the
+// task. Inside one activation the results are in `seq` order, with the appends before the closes,
+// after the other jobs.
 //
 // A replay gives a result where the first run gave it. A result that the ledger of the task of its
 // call has comes right after the activation of the call, and any other result comes in the first
 // activation of the task whose ledger has it. Without the flag that turns workflow task chunking
-// off, a replay can join two activations in one. A Workflow Task that completes with no command
-// and no `stream_calls` joins the next task. A Local Activity result of that next task can then
-// come in an earlier activation than in the first run, and there it comes before the Stream
-// results, which come after the other jobs.
+// off, a Workflow Task that completes with no command and no `stream_calls` joins the next task,
+// unless the completion of that task has `stream_calls`. A replay can then give the jobs of
+// several activations in one, in the order of the first run. A Worker that takes over a run can't
+// see that completion yet, so it joins such a task with the task in hand, and it gives no append
+// of the task in hand a round. If both tasks have events, a later replay that keeps them apart
+// gives the jobs of those events in two activations, where that Worker gave them in one.
 message ResolveStreamAppend {
     // The `seq` of the `AppendToStream`.
     uint32 seq = 1;

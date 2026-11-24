@@ -150,6 +150,11 @@ pub(crate) struct StreamCalls {
     time_up: bool,
     /// True if a call started when the task had no Stream time left.
     started_late: bool,
+    /// True if the task in hand came in one sequence with a task before it. Its Local Activity
+    /// results then count activations from the start of that sequence, while a replay of the
+    /// whole History starts a sequence at a task with Stream calls. So no append of the task has a
+    /// round, or a replay could move such a result past a result of the round.
+    joined: bool,
     held: Held,
     /// History's results whose calls Workflow code issued, for the next activation.
     ready: BTreeMap<CallKey, workflow_activation_job::Variant>,
@@ -191,6 +196,7 @@ impl StreamCalls {
             first: false,
             time_up: false,
             started_late: false,
+            joined: false,
             held: Held::default(),
             ready: BTreeMap::new(),
             ledger,
@@ -212,6 +218,12 @@ impl StreamCalls {
         }
         self.task = state;
         self.start_heads();
+    }
+
+    /// Notes whether the sequence of History that Core applied last has a task before the task in
+    /// hand.
+    pub(crate) fn set_joined(&mut self, joined: bool) {
+        self.joined = joined;
     }
 
     /// Handles an append command.
@@ -241,10 +253,11 @@ impl StreamCalls {
         self.match_append(seq)?;
         if self.phase == Phase::Live {
             let call = CallKey::Append(seq);
-            if self.task.is_open() && !self.time_up {
+            if self.task.is_open() && !self.time_up && !self.joined {
                 self.round.insert(call);
             } else {
-                // A call with no Stream time left can't have its round, so its result is late.
+                // A call with no Stream time left, or of a joined task, can't have its round, so
+                // its result is late.
                 self.late.insert(call);
                 self.started_late |= self.task.is_open();
             }
@@ -1455,6 +1468,8 @@ mod tests {
         /// The commands with a Stream id or a Store name out of range.
         invalid: usize,
         bad_seqs: usize,
+        /// The appends of a task that came in one sequence with the task before it.
+        joined_appends: usize,
     }
 
     /// What the rules of rounds say about the task in hand. The first run keeps it apart from the
@@ -1473,6 +1488,8 @@ mod tests {
         first_sent: bool,
         /// True if a call started when the task had no Stream time left.
         started_late: bool,
+        /// True if the task came in one sequence with the task before it, so no call has a round.
+        joined: bool,
     }
 
     impl Rules {
@@ -1519,7 +1536,7 @@ mod tests {
             self.first_sent = true;
             for command in commands {
                 match command {
-                    Command::Append(append) if !self.time_up => {
+                    Command::Append(append) if !self.time_up && !self.joined => {
                         self.round.insert(CallKey::Append(append.seq));
                     }
                     Command::Append(append) => {
@@ -1684,10 +1701,15 @@ mod tests {
             }
             self.run.activation = 0;
             self.run.has_work_for_server = false;
+            // A Worker that takes the run over can apply a task in one sequence with the task
+            // before it.
+            let joined = self.rng.random_bool(0.1);
+            self.run.calls.set_joined(joined);
             let answered = std::mem::take(&mut self.rules.answered);
             self.rules = Rules {
                 late: self.unresolved.clone(),
                 answered: answered.intersection(&self.unresolved).copied().collect(),
+                joined,
                 ..Default::default()
             };
             for resolution in std::mem::take(&mut self.deferred) {
@@ -1797,6 +1819,7 @@ mod tests {
             for command in &commands {
                 match command {
                     Command::Append(append) => {
+                        self.seen.joined_appends += usize::from(self.rules.joined);
                         self.unresolved.insert(CallKey::Append(append.seq));
                     }
                     Command::Close(close) => {
@@ -2060,6 +2083,7 @@ mod tests {
             dropped,
             invalid,
             bad_seqs,
+            joined_appends,
         } = seen;
         let counts = [
             full_ledgers,
@@ -2071,6 +2095,7 @@ mod tests {
             dropped,
             invalid,
             bad_seqs,
+            joined_appends,
         ];
         assert!(counts.iter().all(|count| *count > 0), "{counts:?}");
     }
