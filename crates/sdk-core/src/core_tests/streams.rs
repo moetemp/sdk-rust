@@ -367,6 +367,11 @@ fn close_intent(stream_id: &str) -> WorkflowTaskStreamCalls {
 fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) {
     history.add_workflow_task_completed();
     let completed = history.current_event_id();
+    // A replay takes its chunking mode from this flag, so the mock server keeps it.
+    let unchunked = CoreInternalFlags::DisableWorkflowTaskChunking;
+    if (completion.sdk_metadata.core_used_flags).contains(&(unchunked as u32)) {
+        history.set_flags_last_wft(&[unchunked], &[]);
+    }
     if let Some(calls) = &completion.sdk_metadata.stream_calls {
         history.set_stream_calls_last_wft(calls.as_ref().clone());
     }
@@ -454,19 +459,19 @@ impl Run {
         &self,
         workflow: impl FnMut(&WorkflowActivation) -> Vec<Command>,
     ) -> Vec<Vec<Job>> {
-        self.replay_with(true, workflow).await
+        self.replay_with(false, workflow).await
     }
 
-    /// Replays as [`Run::replay`] does, with chunking on or off. The mock server writes no flag,
-    /// so a History has chunking on unless this turns it off.
+    /// Replays as [`Run::replay`] does. With `chunking`, the first completion has no flag, as if
+    /// it came from a Worker with no Stream runtime, so the replay has chunking on.
     async fn replay_with(
         &self,
         chunking: bool,
         workflow: impl FnMut(&WorkflowActivation) -> Vec<Command>,
     ) -> Vec<Vec<Job>> {
         let mut t = self.history.lock().clone();
-        if !chunking {
-            t.set_flags_first_wft(&[CoreInternalFlags::DisableWorkflowTaskChunking], &[]);
+        if chunking {
+            t.set_flags_first_wft(&[], &[]);
         }
         let mut opts = StartOpts::new(&self.store);
         opts.replay = true;
@@ -2137,10 +2142,11 @@ struct Reached {
 
 // The first run of generated Workflow code, with Local Activities, queries, rejected Updates and
 // Store calls that wait, writes a History whose replay gives the same jobs in the same activations.
-// Queries and rejected Updates leave no event, so the replay has none of their jobs. With chunking
-// on, one activation of the replay can have the jobs of several, and a Local Activity result can
-// come earlier, but each kind of result keeps its order. With no Local Activity, the jobs keep the
-// order of the first run.
+// Queries and rejected Updates leave no event, so the replay has none of their jobs. The same
+// History with no flag in its first completion replays with chunking on, as for a Workflow that
+// started on a Worker with no Stream runtime. One activation of that replay can have the jobs of
+// several, and a Local Activity result can come earlier, but each kind of result keeps its order.
+// With no Local Activity, the jobs keep the order of the first run.
 #[tokio::test]
 async fn a_replay_gives_the_activations_of_the_first_run() {
     let ids = ["s0", "s1", "s2"];

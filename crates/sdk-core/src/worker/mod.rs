@@ -286,6 +286,11 @@ pub struct WorkerConfig {
     /// The Stream runtimes of this Worker, identified by the name of the Store that each one
     /// serves, with the settings that the Stream calls of Workflow code use. A Stream call on a
     /// Store with no runtime here fails the Workflow Task.
+    ///
+    /// With at least one runtime here, the Worker turns workflow task chunking off for each
+    /// Workflow whose first task it completes. That first task decides the mode for the life of
+    /// the Workflow, so each Worker of a task queue should have its Stream runtime before a
+    /// Workflow that uses Streams starts.
     /// NOTE: Experimental
     #[builder(default)]
     pub stream_runtimes: StreamRuntimes,

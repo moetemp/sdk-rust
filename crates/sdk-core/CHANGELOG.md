@@ -57,6 +57,11 @@ relevant information.
   Workflow's last command arrives, as it drops a Local Activity. If a call is waiting to try again
   at the task's heartbeat, because a try failed with `StoreUnavailable` or got no answer within
   `try_deadline`, the task fails, and its failure message starts with `StreamStoreUnavailable:`.
+  A Worker with a Stream runtime records `DisableWorkflowTaskChunking` on the first completion of
+  a new Workflow, as the Cargo feature `disable_workflow_task_chunking` does, so the Workflow
+  replays with workflow task chunking off. With chunking on, a replay can give a Local Activity
+  result before a Stream result that the first run gave earlier. A Workflow whose first task
+  completed on a Worker with no Stream runtime keeps chunking on.
 
 ## [0.12.0] - 2026-11-23
 

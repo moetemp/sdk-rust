@@ -53,6 +53,10 @@ impl StreamRuntimes {
     pub(crate) fn get(&self, store: &str) -> Option<&Arc<StreamRuntime>> {
         self.runtimes.get(store)
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.runtimes.is_empty()
+    }
 }
 
 /// The settings of a Worker's Stream calls. A try that fails with

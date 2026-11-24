@@ -683,7 +683,11 @@ impl WorkflowMachines {
         // report that our ID was the one used for the completion.
         self.current_wft_deployment_info = self.worker_config.computed_deployment_version();
         let mut flags = (*self.observed_internal_flags).borrow_mut();
-        if cfg!(feature = "disable_workflow_task_chunking")
+        // With chunking on, a replay can give a Local Activity result before a Stream result that
+        // the first run gave earlier, so a Worker with a Stream runtime starts its Workflows with
+        // chunking off.
+        if (cfg!(feature = "disable_workflow_task_chunking")
+            || !self.worker_config.stream_runtimes.is_empty())
             && !self.replaying
             && self.last_history_from_server.previous_wft_started_id == 0
         {

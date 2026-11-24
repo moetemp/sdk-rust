@@ -50,11 +50,13 @@ import "temporal/sdk/core/nexus/nexus.proto";
 //  this to ensure the LA resolution happens after that cancel (or whatever else it may be) as it
 //  normally would have when executing.
 // * The results of Stream calls go after the local activity resolutions, because a replay also
-//  scans ahead for their ledger. Appends go before closes, and each kind is in `seq` order. With
-//  workflow task chunking on, a replay can give the results of several activations in one, and a
-//  local activity resolution can come in an earlier activation. The local activity resolutions
-//  and the Stream results each keep their order, but a local activity resolution can then come
-//  before a Stream result that the first run gave earlier (see `ResolveStreamAppend`).
+//  scans ahead for their ledger. Appends go before closes, and each kind is in `seq` order.
+//  Workflow task chunking is on only for a workflow whose first task completed on a worker with
+//  no Stream runtime, in a build without the Cargo feature `disable_workflow_task_chunking`. Its
+//  replay can give the results of several activations in one, and a local activity resolution
+//  can come in an earlier activation. The local activity resolutions and the Stream results each
+//  keep their order, but a local activity resolution can then come before a Stream result that
+//  the first run gave earlier (see `ResolveStreamAppend`).
 // * Queries always go last (and, in fact, always come in their own activation)
 // * Evictions also always come in their own activation
 //
@@ -454,11 +456,13 @@ message RemoveFromCache {
 //
 // A replay gives a result where the first run gave it. A result that the ledger of the task of its
 // call has comes right after the activation of the call, and any other result comes in the first
-// activation of the task whose ledger has it. Without the flag that turns workflow task chunking
-// off, a replay can join two activations in one. A Workflow Task that completes with no command
-// and no `stream_calls` joins the next task. A Local Activity result of that next task can then
-// come in an earlier activation than in the first run, and there it comes before the Stream
-// results, which come after the other jobs.
+// activation of the task whose ledger has it. A Worker with a Stream runtime turns workflow task
+// chunking off on the first completion of a Workflow. A Workflow whose first task completed on a
+// Worker with no Stream runtime, in a build without the Cargo feature
+// `disable_workflow_task_chunking`, keeps chunking on, and its replay can join two activations in
+// one. A Workflow Task that completes with no command and no `stream_calls` joins the next task.
+// A Local Activity result of that next task can then come in an earlier activation than in the
+// first run, and there it comes before the Stream results, which come after the other jobs.
 message ResolveStreamAppend {
     // The `seq` of the `AppendToStream`.
     uint32 seq = 1;

@@ -44,6 +44,14 @@ metadata. That selects unchunked replay for the entire workflow. Workflows whose
 does not record the flag retain legacy chunking for their lifetime, even on a worker built with
 the feature enabled. Server SDK metadata support is required to adopt the new mode.
 
+A Worker with at least one Stream runtime (`WorkerConfig::stream_runtimes`) records the flag too,
+in a build with or without the feature. With legacy chunking, a replay can join a task that
+completed with no command and no Stream ledger into the next task, and a Local Activity result of
+that next task can then come before a Stream result that the first run gave earlier. Since the
+first completion decides the mode, each Worker of a task queue should have its Stream runtime
+before a Workflow that uses Streams starts. A Workflow whose first task completed on a Worker with
+no Stream runtime keeps legacy chunking, and with it that limit.
+
 In unchunked mode, successful workflow tasks are processed separately, preserving the timestamps
 and grouping of their activation jobs. Tasks with no jobs are handled internally without
 activating lang or polling workflow routines, just as during live execution.

@@ -2361,11 +2361,13 @@ mod tests {
     mod local_activity_replay_tests {
         use super::super::WorkflowManager;
         use crate::{
+            StreamRuntimes,
             internal_flags::CoreInternalFlags,
             replay::{DEFAULT_ACTIVITY_TYPE, DEFAULT_WORKFLOW_TYPE, TestHistoryBuilder},
             telemetry::metrics::MetricsContext,
             test_help::{
-                PollWFTRespExt, schedule_activity_cmd, schedule_local_activity_cmd, test_worker_cfg,
+                PollWFTRespExt, schedule_activity_cmd, schedule_local_activity_cmd,
+                stream_store::MemoryStore, test_worker_cfg,
             },
             worker::{
                 LocalActRequest, LocalActivityExecutionResult, LocalActivityResolution,
@@ -2377,7 +2379,7 @@ mod tests {
         use itertools::Itertools;
         use prost::Message;
         use rstest::rstest;
-        use std::{collections::BTreeMap, time::Duration};
+        use std::{collections::BTreeMap, sync::Arc, time::Duration};
         use temporalio_common::protos::{
             coresdk::{
                 AsJsonPayloadExt,
@@ -2398,6 +2400,7 @@ mod tests {
                 workflowservice::v1::get_system_info_response::Capabilities,
             },
         };
+        use temporalio_streams::StreamRuntime;
 
         #[derive(Clone, Copy, Debug)]
         enum Activity {
@@ -2741,6 +2744,7 @@ mod tests {
         fn chunking_mode_is_chosen_only_on_first_completion(
             #[case] sdk_metadata: bool,
             #[values(false, true)] already_completed_task: bool,
+            #[values(false, true)] stream_runtime: bool,
         ) {
             let mut history = TestHistoryBuilder::default();
             history.add_by_type(EventType::WorkflowExecutionStarted);
@@ -2749,8 +2753,15 @@ mod tests {
                 history.add_we_signaled("start", vec![]);
             }
             history.add_workflow_task_scheduled_and_started();
+            let mut worker_config = test_worker_cfg().build().unwrap();
+            if stream_runtime {
+                let runtime =
+                    StreamRuntime::new(Arc::new(MemoryStore::default()), Default::default());
+                worker_config.stream_runtimes =
+                    StreamRuntimes::new([("mem".to_owned(), Arc::new(runtime))]);
+            }
             let mut live = WorkflowManager::new(RunBasics {
-                worker_config: test_worker_cfg().build().unwrap().into(),
+                worker_config: worker_config.into(),
                 workflow_id: "chunking-mode".to_owned(),
                 workflow_type: DEFAULT_WORKFLOW_TYPE.to_owned(),
                 run_id: history.get_orig_run_id().to_owned(),
@@ -2780,7 +2791,7 @@ mod tests {
                 flags.contains(&(CoreInternalFlags::DisableWorkflowTaskChunking as u32)),
                 !already_completed_task
                     && sdk_metadata
-                    && cfg!(feature = "disable_workflow_task_chunking")
+                    && (stream_runtime || cfg!(feature = "disable_workflow_task_chunking"))
             );
         }
 
