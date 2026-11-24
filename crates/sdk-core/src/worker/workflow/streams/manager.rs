@@ -734,11 +734,12 @@ mod tests {
             .collect()
     }
 
-    // Workflow code reads a Stream with one read for each page, from the last Record that it got.
-    // A read waits out its wait, so a Store that answers immediately gets no read in a loop.
+    // Workflow code reads a Stream with one read for each page, from the `last_offset` of the page
+    // before. A read waits out its wait, so a Store that answers immediately gets no read in a
+    // loop.
     #[tokio::test(start_paused = true)]
     async fn a_read_gives_the_next_records_or_none_once_its_wait_is_over() {
-        let (mut ends, mut outages, mut early, mut loops) = ([0; 3], 0, 0, 0);
+        let (mut ends, mut outages, mut early, mut loops, mut moved) = ([0; 3], 0, 0, 0, 0);
         for seed in 0..300 {
             let mut rng = StdRng::seed_from_u64(seed);
             let entries = entries(&mut rng);
@@ -863,9 +864,11 @@ mod tests {
                     bytes <= max_bytes as usize || page.records.len() == 1,
                     "seed {seed}"
                 );
-                if let Some(last) = page.records.last() {
-                    cursor.clone_from(&last.offset);
-                }
+                // The page ends where the last answer of the Store ended, also with no Record.
+                let answered = store.model.lock().last_offset.clone();
+                assert_eq!(page.last_offset, answered, "seed {seed}");
+                moved += usize::from(page.records.is_empty() && page.last_offset > cursor);
+                cursor.clone_from(&page.last_offset);
                 let came = !page.records.is_empty();
                 got.extend(page.records);
                 let all = store.records_after(&from_offset);
@@ -892,11 +895,12 @@ mod tests {
             assert_eq!(violations.concat(), Vec::<String>::new(), "seed {seed}");
             early += store.model.lock().answered_early;
         }
-        // The scripts reach each kind of end, an outage, a Store that answers before the wait, and
-        // a Stream that takes several reads.
+        // The scripts reach each kind of end, an outage, a Store that answers before the wait, a
+        // Stream that takes several reads, and a page with no Record that ends past its start.
+        let reached = [outages, early, loops, moved];
         assert!(
-            ends.iter().all(|count| *count > 0) && outages > 0 && early > 0 && loops > 0,
-            "{ends:?} {outages} {early} {loops}"
+            ends.iter().chain(&reached).all(|count| *count > 0),
+            "{ends:?} {reached:?}"
         );
     }
 }

@@ -497,9 +497,7 @@ message CloseStream {
 // * no Records and `done`, if the Stream is closed and has none after `from_offset`
 // * no Records, if none came within `wait`
 //
-// To read on, lang sends a new `ReadStream` whose `from_offset` is the offset of the last Record
-// that it got. A page with no Record gives no offset, so the next read starts at the `from_offset`
-// of this one.
+// To read on, lang sends a new `ReadStream` whose `from_offset` is the `last_offset` of the page.
 //
 // What a read costs:
 // * Each page takes a command, an activation and an entry in the ledger of its Workflow Task.

@@ -64,6 +64,8 @@ pub(crate) struct Model {
     pub(crate) empty_until: Option<(Vec<u8>, tokio::time::Instant)>,
     /// The answers with nothing that came before the read's wait was up.
     pub(crate) answered_early: usize,
+    /// The `last_offset` of the last answer.
+    pub(crate) last_offset: Vec<u8>,
     pub(crate) violations: Vec<String>,
 }
 
@@ -86,6 +88,7 @@ impl Model {
             moved_to: None,
             empty_until: None,
             answered_early: 0,
+            last_offset: vec![],
             violations: vec![],
         }
     }
@@ -188,6 +191,7 @@ impl ModelStore {
             moved_to,
             empty_until,
             answered_early,
+            last_offset: last_answer,
             ..
         } = &mut *model;
         let now = tokio::time::Instant::now();
@@ -237,6 +241,7 @@ impl ModelStore {
         let done = *closed && take == later.len();
         *empty_until = (take == 0 && !done).then(|| (last_offset.clone(), asked + wait));
         *answered_early += usize::from(empty_until.is_some() && now < asked + wait);
+        last_answer.clone_from(&last_offset);
         Ok(ReadRecordsResponse {
             records,
             last_offset,

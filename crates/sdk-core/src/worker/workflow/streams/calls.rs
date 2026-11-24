@@ -1887,6 +1887,8 @@ mod tests {
         late_results: usize,
         /// The tasks that only reads held, which completed for a close intent.
         completed_for_intent: usize,
+        /// The pages with no Record whose `last_offset` is past the `from_offset` of their read.
+        moved_on: usize,
     }
 
     /// The state as of the last task in History, which a failed task goes back to.
@@ -2451,10 +2453,19 @@ mod tests {
                             .count();
                         let count = fitting.max(most.min(1));
                         self.seen.pages += 1;
+                        // A page ends at its last Record, or where its read started, or past
+                        // entries after that which aren't Records.
+                        let mut last_offset = match left[..count].last() {
+                            Some(record) => record.offset.clone(),
+                            None => request.from_offset.clone(),
+                        };
+                        if self.rng.random_bool(0.3) {
+                            last_offset.push(1);
+                        }
                         Ok(ReadRecordsResponse {
                             records: left[..count].to_vec(),
+                            last_offset,
                             done: stream.closed && count == left.len(),
-                            ..Default::default()
                         })
                     };
                     let from_offset = request.from_offset.clone();
@@ -2582,6 +2593,13 @@ mod tests {
                 })
                 .collect();
             let reads = self.reads();
+            let moved_on = reads.values().filter(|read| match &read.job {
+                Some(resolve_stream_read::Status::Page(page)) => {
+                    page.records.is_empty() && page.last_offset > read.from_offset
+                }
+                _ => false,
+            });
+            self.seen.moved_on += moved_on.count();
             // A read with a cancel and no result in History has the job of its cancel once the
             // replay is over, also if the Store gave an answer that no ledger has.
             let cancels: BTreeSet<u32> = (self.history.iter())
@@ -2629,7 +2647,8 @@ mod tests {
         }
 
         /// Returns what Workflow code got of each read of History, and checks that each read got
-        /// at most one job, whose page has the next Records of the read's Stream.
+        /// at most one job, whose page has the next Records of the read's Stream and ends where
+        /// the next read gives the Records after them.
         fn reads(&self) -> BTreeMap<u32, ReadSeen> {
             let seed = self.seed;
             let mut reads = BTreeMap::new();
@@ -2664,6 +2683,9 @@ mod tests {
                 assert!(after.starts_with(&page.records), "seed {seed}: read {seq}");
                 let last = stream.closed && after.len() == page.records.len();
                 assert_eq!(page.done, last, "seed {seed}: read {seq}");
+                let next = self::after(stream, &page.last_offset);
+                let rest = &after[page.records.len()..];
+                assert_eq!(next, rest, "seed {seed}: read {seq}");
             }
             reads
         }
@@ -2763,6 +2785,7 @@ mod tests {
             cancelled_in_history,
             late_results,
             completed_for_intent,
+            moved_on,
         } = seen;
         let counts = [
             full_ledgers,
@@ -2779,6 +2802,7 @@ mod tests {
             cancelled_in_history,
             late_results,
             completed_for_intent,
+            moved_on,
         ];
         let counts = [&counts[..], &cancels[..]].concat();
         assert!(counts.iter().all(|count| *count > 0), "{counts:?}");

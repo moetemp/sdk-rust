@@ -82,6 +82,7 @@ impl ReadDone {
         let mut entry = StreamReadPage {
             record_count: page.records.len() as u32,
             done: page.done,
+            last_offset: page.last_offset,
             ..Default::default()
         };
         if !page.records.is_empty() {
@@ -162,10 +163,11 @@ pub(crate) fn close_job(entry: &StreamCloseResult) -> ResolveStreamClose {
 /// of its page.
 pub(crate) fn read_job(entry: &StreamReadResult, records: Vec<StreamRecord>) -> ResolveStreamRead {
     let status = entry.result.as_ref().map(|result| match result {
-        stream_read_result::Result::Page(page) => {
-            let done = page.done;
-            resolve_stream_read::Status::Page(StreamPage { records, done })
-        }
+        stream_read_result::Result::Page(page) => resolve_stream_read::Status::Page(StreamPage {
+            records,
+            done: page.done,
+            last_offset: page.last_offset.clone(),
+        }),
         stream_read_result::Result::Failure(failure) => {
             resolve_stream_read::Status::Failed(failure_of(failure))
         }
@@ -491,18 +493,26 @@ mod tests {
         assert!(builder.close_result(&close, 1));
         let prices = ReadRecordsResponse {
             records: vec![record(8, "1.5"), record(9, "1.6"), record(10, "1.4")],
+            last_offset: offset(10),
             ..Default::default()
         };
         let prices = ReadDone::new(&stream("prices"), 1, offset(7), Ok(prices));
         builder.read_result(prices, 0);
         let replies = ReadRecordsResponse {
             records: vec![record(1, "hello"), record(2, "bye")],
+            last_offset: offset(2),
             done: true,
-            ..Default::default()
         };
         let replies = ReadDone::new(&stream("replies"), 2, vec![], Ok(replies));
         builder.read_result(replies, 1);
         builder.read_result(ReadDone::cancelled(&stream("prices"), 3, offset(10)), 1);
+        // The Store passed entries that aren't Records, so a page with none ends past its start.
+        let passed = ReadRecordsResponse {
+            last_offset: offset(14),
+            ..Default::default()
+        };
+        let passed = ReadDone::new(&stream("prices"), 4, offset(10), Ok(passed));
+        builder.read_result(passed, 2);
         assert!(builder.close_intent(&stream("orders"), 2));
         let ledger = builder.take().unwrap();
 
@@ -517,14 +527,17 @@ mod tests {
             "4e5f434c4f53454412145468652053747265616d20697320636c6f736564",
             // Close 1, at activation 1.
             "1a0408011001",
-            // Read 1 of `prices`, with its digest.
-            "2234080112067072696365731a0572656469732a080000000000000007321708031a101be96426707f0f",
-            "4fff8300217b932d4d20db01",
-            // Read 2 of `replies`, with its digest.
-            "222f080212077265706c6965731a05726564697320013219080210011a1057e53d263ef48dd39e62ca29",
-            "4ef6a2de209401",
+            // Read 1 of `prices`, with its digest and its last offset.
+            "223e080112067072696365731a0572656469732a080000000000000007322108031a101be96426707f0f",
+            "4fff8300217b932d4d20db012a08000000000000000a",
+            // Read 2 of `replies`, with its digest and its last offset.
+            "2239080212077265706c6965731a05726564697320013223080210011a1057e53d263ef48dd39e62ca29",
+            "4ef6a2de2094012a080000000000000002",
             // Read 3 of `prices`, cancelled.
             "221f080312067072696365731a05726564697320012a08000000000000000a4200",
+            // Read 4 of `prices`, with no Record and a last offset past its start.
+            "2229080412067072696365731a05726564697320022a08000000000000000a320a2a0800000000000000",
+            "0e",
         ];
         assert_eq!(hex(&encoded), pinned.concat());
         assert_eq!(peeked_ledger(&event(encoded)), Some(Ok(ledger)));
@@ -673,8 +686,8 @@ mod tests {
         for seq in 1..=rng.random_range(0..5) {
             let page = ReadRecordsResponse {
                 records: (0..rng.random_range(0..4)).map(|_| record(rng)).collect(),
+                last_offset: offset(rng),
                 done: rng.random_bool(0.5),
-                ..Default::default()
             };
             let stream = stream(rng);
             let done = match rng.random_range(0..5) {

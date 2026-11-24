@@ -1,6 +1,7 @@
 //! The Stream reads of Workflow code, through a Worker on a mock server. These tests need the real
 //! machinery of a Worker, such as the completion of a task while a read runs, or a replay.
-//! Workflow code reads a Stream with one read for each page, from the last Record that it got.
+//! Workflow code reads a Stream with one read for each page, from the `last_offset` of the page
+//! before.
 
 use super::*;
 use crate::worker::{
@@ -113,9 +114,8 @@ fn page_of(read: &ResolveStreamRead) -> Option<&StreamPage> {
 /// Returns the read that goes on after the page of `read`, with the next seq. Returns `None` if
 /// the read gave no Record, or the last one of its Stream, so Workflow code stops reading.
 fn next_read(read: &ResolveStreamRead, wait: Duration) -> Option<ReadStream> {
-    let page = page_of(read)?;
-    let last = page.records.last().filter(|_| !page.done)?;
-    Some(self::read(read.seq + 1, "s", &last.offset, wait))
+    let page = page_of(read).filter(|page| !page.records.is_empty() && !page.done)?;
+    Some(self::read(read.seq + 1, "s", &page.last_offset, wait))
 }
 
 /// Returns true if `activation` has the result of a read after which Workflow code stops reading.

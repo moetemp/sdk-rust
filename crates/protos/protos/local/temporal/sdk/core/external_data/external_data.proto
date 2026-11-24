@@ -130,4 +130,7 @@ message StreamReadPage {
   // its field. That is the measure of the `max_bytes` of a read. It's set when `digest` is, so a
   // replay knows how much it reads.
   uint64 record_bytes = 4;
+  // The `last_offset` that Workflow code got with the page. A replay gives the same value, since
+  // another read of the Store can end at another offset.
+  bytes last_offset = 5;
 }

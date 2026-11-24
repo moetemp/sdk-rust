@@ -469,6 +469,9 @@ message StreamPage {
     // True if the Stream is closed and has no Record after this page. It's false if the page has
     // no Record because none came within the `wait` of the read.
     bool done = 2;
+    // The offset where the page ends, as the Store gave it. The next read can pass it as its
+    // `from_offset`. It's set also for a page with no Record.
+    bytes last_offset = 3;
 }
 
 // The result of an `AppendToStream`. Core gives each result in the next activation after the
