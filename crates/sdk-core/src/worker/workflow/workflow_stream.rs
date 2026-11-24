@@ -142,6 +142,10 @@ impl WFStream {
                             LocalInputs::HeartbeatTimeout(hbt) => {
                                 state.process_heartbeat_timeout(hbt)
                             }
+                            LocalInputs::StreamTimeUp(run_id, generation) => state
+                                .runs
+                                .get_mut(&run_id)
+                                .and_then(|rh| rh.stream_time_up(generation)),
                             LocalInputs::LocalActivityCancelProcessed(run_id) => state
                                 .runs
                                 .get_mut(&run_id)
@@ -209,6 +213,14 @@ impl WFStream {
                 };
 
                 activations.extend(maybe_act);
+                // A graceful shutdown ends the Stream time of each task, so no hold makes it wait.
+                // Any input of the shutdown can find a run that holds, so each one checks them all.
+                if state.shutdown_token.is_cancelled() {
+                    activations.extend(
+                        (state.runs.handles_mut())
+                            .filter_map(|run| run.end_stream_time_for_shutdown()),
+                    );
+                }
                 activations.extend(state.reconcile_buffered());
                 actions.extend(
                     activations
@@ -698,6 +710,8 @@ pub(super) enum LocalInputs {
     PostActivation(Box<PostActivationMsg>),
     RequestEviction(RequestEvictMsg),
     HeartbeatTimeout(String),
+    /// The Stream time of the run's task is up, at the timer of a wait.
+    StreamTimeUp(String, u64),
     /// A queued cancel was handed to lang, so the run may be ready to evict
     #[from(ignore)]
     LocalActivityCancelProcessed(String),
@@ -713,6 +727,7 @@ impl LocalInputs {
             LocalInputs::PostActivation(pa) => &pa.run_id,
             LocalInputs::RequestEviction(re) => &re.run_id,
             LocalInputs::HeartbeatTimeout(run_id)
+            | LocalInputs::StreamTimeUp(run_id, _)
             | LocalInputs::LocalActivityCancelProcessed(run_id) => run_id,
             LocalInputs::GetStateInfo(_) | LocalInputs::BumpStream => return None,
         })

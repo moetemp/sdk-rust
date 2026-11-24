@@ -50,9 +50,11 @@ import "temporal/sdk/core/nexus/nexus.proto";
 //  this to ensure the LA resolution happens after that cancel (or whatever else it may be) as it
 //  normally would have when executing.
 // * The results of Stream calls go after the local activity resolutions, because a replay also
-//  scans ahead for their marker. Appends go before closes, and each kind is in `seq` order. When a
-//  replay gives the results of several activations in one, the Stream results keep the order of
-//  those activations, after all local activity resolutions.
+//  scans ahead for their ledger. Appends go before closes, and each kind is in `seq` order. With
+//  workflow task chunking on, a replay can give the results of several activations in one, and a
+//  local activity resolution can come in an earlier activation. The local activity resolutions
+//  and the Stream results each keep their order, but a local activity resolution can then come
+//  before a Stream result that the first run gave earlier (see `ResolveStreamAppend`).
 // * Queries always go last (and, in fact, always come in their own activation)
 // * Evictions also always come in their own activation
 //
@@ -442,21 +444,21 @@ message RemoveFromCache {
     EvictionReason reason = 2;
 }
 
-// The result of an `AppendToStream`. Core gives each result in the next activation after the
-// Store answers, so each result can cost an activation.
+// The result of an `AppendToStream`. The appends of one activation are a round. Core gives the
+// results of a round that are ready in the activation right after the one of their commands, once
+// each append of the round has an answer or the Stream time of the Workflow Task is up. Any other
+// result comes in the first activation of a later task: an append that has no answer at the end of
+// its round, an append that lang sends when the task has no Stream time left, and a result with
+// no room in the ledger of the task. Inside one activation the results are in `seq` order, with
+// the appends before the closes, after the other jobs.
 //
-// A replay gives each result in the same activation as the first run only if History has the flag
-// that turns workflow task chunking off. Without the flag, a replay keeps the order of the results
-// of a task, but it can give a result in another activation in two cases.
-// * A Workflow Task completes with no command, and the first activation of the next task has a
-//   result. A replay takes the two tasks as one, and can give the results of the first two
-//   activations of the second task in one.
-// * A Workflow Task starts with an Update that Workflow code rejects, which leaves no event. When
-//   such a replay has no other job to give, it gives the results of History in one activation, in
-//   the order of the first run, up to the first one whose call Workflow code hasn't made yet.
-// A task with only Stream calls replays in the same activations as a task with only Local
-// Activities. In a task with both, a result waits for each result of the other kind that the first
-// run gave before it, so its activations can differ from those of Local Activities alone.
+// A replay gives a result where the first run gave it. A result that the ledger of the task of its
+// call has comes right after the activation of the call, and any other result comes in the first
+// activation of the task whose ledger has it. Without the flag that turns workflow task chunking
+// off, a replay can join two activations in one. A Workflow Task that completes with no command
+// and no `stream_calls` joins the next task. A Local Activity result of that next task can then
+// come in an earlier activation than in the first run, and there it comes before the Stream
+// results, which come after the other jobs.
 message ResolveStreamAppend {
     // The `seq` of the `AppendToStream`.
     uint32 seq = 1;
@@ -477,7 +479,8 @@ message StreamAppended {
     bytes last_offset = 2;
 }
 
-// The result of a `CloseStream`. The activation rules of `ResolveStreamAppend` apply to it too.
+// The result of a `CloseStream`. It always comes in the first activation of a later Workflow Task,
+// and the activation rules of `ResolveStreamAppend` apply to it too.
 message ResolveStreamClose {
     // The `seq` of the `CloseStream`.
     uint32 seq = 1;

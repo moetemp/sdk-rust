@@ -44,11 +44,19 @@ relevant information.
 * [lang-internal] Workflow code can append to and close a Stream with the experimental
   `AppendToStream` and `CloseStream` commands, on a Store in `WorkerConfig::stream_runtimes`. Each
   call writes with the Producer and the attempt of its Workflow Task. Its result comes back in a
-  `ResolveStreamAppend` or `ResolveStreamClose` job and goes into a `core_stream` marker, so a
-  replay doesn't make a Store call. Core drops a call that has no result when the Workflow's last
-  command arrives, as it drops a Local Activity. If a call is waiting to try again at the task's
-  heartbeat, because a try failed with `StoreUnavailable` or got no answer within `try_deadline`,
-  the task fails, and its failure message starts with `StreamStoreUnavailable:`.
+  `ResolveStreamAppend` or `ResolveStreamClose` job and goes into the ledger of the task, which Core
+  puts on the completion as the new `stream_calls` of `sdk_metadata`, so a replay doesn't make a
+  Store call. After an activation with appends, Core gives no other activation until each append
+  has an answer or the Stream time of the task is up, and the next activation has the results of
+  that round. A result that comes later, and the result of each close, comes in the first activation
+  of a later task, and Core asks for a new task once one is ready. The new
+  `StreamSettings::task_time` sets the Stream time of a task, which is half the Workflow Task
+  timeout by default and never runs past the task's heartbeat. A close runs once History has the
+  task that asked for it. A Stream call adds no event to History. If the server doesn't take
+  `sdk_metadata`, a Stream call fails its task. Core drops a call that has no result when the
+  Workflow's last command arrives, as it drops a Local Activity. If a call is waiting to try again
+  at the task's heartbeat, because a try failed with `StoreUnavailable` or got no answer within
+  `try_deadline`, the task fails, and its failure message starts with `StreamStoreUnavailable:`.
 
 ## [0.12.0] - 2026-11-23
 

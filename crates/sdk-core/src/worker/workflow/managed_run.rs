@@ -14,8 +14,8 @@ use crate::{
             WFCommand, WFCommandVariant, WFMachinesError, WFT_HEARTBEAT_TIMEOUT_FRACTION,
             WFTReportStatus, WftFailureKind, WorkflowTaskInfo,
             history_update::HistoryPaginator,
-            machines::{MachinesWFTResponseContent, WorkflowMachines},
-            streams::{RunStreams, Streams, TaskState, is_stream_marker, task_attempt},
+            machines::{MachinesWFTResponseContent, WorkflowMachines, is_update_rejection},
+            streams::{RunStreams, StreamTime, Streams, TaskState, has_ledger, task_attempt},
         },
     },
 };
@@ -74,6 +74,8 @@ pub(super) struct ManagedRun {
     /// This field is `None` when `WorkerTaskTypes.enable_local_activities` is false.
     local_activity_request_sink: Option<Rc<dyn LocalActivityRequestSink>>,
     streams: RunStreams,
+    /// The Stream time of the task in hand.
+    stream_time: StreamTime,
     /// Set if the run is currently waiting on the execution of some local activities.
     waiting_on_la: Option<WaitingOnLAs>,
     /// Is set to true if the machines encounter an error and the only subsequent thing we should
@@ -119,6 +121,7 @@ impl ManagedRun {
             wfm,
             local_activity_request_sink,
             streams,
+            stream_time: StreamTime::default(),
             waiting_on_la: None,
             am_broken: false,
             wft: None,
@@ -142,7 +145,9 @@ impl ManagedRun {
         // complete a local activity while waiting for server to send us the next WFT.
         // Activating lang would be harmful at this stage, as there might be work returned
         // in that next WFT which should be part of the next activation.
-        self.wft.is_some() && self.wfm.machines.activation_needed()
+        self.wft.is_some()
+            && !self.wfm.machines.stream_calls.holds_round()
+            && self.wfm.machines.activation_needed()
     }
 
     pub(super) fn waiting_on_local_activities(&self) -> bool {
@@ -232,9 +237,12 @@ impl ManagedRun {
         if !was_legacy_query {
             let task = TaskState::Open(task_attempt(&wft_info));
             self.wfm.machines.stream_calls.set_task(task);
+            self.streams.stop_wait(&mut self.stream_time);
+            self.stream_time = StreamTime::default();
         }
         self.wft = Some(OutstandingTask {
             info: wft_info,
+            has_update_request: !work.messages.is_empty(),
             pending_queries,
             start_time,
             permit: pwft.permit,
@@ -365,6 +373,13 @@ impl ManagedRun {
 
         if self.wft.is_none() {
             // It doesn't make sense to do workflow work unless we have a WFT
+            return Ok(None);
+        }
+
+        // While a round of Stream calls lasts, Core gives lang no activation of any kind, so the
+        // activation of the round is the one right after the activation of its calls. It doesn't
+        // complete the task either.
+        if self.wfm.machines.stream_calls.holds_round() {
             return Ok(None);
         }
 
@@ -706,7 +721,7 @@ impl ManagedRun {
                 });
         }
 
-        // History gets no marker from a failed task, so Workflow code must not get any of its
+        // History gets no ledger from a failed task, so Workflow code must not get any of its
         // Stream results.
         if !is_no_report_query_fail {
             self.streams.stop(&mut self.wfm.machines.stream_calls);
@@ -946,21 +961,104 @@ impl ManagedRun {
         }
         self.wfm.notify_of_local_result(res)?;
         self.streams.dispatch(&mut self.wfm.machines.stream_calls);
-        // A Stream result that doesn't fit in the task's marker needs the next task.
+        self.complete_for_streams_if_needed();
+        if self.activation.is_none() {
+            self._check_more_activations()
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Ends the Stream time of the task, at the timer of `generation`.
+    pub(super) fn stream_time_up(&mut self, generation: u64) -> RunUpdateAct {
+        if !self.stream_time.expires(generation) {
+            return None;
+        }
+        // The heartbeat of the task fires at the same instant and completes the task, so the
+        // ready results of a round are late. The first activation of a task still goes, or a late
+        // call that never answers would hold each later task up to its heartbeat too.
+        if self.stream_time.at_heartbeat()
+            && self.waiting_on_la.is_some()
+            && self.wfm.machines.stream_calls.holds_round()
+        {
+            return None;
+        }
+        self.wfm.machines.stream_calls.time_up();
+        let res = self.after_stream_time();
+        self.update_to_acts(res.map(Into::into))
+    }
+
+    /// Ends the Stream time of the task in hand at a graceful shutdown, so that no hold makes the
+    /// shutdown wait. A late call then completes the task as at a heartbeat.
+    pub(super) fn end_stream_time_for_shutdown(&mut self) -> RunUpdateAct {
+        if self.wft.is_none() || self.trying_to_evict.is_some() || self.stream_time.is_over() {
+            return None;
+        }
+        self.streams.stop_wait(&mut self.stream_time);
+        self.stream_time.end();
+        let calls = &mut self.wfm.machines.stream_calls;
+        calls.time_up();
+        if calls.late_runs()
+            && let Some(waiting) = self.waiting_on_la.as_mut()
+        {
+            waiting.hb_timeout_handle.abort();
+            waiting
+                .completion_pending
+                .get_or_insert(EarlyCompletion::Stream);
+            self.complete_stream_task();
+        }
+        let res = self.after_stream_time();
+        self.update_to_acts(res.map(Into::into))
+    }
+
+    fn after_stream_time(&mut self) -> Result<Option<ActivationOrAuto>, RunUpdateErr> {
+        self.complete_for_streams_if_needed();
+        if self.activation.is_none() {
+            self._check_more_activations()
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Completes the task as at a heartbeat if its Stream calls need that, once no round holds it.
+    fn complete_for_streams_if_needed(&mut self) {
         if self.wfm.machines.stream_must_complete()
             && let Some(waiting) = self.waiting_on_la.as_mut()
         {
             waiting.hb_timeout_handle.abort();
             waiting
                 .completion_pending
-                .get_or_insert(EarlyCompletion::OutOfRoom);
+                .get_or_insert(EarlyCompletion::Stream);
             self.complete_stream_task();
         }
-        if self.activation.is_none() {
-            self._check_more_activations()
-        } else {
-            Ok(None)
+    }
+
+    /// Runs the Stream time of the task while Core makes something wait for Stream calls, and
+    /// pauses it while lang has an activation. Core waits for them while a round or a late call
+    /// holds an activation, and while a late call holds a task that has work for the server.
+    fn sync_stream_time(&mut self) {
+        let waits = self.wft.is_some() && self.activation.is_none() && !self.am_broken && {
+            let machines = &self.wfm.machines;
+            let calls = &machines.stream_calls;
+            calls.holds_round()
+                || calls.holds_first()
+                || (self.waiting_on_la.is_some()
+                    && calls.late_runs()
+                    && machines.has_work_for_server())
+        };
+        if !waits {
+            self.streams.stop_wait(&mut self.stream_time);
+            return;
         }
+        if !self.stream_time.is_set()
+            && let Some(wft) = self.wft.as_ref()
+            && let Some(timeout) =
+                (self.wfm.machines.get_started_info()).and_then(|attrs| attrs.workflow_task_timeout)
+        {
+            let settings = &self.wfm.machines.stream_calls.settings();
+            self.stream_time = StreamTime::new(settings, wft.start_time, timeout);
+        }
+        self.streams.wait(&mut self.stream_time);
     }
 
     pub(super) fn heartbeat_timeout(&mut self) -> RunUpdateAct {
@@ -1031,8 +1129,8 @@ impl ManagedRun {
     /// - `work` isn't the next task of the run's History. It replaces the task that the run holds,
     ///   or its `previous_started_event_id` is above the last started event id that the run knows,
     ///   so another Worker completed a task.
-    /// - The run has Stream work, which is a call with no result in a marker, a marker that it
-    ///   hasn't sent, or a Stream marker in the events of `work`.
+    /// - The run has Stream work, which is a call with no result in a ledger, a ledger that it
+    ///   hasn't sent, or a completion with a ledger in the events of `work`.
     pub(super) fn stream_work_is_stale_for(&self, work: &PreparedWFT) -> bool {
         let machines = &self.wfm.machines;
         let update = &work.update;
@@ -1056,8 +1154,8 @@ impl ManagedRun {
         let after_other_tasks = update.is_real() && update.previous_wft_started_id > held;
         (replaces_held_task || after_other_tasks)
             && (machines.stream_calls.needs_next_task()
-                || machines.stream_calls.has_marker()
-                || update.get_events().iter().any(is_stream_marker))
+                || machines.stream_calls.has_ledger()
+                || update.get_events().iter().any(has_ledger))
     }
 
     /// Stops the Stream calls of the run, and evicts it. The run that replaces it processes `work`,
@@ -1247,7 +1345,7 @@ impl ManagedRun {
                     f.fulfill();
                 }
 
-                match r {
+                let act = match r {
                     // After each run update, check if it's ready to handle any buffered task
                     None | Some(ActivationOrAuto::Autocomplete { .. })
                         if !self.has_any_pending_work(true) =>
@@ -1263,7 +1361,9 @@ impl ManagedRun {
                         Some(r)
                     }
                     None => None,
-                }
+                };
+                self.sync_stream_time();
+                act
             }
             Err(fail) => {
                 self.am_broken = true;
@@ -1341,12 +1441,12 @@ impl ManagedRun {
             data.activation_was_eviction && self.wft.is_some() && !self.am_broken;
         // An evicted run with an open Stream call completes its task, and doesn't let it time out.
         let stream_calls_open = self.wfm.machines.stream_calls.needs_next_task();
-        let has_stream_marker = self.wfm.machines.stream_calls.has_marker();
+        let has_ledger = self.wfm.machines.stream_calls.has_ledger();
         let mut machines_wft_response = self.wfm.prepare_for_wft_response();
         let eviction_has_output = can_report_eviction
             && (machines_wft_response.commands().peek().is_some()
                 || machines_wft_response.has_messages()
-                || has_stream_marker
+                || has_ledger
                 || stream_calls_open);
 
         let query_responses = data.query_responses;
@@ -1394,12 +1494,22 @@ impl ManagedRun {
                 dbg_panic!("Attempted to report a successful completion for a broken evicted run");
                 (vec![], vec![])
             } else {
-                machines_wft_response.seal_stream_marker();
                 (
                     machines_wft_response.commands().collect(),
                     machines_wft_response.messages(),
                 )
             };
+            let sdk_metadata = machines_wft_response.metadata_for_complete();
+            // The server drops the completion of a speculative task, which an Update makes, if it
+            // has no command and only rejects Updates. A ledger isn't a command, so a forced task
+            // makes the server keep the completion that has one.
+            if sdk_metadata.stream_calls.is_some()
+                && commands.is_empty()
+                && messages.iter().all(is_update_rejection)
+                && self.wft.as_ref().is_some_and(|t| t.has_update_request)
+            {
+                force_new_wft = true;
+            }
 
             let attempt = self.wft.as_ref().map(|t| t.info.attempt).unwrap_or(1);
             ActivationCompleteOutcome::ReportWFTSuccess(ServerCommandsWithWorkflowInfo {
@@ -1410,7 +1520,7 @@ impl ManagedRun {
                     commands,
                     messages,
                     query_responses,
-                    sdk_metadata: machines_wft_response.metadata_for_complete(),
+                    sdk_metadata,
                     versioning_behavior: data.versioning_behavior,
                     attempt,
                 },
@@ -1667,7 +1777,7 @@ struct WaitingOnLAs {
     wft_timeout: Duration,
     /// Can be used to abort heartbeat timeouts
     hb_timeout_handle: AbortHandle,
-    /// Defers the completion of the workflow task at its heartbeat, or at a full Stream marker,
+    /// Defers the completion of the workflow task at its heartbeat, or at a full ledger,
     /// when lang must finish an outstanding activation before Core can safely complete the task.
     completion_pending: Option<EarlyCompletion>,
 }
@@ -1677,8 +1787,9 @@ struct WaitingOnLAs {
 enum EarlyCompletion {
     /// The heartbeat of the task fired.
     Heartbeat,
-    /// The Stream marker of the task has no room for the next result.
-    OutOfRoom,
+    /// A Stream result can't come in this task, a call started with no Stream time left, or the
+    /// task waited out its Stream time with work for the server.
+    Stream,
 }
 #[derive(Debug)]
 struct CompletionDataForWFT {

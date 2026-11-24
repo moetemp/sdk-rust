@@ -425,7 +425,17 @@ message RequestCancelNexusOperation {
 }
 
 // Appends Records to a Stream as the Workflow's Producer. Core makes the request id of the append
-// and sends the result in a `ResolveStreamAppend` job.
+// and sends the result in a `ResolveStreamAppend` job. History keeps the result in the ledger of
+// the Workflow Task in which lang got it, which is the `stream_calls` of the `sdk_metadata` of the
+// completion of that task.
+//
+// After an activation with appends, Core gives lang no other activation, also none for a query or
+// a Local Activity result, and doesn't complete the Workflow Task, until each append of that
+// activation has an answer or the Stream time of the task is up. The Stream time is
+// `StreamSettings::task_time`, half the Workflow Task timeout by default, summed over the waits of
+// one task, and it never runs past the task's heartbeat. `ResolveStreamAppend` says in which
+// activation a result comes. When a result is ready for a later task, Core completes the task in
+// hand and asks for a new one, once lang has no activation outstanding.
 //
 // An append is at-least-once. A later attempt of the Workflow Task writes it again, on this Worker
 // or on another one.
@@ -441,10 +451,12 @@ message RequestCancelNexusOperation {
 // written before the close.
 //
 // Core fails the Workflow Task in each of these cases, and gives lang no failure of the append.
-// * `seq` is 0, or isn't above the `seq` of the append before it.
+// * `seq` is 0, isn't above the `seq` of the append before it, or is above 2147483647, since
+//   History keeps it as an `int32`.
 // * `stream` is unset, its id is empty or longer than 4096 bytes, or its Store name is longer than
 //   4096 bytes.
 // * The Worker has no Stream runtime for the Store of `stream`.
+// * The server doesn't take the `sdk_metadata` of a completion, so History can't keep the result.
 // * The append must wait for the task's heartbeat to try again, because the Store answered
 //   `StoreUnavailable` or gave no answer. The failure message then starts with
 //   `StreamStoreUnavailable:`.
@@ -456,7 +468,7 @@ message RequestCancelNexusOperation {
 // `bodies`. A `stream` with no Store name matches any Store in History. An append with no result
 // in History runs again after the replay, as a later attempt, so a reader can see its batch twice.
 //
-// If lang completes the Workflow Task while an append has no result in a marker, Core forces a new
+// If lang completes the Workflow Task while an append has no result in a ledger, Core forces a new
 // task, unless the completion has the Workflow's last command.
 message AppendToStream {
     // Lang's incremental sequence number for appends, starting at 1.
@@ -467,14 +479,15 @@ message AppendToStream {
 
 // Closes a Stream. The Workflow Task that sends the command records only the intent to close.
 // Core closes the Stream when History has that task, and sends the result in a
-// `ResolveStreamClose` job of a later task. So a close needs at least one more Workflow Task.
+// `ResolveStreamClose` job in the first activation of a later task. So a close needs at least one
+// more Workflow Task, and Core gives lang the next activation without waiting for it.
 //
 // These rules of `AppendToStream` apply to a close too.
 // * No command cancels it.
 // * Core drops it if it has no result when lang sends the Workflow's last command.
 // * The same cases fail the Workflow Task.
 // * A replay compares the command with History in the same way.
-// * If lang completes the task while the close has no result in a marker, Core forces a new task.
+// * If lang completes the task while the close has no result in a ledger, Core forces a new task.
 //
 // Workflow code that needs its close must await the result before its last command. A close whose
 // intent is in History with no result runs again after a replay.
