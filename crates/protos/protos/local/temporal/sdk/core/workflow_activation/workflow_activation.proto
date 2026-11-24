@@ -50,7 +50,7 @@ import "temporal/sdk/core/nexus/nexus.proto";
 //  this to ensure the LA resolution happens after that cancel (or whatever else it may be) as it
 //  normally would have when executing.
 // * The results of Stream calls go after the local activity resolutions, because a replay also
-//  scans ahead for their marker. Appends go before closes, and each kind is in `seq` order. When a
+//  scans ahead for their ledger. Appends go before closes, and each kind is in `seq` order. When a
 //  replay gives the results of several activations in one, the Stream results keep the order of
 //  those activations, after all local activity resolutions.
 // * Queries always go last (and, in fact, always come in their own activation)

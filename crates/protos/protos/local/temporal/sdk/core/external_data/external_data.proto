@@ -41,16 +41,17 @@ message PatchedMarkerData {
   bool deprecated = 2;
 }
 
-// The data of a `core_stream` marker. Core records one in each Workflow Task in which Workflow
-// code got a Stream result or asked for a close. The `data` detail of the marker holds this
-// message as JSON, with each `bytes` field in lower-case hex.
+// The ledger of a Workflow Task, which has the results and the close intents of its Stream calls.
+// Core puts it on the completion of each task in which Workflow code got a Stream result or asked
+// for a close, as the protobuf encoding of this message in the `core_stream_calls` of the
+// `sdk_metadata`.
 //
-// Every later version of Core must read the markers in History, so these rules apply to each
-// message of the marker.
-// * A field never changes its name, because the name is its key in the JSON.
-// * A new field is `optional`, because older markers don't have it.
-// * A new `repeated` field gets `#[serde(default)]` in `build.rs`, for the same reason.
-message StreamMarkerData {
+// Every later version of Core must read the ledgers in History, so these rules apply to each
+// message of the ledger.
+// * A field keeps its number and its type.
+// * The default value of a new field means what an older ledger meant, since an older ledger
+//   decodes to that value.
+message StreamLedger {
   repeated StreamCloseIntent close_intents = 1;
   repeated StreamAppendResult appends = 2;
   repeated StreamCloseResult closes = 3;

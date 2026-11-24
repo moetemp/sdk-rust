@@ -618,6 +618,21 @@ impl TestHistoryBuilder {
         )
     }
 
+    /// Sets the Stream calls of the most recent WFT complete event, which SDK Core encodes
+    pub fn set_stream_calls_last_wft(&mut self, calls: Vec<u8>) {
+        let completed = self.events.iter_mut().rev().find_map(|e| {
+            if let Some(Attributes::WorkflowTaskCompletedEventAttributes(a)) = e.attributes.as_mut()
+            {
+                Some(a)
+            } else {
+                None
+            }
+        });
+        let completed = completed.expect("History has a WFT complete event");
+        let sdk_dat = completed.sdk_metadata.get_or_insert_with(Default::default);
+        sdk_dat.core_stream_calls = calls;
+    }
+
     /// Get the event ID of the most recently added event
     pub fn current_event_id(&self) -> i64 {
         self.current_event_id

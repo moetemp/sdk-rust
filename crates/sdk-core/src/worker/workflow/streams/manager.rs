@@ -17,7 +17,7 @@ use temporalio_streams::{
 };
 use tokio::{runtime::Handle, task::AbortHandle};
 
-/// The maximum length of a failure message that Workflow code gets and a marker records, in bytes.
+/// The maximum length of a failure message that Workflow code gets and a ledger records, in bytes.
 /// A Store can return error text of any size, so the message needs a bound.
 const MAX_FAILURE_MESSAGE_BYTES: usize = 4096;
 
@@ -328,7 +328,7 @@ pub(super) fn is_outage<R: Copy + Into<StreamErrorReason>>(error: &StreamError<R
     error.reason.into() == StreamErrorReason::StoreUnavailable
 }
 
-/// Returns the reason and the message of `error`, as a marker records a failed call.
+/// Returns the reason and the message of `error`, as a ledger records a failed call.
 pub(super) fn recorded<R: Copy + Into<StreamErrorReason>>(error: &StreamError<R>) -> StreamFailure {
     StreamFailure {
         reason: error.reason.into().as_str_name().to_string(),
@@ -336,10 +336,10 @@ pub(super) fn recorded<R: Copy + Into<StreamErrorReason>>(error: &StreamError<R>
     }
 }
 
-/// Returns the failure that Workflow code gets for a failed call that a marker records.
+/// Returns the failure that Workflow code gets for a failed call that a ledger records.
 pub(super) fn failure_of(recorded: &StreamFailure) -> Failure {
     let reason = StreamErrorReason::from_str_name(&recorded.reason)
-        .expect("The decode of a marker checks the reason of each failure");
+        .expect("The decode of a ledger checks the reason of each failure");
     let message = recorded.message.clone();
     failure(&StreamError { reason, message })
 }
@@ -538,7 +538,7 @@ mod tests {
         message
     }
 
-    // Workflow code gets the failure of a call from the reason and the message that a marker
+    // Workflow code gets the failure of a call from the reason and the message that a ledger
     // records, in the first run and in a replay. A message over 4096 bytes is cut on a character,
     // with `...` at the end.
     #[test]

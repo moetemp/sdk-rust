@@ -11,13 +11,11 @@ use crate::{
         stream_store::{MemoryStore, Op, Request},
         test_worker_cfg,
     },
-    worker::{
-        client::{WorkflowTaskCompletion, mocks::mock_worker_client},
-        streams::marker_details,
-    },
+    worker::client::{WorkflowTaskCompletion, mocks::mock_worker_client},
 };
 use futures_util::{StreamExt, stream};
 use parking_lot::Mutex;
+use prost::Message;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::{
     cell::Cell,
@@ -26,12 +24,10 @@ use std::{
     time::{Duration, Instant},
 };
 use temporalio_common::protos::{
-    constants::STREAM_MARKER_NAME,
     coresdk::{
-        FromJsonPayloadExt,
         external_data::{
             StreamAppendOffsets, StreamAppendResult, StreamCloseIntent, StreamCloseResult,
-            StreamMarkerData, stream_append_result,
+            StreamLedger, stream_append_result,
         },
         workflow_activation::{
             ResolveStreamAppend, ResolveStreamClose, StreamAppended, WorkflowActivation,
@@ -329,20 +325,15 @@ fn answer(activation: &WorkflowActivation) -> Option<Command> {
     Some(answer.into())
 }
 
-/// Completes the last task of `t` with the marker `data`.
-fn complete_with_marker(t: &mut TestHistoryBuilder, data: &StreamMarkerData) {
+/// Completes the last task of `t` with the ledger `data`.
+fn complete_with_ledger(t: &mut TestHistoryBuilder, data: &StreamLedger) {
     t.add_workflow_task_completed();
-    t.add(MarkerRecordedEventAttributes {
-        marker_name: STREAM_MARKER_NAME.to_string(),
-        details: marker_details(data),
-        workflow_task_completed_event_id: t.current_event_id(),
-        ..Default::default()
-    });
+    t.set_stream_calls_last_wft(data.encode_to_vec());
 }
 
-/// Returns the marker of a task that asked for close 1 of the Stream `stream_id`.
-fn close_intent(stream_id: &str) -> StreamMarkerData {
-    StreamMarkerData {
+/// Returns the ledger of a task that asked for close 1 of the Stream `stream_id`.
+fn close_intent(stream_id: &str) -> StreamLedger {
+    StreamLedger {
         close_intents: vec![StreamCloseIntent {
             seq: 1,
             stream_id: stream_id.to_string(),
@@ -356,6 +347,10 @@ fn close_intent(stream_id: &str) -> StreamMarkerData {
 fn write(history: &mut TestHistoryBuilder, completion: &WorkflowTaskCompletion) {
     history.add_workflow_task_completed();
     let completed = history.current_event_id();
+    let calls = &completion.sdk_metadata.core_stream_calls;
+    if !calls.is_empty() {
+        history.set_stream_calls_last_wft(calls.clone());
+    }
     for command in &completion.commands {
         match command.attributes.as_ref() {
             Some(Attributes::RecordMarkerCommandAttributes(marker)) => {
@@ -479,20 +474,10 @@ fn complete() -> Command {
     CompleteWorkflowExecution { result: None }.into()
 }
 
-/// Returns the data of the `core_stream` marker of a completion, if it has one.
-fn marker(completion: &WorkflowTaskCompletion) -> Option<StreamMarkerData> {
-    completion
-        .commands
-        .iter()
-        .find_map(|command| match command.attributes.as_ref()? {
-            Attributes::RecordMarkerCommandAttributes(marker)
-                if marker.marker_name == STREAM_MARKER_NAME =>
-            {
-                let payload = &marker.details["data"].payloads[0];
-                Some(StreamMarkerData::from_json_payload(payload).unwrap())
-            }
-            _ => None,
-        })
+/// Returns the ledger of a completion, if it has one.
+fn ledger(completion: &WorkflowTaskCompletion) -> Option<StreamLedger> {
+    let calls = &completion.sdk_metadata.core_stream_calls;
+    (!calls.is_empty()).then(|| StreamLedger::decode(&calls[..]).unwrap())
 }
 
 fn command_types(completion: &WorkflowTaskCompletion) -> Vec<CommandType> {
@@ -513,7 +498,7 @@ fn producer(run_id: &str, attempt: WorkflowTaskAttempt) -> Producer {
 }
 
 #[tokio::test]
-async fn an_append_writes_as_its_workflow_task_and_replays_from_its_marker() {
+async fn an_append_writes_as_its_workflow_task_and_replays_from_its_ledger() {
     let store = store(&["s"]).await;
     let t = history(Duration::from_secs(60));
     let run_id = t.get_orig_run_id().to_string();
@@ -557,11 +542,11 @@ async fn an_append_writes_as_its_workflow_task_and_replays_from_its_marker() {
             },
         )),
     };
-    let expected = StreamMarkerData {
+    let expected = StreamLedger {
         appends: vec![entry],
         ..Default::default()
     };
-    assert_eq!(marker(&run.sent()[0]), Some(expected));
+    assert_eq!(ledger(&run.sent()[0]), Some(expected));
     run.worker.drain_pollers_and_shutdown_ref().await;
     let writes = store.requests().len();
     assert_eq!(run.replay(workflow).await, live);
@@ -623,8 +608,8 @@ async fn a_close_takes_effect_only_after_the_server_took_its_task(#[case] failur
             failed: None,
         };
         assert_eq!(rest, [[Job::ResolveStreamClose(closed)]]);
-        let marker = marker(&run.sent()[0]).unwrap();
-        assert_eq!(marker.close_intents, close_intent("c").close_intents);
+        let ledger = ledger(&run.sent()[0]).unwrap();
+        assert_eq!(ledger.close_intents, close_intent("c").close_intents);
     } else {
         assert_eq!(rest, Vec::<Vec<Job>>::new());
         assert_eq!(closes(&store), 0);
@@ -774,7 +759,7 @@ impl Ending {
     fn history(&self, task_timeout: Duration) -> TestHistoryBuilder {
         let mut t = history(task_timeout);
         let closes = &self.calls[..self.in_history];
-        let mut intents = StreamMarkerData::default();
+        let mut intents = StreamLedger::default();
         for close in closes {
             intents.close_intents.push(StreamCloseIntent {
                 seq: close.seq,
@@ -785,7 +770,7 @@ impl Ending {
         if closes.is_empty() {
             t.add_workflow_task_completed();
         } else {
-            complete_with_marker(&mut t, &intents);
+            complete_with_ledger(&mut t, &intents);
         }
         t.add_we_signaled("go", vec![]);
         if self.end == End::Cancel {
@@ -918,7 +903,7 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
 
         // The completion has the results that Workflow code took, and then the last command. It
         // has no intent of a close, and forces no task.
-        let mut expected = StreamMarkerData::default();
+        let mut expected = StreamLedger::default();
         for (activation, at) in (1..).zip(&ending.taken) {
             let call = &ending.calls[*at];
             if call.op == Op::Close {
@@ -945,17 +930,15 @@ async fn the_last_command_of_a_workflow_drops_each_call_with_no_result() {
         let sent = run.sent();
         assert_eq!(sent.len(), 1, "seed {seed}: {ending:?}");
         let recorded = (!ending.taken.is_empty()).then_some(expected);
-        assert_eq!(marker(&sent[0]), recorded, "seed {seed}: {ending:?}");
+        assert_eq!(ledger(&sent[0]), recorded, "seed {seed}: {ending:?}");
         let last_command = match ending.end {
             End::Complete => CommandType::CompleteWorkflowExecution,
             End::Fail | End::CoreFails => CommandType::FailWorkflowExecution,
             End::Cancel => CommandType::CancelWorkflowExecution,
             End::ContinueAsNew => CommandType::ContinueAsNewWorkflowExecution,
         };
-        let types: Vec<CommandType> = (recorded.iter().map(|_| CommandType::RecordMarker))
-            .chain([last_command])
-            .collect();
-        assert_eq!(command_types(&sent[0]), types, "seed {seed}: {ending:?}");
+        let types = command_types(&sent[0]);
+        assert_eq!(types, [last_command], "seed {seed}: {ending:?}");
         assert!(!sent[0].force_create_new_workflow_task, "seed {seed}");
 
         // No Store call starts after the last command, and a call with no answer writes nothing.
@@ -1143,8 +1126,8 @@ async fn a_call_in_flight_goes_on_in_a_forced_task(#[case] query: bool) {
     assert!(sent[0].force_create_new_workflow_task && sent[0].commands.is_empty());
     assert_eq!(sent[0].query_responses.len(), usize::from(query));
     // A heartbeat of the forced task can complete it before the result arrives.
-    let recorded: Vec<usize> = (sent[1..].iter().filter_map(marker))
-        .map(|marker| marker.appends.len())
+    let recorded: Vec<usize> = (sent[1..].iter().filter_map(ledger))
+        .map(|ledger| ledger.appends.len())
         .collect();
     assert_eq!(recorded, [1]);
     assert_eq!(store.requests().len(), 1);
@@ -1152,7 +1135,7 @@ async fn a_call_in_flight_goes_on_in_a_forced_task(#[case] query: bool) {
 }
 
 #[tokio::test]
-async fn a_call_in_an_outage_goes_on_when_a_full_marker_completes_its_task() {
+async fn a_call_in_an_outage_goes_on_when_a_full_ledger_completes_its_task() {
     let store = store(&["c", "f"]).await;
     // The close is in an outage once it runs, and each append fails with a large message.
     store.fail(
@@ -1202,7 +1185,7 @@ async fn a_call_in_an_outage_goes_on_when_a_full_marker_completes_its_task() {
     })
     .await;
     // The appends of one Stream run one at a time. Each result arrives while no activation is
-    // outstanding, so the one that doesn't fit in the marker completes the task with a new one
+    // outstanding, so the one that doesn't fit in the ledger completes the task with a new one
     // forced.
     let mut results = vec![];
     let is_append = |request: &Request| matches!(request, Request::Append(..));
@@ -1231,12 +1214,12 @@ async fn a_call_in_an_outage_goes_on_when_a_full_marker_completes_its_task() {
     ));
     respond(&run.worker, &closed, workflow).await;
     run.worker.drain_pollers_and_shutdown_ref().await;
-    // Task 2 completed with a new task forced when its marker was full, and the results that
-    // didn't fit went into the marker of task 3.
+    // Task 2 completed with a new task forced when its ledger was full, and the results that
+    // didn't fit went into the ledger of task 3.
     let sent = run.sent();
     let appends = |sent: &WorkflowTaskCompletion| -> Vec<u32> {
-        let marker = marker(sent).unwrap_or_default();
-        marker.appends.iter().map(|append| append.seq).collect()
+        let ledger = ledger(sent).unwrap_or_default();
+        ledger.appends.iter().map(|append| append.seq).collect()
     };
     let (second, third) = (appends(&sent[1]), appends(&sent[2]));
     assert!(sent[1].force_create_new_workflow_task && !third.is_empty());
@@ -1248,12 +1231,12 @@ async fn a_call_in_an_outage_goes_on_when_a_full_marker_completes_its_task() {
 }
 
 #[rstest::rstest]
-#[case::with_a_marker_to_send(true, 1)]
+#[case::with_a_ledger_to_send(true, 1)]
 #[case::with_nothing_else(false, 1)]
 #[case::with_no_cache(false, 0)]
 #[tokio::test]
 async fn an_eviction_completes_a_task_that_a_call_holds(
-    #[case] with_a_marker: bool,
+    #[case] with_a_ledger: bool,
     #[case] cache: usize,
 ) {
     let store = store(&["s"]).await;
@@ -1263,7 +1246,7 @@ async fn an_eviction_completes_a_task_that_a_call_holds(
     let run = start(history(Duration::from_secs(60)), opts);
     let first = run.worker.poll_workflow_activation().await.unwrap();
     let run_id = first.run_id.clone();
-    if !with_a_marker {
+    if !with_a_ledger {
         store.hold(Op::Append);
     }
     let completion = WorkflowActivationCompletion::from_cmd(run_id.clone(), append(1, "s"));
@@ -1271,7 +1254,7 @@ async fn an_eviction_completes_a_task_that_a_call_holds(
         .complete_workflow_activation(completion)
         .await
         .unwrap();
-    if with_a_marker {
+    if with_a_ledger {
         let result = run.worker.poll_workflow_activation().await.unwrap();
         assert!(matches!(
             result.jobs[0].variant,
@@ -1291,8 +1274,8 @@ async fn an_eviction_completes_a_task_that_a_call_holds(
     assert!(last.force_create_new_workflow_task);
     // The completion has the sticky queue of a Worker with a cache, as any completion has.
     assert_eq!(last.sticky_attributes.is_some(), cache > 0);
-    let recorded = marker(last).map(|marker| marker.appends.len());
-    assert_eq!(recorded, with_a_marker.then_some(1));
+    let recorded = ledger(last).map(|ledger| ledger.appends.len());
+    assert_eq!(recorded, with_a_ledger.then_some(1));
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
@@ -1300,7 +1283,7 @@ async fn an_eviction_completes_a_task_that_a_call_holds(
 async fn a_replay_worker_makes_no_live_call() {
     let store = store(&["s", "c"]).await;
     let mut t = history(Duration::from_secs(60));
-    complete_with_marker(&mut t, &close_intent("c"));
+    complete_with_ledger(&mut t, &close_intent("c"));
     t.add_workflow_task_scheduled_and_started();
     let mut opts = StartOpts::new(&store);
     opts.replay = true;
@@ -1366,7 +1349,7 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
     let store = store(&["s", "c"]).await;
     // Task 1 recorded the intent of close 1.
     let mut t = history(Duration::from_secs(60));
-    complete_with_marker(&mut t, &close_intent("c"));
+    complete_with_ledger(&mut t, &close_intent("c"));
     let second = next_task(&mut t);
     let run_id = t.get_orig_run_id().to_string();
     match earlier {
@@ -1381,7 +1364,7 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
     }
     let mut task = next_task(&mut t);
     if let EarlierAttempt::UpdateAccepted | EarlierAttempt::UpdateRejected = earlier {
-        task.add_update_request("u", 9);
+        task.add_update_request("u", 8);
     }
     let runs_the_earlier_attempt = matches!(
         earlier,
@@ -1389,7 +1372,7 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
     );
     if !runs_the_earlier_attempt {
         let attempt = WorkflowTaskAttempt {
-            started_event_id: 7,
+            started_event_id: 6,
             attempt: 1,
             started_time: None,
         };
@@ -1485,9 +1468,9 @@ async fn a_run_on_a_new_attempt_or_worker_writes_above_each_earlier_attempt(
     assert!(appended, "{jobs:?}");
     let id = producer_key(&producer(&run_id, Default::default())).unwrap();
     let (earlier_task, go_live) = match earlier {
-        EarlierAttempt::LaterRetryOfAFailedTask => ((10, 1), (10, 2)),
-        EarlierAttempt::UpdateRejected => ((7, 1), (13, 1)),
-        _ => ((7, 1), (10, 1)),
+        EarlierAttempt::LaterRetryOfAFailedTask => ((9, 1), (9, 2)),
+        EarlierAttempt::UpdateRejected => ((6, 1), (12, 1)),
+        _ => ((6, 1), (9, 1)),
     };
     let mut expected = vec![
         (id.clone(), earlier_task.0, earlier_task.1),
@@ -1560,7 +1543,7 @@ async fn a_cached_run_that_meets_another_workers_task_replays_from_history(
     } else {
         1
     };
-    // The other attempt or Worker completed its task, with the result of append 1 in its marker.
+    // The other attempt or Worker completed its task, with the result of append 1 in its ledger.
     let mut other = t.clone();
     match other_task {
         OtherTask::WithNoActivationOut => other.add_workflow_task_completed(),
@@ -1581,11 +1564,11 @@ async fn a_cached_run_that_meets_another_workers_task_replays_from_history(
         activation_index: 0,
         result: Some(stream_append_result::Result::Appended(offsets)),
     };
-    let marker = StreamMarkerData {
+    let ledger = StreamLedger {
         appends: vec![result],
         ..Default::default()
     };
-    complete_with_marker(&mut other, &marker);
+    complete_with_ledger(&mut other, &ledger);
     other.add_we_signaled("done", vec![]);
     let next = next_task(&mut other);
     let workflow: Workflow = |activation| match &activation.jobs[0].variant {
@@ -1767,6 +1750,67 @@ async fn a_call_of_an_update_handler_runs_after_the_update_is_accepted(#[case] c
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
+/// Rejects the Update `u`, whose request came in an earlier activation.
+fn reject_update() -> Command {
+    UpdateResponse {
+        protocol_instance_id: "u".to_string(),
+        response: Some(update_response::Response::Rejected(Failure::default())),
+    }
+    .into()
+}
+
+// The server drops the completion of a speculative task, which an Update makes, when it has no
+// command and only rejects Updates. A ledger isn't a command, so a completion with one forces a
+// new task, which makes the server keep it. Here task 2 has a Signal too, so that Workflow code
+// can append in it, which the validator of an Update can't.
+#[rstest::rstest]
+#[case::with_an_append(true)]
+#[case::with_no_stream_call(false)]
+#[tokio::test]
+async fn a_completion_with_a_ledger_that_only_rejects_updates_forces_a_task(#[case] appends: bool) {
+    let store = store(&["s"]).await;
+    let mut t = history(Duration::from_secs(60));
+    t.add_workflow_task_completed();
+    t.add_timer_started("1".to_string());
+    t.add_we_signaled("go", vec![]);
+    let mut update = next_task(&mut t);
+    update.add_update_request("u", 7);
+    let mut opts = StartOpts::new(&store);
+    opts.responses = vec![ResponseType::ToTaskNum(1), ResponseType::Raw(update)];
+    opts.served = None;
+    let run = start(t, opts);
+    let signaled = |activation: &WorkflowActivation| {
+        (activation.jobs.iter()).any(|job| matches!(job.variant, Some(Job::SignalWorkflow(_))))
+    };
+    let workflow = |activation: &WorkflowActivation| match &activation.jobs[0].variant {
+        Some(Job::InitializeWorkflow(_)) => vec![timer(1)],
+        _ if signaled(activation) && appends => vec![append(1, "s"), reject_update()],
+        _ if signaled(activation) => vec![reject_update()],
+        _ => vec![],
+    };
+    let respond = async {
+        while run.sent().len() < 2 {
+            let activation = run.worker.poll_workflow_activation().await.unwrap();
+            let commands = workflow(&activation);
+            let completion = WorkflowActivationCompletion::from_cmds(activation.run_id, commands);
+            run.worker
+                .complete_workflow_activation(completion)
+                .await
+                .unwrap();
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), respond)
+        .await
+        .expect("Task 2 never completed");
+    let completion = &run.sent()[1];
+    assert_eq!(command_types(completion), []);
+    assert_eq!(completion.messages.len(), 1);
+    let appended = ledger(completion).map(|ledger| ledger.appends.len());
+    assert_eq!(appended, appends.then_some(1));
+    assert_eq!(completion.force_create_new_workflow_task, appends);
+    run.worker.drain_pollers_and_shutdown_ref().await;
+}
+
 /// The kind of a call of a first run that [`replay_calls`] replays. In one activation the first
 /// run gave the results of Local Activities before those of appends.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1816,12 +1860,11 @@ async fn replay_calls(
     }
     t.add_workflow_task_scheduled_and_started();
     t.add_workflow_task_completed();
-    let completed = t.current_event_id();
     let offsets = StreamAppendOffsets {
         first_offset: vec![1],
         last_offset: vec![1],
     };
-    let mut data = StreamMarkerData::default();
+    let mut data = StreamLedger::default();
     // History has the results in the order that the first run gave them.
     for seq in first_run(calls).concat() {
         let activation_index = calls[seq as usize - 1].activation;
@@ -1843,12 +1886,7 @@ async fn replay_calls(
         }
     }
     if !data.appends.is_empty() {
-        t.add(MarkerRecordedEventAttributes {
-            marker_name: STREAM_MARKER_NAME.to_string(),
-            details: marker_details(&data),
-            workflow_task_completed_event_id: completed,
-            ..Default::default()
-        });
+        t.set_stream_calls_last_wft(data.encode_to_vec());
     }
     t.add_workflow_execution_completed();
     let mut opts = StartOpts::new(store);

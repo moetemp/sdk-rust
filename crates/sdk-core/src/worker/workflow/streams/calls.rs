@@ -3,8 +3,8 @@
 
 use super::{
     StreamRuntimes, TaskState,
+    ledger::{LedgerBuilder, Waiting, append_job, close_job},
     manager::{Call, Op, Outcome, Request, StreamResolution},
-    marker::{MarkerBuilder, Waiting, append_job, close_job},
 };
 use crate::worker::workflow::WFMachinesError;
 use std::{
@@ -14,9 +14,7 @@ use std::{
 };
 use temporalio_common::protos::{
     coresdk::{
-        external_data::{
-            StreamAppendResult, StreamCloseIntent, StreamCloseResult, StreamMarkerData,
-        },
+        external_data::{StreamAppendResult, StreamCloseIntent, StreamCloseResult, StreamLedger},
         workflow_activation::workflow_activation_job,
         workflow_commands::{AppendToStream, CloseStream},
     },
@@ -32,7 +30,7 @@ use temporalio_streams::{
     },
 };
 
-/// The maximum length of a Store name in a Workflow call, in bytes. A marker records the Store of
+/// The maximum length of a Store name in a Workflow call, in bytes. A ledger records the Store of
 /// each call, so Core fails the Workflow Task of a call with a longer name.
 const MAX_STORE_NAME_BYTES: usize = 4096;
 
@@ -43,7 +41,7 @@ static CALL_IDS: AtomicU64 = AtomicU64::new(0);
 /// How far a run is through its History.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Phase {
-    /// The run replays History, so each call waits for its result in a marker.
+    /// The run replays History, so each call waits for its result in a ledger.
     Replaying,
     /// The replay is over, so calls run.
     Live,
@@ -82,7 +80,7 @@ enum AppendState {
         attempt: Option<WorkflowTaskAttempt>,
     },
     Running(u64),
-    /// The result waits for an activation, in the form that the marker records it.
+    /// The result waits for an activation, in the form that the ledger records it.
     Done(Waiting<StreamAppendResult>),
     /// History has the result, which waits for its activation.
     Replayed,
@@ -94,20 +92,20 @@ struct Close {
 }
 
 enum CloseState {
-    /// No marker has the intent yet.
+    /// No ledger has the intent yet.
     Asked,
-    /// The marker of the task has the intent. A replayed close gets its attempt at go-live.
+    /// The ledger of the task has the intent. A replayed close gets its attempt at go-live.
     Sealed(Option<WorkflowTaskAttempt>),
     /// History has the intent, so the close is in its queue.
     Waiting(Option<WorkflowTaskAttempt>),
     Running(u64),
-    /// The result waits for an activation, in the form that the marker records it.
+    /// The result waits for an activation, in the form that the ledger records it.
     Done(Waiting<StreamCloseResult>),
     /// History has the result, which waits for its activation.
     Replayed,
 }
 
-/// The entries of History's markers whose calls Workflow code hasn't issued yet, by seq.
+/// The entries of History's ledgers whose calls Workflow code hasn't issued yet, by seq.
 #[derive(Default)]
 struct Held {
     appends: HashMap<u32, StreamAppendResult>,
@@ -126,12 +124,15 @@ impl Held {
     }
 }
 
-/// The Stream calls of one run. A call is removed from the run once its result is in a marker.
+/// The Stream calls of one run. A call is removed from the run once its result is in a ledger.
 pub(crate) struct StreamCalls {
     /// The Producer of the run. A write adds the attempt of its Workflow Task.
     producer: WorkflowProducer,
     runtimes: StreamRuntimes,
     phase: Phase,
+    /// True if the server keeps the `sdk_metadata` of a completion, which has the ledger of the
+    /// task.
+    keeps_ledgers: bool,
     /// The state of the run's current Workflow Task.
     task: TaskState,
     appends: HashMap<u32, Append>,
@@ -148,7 +149,7 @@ pub(crate) struct StreamCalls {
     ready: BTreeMap<(u64, CallKey), workflow_activation_job::Variant>,
     /// The last result of `ready` that a release gave to the next activation.
     released: Option<(u64, CallKey)>,
-    marker: MarkerBuilder,
+    ledger: LedgerBuilder,
     requests: Vec<Request>,
 }
 
@@ -160,9 +161,10 @@ impl StreamCalls {
         run_id: &str,
         runtimes: StreamRuntimes,
         phase: Phase,
+        keeps_ledgers: bool,
     ) -> Self {
         debug_assert_ne!(phase, Phase::Stopped);
-        let marker = MarkerBuilder::new(runtimes.settings);
+        let ledger = LedgerBuilder::new(runtimes.settings);
         Self {
             producer: WorkflowProducer {
                 namespace: namespace.to_string(),
@@ -172,6 +174,7 @@ impl StreamCalls {
             },
             runtimes,
             phase,
+            keeps_ledgers,
             task: TaskState::NoTask,
             appends: HashMap::new(),
             closes: HashMap::new(),
@@ -182,7 +185,7 @@ impl StreamCalls {
             held: Held::default(),
             ready: BTreeMap::new(),
             released: None,
-            marker,
+            ledger,
             requests: vec![],
         }
     }
@@ -223,7 +226,7 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// Handles a close command. The marker of the task records its intent, and the close runs once
+    /// Handles a close command. The ledger of the task records its intent, and the close runs once
     /// History has that intent.
     pub(crate) fn close(&mut self, command: CloseStream) -> Result<(), WFMachinesError> {
         if self.phase == Phase::Stopped {
@@ -293,7 +296,7 @@ impl StreamCalls {
     }
 
     /// Returns the results for the activation at index `activation` of the task, as
-    /// [`Self::has_jobs`] decides them. The marker records each live result with that index.
+    /// [`Self::has_jobs`] decides them. The ledger records each live result with that index.
     pub(crate) fn take_jobs(
         &mut self,
         activation: u64,
@@ -322,9 +325,9 @@ impl StreamCalls {
         jobs
     }
 
-    /// Holds the entries of a marker from History, each for its call.
-    pub(crate) fn peeked(&mut self, data: StreamMarkerData) -> Result<(), WFMachinesError> {
-        let StreamMarkerData {
+    /// Holds the entries of a ledger from History, each for its call.
+    pub(crate) fn peeked(&mut self, data: StreamLedger) -> Result<(), WFMachinesError> {
+        let StreamLedger {
             close_intents,
             appends,
             closes,
@@ -353,9 +356,9 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// Handles the event of a marker. Each entry of the marker must already have its call, and each
-    /// close whose intent the marker has joins its queue.
-    pub(crate) fn marker_recorded(&mut self) -> Result<(), WFMachinesError> {
+    /// Handles the completion in History that has a ledger. Each entry of the ledger must already
+    /// have its call, and each close whose intent the ledger has joins its queue.
+    pub(crate) fn ledger_recorded(&mut self) -> Result<(), WFMachinesError> {
         let never = |what: &str, call: CallKey| {
             WFMachinesError::Nondeterminism(format!(
                 "History has {what} of Stream {call} that Workflow code never issued"
@@ -412,6 +415,9 @@ impl StreamCalls {
         if let Some((_, stream)) = unserved {
             return Err(no_runtime(stream));
         }
+        if !self.keeps_ledgers && self.needs_next_task() {
+            return Err(no_ledger());
+        }
         self.phase = Phase::Live;
         let attempt = self.task.attempt();
         for append in self.appends.values_mut() {
@@ -432,7 +438,7 @@ impl StreamCalls {
     }
 
     /// Drops each call at a command that ends the Workflow, as Core drops a Local Activity there.
-    /// The marker keeps the results that Workflow code already got in the task.
+    /// The ledger keeps the results that Workflow code already got in the task.
     pub(crate) fn stop_for_terminal(&mut self) {
         let mut unsent = HashSet::new();
         self.requests.retain(|request| match request {
@@ -461,17 +467,17 @@ impl StreamCalls {
         self.done.clear();
     }
 
-    /// Returns true while a call has no result in a marker, so the run needs another task.
+    /// Returns true while a call has no result in a ledger, so the run needs another task.
     pub(crate) fn needs_next_task(&self) -> bool {
         !self.appends.is_empty() || !self.closes.is_empty()
     }
 
-    /// Returns true if the marker of the task has an entry.
-    pub(crate) fn has_marker(&self) -> bool {
-        !self.marker.is_empty()
+    /// Returns true if the ledger of the task has an entry.
+    pub(crate) fn has_ledger(&self) -> bool {
+        !self.ledger.is_empty()
     }
 
-    /// Returns true once the marker of the task has no room for a result that waits, so the task
+    /// Returns true once the ledger of the task has no room for a result that waits, so the task
     /// must complete with a new one forced.
     pub(crate) fn must_complete(&self, activation: u64) -> bool {
         self.next_result_fits(activation) == Some(false)
@@ -521,8 +527,8 @@ impl StreamCalls {
             && marker.is_none_or(|marker| key.0 < marker)
     }
 
-    /// Returns the marker of the task as it completes, with the intent of each close that fits.
-    pub(crate) fn take_marker(&mut self) -> Option<StreamMarkerData> {
+    /// Returns the ledger of the task as it completes, with the intent of each close that fits.
+    pub(crate) fn take_ledger(&mut self) -> Option<StreamLedger> {
         if matches!(self.phase, Phase::Replaying | Phase::ReplayOnly) {
             return None;
         }
@@ -537,12 +543,12 @@ impl StreamCalls {
                 .closes
                 .get_mut(&seq)
                 .expect("The close was just listed");
-            if !self.marker.close_intent(&close.stream, seq) {
+            if !self.ledger.close_intent(&close.stream, seq) {
                 break;
             }
             close.state = CloseState::Sealed(attempt);
         }
-        self.marker.take()
+        self.ledger.take()
     }
 
     /// Returns the calls that the Worker must start or stop.
@@ -550,7 +556,7 @@ impl StreamCalls {
         std::mem::take(&mut self.requests)
     }
 
-    /// Drops every call, the marker of the task and the entries of History, and leaves the run
+    /// Drops every call, the ledger of the task and the entries of History, and leaves the run
     /// with no task, as a failed task does. The run records no call after this.
     pub(crate) fn stop(&mut self) {
         self.stop_for_terminal();
@@ -558,12 +564,20 @@ impl StreamCalls {
         self.held = Held::default();
         self.ready.clear();
         self.released = None;
-        self.marker = MarkerBuilder::new(self.runtimes.settings);
+        self.ledger = LedgerBuilder::new(self.runtimes.settings);
         self.requests.clear();
     }
 
+    /// Checks that a live call can run on the Store of `stream`, and that History can keep its
+    /// result. A call whose result History can't keep must never run.
     fn check_runtime(&self, stream: &StreamRef) -> Result<(), WFMachinesError> {
-        if self.phase == Phase::Live && self.runtimes.get(&stream.store).is_none() {
+        if self.phase != Phase::Live {
+            return Ok(());
+        }
+        if !self.keeps_ledgers {
+            return Err(no_ledger());
+        }
+        if self.runtimes.get(&stream.store).is_none() {
             return Err(no_runtime(stream));
         }
         Ok(())
@@ -622,7 +636,7 @@ impl StreamCalls {
         Ok(())
     }
 
-    /// Returns whether the marker has room for the first result that waits, if the task is open.
+    /// Returns whether the ledger has room for the first result that waits, if the task is open.
     fn next_result_fits(&self, activation: u64) -> Option<bool> {
         let call = *self.done.first()?;
         if !self.task.is_open() {
@@ -633,18 +647,18 @@ impl StreamCalls {
                 let AppendState::Done(result) = &self.appends[&seq].state else {
                     return None;
                 };
-                Some(self.marker.has_room_for_append(result, activation))
+                Some(self.ledger.has_room_for_append(result, activation))
             }
             CallKey::Close(seq) => {
                 let CloseState::Done(result) = &self.closes[&seq].state else {
                     return None;
                 };
-                Some(self.marker.has_room_for_close(result, activation))
+                Some(self.ledger.has_room_for_close(result, activation))
             }
         }
     }
 
-    /// Records a live result in the marker, and returns its job. Returns `None` if the marker has
+    /// Records a live result in the ledger, and returns its job. Returns `None` if the ledger has
     /// no room for it.
     fn record(
         &mut self,
@@ -656,7 +670,7 @@ impl StreamCalls {
                 let AppendState::Done(result) = &self.appends[&seq].state else {
                     return None;
                 };
-                if !self.marker.append_result(result, activation) {
+                if !self.ledger.append_result(result, activation) {
                     return None;
                 }
                 Some(append_job(&result.entry).into())
@@ -665,7 +679,7 @@ impl StreamCalls {
                 let CloseState::Done(result) = &self.closes[&seq].state else {
                     return None;
                 };
-                if !self.marker.close_result(result, activation) {
+                if !self.ledger.close_result(result, activation) {
                     return None;
                 }
                 Some(close_job(&result.entry).into())
@@ -835,6 +849,14 @@ fn valid_stream(call: CallKey, stream: Option<StreamRef>) -> Result<StreamRef, W
     Ok(stream)
 }
 
+fn no_ledger() -> WFMachinesError {
+    WFMachinesError::Stream(
+        "The server doesn't take the `sdk_metadata` of a Workflow Task completion, so History \
+         can't keep the results of Stream calls"
+            .to_string(),
+    )
+}
+
 fn no_runtime(stream: &StreamRef) -> WFMachinesError {
     WFMachinesError::Stream(format!(
         "This Worker has no Stream runtime for the Store `{}`",
@@ -895,6 +917,7 @@ mod tests {
     use super::super::{StreamManager, StreamSettings, manager::recorded};
     use super::*;
     use crate::test_help::stream_store::{MemoryStore, Request as StoreRequest};
+    use prost::Message;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
     use std::sync::Arc;
     use temporalio_common::protos::coresdk::{
@@ -917,17 +940,17 @@ mod tests {
     }
 
     fn calls(phase: Phase, task: i64) -> StreamCalls {
-        let mut calls = StreamCalls::new("n", "w", "r", runtimes(&["mem"]), phase);
+        let mut calls = StreamCalls::new("n", "w", "r", runtimes(&["mem"]), phase, true);
         calls.set_task(TaskState::Open(task_attempt(task)));
         calls
     }
 
     /// Completes the current task, and opens the next one.
-    fn next_task(calls: &mut StreamCalls, task: i64) -> Option<StreamMarkerData> {
-        let marker = calls.take_marker();
+    fn next_task(calls: &mut StreamCalls, task: i64) -> Option<StreamLedger> {
+        let ledger = calls.take_ledger();
         calls.set_task(TaskState::NoTask);
         calls.set_task(TaskState::Open(task_attempt(task)));
-        marker
+        ledger
     }
 
     fn task_attempt(task: i64) -> WorkflowTaskAttempt {
@@ -967,7 +990,7 @@ mod tests {
         })
     }
 
-    /// Returns the result of append `seq` to the Stream `id`, as a run holds it before a marker
+    /// Returns the result of append `seq` to the Stream `id`, as a run holds it before a ledger
     /// records it.
     fn append_done(seq: u32, id: &str) -> Waiting<StreamAppendResult> {
         Waiting::new(StreamAppendResult {
@@ -983,11 +1006,11 @@ mod tests {
         recorded(&AnyError::invalid_argument(message))
     }
 
-    /// Returns a marker that `write` fills.
-    fn history(write: impl FnOnce(&mut MarkerBuilder)) -> StreamMarkerData {
-        let mut marker = MarkerBuilder::new(StreamSettings::default());
-        write(&mut marker);
-        marker.take().unwrap()
+    /// Returns a ledger that `write` fills.
+    fn history(write: impl FnOnce(&mut LedgerBuilder)) -> StreamLedger {
+        let mut ledger = LedgerBuilder::new(StreamSettings::default());
+        write(&mut ledger);
+        ledger.take().unwrap()
     }
 
     /// Returns the calls that started since the last look, as `append 1 of s at 3`, with the
@@ -1107,7 +1130,7 @@ mod tests {
         calls.append(append(2, "s")).unwrap();
         calls.close(close(1, "s")).unwrap();
         assert_eq!(started(&mut calls), ["append 1 of s at 3"]);
-        // Closes on Streams with long ids fill the marker, so the last intent waits for task 7.
+        // Closes on Streams with long ids fill the ledger, so the last intent waits for task 7.
         let long = |seq: u32| format!("{seq:02}{}", "s".repeat(4000));
         for seq in 2..=70 {
             calls.close(close(seq, &long(seq))).unwrap();
@@ -1115,7 +1138,7 @@ mod tests {
         let first = next_task(&mut calls, 7).unwrap();
         let sealed = first.close_intents.len() as u32;
         assert!(sealed < 70, "{sealed}");
-        calls.marker_recorded().unwrap();
+        calls.ledger_recorded().unwrap();
         finish(&mut calls, CallKey::Append(1), None);
         let mut expected = vec!["append 2 of s at 3".to_string()];
         expected.extend((2..=sealed).map(|seq| format!("close {seq} of {} at 3", long(seq))));
@@ -1124,7 +1147,7 @@ mod tests {
         finish(&mut calls, CallKey::Append(2), None);
         assert_eq!(started(&mut calls), ["close 1 of s at 3"]);
         next_task(&mut calls, 11).unwrap();
-        calls.marker_recorded().unwrap();
+        calls.ledger_recorded().unwrap();
         let rest = started(&mut calls);
         assert_eq!(rest.len(), 70 - sealed as usize);
         assert!(rest.iter().all(|call| call.ends_with(" at 7")), "{rest:?}");
@@ -1141,16 +1164,16 @@ mod tests {
         live.set_task(TaskState::Completing(task_attempt(3)));
         assert!(!live.has_jobs(4, None));
         assert_eq!(jobs(&mut live, 4), Vec::<String>::new());
-        let marker = next_task(&mut live, 7);
-        assert_eq!(marker, None);
+        let ledger = next_task(&mut live, 7);
+        assert_eq!(ledger, None);
         assert!(live.has_jobs(0, None));
         assert_eq!(jobs(&mut live, 0), ["append 1", "append 2"]);
         live.append(append(3, "s")).unwrap();
         started(&mut live);
         finish(&mut live, CallKey::Append(3), None);
         assert_eq!(jobs(&mut live, 2), ["append 3"]);
-        let marker = next_task(&mut live, 11).unwrap();
-        let entries: Vec<_> = (marker.appends.iter())
+        let ledger = next_task(&mut live, 11).unwrap();
+        let entries: Vec<_> = (ledger.appends.iter())
             .map(|append| (append.seq, append.activation_index))
             .collect();
         assert_eq!(entries, [(1, 0), (2, 0), (3, 2)]);
@@ -1158,15 +1181,15 @@ mod tests {
 
     #[test]
     fn a_release_ends_with_its_activation() {
-        let marker = history(|marker| assert!(marker.append_result(&append_done(1, "1"), 2)));
+        let ledger = history(|ledger| assert!(ledger.append_result(&append_done(1, "1"), 2)));
         let mut replay = calls(Phase::Replaying, 9);
         replay.append(append(1, "1")).unwrap();
-        replay.peeked(marker).unwrap();
+        replay.peeked(ledger).unwrap();
         replay.release_ready();
         assert_eq!(jobs(&mut replay, 0), ["append 1"]);
         // A result of the next task waits for its own activation.
         replay.append(append(2, "2")).unwrap();
-        let next = history(|marker| assert!(marker.append_result(&append_done(2, "2"), 1)));
+        let next = history(|ledger| assert!(ledger.append_result(&append_done(2, "2"), 1)));
         replay.peeked(next).unwrap();
         assert!(!replay.has_jobs(0, None));
     }
@@ -1237,7 +1260,7 @@ mod tests {
         /// activation even with no Stream result.
         has_events: bool,
         activations: Vec<Activation>,
-        marker: Option<StreamMarkerData>,
+        ledger: Option<StreamLedger>,
         /// True if this task sent the last command of the Workflow.
         ends_workflow: bool,
     }
@@ -1309,7 +1332,7 @@ mod tests {
         history: &[Task],
         live: WorkflowTaskAttempt,
     ) -> Result<Replayed, WFMachinesError> {
-        let calls = StreamCalls::new("n", "w", "r", runtimes(&["mem"]), Phase::Replaying);
+        let calls = StreamCalls::new("n", "w", "r", runtimes(&["mem"]), Phase::Replaying, true);
         let mut run = Run {
             calls,
             activation: 0,
@@ -1319,12 +1342,12 @@ mod tests {
         let mut replayed = vec![];
         let mut sent_in = None;
         for (index, task) in history.iter().enumerate() {
-            if index > 0 && history[index - 1].marker.is_some() {
-                run.calls.marker_recorded()?;
+            if index > 0 && history[index - 1].ledger.is_some() {
+                run.calls.ledger_recorded()?;
             }
-            // Core peeks the marker that the task's completion recorded before it activates.
-            if let Some(marker) = &task.marker {
-                run.calls.peeked(marker.clone())?;
+            // Core peeks the ledger that the task's completion recorded before it activates.
+            if let Some(ledger) = &task.ledger {
+                run.calls.peeked(ledger.clone())?;
             }
             run.activation = 0;
             let mut activations = vec![];
@@ -1351,8 +1374,8 @@ mod tests {
             assert!(requests.is_empty(), "seed {seed}: {requests:?}");
             replayed.push(activations);
         }
-        if history.last().is_some_and(|task| task.marker.is_some()) {
-            run.calls.marker_recorded()?;
+        if history.last().is_some_and(|task| task.ledger.is_some()) {
+            run.calls.ledger_recorded()?;
         }
         run.activation = 0;
         run.calls.go_live()?;
@@ -1366,10 +1389,10 @@ mod tests {
     /// The cases that the generated scripts reached, over all seeds.
     #[derive(Default)]
     struct Seen {
-        full_markers: usize,
+        full_ledgers: usize,
         heartbeats: usize,
         failed_tasks: usize,
-        /// The last commands that Workflow code sent while a call had no result in a marker.
+        /// The last commands that Workflow code sent while a call had no result in a ledger.
         dropped: usize,
         /// The commands with a Stream id or a Store name out of range.
         invalid: usize,
@@ -1393,7 +1416,7 @@ mod tests {
         deferred: Vec<StreamResolution>,
         last_append: u32,
         last_close: u32,
-        /// The calls whose result no marker has.
+        /// The calls whose result no ledger has.
         unresolved: BTreeSet<CallKey>,
         /// The state as of the last task in History, which a failed task goes back to.
         committed: (u32, u32, BTreeSet<CallKey>),
@@ -1402,7 +1425,7 @@ mod tests {
     impl<'a> FirstRun<'a> {
         fn new(seed: u64, seen: &'a mut Seen) -> Self {
             let run = Run {
-                calls: StreamCalls::new("n", "w", "r", runtimes(&["mem"]), Phase::Live),
+                calls: StreamCalls::new("n", "w", "r", runtimes(&["mem"]), Phase::Live, true),
                 activation: 0,
                 ended: false,
             };
@@ -1456,9 +1479,9 @@ mod tests {
             if self
                 .history
                 .last()
-                .is_some_and(|task| task.marker.is_some())
+                .is_some_and(|task| task.ledger.is_some())
             {
-                self.run.calls.marker_recorded().unwrap();
+                self.run.calls.ledger_recorded().unwrap();
             }
             self.run.activation = 0;
             for resolution in std::mem::take(&mut self.deferred) {
@@ -1483,7 +1506,7 @@ mod tests {
                     continue;
                 }
                 if self.run.calls.must_complete(self.run.activation) {
-                    self.seen.full_markers += 1;
+                    self.seen.full_ledgers += 1;
                     self.complete();
                     return Ok(());
                 }
@@ -1641,7 +1664,7 @@ mod tests {
                         return (commands, None);
                     }
                     87..=89 => {
-                        // A burst of appends, each on a Stream of its own, can fill a marker.
+                        // A burst of appends, each on a Stream of its own, can fill a ledger.
                         for _ in 0..self.rng.random_range(40..=90) {
                             self.last_append += 1;
                             let long = "x".repeat(self.rng.random_range(0..3000));
@@ -1660,7 +1683,7 @@ mod tests {
             let call = (self.in_flight).swap_remove(self.rng.random_range(0..self.in_flight.len()));
             let failure = match &call.op {
                 Op::Append(request, _) => {
-                    // A large failure fills the marker in a few dozen results.
+                    // A large failure fills the ledger in a few dozen results.
                     let burst = request.r#ref.as_ref().unwrap().id.starts_with('b');
                     let large = if burst { 8 } else { 1 };
                     match self.rng.random_range(0..10) {
@@ -1679,11 +1702,11 @@ mod tests {
         }
 
         /// Completes the task in hand, and checks that the run tracks exactly the calls whose
-        /// result no marker has.
+        /// result no ledger has.
         fn complete(&mut self) {
-            let marker = self.run.calls.take_marker();
+            let ledger = self.run.calls.take_ledger();
             self.run.calls.set_task(TaskState::NoTask);
-            for entry in marker.iter() {
+            for entry in ledger.iter() {
                 for append in &entry.appends {
                     self.unresolved.remove(&CallKey::Append(append.seq));
                 }
@@ -1692,7 +1715,7 @@ mod tests {
                 }
             }
             let mut task = std::mem::take(&mut self.task);
-            task.marker = marker;
+            task.ledger = ledger;
             task.ends_workflow = self.run.ended;
             self.history.push(task);
             self.committed = (self.last_append, self.last_close, self.unresolved.clone());
@@ -1751,16 +1774,16 @@ mod tests {
             assert_eq!(replayed, first, "seed {seed}");
             let ended = self.history.iter().position(|task| task.ends_workflow);
             assert_eq!(sent_in, ended, "seed {seed}");
-            // The replay resumes each call whose result no marker has, and only those.
+            // The replay resumes each call whose result no ledger has, and only those.
             assert_eq!(run.tracked(), self.unresolved, "seed {seed}");
             let recorded: BTreeSet<CallKey> = (self.history.iter())
-                .filter_map(|task| task.marker.as_ref())
-                .flat_map(|marker| {
-                    (marker
+                .filter_map(|task| task.ledger.as_ref())
+                .flat_map(|ledger| {
+                    (ledger
                         .appends
                         .iter()
                         .map(|append| CallKey::Append(append.seq)))
-                    .chain(marker.closes.iter().map(|close| CallKey::Close(close.seq)))
+                    .chain(ledger.closes.iter().map(|close| CallKey::Close(close.seq)))
                 })
                 .collect();
             for request in run.calls.take_requests() {
@@ -1794,7 +1817,7 @@ mod tests {
         }
         // The scripts reach each case that the test is for.
         let Seen {
-            full_markers,
+            full_ledgers,
             heartbeats,
             failed_tasks,
             dropped,
@@ -1802,7 +1825,7 @@ mod tests {
             bad_seqs,
         } = seen;
         let counts = [
-            full_markers,
+            full_ledgers,
             heartbeats,
             failed_tasks,
             dropped,
@@ -1849,9 +1872,9 @@ mod tests {
                 }
                 if rng.random_bool(0.15) {
                     task += 4;
-                    if let Some(marker) = next_task(&mut calls, task) {
-                        calls.marker_recorded().unwrap();
-                        for intent in &marker.close_intents {
+                    if let Some(ledger) = next_task(&mut calls, task) {
+                        calls.ledger_recorded().unwrap();
+                        for intent in &ledger.close_intents {
                             queues
                                 .entry(intent.stream_id.clone())
                                 .or_default()
@@ -1897,31 +1920,31 @@ mod tests {
     }
 
     #[test]
-    fn each_result_and_intent_is_in_exactly_one_marker_in_order() {
+    fn each_result_and_intent_is_in_exactly_one_ledger_in_order() {
         let (mut full, mut oversized, mut out_of_order) = (0, 0, 0);
         for seed in 0..SEEDS {
             let mut rng = StdRng::seed_from_u64(seed);
-            // A small bound fills a marker after a few entries, and the default after many.
+            // A small bound fills a ledger after a few entries, and the default after many.
             let mut runtimes = runtimes(&["mem"]);
             if rng.random_bool(0.5) {
-                runtimes.settings.bounds.max_marker_entry_bytes = rng.random_range(1..=16 * 1024);
+                runtimes.settings.bounds.max_ledger_bytes = rng.random_range(1..=16 * 1024);
             }
-            let max_entry = runtimes.settings.bounds.max_marker_entry_bytes;
-            let mut calls = StreamCalls::new("n", "w", "r", runtimes, Phase::Live);
+            let max_entry = runtimes.settings.bounds.max_ledger_bytes;
+            let mut calls = StreamCalls::new("n", "w", "r", runtimes, Phase::Live, true);
             calls.set_task(TaskState::Open(task_attempt(3)));
             let budget = rng.random_range(1..=150);
             let (mut appends, mut closes) = (0, 0);
             let mut in_flight: Vec<Call> = vec![];
             // The results that Core took in each task, in order, with their activation.
             let mut taken: Vec<Vec<(u64, CallKey)>> = vec![vec![]];
-            let mut markers = vec![];
+            let mut ledgers = vec![];
             let (mut activation, mut task) = (0, 3);
             // The highest seq of each kind that Core took so far.
             let mut highest = (0, 0);
             for round in 0.. {
                 assert!(round < 100_000, "seed {seed}: the run never ends");
                 // Most calls share a few Streams, so they wait in a queue. The others have a
-                // Stream of their own, whose long id fills a marker sooner.
+                // Stream of their own, whose long id fills a ledger sooner.
                 for _ in 0..rng.random_range(0..=4) {
                     if appends + closes == budget {
                         break;
@@ -1943,7 +1966,7 @@ mod tests {
                 }
                 dispatch(&mut calls, &mut in_flight);
                 // The Store answers some of the calls in flight, in any order. Most of them fail
-                // with a long message, which fills a marker sooner.
+                // with a long message, which fills a ledger sooner.
                 for _ in 0..rng.random_range(0..=in_flight.len().min(6)) {
                     let call = in_flight.swap_remove(rng.random_range(0..in_flight.len()));
                     let bytes = rng.random_range(0..4200);
@@ -1952,7 +1975,7 @@ mod tests {
                     dispatch(&mut calls, &mut in_flight);
                 }
                 // Core takes the results that wait in their order, up to the first that doesn't
-                // fit, and the marker records them with the activation.
+                // fit, and the ledger records them with the activation.
                 let waiting: Vec<CallKey> = calls.done.iter().copied().collect();
                 let took = if calls.has_jobs(activation, None) && rng.random_bool(0.8) {
                     let jobs: Vec<CallKey> = calls
@@ -1970,7 +1993,7 @@ mod tests {
                     "seed {seed}"
                 );
                 // A take stops only at a result that doesn't fit, so a result that still waits
-                // means that the marker is full and the task must complete.
+                // means that the ledger is full and the task must complete.
                 if took > 0 {
                     let waits = !calls.done.is_empty();
                     assert_eq!(calls.must_complete(activation), waits, "seed {seed}");
@@ -1990,15 +2013,15 @@ mod tests {
                     activation += 1;
                     continue;
                 }
-                // A full marker completes the task, and so does a heartbeat at any time.
+                // A full ledger completes the task, and so does a heartbeat at any time.
                 let finished = appends + closes == budget && !calls.needs_next_task();
                 if finished || calls.must_complete(activation) || rng.random_bool(0.03) {
                     task += 4;
-                    let marker = next_task(&mut calls, task);
-                    if marker.is_some() {
-                        calls.marker_recorded().unwrap();
+                    let ledger = next_task(&mut calls, task);
+                    if ledger.is_some() {
+                        calls.ledger_recorded().unwrap();
                     }
-                    markers.push(marker.unwrap_or_default());
+                    ledgers.push(ledger.unwrap_or_default());
                     taken.push(vec![]);
                     activation = 0;
                     if finished {
@@ -2006,14 +2029,14 @@ mod tests {
                     }
                 }
             }
-            // Each marker records the results of its task in the order that Core took them, with
+            // Each ledger records the results of its task in the order that Core took them, with
             // their activations. The appends come first, then the closes.
-            for (index, marker) in markers.iter().enumerate() {
-                let appended = marker.appends.iter();
+            for (index, ledger) in ledgers.iter().enumerate() {
+                let appended = ledger.appends.iter();
                 let recorded: Vec<(u64, CallKey)> = (appended)
                     .map(|append| (append.activation_index, CallKey::Append(append.seq)))
                     .chain(
-                        marker
+                        ledger
                             .closes
                             .iter()
                             .map(|c| (c.activation_index, CallKey::Close(c.seq))),
@@ -2032,18 +2055,18 @@ mod tests {
                     "seed {seed}: {seqs:?}"
                 );
             };
-            let all = |seqs: &dyn Fn(&StreamMarkerData) -> Vec<u32>| -> Vec<u32> {
-                markers.iter().flat_map(seqs).collect()
+            let all = |seqs: &dyn Fn(&StreamLedger) -> Vec<u32>| -> Vec<u32> {
+                ledgers.iter().flat_map(seqs).collect()
             };
             once(all(&|m| m.appends.iter().map(|a| a.seq).collect()), appends);
             once(all(&|m| m.closes.iter().map(|c| c.seq).collect()), closes);
             let intents = all(&|m| m.close_intents.iter().map(|i| i.seq).collect());
             assert_eq!(intents, (1..=closes).collect::<Vec<_>>(), "seed {seed}");
-            for marker in &markers {
+            for ledger in &ledgers {
                 let entries =
-                    marker.appends.len() + marker.close_intents.len() + marker.closes.len();
-                // The bound of the entries is on the JSON of the marker's data.
-                let size = serde_json::to_string(marker).unwrap().len();
+                    ledger.appends.len() + ledger.close_intents.len() + ledger.closes.len();
+                // The bound of the entries is on the encoded ledger.
+                let size = ledger.encoded_len();
                 assert!(size <= max_entry || entries == 1, "seed {seed}: {size}");
                 oversized += usize::from(size > max_entry);
             }
@@ -2076,14 +2099,14 @@ mod tests {
     /// Makes a random change to `history`, if it has an entry to change.
     fn mutate(rng: &mut StdRng, history: &mut [Task]) -> Option<Change> {
         let entries: Vec<(usize, CallKey)> = (history.iter().enumerate())
-            .filter_map(|(index, task)| Some((index, task.marker.as_ref()?)))
-            .flat_map(|(index, marker)| {
-                (marker
+            .filter_map(|(index, task)| Some((index, task.ledger.as_ref()?)))
+            .flat_map(|(index, ledger)| {
+                (ledger
                     .appends
                     .iter()
                     .map(move |append| (index, CallKey::Append(append.seq))))
                 .chain(
-                    marker
+                    ledger
                         .closes
                         .iter()
                         .map(move |close| (index, CallKey::Close(close.seq))),
@@ -2120,17 +2143,17 @@ mod tests {
             }
             return Some(change);
         }
-        let marker = history[task].marker.as_mut().unwrap();
+        let ledger = history[task].ledger.as_mut().unwrap();
         match call {
             CallKey::Append(seq) => {
-                let at = marker.appends.iter().position(|append| append.seq == seq)?;
+                let at = ledger.appends.iter().position(|append| append.seq == seq)?;
                 match change {
-                    Change::Twice => marker.appends.push(marker.appends[at].clone()),
-                    Change::Seq => marker.appends[at].seq = 999,
-                    Change::Activation => marker.appends[at].activation_index += 1,
+                    Change::Twice => ledger.appends.push(ledger.appends[at].clone()),
+                    Change::Seq => ledger.appends[at].seq = 999,
+                    Change::Activation => ledger.appends[at].activation_index += 1,
                     _ => {
-                        let entry = marker.appends.remove(at);
-                        marker.closes.push(StreamCloseResult {
+                        let entry = ledger.appends.remove(at);
+                        ledger.closes.push(StreamCloseResult {
                             seq,
                             activation_index: entry.activation_index,
                             failure: None,
@@ -2139,14 +2162,14 @@ mod tests {
                 }
             }
             CallKey::Close(seq) => {
-                let at = marker.closes.iter().position(|close| close.seq == seq)?;
+                let at = ledger.closes.iter().position(|close| close.seq == seq)?;
                 match change {
-                    Change::Twice => marker.closes.push(marker.closes[at].clone()),
-                    Change::Seq => marker.closes[at].seq = 999,
-                    Change::Activation => marker.closes[at].activation_index += 1,
+                    Change::Twice => ledger.closes.push(ledger.closes[at].clone()),
+                    Change::Seq => ledger.closes[at].seq = 999,
+                    Change::Activation => ledger.closes[at].activation_index += 1,
                     _ => {
-                        let entry = marker.closes.remove(at);
-                        marker.appends.push(StreamAppendResult {
+                        let entry = ledger.closes.remove(at);
+                        ledger.appends.push(StreamAppendResult {
                             seq,
                             stream_id: "s0".to_string(),
                             store: "mem".to_string(),
@@ -2201,15 +2224,15 @@ mod tests {
         let mut nameless = append(1, "s");
         nameless.stream.as_mut().unwrap().store.clear();
         replay.append(nameless).unwrap();
-        let marker = history(|m| assert!(m.append_result(&append_done(1, "s"), 0)));
-        replay.peeked(marker).unwrap();
+        let ledger = history(|m| assert!(m.append_result(&append_done(1, "s"), 0)));
+        replay.peeked(ledger).unwrap();
         assert_eq!(jobs(&mut replay, 0), ["append 1"]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_call_on_a_store_with_no_runtime_fails_the_task() {
+    async fn a_call_with_no_runtime_or_no_ledger_fails_the_task() {
         let stores = ["a", "b", "c"];
-        let mut with_no_runtime = 0;
+        let (mut with_no_runtime, mut with_no_ledger) = (0, 0);
         for seed in 0..SEEDS {
             let mut rng = StdRng::seed_from_u64(seed);
             let served: Vec<(&str, Arc<MemoryStore>)> = (stores.into_iter())
@@ -2224,7 +2247,10 @@ mod tests {
                 let runtime = StreamRuntime::new(store.clone(), StoreLimits::default());
                 (name.to_string(), Arc::new(runtime))
             }));
-            let mut calls = StreamCalls::new("n", "w", "r", runtimes.clone(), phase);
+            // A server that doesn't take the `sdk_metadata` of a completion keeps no ledger.
+            let keeps_ledgers = rng.random_bool(0.7);
+            with_no_ledger += usize::from(!keeps_ledgers && phase != Phase::ReplayOnly);
+            let mut calls = StreamCalls::new("n", "w", "r", runtimes.clone(), phase, keeps_ledgers);
             calls.set_task(TaskState::Open(task_attempt(3)));
             let (mut appends, mut closes) = (0, 0);
             let (mut unserved, mut store_of) = (BTreeMap::new(), HashMap::new());
@@ -2255,8 +2281,9 @@ mod tests {
                     "This Worker has no Stream runtime for the Store `{store}`"
                 ));
                 let is_served = served.iter().any(|(name, _)| *name == store);
-                if phase == Phase::Live && !is_served {
+                if phase == Phase::Live && (!is_served || !keeps_ledgers) {
                     // The command fails the task, so the run records nothing of the call.
+                    let error = if keeps_ledgers { error } else { no_ledger() };
                     assert_eq!(result, Err(error), "seed {seed}");
                     let tracked = match call {
                         CallKey::Append(seq) => calls.appends.contains_key(&seq),
@@ -2270,13 +2297,13 @@ mod tests {
                     unserved.insert(call, error);
                 }
             }
-            let marker = calls.take_marker().unwrap_or_default();
-            calls.marker_recorded().unwrap();
+            let ledger = calls.take_ledger().unwrap_or_default();
+            calls.ledger_recorded().unwrap();
             let mut sent = calls.take_requests();
             let at_go_live = calls.go_live();
             sent.extend(calls.take_requests());
             // No call on a Store with no runtime records an intent or reaches a Store.
-            let streams: Vec<&str> = (marker.close_intents.iter())
+            let streams: Vec<&str> = (ledger.close_intents.iter())
                 .map(|intent| intent.store.as_str())
                 .chain(sent.iter().map(|request| match request {
                     Request::Run(call) => call.store.as_str(),
@@ -2287,13 +2314,18 @@ mod tests {
                 (streams.iter()).all(|store| served.iter().any(|(name, _)| name == store)),
                 "seed {seed}"
             );
-            // A replay fails the task when it goes live with an unserved call, which a replay
-            // Worker never does.
+            // A replay fails the task when it goes live with an unserved call, or with any call
+            // whose result History can't keep, which a replay Worker never does.
             let expected = match (phase, unserved.into_values().next()) {
                 (Phase::Replaying, Some(error)) => Err(error),
+                (Phase::Replaying, None) if !keeps_ledgers && appends + closes > 0 => {
+                    Err(no_ledger())
+                }
                 _ => Ok(()),
             };
             assert_eq!(at_go_live, expected, "seed {seed}");
+            // No call runs if History can't keep its result.
+            assert!(keeps_ledgers || sent.is_empty(), "seed {seed}");
             // Each Store gets only the calls whose ref has its name.
             let manager = StreamManager::new(runtimes, Handle::current(), |_, _| {});
             manager.dispatch("r", sent);
@@ -2309,5 +2341,9 @@ mod tests {
             }
         }
         assert!(with_no_runtime > 0, "No seed had a Worker with no runtime");
+        assert!(
+            with_no_ledger > 0,
+            "No seed had a server that keeps no ledger"
+        );
     }
 }

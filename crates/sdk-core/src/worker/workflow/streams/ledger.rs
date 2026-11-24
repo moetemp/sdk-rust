@@ -1,66 +1,59 @@
-//! The `core_stream` marker of a Workflow Task, which records the results and the close intents
-//! of the task's Stream calls.
+//! The ledger of a Workflow Task, which has the results and the close intents of the task's Stream
+//! calls. Core puts it on the completion of the task, and History keeps it in the
+//! `WorkflowTaskCompleted` event.
 
 use super::{StreamSettings, manager::failure_of};
 use crate::worker::workflow::WFMachinesError;
-use serde::Serialize;
-use std::{collections::HashMap, sync::LazyLock};
+use prost::{Message, encoding::encoded_len_varint};
 use temporalio_common::protos::{
-    constants::STREAM_MARKER_NAME,
     coresdk::{
-        AsJsonPayloadExt, FromJsonPayloadExt,
         external_data::{
-            StreamAppendResult, StreamCloseIntent, StreamCloseResult, StreamMarkerData,
+            StreamAppendResult, StreamCloseIntent, StreamCloseResult, StreamLedger,
             stream_append_result,
         },
         workflow_activation::{
             ResolveStreamAppend, ResolveStreamClose, StreamAppended, resolve_stream_append,
         },
     },
-    temporal::api::{
-        common::v1::{Payload, Payloads},
-        history::v1::{HistoryEvent, MarkerRecordedEventAttributes, history_event},
-    },
+    temporal::api::history::v1::{HistoryEvent, history_event},
 };
-use temporalio_streams::proto::{StreamErrorReason, StreamRef};
+use temporalio_streams::{
+    proto::{StreamErrorReason, StreamRef},
+    record::field_len,
+};
 
-/// The maximum activation index that Core takes from a marker entry. A replay adds one to the
+/// The maximum activation index that Core takes from a ledger entry. A replay adds one to the
 /// index of an entry for each later activation, and the bound prevents an overflow of that sum.
 const MAX_ACTIVATION: u64 = u32::MAX as u64;
 
-/// The key of the marker's details that holds its data. It can't change, because History keeps
-/// the markers that earlier releases wrote.
-const MARKER_DATA_KEY: &str = "data";
-
-/// The length of the JSON of a marker's data with no entry. Each new run and each failed task
-/// makes an empty marker, so Core measures it once.
-static EMPTY_DATA_BYTES: LazyLock<usize> =
-    LazyLock::new(|| json(&StreamMarkerData::default()).data.len());
-
-/// The entry of a result that waits for an activation, as a marker records it, with the length of
-/// its JSON. So the room check of each activation doesn't write JSON.
+/// The entry of a result that waits for an activation, as a ledger records it, with its encoded
+/// size.
 #[derive(Debug)]
 pub(crate) struct Waiting<T> {
-    /// The entry, which gets its activation when a marker records it.
+    /// The entry, which gets its activation when a ledger records it.
     pub(crate) entry: T,
-    json_len: usize,
+    len: usize,
 }
 
-impl<T: Serialize> Waiting<T> {
+impl<T: Message> Waiting<T> {
     pub(crate) fn new(entry: T) -> Self {
-        let json_len = json(&entry).data.len();
-        Self { entry, json_len }
+        let len = entry.encoded_len();
+        Self { entry, len }
     }
 
-    /// Returns the bytes that the entry adds to the JSON of a marker's data at `activation`, as
-    /// the next item of `list`. Each item but the first has a comma before it.
-    fn len_at(&self, activation: u64, list: &[T]) -> usize {
-        // The entry was measured with activation 0, whose JSON has one digit.
-        self.json_len + activation.to_string().len() - 1 + usize::from(!list.is_empty())
+    /// Returns the bytes that the entry adds to a ledger at `activation`.
+    fn len_at(&self, activation: u64) -> usize {
+        // The entry was measured with activation 0, which the encoding leaves out. Another
+        // activation adds its one-byte tag and its varint.
+        let activation_len = match activation {
+            0 => 0,
+            _ => 1 + encoded_len_varint(activation),
+        };
+        field_len(self.len + activation_len)
     }
 }
 
-/// Returns the job that gives Workflow code the result of an append in a marker. A replay and a
+/// Returns the job that gives Workflow code the result of an append in a ledger. A replay and a
 /// live run both build their jobs from the entry, so both give Workflow code the same job for it.
 pub(crate) fn append_job(entry: &StreamAppendResult) -> ResolveStreamAppend {
     let status = entry.result.as_ref().map(|result| match result {
@@ -80,7 +73,7 @@ pub(crate) fn append_job(entry: &StreamAppendResult) -> ResolveStreamAppend {
     }
 }
 
-/// Returns the job that gives Workflow code the result of a close in a marker.
+/// Returns the job that gives Workflow code the result of a close in a ledger.
 pub(crate) fn close_job(entry: &StreamCloseResult) -> ResolveStreamClose {
     ResolveStreamClose {
         seq: entry.seq,
@@ -88,35 +81,35 @@ pub(crate) fn close_job(entry: &StreamCloseResult) -> ResolveStreamClose {
     }
 }
 
-/// The marker of the current task. Its results of each kind are in the order that Core took them,
+/// The ledger of the current task. Its results of each kind are in the order that Core took them,
 /// and its intents are in `seq` order. Each caller stops at the first entry that doesn't fit, so
-/// the marker never records an entry while an earlier one waits.
+/// the ledger never records an entry while an earlier one waits.
 #[derive(Debug)]
-pub(crate) struct MarkerBuilder {
-    data: StreamMarkerData,
-    /// The length of the JSON of `data`.
+pub(crate) struct LedgerBuilder {
+    data: StreamLedger,
+    /// The encoded size of `data`.
     bytes: usize,
     settings: StreamSettings,
 }
 
-impl MarkerBuilder {
-    /// Creates an empty marker with the sizes of `settings`.
+impl LedgerBuilder {
+    /// Creates an empty ledger with the sizes of `settings`.
     pub(crate) fn new(settings: StreamSettings) -> Self {
         Self {
-            bytes: *EMPTY_DATA_BYTES,
-            data: StreamMarkerData::default(),
+            bytes: 0,
+            data: StreamLedger::default(),
             settings,
         }
     }
 
     /// Records the result of an append, given to Workflow code at `activation`. Returns false if
-    /// the marker has no room for it.
+    /// the ledger has no room for it.
     pub(crate) fn append_result(
         &mut self,
         done: &Waiting<StreamAppendResult>,
         activation: u64,
     ) -> bool {
-        if !self.fits(done.len_at(activation, &self.data.appends)) {
+        if !self.fits(done.len_at(activation)) {
             return false;
         }
         self.data.appends.push(StreamAppendResult {
@@ -126,37 +119,37 @@ impl MarkerBuilder {
         true
     }
 
-    /// Returns true if the marker has room for the result of an append, without recording it.
+    /// Returns true if the ledger has room for the result of an append, without recording it.
     pub(crate) fn has_room_for_append(
         &self,
         done: &Waiting<StreamAppendResult>,
         activation: u64,
     ) -> bool {
-        self.has_room(done.len_at(activation, &self.data.appends))
+        self.has_room(done.len_at(activation))
     }
 
-    /// Records the intent of close `seq` on `stream`. Returns false if the marker has no room.
+    /// Records the intent of close `seq` on `stream`. Returns false if the ledger has no room.
     pub(crate) fn close_intent(&mut self, stream: &StreamRef, seq: u32) -> bool {
         let entry = StreamCloseIntent {
             seq,
             stream_id: stream.id.clone(),
             store: stream.store.clone(),
         };
-        if !self.fits(item_len(&entry, &self.data.close_intents)) {
+        if !self.fits(field_len(entry.encoded_len())) {
             return false;
         }
         self.data.close_intents.push(entry);
         true
     }
 
-    /// Records the result of a close, given at `activation`. Returns false if the marker has no
+    /// Records the result of a close, given at `activation`. Returns false if the ledger has no
     /// room for it.
     pub(crate) fn close_result(
         &mut self,
         done: &Waiting<StreamCloseResult>,
         activation: u64,
     ) -> bool {
-        if !self.fits(done.len_at(activation, &self.data.closes)) {
+        if !self.fits(done.len_at(activation)) {
             return false;
         }
         self.data.closes.push(StreamCloseResult {
@@ -166,32 +159,32 @@ impl MarkerBuilder {
         true
     }
 
-    /// Returns true if the marker has room for the result of a close, without recording it.
+    /// Returns true if the ledger has room for the result of a close, without recording it.
     pub(crate) fn has_room_for_close(
         &self,
         done: &Waiting<StreamCloseResult>,
         activation: u64,
     ) -> bool {
-        self.has_room(done.len_at(activation, &self.data.closes))
+        self.has_room(done.len_at(activation))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.data == StreamMarkerData::default()
+        self.data == StreamLedger::default()
     }
 
-    /// Returns the marker, if it has an entry, and leaves an empty builder for the next task.
-    pub(crate) fn take(&mut self) -> Option<StreamMarkerData> {
+    /// Returns the ledger, if it has an entry, and leaves an empty builder for the next task.
+    pub(crate) fn take(&mut self) -> Option<StreamLedger> {
         if self.is_empty() {
             return None;
         }
         let builder = std::mem::replace(self, Self::new(self.settings));
-        debug_assert_eq!(builder.bytes, json(&builder.data).data.len());
+        debug_assert_eq!(builder.bytes, builder.data.encoded_len());
         Some(builder.data)
     }
 
-    /// An empty marker accepts any entry, because each input of an entry has a bound.
+    /// An empty ledger accepts any entry, because each input of an entry has a bound.
     fn has_room(&self, len: usize) -> bool {
-        self.is_empty() || self.bytes + len <= self.settings.max_marker_entry_bytes()
+        self.is_empty() || self.bytes + len <= self.settings.max_ledger_bytes()
     }
 
     fn fits(&mut self, len: usize) -> bool {
@@ -203,56 +196,34 @@ impl MarkerBuilder {
     }
 }
 
-/// Returns `value` as the JSON payload of a marker. The data of a marker has no map, so its JSON
-/// can always be written.
-fn json(value: &impl Serialize) -> Payload {
-    (value.as_json_payload()).expect("The data of a Stream marker has a JSON form")
+/// Returns true if `event` is the completion of a Workflow Task with a ledger.
+pub(crate) fn has_ledger(event: &HistoryEvent) -> bool {
+    ledger_of(event).is_some()
 }
 
-/// Returns the bytes that `entry` adds to the JSON of a marker's data as the next item of `list`.
-/// Each item but the first has a comma before it.
-fn item_len<T: Serialize>(entry: &T, list: &[T]) -> usize {
-    json(entry).data.len() + usize::from(!list.is_empty())
+/// Decodes the ledger of a `WorkflowTaskCompleted` event, and returns `None` for an event with no
+/// ledger. A ledger that doesn't decode, or that has a result which Core can't give Workflow code,
+/// is an error.
+pub(crate) fn peeked_ledger(event: &HistoryEvent) -> Option<Result<StreamLedger, WFMachinesError>> {
+    ledger_of(event).map(decode)
 }
 
-/// Returns the details of the marker command that records `data`.
-pub(crate) fn marker_details(data: &StreamMarkerData) -> HashMap<String, Payloads> {
-    HashMap::from([(MARKER_DATA_KEY.to_string(), json(data).into())])
-}
-
-/// Returns true if `event` is a `core_stream` marker.
-pub(crate) fn is_stream_marker(event: &HistoryEvent) -> bool {
-    marker_of(event).is_some()
-}
-
-/// Decodes a `core_stream` marker event, and returns `None` for any other event. A marker that
-/// doesn't decode, or that has a result which Core can't give Workflow code, is an error.
-pub(crate) fn peeked_marker(
-    event: &HistoryEvent,
-) -> Option<Result<StreamMarkerData, WFMachinesError>> {
-    marker_of(event).map(decode)
-}
-
-fn marker_of(event: &HistoryEvent) -> Option<&MarkerRecordedEventAttributes> {
+/// Returns the encoded ledger of a `WorkflowTaskCompleted` event. A completion has one only if
+/// its ledger has an entry, which is never empty when encoded.
+fn ledger_of(event: &HistoryEvent) -> Option<&[u8]> {
     match event.attributes.as_ref()? {
-        history_event::Attributes::MarkerRecordedEventAttributes(marker)
-            if marker.marker_name == STREAM_MARKER_NAME =>
-        {
-            Some(marker)
+        history_event::Attributes::WorkflowTaskCompletedEventAttributes(completed) => {
+            let ledger = &completed.sdk_metadata.as_ref()?.core_stream_calls;
+            (!ledger.is_empty()).then_some(&ledger[..])
         }
         _ => None,
     }
 }
 
-fn decode(marker: &MarkerRecordedEventAttributes) -> Result<StreamMarkerData, WFMachinesError> {
-    let bad = |why: String| WFMachinesError::Fatal(format!("The Stream marker {why}"));
-    let payload = marker
-        .details
-        .get(MARKER_DATA_KEY)
-        .and_then(|payloads| payloads.payloads.first())
-        .ok_or_else(|| bad("has no data".to_string()))?;
-    let data = StreamMarkerData::from_json_payload(payload)
-        .map_err(|error| bad(format!("doesn't decode: {error}")))?;
+fn decode(encoded: &[u8]) -> Result<StreamLedger, WFMachinesError> {
+    let bad = |why: String| WFMachinesError::Fatal(format!("The Stream ledger {why}"));
+    let data =
+        StreamLedger::decode(encoded).map_err(|error| bad(format!("doesn't decode: {error}")))?;
     if let Some(append) = data.appends.iter().find(|append| append.result.is_none()) {
         return Err(bad(format!("has no result of append {}", append.seq)));
     }
@@ -289,20 +260,36 @@ mod tests {
     use super::super::manager::recorded;
     use super::*;
     use rand::{RngExt, SeedableRng, rngs::StdRng};
-    use temporalio_common::protos::coresdk::external_data::{StreamAppendOffsets, StreamFailure};
+    use temporalio_common::protos::{
+        coresdk::external_data::{StreamAppendOffsets, StreamFailure},
+        temporal::api::{
+            history::v1::WorkflowTaskCompletedEventAttributes,
+            sdk::v1::WorkflowTaskCompletedMetadata,
+        },
+    };
     use temporalio_streams::{AppendError, AppendReason, StreamError};
 
-    fn event(details: HashMap<String, Payloads>) -> HistoryEvent {
+    /// Returns the completion of a Workflow Task with the ledger `encoded`.
+    fn event(encoded: Vec<u8>) -> HistoryEvent {
+        let sdk_metadata = WorkflowTaskCompletedMetadata {
+            core_stream_calls: encoded,
+            ..Default::default()
+        };
         HistoryEvent {
-            attributes: Some(history_event::Attributes::MarkerRecordedEventAttributes(
-                MarkerRecordedEventAttributes {
-                    marker_name: STREAM_MARKER_NAME.to_string(),
-                    details,
-                    ..Default::default()
-                },
-            )),
+            attributes: Some(
+                history_event::Attributes::WorkflowTaskCompletedEventAttributes(
+                    WorkflowTaskCompletedEventAttributes {
+                        sdk_metadata: Some(sdk_metadata),
+                        ..Default::default()
+                    },
+                ),
+            ),
             ..Default::default()
         }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
     }
 
     fn append_done(
@@ -319,16 +306,16 @@ mod tests {
         })
     }
 
-    // History keeps the markers of earlier releases, so the JSON of the data and the key of its
-    // detail can't change.
+    // History keeps the ledgers of earlier releases, so the encoding of a known ledger can't
+    // change.
     #[test]
-    fn the_details_of_a_known_marker_never_change() {
+    fn the_encoding_of_a_known_ledger_never_changes() {
         let stream = |id: &str| StreamRef {
             id: id.to_string(),
             store: "redis".to_string(),
         };
         let offset = |at: u64| at.to_be_bytes().to_vec();
-        let mut builder = MarkerBuilder::new(StreamSettings::default());
+        let mut builder = LedgerBuilder::new(StreamSettings::default());
         let appended = stream_append_result::Result::Appended(StreamAppendOffsets {
             first_offset: offset(42),
             last_offset: offset(43),
@@ -343,31 +330,25 @@ mod tests {
         });
         assert!(builder.close_result(&close, 1));
         assert!(builder.close_intent(&stream("orders"), 2));
-        let marker = builder.take().unwrap();
+        let ledger = builder.take().unwrap();
 
-        let details = marker_details(&marker);
-        let keys: Vec<&str> = details.keys().map(String::as_str).collect();
-        assert_eq!(keys, ["data"]);
-        let encoding = |name: &str| HashMap::from([("encoding".to_string(), name.into())]);
-        let [data] = &details["data"].payloads[..] else {
-            panic!("The data is one payload");
-        };
-        assert_eq!(data.metadata, encoding("json/plain"));
-        let json = [
-            r#"{"close_intents":[{"seq":2,"stream_id":"orders","store":"redis"}],"#,
-            r#""appends":[{"seq":3,"stream_id":"orders","store":"redis","activation_index":0,"#,
-            r#""result":{"appended":{"first_offset":"000000000000002a","#,
-            r#""last_offset":"000000000000002b"}}},"#,
-            r#"{"seq":4,"stream_id":"audit","store":"redis","activation_index":1,"#,
-            r#""result":{"failure":{"reason":"STREAM_ERROR_REASON_CLOSED","#,
-            r#""message":"The Stream is closed"}}}],"#,
-            r#""closes":[{"seq":1,"activation_index":1,"failure":null}]}"#,
+        let encoded = ledger.encode_to_vec();
+        let pinned = [
+            // The intent of close 2 on `orders`.
+            "0a11080212066f72646572731a057265646973",
+            // Append 3 on `orders`, at activation 0, with its offsets.
+            "1227080312066f72646572731a0572656469732a140a08000000000000002a1208000000000000002b",
+            // Append 4 on `audit`, at activation 1, with its failure.
+            "12460804120561756469741a057265646973200132320a1a53545245414d5f4552524f52",
+            "5f524541534f4e5f434c4f53454412145468652053747265616d20697320636c6f736564",
+            // Close 1, at activation 1.
+            "1a0408011001",
         ];
-        assert_eq!(std::str::from_utf8(&data.data).unwrap(), json.concat());
-        assert_eq!(peeked_marker(&event(details)), Some(Ok(marker)));
+        assert_eq!(hex(&encoded), pinned.concat());
+        assert_eq!(peeked_ledger(&event(encoded)), Some(Ok(ledger)));
     }
 
-    // A marker records a failed call by the name of its reason, and a replay reads that name.
+    // A ledger records a failed call by the name of its reason, and a replay reads that name.
     #[test]
     fn the_names_of_the_reasons_never_change() {
         let names: Vec<&str> = (0..)
@@ -392,8 +373,8 @@ mod tests {
         assert_eq!(names, pinned);
     }
 
-    /// Returns text of 1 to `max` characters that JSON escapes or has in several bytes, such as a
-    /// quote, a control character or a character of another script.
+    /// Returns text of 1 to `max` characters, such as a quote, a control character or a character
+    /// of several bytes.
     fn text(rng: &mut StdRng, max: usize) -> String {
         let chars = [
             'a', '"', '\\', '/', '\n', '\0', '\u{7f}', 'é', '€', '𝄞', '\u{2028}',
@@ -433,9 +414,9 @@ mod tests {
         recorded(&StreamError { reason, message })
     }
 
-    /// Returns a marker with random entries of each kind, as the builder of a task makes it.
-    fn valid_marker(rng: &mut StdRng) -> StreamMarkerData {
-        let mut builder = MarkerBuilder::new(StreamSettings::default());
+    /// Returns a ledger with random entries of each kind, as the builder of a task makes it.
+    fn valid_ledger(rng: &mut StdRng) -> StreamLedger {
+        let mut builder = LedgerBuilder::new(StreamSettings::default());
         let activation = |rng: &mut StdRng| match rng.random_bool(0.9) {
             true => rng.random_range(0..10),
             false => MAX_ACTIVATION,
@@ -461,61 +442,48 @@ mod tests {
             });
             builder.close_result(&close, activation(rng));
         }
-        builder.take().expect("The marker has an intent")
+        builder.take().expect("The ledger has an intent")
     }
 
     #[test]
-    fn a_marker_reads_back_as_it_was_written() {
+    fn a_ledger_reads_back_as_it_was_written() {
         for seed in 0..1000 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let marker = valid_marker(&mut rng);
-            let read_back = peeked_marker(&event(marker_details(&marker)));
-            assert_eq!(read_back, Some(Ok(marker)), "seed {seed}");
+            let ledger = valid_ledger(&mut rng);
+            let read_back = peeked_ledger(&event(ledger.encode_to_vec()));
+            assert_eq!(read_back, Some(Ok(ledger)), "seed {seed}");
         }
+        // A completion with no Stream call has no ledger.
+        assert!(!has_ledger(&event(vec![])));
     }
 
-    /// Breaks one rule of `marker`. Returns the details of the marker event and the reason that
-    /// the decode gives, or the start of it where the rest is the text of the JSON parser.
-    fn corrupt(
-        rng: &mut StdRng,
-        mut marker: StreamMarkerData,
-    ) -> (HashMap<String, Payloads>, String) {
-        let why = match rng.random_range(0..5) {
-            0 => return (HashMap::new(), "has no data".to_string()),
-            1 => {
-                let mut details = marker_details(&marker);
-                let payload = &mut details.get_mut(MARKER_DATA_KEY).unwrap().payloads[0];
-                let text = String::from_utf8(payload.data.clone()).unwrap();
-                // One more character makes the hex of an offset odd, and a `g` isn't hex.
-                let has_offset = "\"first_offset\":\"";
-                match rng.random_range(0..3) {
-                    0 => payload.metadata.clear(),
-                    1 if text.contains(has_offset) => {
-                        let not_hex = ["\"first_offset\":\"0", "\"first_offset\":\"0g"];
-                        let not_hex = not_hex[rng.random_range(0..2)];
-                        payload.data = text.replacen(has_offset, not_hex, 1).into_bytes();
-                    }
-                    _ => payload.data.truncate(text.len() - 1),
-                }
-                return (details, "doesn't decode: ".to_string());
+    /// Breaks one rule of `ledger`. Returns the encoded ledger and the reason that the decode
+    /// gives, or the start of it where the rest is the text of the protobuf decoder.
+    fn corrupt(rng: &mut StdRng, mut ledger: StreamLedger) -> (Vec<u8>, String) {
+        let why = match rng.random_range(0..4) {
+            0 => {
+                // A field whose length passes the end of the ledger.
+                let mut encoded = ledger.encode_to_vec();
+                encoded.extend([0x0a, 0x7f]);
+                return (encoded, "doesn't decode: ".to_string());
             }
-            2 => {
-                marker.appends.push(StreamAppendResult {
+            1 => {
+                ledger.appends.push(StreamAppendResult {
                     seq: 99,
                     ..Default::default()
                 });
                 "has no result of append 99".to_string()
             }
-            3 => {
+            2 => {
                 let activation = rng.random_range(MAX_ACTIVATION + 1..=u64::MAX);
                 match rng.random_bool(0.5) {
-                    true => marker.appends.push(StreamAppendResult {
+                    true => ledger.appends.push(StreamAppendResult {
                         seq: 99,
                         activation_index: activation,
                         result: Some(stream_append_result::Result::Appended(Default::default())),
                         ..Default::default()
                     }),
-                    false => marker.closes.push(StreamCloseResult {
+                    false => ledger.closes.push(StreamCloseResult {
                         seq: 99,
                         activation_index: activation,
                         failure: None,
@@ -529,12 +497,12 @@ mod tests {
                     message: "A later version of Core has this reason".to_string(),
                 };
                 match rng.random_bool(0.5) {
-                    true => marker.appends.push(StreamAppendResult {
+                    true => ledger.appends.push(StreamAppendResult {
                         seq: 99,
                         result: Some(stream_append_result::Result::Failure(later)),
                         ..Default::default()
                     }),
-                    false => marker.closes.push(StreamCloseResult {
+                    false => ledger.closes.push(StreamCloseResult {
                         seq: 99,
                         failure: Some(later),
                         ..Default::default()
@@ -545,19 +513,19 @@ mod tests {
                     .to_string()
             }
         };
-        (marker_details(&marker), why)
+        (ledger.encode_to_vec(), why)
     }
 
     #[test]
-    fn a_bad_marker_is_fatal() {
+    fn a_bad_ledger_is_fatal() {
         for seed in 0..1000 {
             let mut rng = StdRng::seed_from_u64(seed);
-            let valid = valid_marker(&mut rng);
-            let (details, why) = corrupt(&mut rng, valid);
-            let Some(Err(WFMachinesError::Fatal(error))) = peeked_marker(&event(details)) else {
-                panic!("seed {seed}: the marker decoded");
+            let valid = valid_ledger(&mut rng);
+            let (encoded, why) = corrupt(&mut rng, valid);
+            let Some(Err(WFMachinesError::Fatal(error))) = peeked_ledger(&event(encoded)) else {
+                panic!("seed {seed}: the ledger decoded");
             };
-            let expected = format!("The Stream marker {why}");
+            let expected = format!("The Stream ledger {why}");
             match why.ends_with(": ") {
                 true => assert!(error.starts_with(&expected), "seed {seed}: {error}"),
                 false => assert_eq!(error, expected, "seed {seed}"),
