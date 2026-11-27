@@ -452,7 +452,7 @@ impl ReplayReader {
                     // the only reason to allow more than the Workflow budget on replay.
                     let limit = match format {
                         DigestFormat::Legacy => recorded.max(super::MAX_TASK_RECORD_BYTES),
-                        DigestFormat::V1 => recorded.min(super::MAX_TASK_RECORD_BYTES),
+                        DigestFormat::V1 => super::MAX_TASK_RECORD_BYTES,
                     };
                     if bytes > limit {
                         return Err(gone(
@@ -1011,10 +1011,7 @@ mod tests {
             StoreLimits::default(),
             MetricsContext::no_op(),
             |page| {
-                if less > 0 {
-                    page.digest = DigestFormat::Legacy.hash(std::slice::from_ref(&given));
-                    page.record_bytes -= less;
-                }
+                page.record_bytes -= less;
             },
             fault,
         )
