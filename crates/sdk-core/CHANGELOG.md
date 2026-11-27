@@ -63,6 +63,8 @@ relevant information.
   the query on a fresh replay.
 * Local Activities now report a schedule-to-close timeout while waiting for a slot or between
   retry attempts. A retry that is still queued at the deadline cannot start.
+* Worker shutdown drains all Activity and Nexus poll responses before ending task delivery.
+
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 
