@@ -175,6 +175,11 @@ mod tests {
         stream::v1::{Producer, WorkflowProducer, WorkflowTaskAttempt, producer::Kind},
     };
 
+    use temporalio_streams::proto::{
+        ActivityAttempt, LocalActivityAttempt, LocalActivityProducer, StandaloneActivityProducer,
+        WorkflowActivityProducer,
+    };
+
     fn record(offset: u8, started_event_id: Option<i64>, body: Option<Payload>) -> StreamRecord {
         let workflow = |started_event_id| Producer {
             kind: Some(Kind::Workflow(WorkflowProducer {
@@ -197,10 +202,6 @@ mod tests {
 
     #[test]
     fn attempts_preserve_signed_values_and_presence_for_each_kind() {
-        use temporalio_streams::proto::{
-            ActivityAttempt, LocalActivityAttempt, LocalActivityProducer,
-            StandaloneActivityProducer, WorkflowActivityProducer,
-        };
         let time = |seconds| Some(prost_types::Timestamp { seconds, nanos: 0 });
         let mut hashes = std::collections::HashSet::new();
         for stamp in [None, time(0), time(-1), time(-2)] {
