@@ -1028,8 +1028,7 @@ impl StreamCalls {
     }
 
     /// Returns true if the task has room for the live result of `call`. A task with no Records yet
-    /// takes a page of any size, since a read asks for at most what such a task holds, and a
-    /// larger page has a single Record.
+    /// can take any accepted page. The manager rejects a Record larger than the Workflow limit.
     fn fits(&self, call: CallKey) -> bool {
         let CallKey::Read(seq) = call else {
             return true;
@@ -1362,8 +1361,10 @@ fn key(stream: &StreamRef) -> (String, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{StreamManager, manager::recorded, read::record_bytes};
-    use super::*;
+    use super::{
+        super::{StreamManager, manager::recorded, read::record_bytes},
+        *,
+    };
     use crate::{
         telemetry::metrics::MetricsContext,
         test_help::stream_store::{MemoryStore, Request as StoreRequest},

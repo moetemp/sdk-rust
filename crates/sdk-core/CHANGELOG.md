@@ -56,7 +56,8 @@ relevant information.
 * [lang-internal] The Worker's metrics count each try of a Stream call of Workflow code, with the
   attribute `stream_store`. Appends have `stream_append_total`, `stream_append_execution_failed` and
   `stream_append_execution_latency`. Reads have `stream_read_total`, `stream_read_execution_failed`
-  and `stream_read_records`, and the Store reads of a replay have
+  and `stream_read_records`. Store reads during replay have separate `stream_replay_read_total`,
+  `stream_replay_read_execution_failed`, `stream_replay_read_records` and
   `stream_replay_read_execution_latency`. Each `_execution_failed` counter has the attribute
   `failure_reason`.
 * [lang-internal] The `Start` of an activity task has the new `scheduled_event_id`, the event id of
@@ -65,6 +66,11 @@ relevant information.
   activity, and for a token that Core can't read.
 
 ### Fixed
+* A Workflow Stream read returns an unsupported-read error for a single Record over 16 MiB.
+  New read markers preserve the Producer's optional timestamps and signed values during replay.
+  Workers can still replay the original marker format, including previously delivered oversized
+  Records. Older Workers cannot interpret the new digest format.
+* Workflow replay now skips timed-out tasks consistently when a History page ends at the task start.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 

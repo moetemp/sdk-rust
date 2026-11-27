@@ -50,9 +50,9 @@ use futures_util::future::BoxFuture;
 /// [`AnyReason::StoreUnavailable`](crate::AnyReason::StoreUnavailable), which tells the caller
 /// that a retry may succeed. Core tries an append of Workflow code again after that reason. If the
 /// Store is still unavailable at the heartbeat of the Workflow Task, the task fails, so Workflow
-/// code never gets that error for an append. A read of Workflow code has a time limit, so it can
-/// end with that error. So a Store returns it only for a failure that can be resolved at a later
-/// try.
+/// code never gets that error for an append. An outage at the read limit or the final read
+/// check also fails the Workflow Task. A Store returns this reason only for a failure that a
+/// later try can resolve.
 ///
 /// # How callers call a Store
 ///
