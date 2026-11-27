@@ -61,6 +61,8 @@ relevant information.
 * Workflow replay now skips timed-out tasks consistently when a History page ends at the task start.
 * A Worker evicts a run when replay fails during a retryable legacy query. The server can retry
   the query on a fresh replay.
+* Local Activities now report a schedule-to-close timeout while waiting for a slot or between
+  retry attempts. A retry that is still queued at the deadline cannot start.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 
