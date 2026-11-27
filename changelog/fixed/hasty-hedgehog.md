@@ -1,0 +1,1 @@
+A Workflow configured to fail on nondeterminism reports the original error once, even when a Local Activity result or an Update is pending. A forced failure on a stale sticky task completes without waiting for another History page. Core retains completed tasks when it replays paginated History.

@@ -4,8 +4,8 @@ use crate::{
     job_assert,
     replay::{TestHistoryBuilder, canned_histories, default_act_sched, default_wes_attribs},
     test_help::{
-        CounterRecordingMeter, FakeWfResponses, MockPollCfg, MocksHolder, ResponseType, WorkerExt,
-        WorkerTestHelpers,
+        CounterRecordingMeter, FakeWfResponses, MockPollCfg, MocksHolder, PollWFTRespExt,
+        ResponseType, WorkerExt, WorkerTestHelpers,
         WorkflowCachingPolicy::{self, AfterEveryReply, NonSticky},
         build_fake_worker, build_mock_pollers, build_multihist_mock_sg, fanout_tasks,
         gen_assert_and_fail, gen_assert_and_reply, hist_to_poll_resp, mock_worker, poll_and_reply,
@@ -24,8 +24,10 @@ use parking_lot::Mutex;
 use rstest::{fixture, rstest};
 use siphasher::sip::SipHasher13;
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet, VecDeque},
     hash::{Hash, Hasher},
+    ops::RangeInclusive,
     sync::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -64,7 +66,7 @@ use temporalio_common::{
             enums::v1::{CommandType, EventType, RetryState, WorkflowTaskFailedCause},
             failure::v1::Failure,
             history::v1::{
-                ActivityTaskFailedEventAttributes, ActivityTaskTimedOutEventAttributes,
+                ActivityTaskFailedEventAttributes, ActivityTaskTimedOutEventAttributes, History,
                 TimerFiredEventAttributes, WorkflowPropertiesModifiedExternallyEventAttributes,
                 history_event,
             },
@@ -1518,15 +1520,34 @@ async fn fail_wft_then_recover() {
     core.drain_pollers_and_shutdown().await;
 }
 
+/// The type of each command of each completion, with the message of its failure if any.
+type SentCommands = Arc<Mutex<Vec<Vec<(CommandType, Option<String>)>>>>;
+
 /// Runs the tasks of `mh` with `WorkflowErrorType::Nondeterminism` in `workflow_failure_errors`,
 /// so nondeterminism fails the workflow rather than the task, and completes each activation with
-/// `lang` until the run is evicted. Returns the type of each command of each completion, with the
-/// message of its failure if any.
+/// `lang` until the run is evicted. Returns the commands of each completion.
 async fn run_failing_workflow_on_nondeterminism(
-    mut mh: MockPollCfg,
+    mh: MockPollCfg,
     mut lang: impl FnMut(&WorkflowActivation) -> WorkflowActivationCompletion,
 ) -> Vec<Vec<(CommandType, Option<String>)>> {
-    let sent = Arc::new(Mutex::new(vec![]));
+    let (core, sent) = worker_failing_workflows_on_nondeterminism(mh);
+    loop {
+        let act = core.poll_workflow_activation().await.unwrap();
+        if act.is_only_eviction() {
+            core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+                .await
+                .unwrap();
+            break;
+        }
+        core.complete_workflow_activation(lang(&act)).await.unwrap();
+    }
+    core.drain_pollers_and_shutdown().await;
+    sent.lock().clone()
+}
+
+/// Returns a worker for `mh` that fails workflows on nondeterminism, and the commands it sends.
+fn worker_failing_workflows_on_nondeterminism(mut mh: MockPollCfg) -> (Worker, SentCommands) {
+    let sent = SentCommands::default();
     let kept = sent.clone();
     mh.completion_mock_fn = Some(Box::new(move |c| {
         let commands = c.commands.iter().map(|command| {
@@ -1546,20 +1567,7 @@ async fn run_failing_workflow_on_nondeterminism(
         wc.max_cached_workflows = 1;
         wc.workflow_failure_errors = HashSet::from([WorkflowErrorType::Nondeterminism]);
     });
-    let core = mock_worker(mock);
-
-    loop {
-        let act = core.poll_workflow_activation().await.unwrap();
-        if act.is_only_eviction() {
-            core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
-                .await
-                .unwrap();
-            break;
-        }
-        core.complete_workflow_activation(lang(&act)).await.unwrap();
-    }
-    core.drain_pollers_and_shutdown().await;
-    sent.lock().clone()
+    (mock_worker(mock), sent)
 }
 
 /// Fails `act` with the nondeterminism error that lang found.
@@ -1704,6 +1712,678 @@ async fn a_nondeterminism_failure_in_a_later_activation_of_a_live_task_keeps_its
         [vec![timer, fail]],
         "Expected exactly one completion, containing the live task's StartTimer followed by a \
          FailWorkflowExecution with lang's error"
+    );
+}
+
+/// The state of the local activity of a live task when lang fails the task.
+#[derive(Clone, Copy, Debug)]
+enum LocalActivityAtTheFailure {
+    Running,
+    ResultCameDuringTheActivation,
+}
+
+// The workflow fails, so the failure must not wait for the local activity. A result that came
+// while lang had the activation must not activate lang again or follow the fail command. The
+// result and the completion go through one ordered queue, so the result reaches the run first.
+#[rstest]
+#[case::running(LocalActivityAtTheFailure::Running)]
+#[case::result_came_during_the_activation(LocalActivityAtTheFailure::ResultCameDuringTheActivation)]
+#[tokio::test]
+async fn a_nondeterminism_failure_in_a_live_task_with_a_local_activity_sends_one_command(
+    #[case] local_activity: LocalActivityAtTheFailure,
+) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_workflow_task_scheduled_and_started();
+    let mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    let (core, sent) = worker_failing_workflows_on_nondeterminism(mh);
+    let act = core.poll_workflow_activation().await.unwrap();
+    // A cancel of an activity that Core never sent resolves at once, in a second activation.
+    let activity = ScheduleActivity {
+        seq: 2,
+        activity_id: "2".to_string(),
+        cancellation_type: ActivityCancellationType::TryCancel as i32,
+        ..default_act_sched()
+    };
+    let commands = vec![
+        schedule_local_activity_cmd(
+            1,
+            "1",
+            ActivityCancellationType::TryCancel,
+            Duration::from_secs(60),
+        ),
+        activity.into(),
+        RequestCancelActivity { seq: 2 }.into(),
+    ];
+    core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+        act.run_id.clone(),
+        commands,
+    ))
+    .await
+    .unwrap();
+    let act = core.poll_workflow_activation().await.unwrap();
+    if let LocalActivityAtTheFailure::ResultCameDuringTheActivation = local_activity {
+        let task = core.poll_activity_task().await.unwrap();
+        core.complete_activity_task(ActivityTaskCompletion {
+            task_token: task.task_token,
+            result: Some(ActivityExecutionResult::ok(vec![1].into())),
+        })
+        .await
+        .unwrap();
+    }
+    core.complete_workflow_activation(langs_nondeterminism_failure(&act))
+        .await
+        .unwrap();
+    let act = tokio::time::timeout(Duration::from_secs(10), core.poll_workflow_activation())
+        .await
+        .expect("Expected the eviction within 10 seconds")
+        .unwrap();
+    assert!(
+        act.is_only_eviction(),
+        "Expected lang to get only the eviction after its failure: {act:?}"
+    );
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+        .await
+        .unwrap();
+    core.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        *sent.lock(),
+        fails_with_langs_error(),
+        "Expected exactly one completion, containing only a FailWorkflowExecution with lang's error"
+    );
+}
+
+/// When the first run's workflow code scheduled local activity 2 of task 1.
+#[derive(Clone, Copy, Debug)]
+enum SecondLocalActivity {
+    AtTheFirstResult,
+    WithTheFirst,
+}
+
+/// What lang answers if Core activates it again after its failure.
+#[derive(Clone, Copy, Debug)]
+enum ReplyAfterTheFailure {
+    FailsAgain,
+    StartsTheTimer,
+    SendsNoCommands,
+}
+
+// History records the two results for activations 1 and 2 of task 1, so replay holds the second
+// one while lang fails the first. The held result must not keep the failure from going out, give
+// lang another activation, or let lang's next reply replace the cause.
+#[rstest]
+#[case::at_the_first_result(
+    SecondLocalActivity::AtTheFirstResult,
+    ReplyAfterTheFailure::FailsAgain
+)]
+#[case::with_the_first_then_a_failure(
+    SecondLocalActivity::WithTheFirst,
+    ReplyAfterTheFailure::FailsAgain
+)]
+#[case::with_the_first_then_a_timer(
+    SecondLocalActivity::WithTheFirst,
+    ReplyAfterTheFailure::StartsTheTimer
+)]
+#[case::with_the_first_then_no_commands(
+    SecondLocalActivity::WithTheFirst,
+    ReplyAfterTheFailure::SendsNoCommands
+)]
+#[tokio::test]
+async fn a_nondeterminism_failure_with_a_local_activity_result_held_sends_one_command(
+    #[case] second: SecondLocalActivity,
+    #[case] reply: ReplyAfterTheFailure,
+) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    for seq in 1..=2 {
+        let result = Some("done".into());
+        t.add_local_activity_marker(seq, &seq.to_string(), result, None, |marker| {
+            marker.activation_index = Some(u64::from(seq));
+        });
+    }
+    let started = t.add_timer_started("1".to_string());
+    t.add_timer_fired(started, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let mh = MockPollCfg::from_resp_batches(
+        "fake_wf_id",
+        t,
+        [ResponseType::AllHistory],
+        mock_worker_client(),
+    );
+    let local_activity = |seq| {
+        schedule_local_activity_cmd(
+            seq,
+            &seq.to_string(),
+            ActivityCancellationType::TryCancel,
+            Duration::from_secs(60),
+        )
+    };
+    let activations = RefCell::new(vec![]);
+    let lang = |act: &WorkflowActivation| {
+        activations.borrow_mut().push(act.jobs.clone());
+        let count = activations.borrow().len();
+        match &act.jobs[0].variant {
+            Some(workflow_activation_job::Variant::InitializeWorkflow(_)) => {
+                let commands = match second {
+                    SecondLocalActivity::AtTheFirstResult => vec![local_activity(1)],
+                    SecondLocalActivity::WithTheFirst => vec![local_activity(1), local_activity(2)],
+                };
+                WorkflowActivationCompletion::from_cmds(act.run_id.clone(), commands)
+            }
+            _ if count == 2 => langs_nondeterminism_failure(act),
+            _ => match reply {
+                ReplyAfterTheFailure::FailsAgain => langs_nondeterminism_failure(act),
+                ReplyAfterTheFailure::StartsTheTimer => WorkflowActivationCompletion::from_cmds(
+                    act.run_id.clone(),
+                    vec![start_timer_cmd(1, Duration::from_secs(1))],
+                ),
+                ReplyAfterTheFailure::SendsNoCommands => {
+                    WorkflowActivationCompletion::empty(act.run_id.clone())
+                }
+            },
+        }
+    };
+    let run = run_failing_workflow_on_nondeterminism(mh, lang);
+    let sent = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("Expected the failure to go out within 10 seconds");
+    assert_eq!(
+        sent,
+        fails_with_langs_error(),
+        "Expected exactly one completion, containing only a FailWorkflowExecution with lang's error"
+    );
+    let activations = activations.into_inner();
+    assert_eq!(
+        activations.len(),
+        2,
+        "Expected lang to get no activation after the one it failed: {activations:?}"
+    );
+    assert_matches!(
+        &activations[1][..],
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::ResolveActivity(
+                ResolveActivity { seq: 1, .. }
+            )),
+        }]
+    );
+}
+
+/// Who finds the nondeterminism in an update-only task.
+#[derive(Clone, Copy, Debug)]
+enum UpdateOnlyNondeterminism {
+    /// Lang fails the activation, as the Rust SDK does with `[TMPRL1100]`.
+    Lang,
+    /// Lang sends a command without accepting the update, which Core rejects.
+    Core,
+}
+
+/// The state of the run when the update-only task comes.
+#[derive(Clone, Copy, Debug)]
+enum RunAtTheUpdate {
+    /// The worker completed task 1 and kept the run.
+    Cached,
+    /// The task brings all of history, as a poll that is not sticky does. The update then comes
+    /// with the workflow's initialization, so the activation is not update-only.
+    Cold,
+}
+
+// A live task that only delivers an update has no new events but its own scheduled and started
+// events. The forced fail command is not an update response, so it must not trip Core's check
+// for commands in an update-only activation. The workflow fails once, with the error found.
+#[rstest]
+#[case::lang_cached(UpdateOnlyNondeterminism::Lang, RunAtTheUpdate::Cached)]
+#[case::core_cached(UpdateOnlyNondeterminism::Core, RunAtTheUpdate::Cached)]
+#[case::lang_cold(UpdateOnlyNondeterminism::Lang, RunAtTheUpdate::Cold)]
+#[tokio::test]
+async fn a_nondeterminism_failure_in_an_update_only_task_fails_the_workflow_once(
+    #[case] found_by: UpdateOnlyNondeterminism,
+    #[case] run_at_the_update: RunAtTheUpdate,
+) {
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_workflow_task_scheduled_and_started();
+    let mut update_task = hist_to_poll_resp(&t, "fake_wf_id", ResponseType::AllHistory).resp;
+    update_task.add_update_request("upd1", 5);
+    let tasks = match run_at_the_update {
+        RunAtTheUpdate::Cached => vec![
+            hist_to_poll_resp(&t, "fake_wf_id", ResponseType::ToTaskNum(1)).resp,
+            update_task,
+        ],
+        RunAtTheUpdate::Cold => vec![update_task],
+    };
+    let mh = MockPollCfg::from_resp_batches("fake_wf_id", t, tasks, mock_worker_client());
+    let activations = RefCell::new(vec![]);
+    let lang = |act: &WorkflowActivation| {
+        activations.borrow_mut().push(act.jobs.clone());
+        let has_update = act.jobs.iter().any(|job| {
+            matches!(
+                job.variant,
+                Some(workflow_activation_job::Variant::DoUpdate(_))
+            )
+        });
+        match found_by {
+            _ if !has_update => WorkflowActivationCompletion::empty(act.run_id.clone()),
+            UpdateOnlyNondeterminism::Lang => langs_nondeterminism_failure(act),
+            UpdateOnlyNondeterminism::Core => WorkflowActivationCompletion::from_cmds(
+                act.run_id.clone(),
+                vec![start_timer_cmd(1, Duration::from_secs(1))],
+            ),
+        }
+    };
+    let run = run_failing_workflow_on_nondeterminism(mh, lang);
+    let sent = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("Expected the run to end within 10 seconds");
+    let fails: Vec<_> = (sent.iter().flatten())
+        .filter(|(command, _)| *command == CommandType::FailWorkflowExecution)
+        .collect();
+    assert_eq!(
+        fails.len(),
+        1,
+        "Expected one FailWorkflowExecution. Completions: {sent:?}"
+    );
+    let expected_error = match found_by {
+        UpdateOnlyNondeterminism::Lang => "changed",
+        UpdateOnlyNondeterminism::Core => {
+            "[TMPRL1100] Nondeterminism error: Update-only activation produced commands without \
+             accepting an update"
+        }
+    };
+    assert_matches!(
+        sent.last().map(Vec::as_slice),
+        Some([(CommandType::FailWorkflowExecution, Some(error))]) if error == expected_error,
+        "Expected the last completion to only fail the workflow with {expected_error:?}. \
+         Completions: {sent:?}"
+    );
+    let activations = activations.into_inner();
+    let expected_activations = match run_at_the_update {
+        RunAtTheUpdate::Cached => 2,
+        RunAtTheUpdate::Cold => 1,
+    };
+    assert_eq!(
+        activations.len(),
+        expected_activations,
+        "Expected lang to get no activation after the one it failed: {activations:?}"
+    );
+}
+
+/// Where the nondeterminism is, in a history whose second page ends inside a task.
+#[derive(Clone, Copy, Debug)]
+enum NondeterminismAtTheLastPage {
+    /// Lang fails the activation of the last task that the second page completes.
+    Lang,
+    /// Lang's command in the activation before that task differs from it, which Core finds.
+    Core,
+}
+
+/// The events of `t` with an id in `ids`, as a page of `GetWorkflowExecutionHistory`.
+fn history_page(
+    t: &TestHistoryBuilder,
+    ids: RangeInclusive<i64>,
+    next_page_token: Vec<u8>,
+) -> GetWorkflowExecutionHistoryResponse {
+    let events = t.get_full_history_info().unwrap().into_events();
+    GetWorkflowExecutionHistoryResponse {
+        history: Some(History {
+            events: (events.into_iter())
+                .filter(|event| ids.contains(&event.event_id))
+                .collect(),
+        }),
+        next_page_token,
+        ..Default::default()
+    }
+}
+
+/// Mocks that poll `task`, and fetch the page of `pages` with the requested page token. The
+/// counter counts the fetches.
+fn paged_history_mocks(
+    wf_id: &str,
+    t: TestHistoryBuilder,
+    task: ResponseType,
+    pages: Vec<(Vec<u8>, GetWorkflowExecutionHistoryResponse)>,
+) -> (MockPollCfg, Arc<AtomicUsize>) {
+    let fetches = Arc::new(AtomicUsize::new(0));
+    let counted = fetches.clone();
+    let mut client = mock_worker_client();
+    client
+        .expect_get_workflow_execution_history()
+        .returning(move |_, _, token| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            let (_, page) = (pages.iter())
+                .find(|(page_token, _)| *page_token == token)
+                .unwrap_or_else(|| panic!("Unexpected page token {token:?}"));
+            Ok(page.clone())
+        });
+    let mh = MockPollCfg::from_resp_batches(wf_id, t, [task], client);
+    (mh, fetches)
+}
+
+/// Runs a workflow that starts timer `n` in activation `n`, until `found_by` makes activation
+/// `failing_activation` nondeterministic. Checks that lang's completion returns, that the workflow
+/// fails once with the error found, and that lang gets no activation after it. Returns the value
+/// of `fetches` when lang got the failing activation.
+async fn fail_a_timer_loop_once(
+    mh: MockPollCfg,
+    found_by: NondeterminismAtTheLastPage,
+    failing_activation: usize,
+    fetches: &AtomicUsize,
+) -> usize {
+    let events = mh.hists[0]
+        .hist
+        .get_full_history_info()
+        .unwrap()
+        .into_events();
+    let timer_id = failing_activation.to_string();
+    let timer_started = (events.iter())
+        .find(|event| {
+            matches!(&event.attributes,
+                Some(history_event::Attributes::TimerStartedEventAttributes(timer))
+                    if timer.timer_id == timer_id)
+        })
+        .expect("Expected history to start the timer of the failing activation")
+        .event_id;
+    let mut activations = 0;
+    let mut fetches_at_the_failure = 0;
+    let lang = |act: &WorkflowActivation| {
+        activations += 1;
+        if activations < failing_activation {
+            let seq = activations as u32;
+            return WorkflowActivationCompletion::from_cmd(
+                act.run_id.clone(),
+                start_timer_cmd(seq, Duration::from_secs(1)),
+            );
+        }
+        fetches_at_the_failure = fetches.load(Ordering::SeqCst);
+        match found_by {
+            NondeterminismAtTheLastPage::Lang => langs_nondeterminism_failure(act),
+            NondeterminismAtTheLastPage::Core => {
+                let activity = ScheduleActivity {
+                    seq: 1,
+                    activity_id: "1".to_string(),
+                    ..default_act_sched()
+                };
+                WorkflowActivationCompletion::from_cmd(act.run_id.clone(), activity.into())
+            }
+        }
+    };
+    let run = run_failing_workflow_on_nondeterminism(mh, lang);
+    let sent = tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .expect("Expected the run to end within 10 seconds");
+    let expected_error = match found_by {
+        NondeterminismAtTheLastPage::Lang => "changed".to_string(),
+        NondeterminismAtTheLastPage::Core => format!(
+            "[TMPRL1100] Nondeterminism error: Activity machine does not handle this event: \
+             HistoryEvent(id: {timer_started}, TimerStarted)"
+        ),
+    };
+    let fail = (CommandType::FailWorkflowExecution, Some(expected_error));
+    assert_eq!(
+        sent,
+        vec![vec![fail]],
+        "Expected one completion, containing only a FailWorkflowExecution with the error found"
+    );
+    assert_eq!(
+        activations, failing_activation,
+        "Expected lang to get no activation after the failure"
+    );
+    fetches_at_the_failure
+}
+
+// The poll brings the first page of a long history and the paginator fetches the rest by page
+// token. The second page ends inside task 3, so the failure in task 2 would come before the last
+// page if the paginator stopped there. It loads every page first, since only the current task
+// follows the previous started event. The workflow fails once and lang's completion returns.
+#[rstest]
+#[case::lang(NondeterminismAtTheLastPage::Lang, 2)]
+#[case::core(NondeterminismAtTheLastPage::Core, 1)]
+#[tokio::test]
+async fn a_nondeterminism_failure_in_a_paged_history_sends_one_command(
+    #[case] found_by: NondeterminismAtTheLastPage,
+    #[case] failing_activation: usize,
+) {
+    let wf_id = "fake_wf_id";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    for timer_id in ["1", "2", "3"] {
+        let started = t.add_timer_started(timer_id.to_string());
+        t.add_timer_fired(started, timer_id.to_string());
+        if timer_id == "3" {
+            t.add_workflow_task_scheduled_and_started();
+        } else {
+            t.add_full_wf_task();
+        }
+    }
+    let mut task = hist_to_poll_resp(&t, wf_id, ResponseType::AllHistory).resp;
+    assert_eq!(
+        (task.previous_started_event_id, task.started_event_id),
+        (13, 18)
+    );
+    // A page holds whole batches. A timer fires in the batch of the next task's scheduled event.
+    task.history = history_page(&t, 1..=7, vec![]).history;
+    task.next_page_token = vec![1];
+    let pages = vec![
+        (vec![1], history_page(&t, 8..=12, vec![2])),
+        (vec![2], history_page(&t, 13..=18, vec![])),
+    ];
+    let (mh, fetches) = paged_history_mocks(wf_id, t, ResponseType::Raw(task), pages);
+    let fetches_at_the_failure =
+        fail_a_timer_loop_once(mh, found_by, failing_activation, &fetches).await;
+    assert_eq!(
+        fetches_at_the_failure, 2,
+        "Expected the paginator to fetch both remaining pages before the failing activation"
+    );
+}
+
+// A sticky task comes for a run that is no longer cached, so Core fetches history from the start.
+// By then the task timed out and another worker completed the next two tasks, so the history goes
+// past the task's own started event. Two tasks then follow the previous started event, and the
+// paginator stops after the second page, which ends inside the last task. A forced failure at the
+// last task of that page must not wait for the next one. The server refuses the completion of a
+// timed out task, which doesn't change what Core sends.
+#[rstest]
+#[case::lang(NondeterminismAtTheLastPage::Lang, 5)]
+#[case::core(NondeterminismAtTheLastPage::Core, 4)]
+#[tokio::test]
+async fn a_nondeterminism_failure_before_the_next_page_of_a_timed_out_task_sends_one_command(
+    #[case] found_by: NondeterminismAtTheLastPage,
+    #[case] failing_activation: usize,
+) {
+    let wf_id = "fake_wf_id";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    for timer_id in ["1", "2"] {
+        let started = t.add_timer_started(timer_id.to_string());
+        t.add_timer_fired(started, timer_id.to_string());
+        t.add_full_wf_task();
+    }
+    let started = t.add_timer_started("3".to_string());
+    t.add_timer_fired(started, "3".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let sticky_task = hist_to_poll_resp(&t, wf_id, ResponseType::OneTask(4)).resp;
+    assert_eq!(
+        (
+            sticky_task.previous_started_event_id,
+            sticky_task.started_event_id
+        ),
+        (13, 18)
+    );
+    // That task times out, and another worker completes the next attempt and one more task.
+    t.add_workflow_task_timed_out();
+    t.add_full_wf_task();
+    let started = t.add_timer_started("4".to_string());
+    t.add_timer_fired(started, "4".to_string());
+    t.add_full_wf_task();
+    let started = t.add_timer_started("5".to_string());
+    t.add_timer_fired(started, "5".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let pages = vec![
+        (vec![], history_page(&t, 1..=23, vec![1])),
+        (vec![1], history_page(&t, 24..=28, vec![2])),
+        (vec![2], history_page(&t, 29..=31, vec![])),
+    ];
+    let (mh, fetches) = paged_history_mocks(wf_id, t, ResponseType::Raw(sticky_task), pages);
+    let fetches_at_the_failure =
+        fail_a_timer_loop_once(mh, found_by, failing_activation, &fetches).await;
+    assert_eq!(
+        fetches_at_the_failure, 2,
+        "Expected the paginator to fetch the first two of three pages before the failing activation"
+    );
+}
+
+// As above, a sticky task for an uncached run reads a history that goes past its started event.
+// Here no task has a command. The first page ends inside a task, so the first update ends at the
+// task of signal "2", which only the events after it on that page show to be complete. Lang must
+// still get every signal once, in order, before Core completes the task.
+#[tokio::test]
+async fn a_task_without_commands_at_the_end_of_a_newer_history_page_reaches_lang() {
+    let wf_id = "fake_wf_id";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    t.add_we_signaled("1", vec![]);
+    t.add_workflow_task_scheduled_and_started();
+    let sticky_task = hist_to_poll_resp(&t, wf_id, ResponseType::OneTask(2)).resp;
+    assert_eq!(
+        (
+            sticky_task.previous_started_event_id,
+            sticky_task.started_event_id
+        ),
+        (3, 7)
+    );
+    // That task times out, and another worker completes the next attempt and three more signals.
+    t.add_workflow_task_timed_out();
+    t.add_full_wf_task();
+    for signal in ["2", "3", "4"] {
+        t.add_we_signaled(signal, vec![]);
+        t.add_full_wf_task();
+    }
+    let pages = vec![
+        (vec![], history_page(&t, 1..=18, vec![1])),
+        (vec![1], history_page(&t, 19..=23, vec![])),
+    ];
+    let (mut mh, fetches) = paged_history_mocks(wf_id, t, ResponseType::Raw(sticky_task), pages);
+    // With no matching expectation, mockall panics with the arguments, so with Core's error.
+    mh.expect_fail_wft_matcher = Box::new(|_, _, _| false);
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+    let mut signals = vec![];
+    let replay = async {
+        while signals.len() < 4 {
+            let act = core.poll_workflow_activation().await.unwrap();
+            for job in &act.jobs {
+                if let Some(workflow_activation_job::Variant::SignalWorkflow(signal)) = &job.variant
+                {
+                    signals.push(signal.signal_name.clone());
+                    if signal.signal_name == "2" {
+                        assert_eq!(
+                            fetches.load(Ordering::SeqCst),
+                            1,
+                            "Expected the task of signal 2 to end the update of the first page"
+                        );
+                    }
+                }
+            }
+            core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
+                .await
+                .unwrap();
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), replay)
+        .await
+        .expect("Expected lang to get every signal within 10 seconds");
+    assert_eq!(
+        signals,
+        ["1", "2", "3", "4"],
+        "Expected lang to get every signal once, in order"
+    );
+    core.drain_pollers_and_shutdown().await;
+}
+
+#[tokio::test]
+async fn a_timeout_on_the_next_page_does_not_change_workflow_history_length() {
+    let wf_id = "wf";
+    let mut t = TestHistoryBuilder::default();
+    t.add_by_type(EventType::WorkflowExecutionStarted);
+    t.add_full_wf_task();
+    let timer = t.add_timer_started("1".to_string());
+    t.add_timer_fired(timer, "1".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let sticky = hist_to_poll_resp(&t, wf_id, ResponseType::OneTask(2)).resp;
+    assert_eq!(
+        (sticky.previous_started_event_id, sticky.started_event_id),
+        (3, 8)
+    );
+    t.add_workflow_task_timed_out();
+    t.add_full_wf_task();
+    let timer = t.add_timer_started("2".to_string());
+    t.add_timer_fired(timer, "2".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    t.add_workflow_task_timed_out();
+    t.add_full_wf_task();
+    let timer = t.add_timer_started("3".to_string());
+    t.add_timer_fired(timer, "3".to_string());
+    t.add_workflow_task_scheduled_and_started();
+    let pages = vec![
+        (vec![], history_page(&t, 1..=16, vec![1])),
+        (vec![1], history_page(&t, 17..=24, vec![])),
+    ];
+    let (mut mh, _) = paged_history_mocks(wf_id, t, ResponseType::Raw(sticky), pages);
+    mh.expect_fail_wft_matcher = Box::new(|_, _, _| false);
+    let mut mock = build_mock_pollers(mh);
+    mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
+    let core = mock_worker(mock);
+    let mut lengths = vec![];
+    let run = async {
+        loop {
+            let act = core.poll_workflow_activation().await.unwrap();
+            let mut commands = vec![];
+            let mut done = false;
+            for job in &act.jobs {
+                match job.variant.as_ref().unwrap() {
+                    workflow_activation_job::Variant::InitializeWorkflow(_) => {
+                        commands.push(start_timer_cmd(1, Duration::from_secs(1)));
+                    }
+                    workflow_activation_job::Variant::FireTimer(timer) => {
+                        lengths.push((timer.seq, act.history_length));
+                        if timer.seq == 3 {
+                            commands.push(CompleteWorkflowExecution::default().into());
+                            done = true;
+                        } else {
+                            commands.push(start_timer_cmd(timer.seq + 1, Duration::from_secs(1)));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            core.complete_workflow_activation(WorkflowActivationCompletion::from_cmds(
+                act.run_id, commands,
+            ))
+            .await
+            .unwrap();
+            if done {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(10), run)
+        .await
+        .unwrap();
+    core.drain_pollers_and_shutdown().await;
+    assert_eq!(
+        lengths,
+        [(1, 11), (2, 19), (3, 24)],
+        "a historical timed-out task must not set the Workflow's observed History length"
     );
 }
 
@@ -3631,6 +4311,18 @@ async fn ensure_fetching_fail_during_complete_sends_task_failure() {
     let core = mock_worker(mock);
 
     let wf_task = core.poll_workflow_activation().await.unwrap();
+    core.complete_workflow_activation(WorkflowActivationCompletion::empty(wf_task.run_id))
+        .await
+        .unwrap();
+
+    // The first page holds the signal's task, so lang gets it before Core fetches the next page.
+    let wf_task = core.poll_workflow_activation().await.unwrap();
+    assert_matches!(
+        wf_task.jobs.as_slice(),
+        [WorkflowActivationJob {
+            variant: Some(workflow_activation_job::Variant::SignalWorkflow(_)),
+        },]
+    );
     core.complete_workflow_activation(WorkflowActivationCompletion::empty(wf_task.run_id))
         .await
         .unwrap();
