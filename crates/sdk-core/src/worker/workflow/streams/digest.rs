@@ -8,7 +8,7 @@ use temporalio_streams::{
     proto::{StreamRecord, WorkflowTaskAttempt, producer::Kind},
 };
 
-/// The length of a digest in a read marker, in bytes. It's a fact of the marker's format.
+/// Number of hash bytes in a read marker, excluding the version prefix.
 const DIGEST_LEN: usize = 16;
 
 /// The first byte of the hashed input, so the digest differs from other hashes of the same bytes.
