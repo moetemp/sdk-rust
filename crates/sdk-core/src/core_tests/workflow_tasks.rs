@@ -2145,11 +2145,15 @@ async fn a_nondeterminism_failure_before_the_next_page_of_a_timed_out_task_sends
     t.add_full_wf_task();
     let started = t.add_timer_started("5".to_string());
     t.add_timer_fired(started, "5".to_string());
+    t.add_full_wf_task();
+    let started = t.add_timer_started("6".to_string());
+    t.add_timer_fired(started, "6".to_string());
     t.add_workflow_task_scheduled_and_started();
+    // The second page supplies the failing task's marker lookahead. The third stays unread.
     let pages = vec![
         (vec![], history_page(&t, 1..=23, vec![1])),
-        (vec![1], history_page(&t, 24..=28, vec![2])),
-        (vec![2], history_page(&t, 29..=31, vec![])),
+        (vec![1], history_page(&t, 24..=33, vec![2])),
+        (vec![2], history_page(&t, 34..=36, vec![])),
     ];
     let (mh, fetches) = paged_history_mocks(wf_id, t, ResponseType::Raw(sticky_task), pages);
     let fetches_at_the_failure =
@@ -2188,7 +2192,7 @@ async fn a_task_without_commands_at_the_end_of_a_newer_history_page_reaches_lang
         (vec![], history_page(&t, 1..=18, vec![1])),
         (vec![1], history_page(&t, 19..=23, vec![])),
     ];
-    let (mut mh, fetches) = paged_history_mocks(wf_id, t, ResponseType::Raw(sticky_task), pages);
+    let (mut mh, _) = paged_history_mocks(wf_id, t, ResponseType::Raw(sticky_task), pages);
     mh.expect_fail_wft_matcher = Box::new(|_, _, _| false);
     let mut mock = build_mock_pollers(mh);
     mock.worker_cfg(|wc| wc.max_cached_workflows = 1);
@@ -2201,13 +2205,6 @@ async fn a_task_without_commands_at_the_end_of_a_newer_history_page_reaches_lang
                 if let Some(workflow_activation_job::Variant::SignalWorkflow(signal)) = &job.variant
                 {
                     signals.push(signal.signal_name.clone());
-                    if signal.signal_name == "2" {
-                        assert_eq!(
-                            fetches.load(Ordering::SeqCst),
-                            1,
-                            "Expected the task of signal 2 to end the update of the first page"
-                        );
-                    }
                 }
             }
             core.complete_workflow_activation(WorkflowActivationCompletion::empty(act.run_id))
@@ -4203,12 +4200,14 @@ async fn fetch_failure_during_completion_evicts_the_run(#[values(false, true)] l
     t.add_we_signaled("sig1", vec![]);
     t.add_full_wf_task(); // started 7
 
-    // The command lets the Worker start replay before the next fetch.
-    t.add_by_type(EventType::TimerStarted);
+    // The second Signal puts the first Signal's marker lookahead on the fetched page.
+    t.add_we_signaled("sig2", vec![]);
     t.add_full_wf_task(); // started 11
+    t.add_we_signaled("sig3", vec![]);
+    t.add_full_wf_task();
     t.add_workflow_execution_completed();
 
-    let mut first_poll = hist_to_poll_resp(&t, wfid, ResponseType::OneTask(4)).resp;
+    let mut first_poll = hist_to_poll_resp(&t, wfid, ResponseType::OneTask(3)).resp;
     // Use an earlier task boundary so replay starts before the failing fetch.
     first_poll.previous_started_event_id = 0;
     first_poll.started_event_id = 11;
@@ -4218,7 +4217,7 @@ async fn fetch_failure_during_completion_evicts_the_run(#[values(false, true)] l
 
     let mut next_page: GetWorkflowExecutionHistoryResponse =
         t.get_full_history_info().unwrap().into();
-    next_page.history.as_mut().unwrap().events.truncate(9);
+    next_page.history.as_mut().unwrap().events.truncate(13);
     next_page.next_page_token = vec![2];
 
     let mut mock = mock_worker_client();

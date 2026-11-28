@@ -1488,8 +1488,7 @@ mod tests {
         assert_matches!(next, NextWFT::NeedFetch);
     }
 
-    // The update can't see the events that `from_events` splits off. It must still take the task
-    // without commands that those events showed to be complete, before it asks for a fetch.
+    // The task outcome is known, but its markers can still be on the next page.
     #[rstest::rstest]
     fn task_without_commands_at_the_end_of_an_update_is_taken(
         #[values(false, true)] chunking_disabled: bool,
@@ -1515,7 +1514,7 @@ mod tests {
         assert_eq!(remaining, [12, 13]);
         let mut from_id = 0;
         for expected in [3, 7, 11] {
-            assert!(update.can_take_next_wft_sequence(from_id), "from {from_id}");
+            assert_eq!(update.can_take_next_wft_sequence(from_id), expected != 11);
             let seq = next_check_peek(&mut update, from_id);
             assert_eq!(seq.last().unwrap().event_id, expected);
             from_id = expected;

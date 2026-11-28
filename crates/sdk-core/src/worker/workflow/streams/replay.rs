@@ -113,9 +113,9 @@ pub(in crate::worker::workflow) enum StreamRecordsReq {
 impl StreamRecordsReq {
     pub(in crate::worker::workflow) fn failure_context(
         &self,
-    ) -> (String, Option<UnstoredWftFailInfo>) {
+    ) -> (String, Option<UnstoredWftFailInfo>, Arc<HistfetchRC>) {
         match self {
-            Self::NewRun(pwft, _) => {
+            Self::NewRun(pwft, rc) => {
                 let work = &pwft.work;
                 let info = UnstoredWftFailInfo {
                     task_token: work.task_token.clone(),
@@ -124,10 +124,10 @@ impl StreamRecordsReq {
                     workflow_type: work.workflow_type.clone(),
                     kind: WftFailureKind::for_history_fetch(work.legacy_query.is_some()),
                 };
-                (work.execution.run_id.clone(), Some(info))
+                (work.execution.run_id.clone(), Some(info), rc.clone())
             }
-            Self::NextPart(req, _) | Self::HistoryPage(req, _, _) => {
-                (req.paginator.run_id.clone(), None)
+            Self::NextPart(req, rc) | Self::HistoryPage(req, _, rc) => {
+                (req.paginator.run_id.clone(), None, rc.clone())
             }
         }
     }

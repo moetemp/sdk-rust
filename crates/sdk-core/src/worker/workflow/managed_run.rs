@@ -16,7 +16,7 @@ use crate::{
             history_update::HistoryPaginator,
             machines::{MachinesWFTResponseContent, WorkflowMachines},
             streams::{
-                ReadLimit, ReplayReader, RunStreams, Streams, TaskState, is_stream_marker,
+                ReadLimit, RunStreams, Streams, TaskState, is_stream_marker,
                 is_stream_replay_failure, task_attempt,
             },
             wft_extraction::FetchedPage,

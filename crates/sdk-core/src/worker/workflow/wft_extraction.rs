@@ -183,9 +183,11 @@ impl WFTExtractor {
         let handle = Handle::current();
         let records = records_stream
             .map(move |request| {
-                let (run_id, auto_reply_fail) = request.failure_context();
+                let (run_id, auto_reply_fail, rc) = request.failure_context();
                 let read = AbortOnDropHandle::new(handle.spawn(request.read()));
                 read.map(move |output| {
+                    // Shutdown must wait for delivery of a failed read even if the Store panics.
+                    let _guard = rc;
                     Ok(
                         output.unwrap_or_else(|error| WFTExtractorOutput::FailedFetch {
                             run_id,
@@ -242,7 +244,14 @@ mod tests {
             });
         let permit = fixed_size_permit_dealer(1).acquire_owned().await;
         let incoming = stream::iter([Ok((task.try_into().unwrap(), permit))]);
-        let output = WFTExtractor::build(Arc::new(client), 2, incoming, stream::pending());
+        let output = WFTExtractor::build(
+            Arc::new(client),
+            2,
+            incoming,
+            stream::pending(),
+            stream::pending(),
+            1,
+        );
         futures_util::pin_mut!(output);
 
         assert!(output.next().now_or_never().is_none());

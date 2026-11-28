@@ -2211,7 +2211,6 @@ async fn a_failed_fetch_of_another_task_fails_no_completion_that_waits_for_recor
     opts.tasks = Some(receiver);
     opts.served = None;
     opts.failed_fetches = 1;
-    opts.fails = 1;
     opts.configure = Box::new(|wc| {
         wc.stream_runtimes.settings.max_task_record_bytes = 1;
         wc.stream_runtimes.settings.try_deadline = Duration::from_secs(600);
@@ -2237,19 +2236,10 @@ async fn a_failed_fetch_of_another_task_fails_no_completion_that_waits_for_recor
     run.all_taken.take().unwrap().await.unwrap();
     store.release();
     completion.await.unwrap();
-    // The replay goes on to the end of the task, which completes. Then the run leaves the cache,
-    // and Core fails the task of the query.
+    // A retryable query failure must not replace the real task's completion.
     run.drive(workflow).await;
     assert_eq!(run.sent().len(), 1);
-    let failed = run.failed.lock().clone();
-    let [(cause, message)] = &failed[..] else {
-        panic!("{failed:?}");
-    };
-    assert_eq!(
-        *cause,
-        WorkflowTaskFailedCause::WorkflowWorkerUnhandledFailure
-    );
-    assert!(message.starts_with("Fetching history failed"), "{message}");
+    assert!(run.failed.lock().is_empty());
     run.worker.drain_pollers_and_shutdown_ref().await;
 }
 
