@@ -60,6 +60,8 @@ relevant information.
   Records. Older Workers cannot interpret the new digest format.
 * Workflow replay now skips timed-out tasks consistently when a History page ends at the task start.
 * Workflow queries retain task results when replay needs another History page.
+* Worker shutdown drains all Activity and Nexus poll responses before ending task delivery.
+
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 
