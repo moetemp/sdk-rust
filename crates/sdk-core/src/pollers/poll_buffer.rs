@@ -405,13 +405,16 @@ where
                             _ = shutdown_clone.cancelled() => break,
                         }
                     }
+                    // A freed slot must not start another poll after shutdown.
                     let permit = tokio::select! {
-                        p = permit_dealer.acquire_owned() => p,
+                        biased;
                         _ = shutdown_clone.cancelled() => break,
+                        p = permit_dealer.acquire_owned() => p,
                     };
                     let active_guard = tokio::select! {
-                        ag = poll_scaler.wait_until_allowed() => ag,
+                        biased;
                         _ = shutdown_clone.cancelled() => break,
+                        ag = poll_scaler.wait_until_allowed() => ag,
                     };
                     // Spawn poll task
                     let shutdown = shutdown_clone.clone();
@@ -899,7 +902,7 @@ mod tests {
     use super::*;
     use crate::{
         abstractions::tests::fixed_size_permit_dealer,
-        pollers::{BoxedPoller, TaskPollerStream, ValidatableTask},
+        pollers::{BoxedPoller, StickyTaskPoller, TaskPollerStream, ValidatableTask},
         telemetry::metrics::MetricsContext,
         worker::client::mocks::mock_manual_worker_client,
     };
@@ -1015,6 +1018,45 @@ mod tests {
             ..Default::default()
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn closed_sticky_poller_still_delivers_normal_tasks() {
+        let mut client = mock_manual_worker_client();
+        client.expect_poll_workflow_task().returning(|_, _| {
+            async {
+                Ok(PollWorkflowTaskQueueResponse {
+                    task_token: vec![1],
+                    ..Default::default()
+                })
+            }
+            .boxed()
+        });
+        let client = Arc::new(client);
+        let make_buffer = |sticky| {
+            LongPollBuffer::new_workflow_task(
+                client.clone(),
+                "task-queue".to_owned(),
+                sticky,
+                PollerBehavior::SimpleMaximum(1),
+                fixed_size_permit_dealer(1),
+                CancellationToken::new(),
+                None::<fn(usize)>,
+                WorkflowTaskOptions {
+                    wft_poller_shared: None,
+                },
+                PollerHeartbeatState::default(),
+                Arc::new(NamespaceCapabilities::default()),
+            )
+        };
+
+        let sticky = make_buffer(Some("sticky".to_owned()));
+        sticky.notify_shutdown();
+        assert!(sticky.poll().await.is_none());
+        let poller = StickyTaskPoller::new(make_buffer(None), Some(sticky));
+        let (task, _permit) = poller.poll().await.unwrap().unwrap();
+        assert_eq!(task.task_token, [1]);
+        poller.shutdown().await;
     }
 
     #[tokio::test]
@@ -1568,6 +1610,58 @@ mod tests {
         }
 
         pb.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn slot_freed_with_shutdown_does_not_start_a_poll() {
+        // Repeat because an unbiased select can choose shutdown by chance.
+        for _ in 0..100 {
+            let mut mock_client = mock_manual_worker_client();
+            let call_count = Arc::new(AtomicUsize::new(0));
+            let call_count_clone = call_count.clone();
+            mock_client
+                .expect_poll_workflow_task()
+                .returning(move |_, _| {
+                    call_count_clone.fetch_add(1, Ordering::SeqCst);
+                    async {
+                        Ok(PollWorkflowTaskQueueResponse {
+                            task_token: vec![1],
+                            ..Default::default()
+                        })
+                    }
+                    .boxed()
+                });
+
+            let shutdown_token = CancellationToken::new();
+            let pb = LongPollBuffer::new_workflow_task(
+                Arc::new(mock_client),
+                "sometq".to_string(),
+                None,
+                PollerBehavior::SimpleMaximum(1),
+                fixed_size_permit_dealer(1),
+                shutdown_token.clone(),
+                None::<fn(usize)>,
+                WorkflowTaskOptions {
+                    wft_poller_shared: None,
+                },
+                PollerHeartbeatState::default(),
+                Arc::new(NamespaceCapabilities::resolved(Capabilities {
+                    worker_poll_complete_on_shutdown: true,
+                    ..Default::default()
+                })),
+            );
+
+            let (_, permit) = pb.poll().await.unwrap().unwrap();
+            shutdown_token.cancel();
+            drop(permit);
+
+            assert!(
+                pb.poll().await.is_none(),
+                "No poll should start after shutdown"
+            );
+            pb.shutdown().await;
+            assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        }
     }
 
     #[rstest]

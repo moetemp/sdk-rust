@@ -84,6 +84,9 @@ relevant information.
   outstanding Update.
 * A stale sticky task replays every completed task in newer paginated History. A forced failure
   completes without waiting for another History page.
+* Workflow slot reservations share the cache limit, including waits for a custom slot supplier.
+* Shutdown drains accepted tasks and History fetches after Workflow polling has started.
+* Workers can use large cache limits without allocating entries up front.
 
 ## [0.12.0] - 2026-11-23
 
