@@ -64,6 +64,8 @@ relevant information.
 
 * A Worker evicts a run when replay fails during a retryable legacy query. The server can retry
   the query on a fresh replay.
+* Local Activities report schedule-to-close timeouts before dispatch and during local backoff.
+  Expired queued attempts do not start.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 
