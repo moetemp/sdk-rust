@@ -13,7 +13,7 @@ use crate::{
     worker::{
         WorkerConfig,
         workflow::{
-            NextPageReq, PermittedWFT, UnstoredWftFailInfo,
+            NextPageReq, PermittedWFT, UnstoredWftFailInfo, WftFailureKind,
             history_update::{HistoryPaginator, HistoryUpdate},
             wft_extraction::{FetchedPage, HistfetchRC, WFTExtractorOutput},
         },
@@ -122,6 +122,7 @@ impl StreamRecordsReq {
                     workflow_id: work.execution.workflow_id.clone(),
                     attempt: work.attempt,
                     workflow_type: work.workflow_type.clone(),
+                    kind: WftFailureKind::for_history_fetch(work.legacy_query.is_some()),
                 };
                 (work.execution.run_id.clone(), Some(info))
             }

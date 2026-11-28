@@ -62,6 +62,8 @@ relevant information.
 * Workflow queries retain task results when replay needs another History page.
 * Worker shutdown drains all Activity and Nexus poll responses before ending task delivery.
 
+* A Worker evicts a run when replay fails during a retryable legacy query. The server can retry
+  the query on a fresh replay.
 * Replayed Local Activity timeouts now report an Activity failure with the timeout as its cause,
   matching live execution.
 
